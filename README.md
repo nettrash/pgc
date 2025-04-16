@@ -1,1 +1,1 @@
-# pgc
+# PostgreSQL Database Comparer
