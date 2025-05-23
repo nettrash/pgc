@@ -8,3 +8,7 @@ name = "pgc"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { version = "1.45.0", features = ["full"] }
+clap = { version = "4.5.38", features = ["derive"] }
+sqlx = "0.8.6"
+sqlx-postgres = "0.8.6"

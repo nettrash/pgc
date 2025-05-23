@@ -30,30 +30,30 @@ Command line arguments can be used to execute just one function in one time.
 
 ## Command line arguments
 
-[-c|--command] {dump|compare} - the command name, dump - to create a dump file, compare - to compare two dumps.
+`--command {dump|compare}` - the command name, dump - to create a dump file, compare - to compare two dumps.
 
-[-h|--host] {hostname} - to specify `host name` for a command, without it tool will use localhost as a host for command.
+`--server {server name}` - to specify `server name` for a command, without it tool will use localhost as a host for command.
 
-[-d|--database] {databasename} - to specify `database name` for the command, without it tool will use `postgres` as a database name.
+`--database {databasename}` - to specify `database name` for the command, without it tool will use `postgres` as a database name.
 
-[-s|--scheme] {schemaname} - to specify concrete scheme for the command, without it `public` schema will be used for command.
+`--scheme {schemaname}` - to specify concrete scheme for the command, without it `public` schema will be used for command.
 
-[-o|--output] {filename} - to specify output file name for the command, without it the tool will use `data.out` as a file name for output file.
+`--output {filename}` - to specify output file name for the command, without it the tool will use `data.out` as a file name for output file.
 
-[-f|--from] {filename} - to specify dump file of the `FROM` databadse for the comparer, default value for this property `dump.from`.
+`--from {filename}` - to specify dump file of the `FROM` databadse for the comparer, default value for this property `dump.from`.
 
-[-t|--to] {filename} - to specify dump file of the `TO` databadse for the comparer, default value for this property is `dump.to`.
+`--to {filename}` - to specify dump file of the `TO` databadse for the comparer, default value for this property is `dump.to`.
 
-[--config] {filename} - this argument avoid usage of any other arguments, and tell comparer to use command chain from this file.
+`--config {filename}` - this argument avoid usage of any other arguments, and tell comparer to use command chain from this file. Default: `pgc.conf`.
 
-[-ssl|--use_ssl] - specify this argument to use SSL for PostgreSQL connection.
+`--use_ssl` - specify this argument to use SSL for PostgreSQL connection.
 
 ## Functionality
 
 ### Create database schema dump
 
 ```bash
-pgc  [-c|--command] dump [-h|--host] {host} [-d|--database] {database} [-s|--scheme] {scheme} [-o|--output] {file}
+pgc  --command dump --server {host} --database {database} --scheme {scheme} --output {file}
 ```
 
 As a result if this command we will have a dump file with all needed information to compile delta between two databases. This file should be used for the `FROM` or `TO` sides in `compare` command.
@@ -61,7 +61,7 @@ As a result if this command we will have a dump file with all needed information
 ### Create delta script between two dumps
 
 ```bash
-pgc [-c|--command] compare [-f|--from] {from_dump} [-t|--to] {to_dump} [-o|--output] {file}
+pgc --command compare --from {from_dump} --to {to_dump} --output {file}
 ```
 
 This command comparing two dumps and produce SQL script for the `FROM` database to be equal to `TO` database after applying it.
