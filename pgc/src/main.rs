@@ -1,5 +1,9 @@
 use clap::{command, CommandFactory, Parser};
-use std::io::Error;
+use std::{io::Error, path::Path};
+
+use crate::config::config::Config;
+
+pub mod config;
 
 // Command line arguments.
 #[derive(Parser, Debug)]
@@ -91,7 +95,13 @@ fn pgc_version() {
 async fn run_by_config(config: String) -> Result<(), Error> {
     // Here you would read the config file and execute the appropriate command.
     // For now, we just print the config file name.
-    println!("Running with config: {}", config);
+    Path::new(&config).exists().then(|| {
+        println!("Running with config: {}", config);
+        let cfg: Config = Config::new(config.clone());
+        println!("Configuration: {:?}", cfg);
+    }).unwrap_or_else(|| {
+        eprintln!("Config file does not exist: {}", config);
+    });
     Ok(())
 }
 
