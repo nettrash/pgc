@@ -1,4 +1,4 @@
-use crate::config::database_config::DumpConfig;
+use crate::config::dump_config::DumpConfig;
 
 // Configuration file representation.
 #[derive(Debug, Clone)]

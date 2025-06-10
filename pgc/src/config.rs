@@ -1,2 +1,2 @@
 pub mod config;
-pub mod database_config;
+pub mod dump_config;
