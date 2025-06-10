@@ -1,5 +1,7 @@
 # PostgreSQL Database Comparer
 
+![rust workflow](https://github.com/nettrash/pgc/actions/workflows/rust.yml/badge.svg)
+
 ## Story
 
 We're faced with vital need to have a proper working free tool for comparing two PostgreSQL databases and preparing the delta as SQL script.
