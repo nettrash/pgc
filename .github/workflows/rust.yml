@@ -16,7 +16,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Go to folder
+      run: cd ${{ github.workspace }}/pgc
     - name: Build
-      run: cd pgc & cargo build --verbose
+      run: cargo build --verbose
     - name: Run tests
-      run: cd pgc & cargo test --verbose
+      run: cargo test --verbose
