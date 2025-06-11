@@ -25,11 +25,17 @@ impl Config {
             .collect::<Vec<&str>>();
 
         let mut from_host = "".to_string();
+        let mut from_port = "5432".to_string();
+        let mut from_user = "".to_string();
+        let mut from_password = "".to_string();
         let mut from_database = "".to_string();
         let mut from_scheme = "".to_string();
         let mut from_ssl = false;
         let mut from_dump = "dump.from".to_string();
         let mut to_host = "".to_string();
+        let mut to_port = "5432".to_string();
+        let mut to_user = "".to_string();
+        let mut to_password = "".to_string();
         let mut to_database = "".to_string();
         let mut to_scheme = "".to_string();
         let mut to_ssl = false;
@@ -47,10 +53,14 @@ impl Config {
             if parts[0].trim().is_empty() || parts[1].trim().is_empty() {
                 panic!("Invalid configuration line: {}", line);
             }
-            if parts[0].trim().to_uppercase() != "FROM_HOST" && parts[0].trim() != "FROM_DATABASE" &&
+            if parts[0].trim().to_uppercase() != "FROM_HOST" && parts[0].trim() != "FROM_PORT" &&
+               parts[0].trim().to_uppercase() != "FROM_USER" && parts[0].trim() != "FROM_PASSWORD" &&
+               parts[0].trim() != "FROM_DATABASE" &&
                parts[0].trim() != "FROM_SCHEME" && parts[0].trim() != "FROM_SSL" &&
                parts[0].trim() != "FROM_DUMP" &&
-               parts[0].trim().to_uppercase() != "TO_HOST" && parts[0].trim() != "TO_DATABASE" &&
+               parts[0].trim().to_uppercase() != "TO_HOST" && parts[0].trim() != "TO_PORT" &&
+               parts[0].trim().to_uppercase() != "TO_USER" && parts[0].trim() != "TO_PASSWORD" &&
+               parts[0].trim() != "TO_DATABASE" &&
                parts[0].trim() != "TO_SCHEME" && parts[0].trim() != "TO_SSL" &&
                parts[0].trim() != "TO_DUMP" &&
                parts[0].trim() != "OUTPUT" {
@@ -65,11 +75,17 @@ impl Config {
 
             match parts[0].trim().to_uppercase().as_str() {
                 "FROM_HOST" => from_host = parts[1].trim().to_string(),
+                "FROM_PORT" => from_port = parts[1].trim().to_string(),
+                "FROM_USER" => from_user = parts[1].trim().to_string(),
+                "FROM_PASSWORD" => from_password = parts[1].trim().to_string(),
                 "FROM_DATABASE" => from_database = parts[1].trim().to_string(),
                 "FROM_SCHEME" => from_scheme = parts[1].trim().to_string(),
                 "FROM_SSL" => from_ssl = parts[1].trim().to_uppercase() == "TRUE",
                 "FROM_DUMP" => from_dump = parts[1].trim().to_string(),
                 "TO_HOST" => to_host = parts[1].trim().to_string(),
+                "TO_PORT" => to_port = parts[1].trim().to_string(),
+                "TO_USER" => to_user = parts[1].trim().to_string(),
+                "TO_PASSWORD" => to_password = parts[1].trim().to_string(),
                 "TO_DATABASE" => to_database = parts[1].trim().to_string(),
                 "TO_SCHEME" => to_scheme = parts[1].trim().to_string(),
                 "TO_SSL" => to_ssl = parts[1].trim().to_uppercase() == "TRUE",
@@ -80,6 +96,9 @@ impl Config {
         }
         let from = DumpConfig {
             host: from_host,
+            port: from_port,
+            user: from_user,
+            password: from_password,
             database: from_database,
             scheme: from_scheme,
             ssl: from_ssl,
@@ -87,6 +106,9 @@ impl Config {
         };
         let to = DumpConfig {
             host: to_host,
+            port: to_port,
+            user: to_user,
+            password: to_password,
             database: to_database,
             scheme: to_scheme,
             ssl: to_ssl,

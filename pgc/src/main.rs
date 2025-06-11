@@ -23,6 +23,18 @@ struct Args {
     #[arg(long, default_value = "localhost")]
     server: Option<String>,
 
+    /// Hostname for the command
+    #[arg(long, default_value = "5432")]
+    port: Option<String>,
+
+    /// User name for the command
+    #[arg(long, default_value = "")]
+    user: Option<String>,
+
+    /// Password of user for the command
+    #[arg(long, default_value = "")]
+    password: Option<String>,
+
     /// Database name for the command
     #[arg(long, default_value = "postgres")]
     database: Option<String>,
@@ -74,6 +86,9 @@ pub async fn main() -> Result<(), Error> {
                 println!("Dumping database...");
                 return create_dump(
                     args.server.unwrap(),
+                    args.port.unwrap(),
+                    args.user.unwrap(),
+                    args.password.unwrap(),
                     args.database.unwrap(),
                     args.scheme.unwrap(),
                     args.use_ssl,
@@ -114,12 +129,12 @@ async fn run_by_config(config: String) -> Result<(), Error> {
         let to_file = cfg.to.file.clone();
         let output_file = cfg.output.clone();
 
-        let result = create_dump(cfg.from.host, cfg.from.database, cfg.from.scheme, cfg.from.ssl, from_file.clone()).await;
+        let result = create_dump(cfg.from.host, cfg.from.port, cfg.from.user, cfg.from.password, cfg.from.database, cfg.from.scheme, cfg.from.ssl, from_file.clone()).await;
         if result.is_err() {
             eprintln!("Error creating dump: {}", result.as_ref().unwrap_err());
             return Err(result.unwrap_err());
         }
-        let result = create_dump(cfg.to.host, cfg.to.database, cfg.to.scheme, cfg.to.ssl, to_file.clone()).await;
+        let result = create_dump(cfg.to.host, cfg.to.port, cfg.to.user, cfg.to.password, cfg.to.database, cfg.to.scheme, cfg.to.ssl, to_file.clone()).await;
         if result.is_err() {
             eprintln!("Error creating dump: {}", result.as_ref().unwrap_err());
             return Err(result.unwrap_err());
@@ -139,6 +154,9 @@ async fn run_by_config(config: String) -> Result<(), Error> {
 
 async fn create_dump(
     server: String,
+    port: String,
+    user: String,
+    password: String,
     database: String,
     scheme: String,
     use_ssl: bool,
@@ -146,6 +164,9 @@ async fn create_dump(
 ) -> Result<(), Error> {
     let dump_config: DumpConfig = DumpConfig {
         host: server,
+        port,
+        user,
+        password,
         database,
         scheme,
         ssl: use_ssl,

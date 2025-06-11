@@ -36,9 +36,15 @@ Command line arguments can be used to execute just one function in one time.
 
 `--server {server name}` - to specify `server name` for a command, without it tool will use localhost as a host for command.
 
+`--port {port number}` - to specify `port number` for a command, without it tool will use 5432 as a host for command.
+
+`--user {user name}` - to specify `user name` for a command, without it tool will use information from pgpass file.
+
+`--password {user password}` - to specify `user password` for a command, without it tool will use information from pgpass file.
+
 `--database {databasename}` - to specify `database name` for the command, without it tool will use `postgres` as a database name.
 
-`--scheme {schemaname}` - to specify concrete scheme for the command, without it `public` schema will be used for command.
+`--scheme {schemaname}` - to specify concrete scheme for the command, without it all schemas will be used for command.
 
 `--output {filename}` - to specify output file name for the command, without it the tool will use `data.out` as a file name for output file.
 
