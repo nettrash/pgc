@@ -179,7 +179,6 @@ async fn create_dump(
         eprintln!("Error creating dump: {}", e);
         return Err(e);
     }
-    println!("Dump created successfully: {}", output);
     Ok(())
 }
 
