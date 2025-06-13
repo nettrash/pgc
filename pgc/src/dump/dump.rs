@@ -176,7 +176,7 @@ impl Dump {
                 join pg_namespace n on t.typnamespace = n.oid 
             where 
                 n.nspname like '{}' 
-                and t.typtype in ('b', 'c', 'd', 'e', 'p', 'r', 's', 'v') 
+                and t.typtype in ('b', 'd', 'e', 'r', 'm') 
                 and t.typisdefined = true",
                 self.configuration.scheme
             )
