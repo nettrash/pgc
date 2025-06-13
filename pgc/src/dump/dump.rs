@@ -100,6 +100,7 @@ impl Dump {
         self.get_extensions(conn).await?;
         self.get_types(conn).await?;
         self.get_enums(conn).await?;
+        self.get_routines(conn).await?;
         Ok(())
     }
 
@@ -263,6 +264,68 @@ impl Dump {
                 };
                 self.enums.push(pgenum.clone());
                 println!(" - enumtypid {} (label: {})", pgenum.enumtypid.0, pgenum.enumlabel);
+            }
+        }
+        Ok(())
+    }
+    
+    // Fetch routines from the database and populate the dump.
+    async fn get_routines(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+        let result = sqlx::query(
+            format!(
+                "select
+                    n.nspname,
+                    r.oid,
+                    r.proname,
+                    l.lanname as prolang,
+                    case when r.prokind = 'f' then 'function' else 'procedure' end as prokind,
+                    t.typname as prorettype,
+                    pg_get_function_identity_arguments(r.oid) as proarguments,
+                    pg_get_expr(r.proargdefaults, 0) as proargdefaults,
+                    r.prosrc
+                from
+                    pg_proc r
+                    join pg_namespace n on r.pronamespace = n.oid
+                    join pg_language l on r.prolang = l.oid
+                    join pg_type t on r.prorettype = t.oid
+                where
+                    n.nspname like '{}'
+                    and n.nspname not in ('pg_catalog', 'information_schema')
+                    and l.lanname not in ('c', 'internal')
+                    and r.prokind in ('f', 'p');
+                ",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(conn)
+        .await;        
+        if result.is_err() {
+            return Err(Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to fetch routines: {}.", result.err().unwrap()),
+            ));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No routines found.");
+        } else {
+            println!("Routines found:");
+            for row in rows {
+                let routine = Routine {
+                    schema: row.get("nspname"),
+                    oid: row.get("oid"),
+                    name: row.get("proname"),
+                    lang: row.get("prolang"),
+                    kind: row.get("prokind"),
+                    return_type: row.get("prorettype"),
+                    arguments: row.get("proarguments"),
+                    arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
+                    source_code: row.get("prosrc")
+                };
+                self.routines.push(routine.clone());
+                println!(" - {} {}.{} (lang: {}, arguments: {})", routine.kind, routine.schema, routine.name, routine.lang, routine.arguments);
             }
         }
         Ok(())
