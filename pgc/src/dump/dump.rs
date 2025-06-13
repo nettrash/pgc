@@ -188,15 +188,15 @@ impl Dump {
         if result.is_err() {
             return Err(Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to fetch types: {}.", result.err().unwrap()),
+                format!("Failed to fetch user-defined types: {}.", result.err().unwrap()),
             ));
         }
         let rows = result.unwrap();
 
         if rows.is_empty() {
-            println!("No types found.");
+            println!("No user-defined types found.");
         } else {
-            println!("Types found:");
+            println!("User-defined types found:");
             for row in rows {
                 let pgtype = PgType {
                     schema: row.get("nspname"),
