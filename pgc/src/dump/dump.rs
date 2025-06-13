@@ -1,10 +1,10 @@
 use crate::dump::pg_enum::PgEnum;
 use crate::dump::pg_type::PgType;
 use crate::dump::routine::Routine;
+use crate::dump::table::Table;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use serde::{Deserialize, Serialize};
-use sqlx::Connection;
-use sqlx::PgConnection;
+use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::types::Oid;
 use std::fs::File;
@@ -31,6 +31,9 @@ pub struct Dump {
 
     // List of routines in the dump.
     routines: Vec<Routine>,
+
+    // List of tables in the dump.
+    tables: Vec<Table>,
 }
 
 impl Dump {
@@ -42,12 +45,13 @@ impl Dump {
             types: Vec::new(),
             enums: Vec::new(),
             routines: Vec::new(),
+            tables: Vec::new(),
         }
     }
 
     // Retrieve the dump from the configuration.
     pub async fn process(&mut self) -> Result<(), Error> {
-        let mut conn = PgConnection::connect(self.configuration.get_connection_string().as_str())
+        let pool = PgPool::connect(self.configuration.get_connection_string().as_str())
             .await
             .map_err(|e| {
                 Error::new(
@@ -61,15 +65,10 @@ impl Dump {
             })?;
 
         // Fill the dump.
-        self.fill(conn.as_mut()).await?;
+        self.fill(&pool).await?;
 
-        let result = conn.close().await;
-        if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to close connection: {}.", result.err().unwrap()),
-            ));
-        }
+        pool.close().await;
+
         // Serialize the dump to a file.
         let serialized = serde_json::to_string(&self);
         if serialized.is_err() {
@@ -95,19 +94,20 @@ impl Dump {
         Ok(())
     }
 
-    async fn fill(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+    async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         // Fetch extensions from the database.
-        self.get_extensions(conn).await?;
-        self.get_types(conn).await?;
-        self.get_enums(conn).await?;
-        self.get_routines(conn).await?;
+        self.get_extensions(pool).await?;
+        self.get_types(pool).await?;
+        self.get_enums(pool).await?;
+        self.get_routines(pool).await?;
+        self.get_tables(pool).await?;
         Ok(())
     }
 
     // Fetch extensions from the database and populate the dump.
-    async fn get_extensions(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
-        let result = sqlx::query(format!("select n.nspname, e.* from pg_extension e join pg_namespace n on e.extnamespace = n.oid and n.nspname like '{}'", self.configuration.scheme).as_str())
-            .fetch_all(conn)
+    async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND n.nspname LIKE '{}'", self.configuration.scheme).as_str())
+            .fetch_all(pool)
             .await;
         if result.is_err() {
             return Err(Error::new(
@@ -138,10 +138,10 @@ impl Dump {
     }
 
     // Fetch types from the database and populate the dump.
-    async fn get_types(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+    async fn get_types(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
             format!(
-                "select 
+                "SELECT 
                 n.nspname, 
                 t.typname,
                 t.typnamespace,
@@ -154,16 +154,16 @@ impl Dump {
                 t.typisdefined,
                 t.typdelim,
                 t.typrelid,
-                t.typsubscript::text as typsubscript,
+                t.typsubscript::text AS typsubscript,
                 t.typelem,
                 t.typarray,
-                t.typinput::text as typinput,
-                t.typoutput::text as typoutput,
-                t.typreceive::text as typreceive,
-                t.typsend::text as typsend,
-                t.typmodin::text as typmodin,
-                t.typmodout::text as typmodout,
-                t.typanalyze::text as typanalyze,
+                t.typinput::text AS typinput,
+                t.typoutput::text AS typoutput,
+                t.typreceive::text AS typreceive,
+                t.typsend::text AS typsend,
+                t.typmodin::text AS typmodin,
+                t.typmodout::text AS typmodout,
+                t.typanalyze::text AS typanalyze,
                 t.typalign,
                 t.typstorage,
                 t.typnotnull,
@@ -172,24 +172,27 @@ impl Dump {
                 t.typndims,
                 t.typcollation,
                 t.typdefault
-            from 
+            FROM 
                 pg_type t 
-                join pg_namespace n on t.typnamespace = n.oid 
-            where 
-                n.nspname like '{}' 
-                and t.typtype in ('d', 'e', 'r', 'm') 
-                and t.typcategory = 'U'
-                and t.typisdefined = true",
+                JOIN pg_namespace n ON t.typnamespace = n.oid 
+            WHERE 
+                n.nspname LIKE '{}' 
+                AND t.typtype IN ('d', 'e', 'r', 'm') 
+                AND t.typcategory = 'U'
+                AND t.typisdefined = true",
                 self.configuration.scheme
             )
             .as_str(),
         )
-        .fetch_all(conn)
+        .fetch_all(pool)
         .await;
         if result.is_err() {
             return Err(Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to fetch user-defined types: {}.", result.err().unwrap()),
+                format!(
+                    "Failed to fetch user-defined types: {}.",
+                    result.err().unwrap()
+                ),
             ));
         }
         let rows = result.unwrap();
@@ -237,12 +240,10 @@ impl Dump {
         }
         Ok(())
     }
-    
+
     // Fetch enums from the database and populate the dump.
-    async fn get_enums(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
-        let result = sqlx::query("select * from pg_enum")
-        .fetch_all(conn)
-        .await;
+    async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query("SELECT * FROM pg_enum").fetch_all(pool).await;
         if result.is_err() {
             return Err(Error::new(
                 std::io::ErrorKind::Other,
@@ -260,17 +261,20 @@ impl Dump {
                     oid: row.get("oid"),
                     enumtypid: row.get("enumtypid"),
                     enumsortorder: row.get("enumsortorder"),
-                    enumlabel: row.get("enumlabel")
+                    enumlabel: row.get("enumlabel"),
                 };
                 self.enums.push(pgenum.clone());
-                println!(" - enumtypid {} (label: {})", pgenum.enumtypid.0, pgenum.enumlabel);
+                println!(
+                    " - enumtypid {} (label: {})",
+                    pgenum.enumtypid.0, pgenum.enumlabel
+                );
             }
         }
         Ok(())
     }
-    
+
     // Fetch routines from the database and populate the dump.
-    async fn get_routines(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+    async fn get_routines(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
             format!(
                 "select
@@ -298,8 +302,8 @@ impl Dump {
             )
             .as_str(),
         )
-        .fetch_all(conn)
-        .await;        
+        .fetch_all(pool)
+        .await;
         if result.is_err() {
             return Err(Error::new(
                 std::io::ErrorKind::Other,
@@ -322,10 +326,76 @@ impl Dump {
                     return_type: row.get("prorettype"),
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
-                    source_code: row.get("prosrc")
+                    source_code: row.get("prosrc"),
                 };
                 self.routines.push(routine.clone());
-                println!(" - {} {}.{} (lang: {}, arguments: {})", routine.kind, routine.schema, routine.name, routine.lang, routine.arguments);
+                println!(
+                    " - {} {}.{} (lang: {}, arguments: {})",
+                    routine.kind, routine.schema, routine.name, routine.lang, routine.arguments
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // Fetch tables from the database and populate the dump.
+    async fn get_tables(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query(
+            format!(
+                "
+                    SELECT * 
+                    FROM 
+                        pg_tables 
+                    WHERE 
+                        schemaname NOT IN ('pg_catalog', 'information_schema') 
+                        AND schemaname LIKE '{}' 
+                        AND tablename NOT LIKE 'pg_%' 
+                    ORDER BY 
+                        schemaname, 
+                        tablename;",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+        if result.is_err() {
+            return Err(Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to fetch tables: {}.", result.err().unwrap()),
+            ));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No tables found.");
+        } else {
+            println!("Tables found:");
+            for row in rows {
+                let mut table = Table {
+                    schema: row.get("schemaname"),
+                    name: row.get("tablename"),
+                    owner: row.get("tableowner"),
+                    space: row.get("tablespace"),
+                    has_indexes: row.get("hasindexes"),
+                    has_triggers: row.get("hastriggers"),
+                    has_rules: row.get("hasrules"),
+                    has_rowsecurity: row.get("rowsecurity"),
+                    columns: Vec::new(),
+                    constraints: Vec::new(),
+                    indexes: Vec::new(),
+                    triggers: Vec::new(),
+                };
+                table.fill(pool).await.map_err(|e| {
+                    Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to fill table {}: {}.", table.name, e),
+                    )
+                })?;
+
+                self.tables.push(table.clone());
+
+                println!(" - {}.{}", table.schema, table.name);
             }
         }
         Ok(())
