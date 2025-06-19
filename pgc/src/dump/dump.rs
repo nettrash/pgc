@@ -94,6 +94,7 @@ impl Dump {
         Ok(())
     }
 
+    // Fill the Dump with data from the database.
     async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         // Fetch extensions from the database.
         self.get_extensions(pool).await?;
