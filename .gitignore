@@ -18,4 +18,8 @@ target/
 
 .vscode/
 
-data/dump.out
+# Dumps
+dump.out
+from.dump
+to.dump
+dump.io
