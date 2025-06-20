@@ -1,1 +1,10 @@
 pub mod dump;
+pub mod extension;
+pub mod pg_type;
+pub mod pg_enum;
+pub mod routine;
+pub mod table;
+pub mod table_column;
+pub mod table_index;
+pub mod table_constraint;
+pub mod table_trigger;
