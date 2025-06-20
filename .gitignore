@@ -18,8 +18,11 @@ target/
 
 .vscode/
 
+.DS_Store
+
 # Dumps
 dump.out
 from.dump
 to.dump
 dump.io
+output.sql
