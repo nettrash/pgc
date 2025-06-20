@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::types::Oid;
 use std::fs::File;
-use std::io::Error;
+use std::io::{Error, Read};
 use std::io::Write;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -400,5 +400,41 @@ impl Dump {
             }
         }
         Ok(())
+    }
+
+    // Read a dump from a file and deserialize it.
+    pub async fn read_from_file(file: &str) -> Result<Self, Error> {
+        let file = File::open(file)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        let mut dump_file = zip.by_name("dump.io")?;
+        let mut serialized_data = String::new();
+        dump_file.read_to_string(&mut serialized_data)?;
+
+        let dump: Dump = serde_json::from_str(&serialized_data)
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("Failed to deserialize dump: {}.", e)))?;
+        
+        Ok(dump)
+    }
+
+    pub fn get_info(&self) -> String {
+        format!("{}\n{}",
+            format!(
+                "\tConnection Info:\n\t\t- Host: {}\n\t\t- Port: {}\n\t\t- User: {}\n\t\t- Database: {}\n\t\t- Scheme: {}\n\t\t- SSL: {}",
+                self.configuration.host,
+                self.configuration.port,
+                self.configuration.user,
+                self.configuration.database,
+                self.configuration.scheme,
+                self.configuration.ssl
+            ),
+            format!("\tDump Info:\n\t\t- File: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+                self.configuration.file,
+                self.extensions.len(),
+                self.types.len(),
+                self.enums.len(),
+                self.routines.len(),
+                self.tables.len()
+            )
+        )
     }
 }
