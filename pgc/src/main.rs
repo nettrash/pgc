@@ -214,11 +214,6 @@ async fn create_dump(
 }
 
 async fn compare_dumps(from: String, to: String, output: String) -> Result<(), Error> {
-    let _ = from;
-    let _ = to;
-    let _ = output;
-    // Here you would implement the logic to compare dumps.
-    // For now, we just print a message.
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
     let to = Dump::read_from_file(&to).await?;
