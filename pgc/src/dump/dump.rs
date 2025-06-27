@@ -18,22 +18,22 @@ use zip::write::SimpleFileOptions;
 pub struct Dump {
     // Configuration of the dump.
     #[serde(skip_serializing, skip_deserializing)]
-    configuration: DumpConfig,
+    pub configuration: DumpConfig,
 
     // List of extensions in the dump.
-    extensions: Vec<Extension>,
+    pub extensions: Vec<Extension>,
 
     // List of PostgreSQL types in the dump.
-    types: Vec<PgType>,
+    pub types: Vec<PgType>,
 
     // List of PostgreSQL enums in the dump.
-    enums: Vec<PgEnum>,
+    pub enums: Vec<PgEnum>,
 
     // List of routines in the dump.
-    routines: Vec<Routine>,
+    pub routines: Vec<Routine>,
 
     // List of tables in the dump.
-    tables: Vec<Table>,
+    pub tables: Vec<Table>,
 }
 
 impl Dump {

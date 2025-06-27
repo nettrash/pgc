@@ -220,7 +220,7 @@ async fn compare_dumps(from: String, to: String, output: String) -> Result<(), E
     println!("--> Dump from:\n{}\n", from.get_info());
     println!("--> Dump to:\n{}\n", to.get_info());
     println!("Comparing dumps...");
-    let comparer = Comparer::new(from, to);
+    let mut comparer = Comparer::new(from, to);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {}", output);
