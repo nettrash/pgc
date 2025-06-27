@@ -64,4 +64,23 @@ impl Routine {
             self.source_code
         )))
     }
+
+    pub fn get_script(&self) -> String {
+        let mut script = format!(
+            "create or replace {} {}.{}({}) returns {} as $${}$$ language {};\n",
+            self.kind.to_lowercase(),
+            self.schema,
+            self.name,
+            self.arguments,
+            self.return_type,
+            self.source_code,
+            self.lang
+        );
+
+        if let Some(defaults) = &self.arguments_defaults {
+            script.push_str(&format!("-- Defaults: {}\n", defaults));
+        }
+
+        script
+    }
 }

@@ -90,12 +90,12 @@ impl Comparer {
         for routine in &self.to.routines {
             if let Some(from_routine) = self.from.routines.iter().find(|r| r.name == routine.name && r.schema == routine.schema) {
                 if from_routine.hash() != routine.hash() {
-                    self.script.push_str(format!("/* Routine: {}.{}*/", routine.schema, routine.name).as_str());
-                    self.script.push_str(routine.source_code.as_str());
+                    self.script.push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+                    self.script.push_str(routine.get_script().as_str());
                 }
             } else {
-                    self.script.push_str(format!("/* Routine: {}.{}*/", routine.schema, routine.name).as_str());
-                    self.script.push_str(routine.source_code.as_str());
+                    self.script.push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+                    self.script.push_str(routine.get_script().as_str());
             }
         }
 
