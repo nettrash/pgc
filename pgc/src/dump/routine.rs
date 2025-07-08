@@ -65,6 +65,7 @@ impl Routine {
         )))
     }
 
+    /// Returns a string to create the routine.
     pub fn get_script(&self) -> String {
         let mut script = format!(
             "create or replace {} {}.{}({}) returns {} as $${}$$ language {};\n",
@@ -84,6 +85,7 @@ impl Routine {
         script
     }
 
+    /// Returns a string to drop the routine.
     pub fn get_drop_script(&self) -> String {
         format!(
             "drop {} if exists {}.{} ({});\n",

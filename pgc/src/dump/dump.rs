@@ -107,7 +107,7 @@ impl Dump {
 
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND n.nspname LIKE '{}'", self.configuration.scheme).as_str())
+        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND n.nspname LIKE '{}' OR n.nspname = 'public'", self.configuration.scheme).as_str())
             .fetch_all(pool)
             .await;
         if result.is_err() {

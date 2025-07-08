@@ -64,7 +64,31 @@ impl Comparer {
 
     // Comparing extentions
     async fn compare_extensions(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Extensions */\n");
+        self.script.push_str("/* Extensions: Start section */\n");
+
+        // We will find all new extensions from "to" dump that are not in "from" dump
+        // and add them to the script.
+        // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
+        for ext in &self.to.extensions {
+            if let Some(_from_ext) = self.from.extensions.iter().find(|r| r.name == ext.name && r.schema == ext.schema) {
+                continue; // Extension is present in both dumps, we already processed it
+            } else {
+                    self.script.push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
+                    self.script.push_str(ext.get_script().as_str());
+            }
+        }
+
+        for ext in &self.from.extensions {
+            if let Some(_to_ext) = self.to.extensions.iter().find(|r| r.name == ext.name && r.schema == ext.schema) {
+                continue; // Routine is present in both dumps, we already processed it
+            } else {
+                self.script.push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
+                self.script.push_str("/* Extension is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(ext.get_drop_script().as_str());
+            }
+        }
+
+        self.script.push_str("/* Extensions: End section */\n");
         Ok(())
     }
 
