@@ -99,6 +99,16 @@ impl Comparer {
             }
         }
 
+        for routine in &self.from.routines {
+            if let Some(_to_routine) = self.to.routines.iter().find(|r| r.name == routine.name && r.schema == routine.schema) {
+                continue; // Routine is present in both dumps, we already processed it
+            } else {
+                self.script.push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+                self.script.push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(routine.get_drop_script().as_str());
+            }
+        }
+
         self.script.push_str("/* Routines: End section */\n");
         Ok(())
     }

@@ -83,4 +83,14 @@ impl Routine {
 
         script
     }
+
+    pub fn get_drop_script(&self) -> String {
+        format!(
+            "drop {} if exists {}.{} ({});\n",
+            self.kind.to_lowercase(),
+            self.schema,
+            self.name,
+            self.arguments
+        )
+    }
 }
