@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,4 +15,23 @@ pub struct TableConstraint {
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub enforced: bool,          // Whether the constraint is enforced
     pub nulls_distinct: Option<bool>, // Whether the constraint allows nulls to be distinct
+}
+
+impl TableConstraint {
+    /// Hash
+    pub fn add_to_hasher(&self, hasher: &mut Sha256) {
+        hasher.update(self.catalog.as_bytes());
+        hasher.update(self.schema.as_bytes());
+        hasher.update(self.name.as_bytes());
+        hasher.update(self.table_catalog.as_bytes());
+        hasher.update(self.table_schema.as_bytes());
+        hasher.update(self.table_name.as_bytes());
+        hasher.update(self.constraint_type.as_bytes());
+        hasher.update(self.is_deferrable.to_string().as_bytes());
+        hasher.update(self.initially_deferred.to_string().as_bytes());
+        hasher.update(self.enforced.to_string().as_bytes());
+        if let Some(nulls_distinct) = self.nulls_distinct {
+            hasher.update(nulls_distinct.to_string().as_bytes());
+        }
+    }
 }

@@ -4,6 +4,7 @@ use crate::dump::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Error, PgPool, Row};
+use sha2::{Sha256, Digest};
 
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub struct Table {
 }
 
 impl Table {
+    /// Fill information about table.
     pub async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         self.fill_columns(pool).await?;
         self.fill_indexes(pool).await?;
@@ -31,6 +33,7 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about columns.
     async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT * FROM information_schema.columns WHERE table_schema = '{}' AND table_name = '{}'",
@@ -94,6 +97,7 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT * FROM pg_indexes WHERE schemaname = '{}' AND tablename = '{}'",
@@ -118,6 +122,7 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT * FROM information_schema.table_constraints WHERE table_schema = '{}' AND table_name = '{}'",
@@ -151,6 +156,7 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about triggers.
     async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}'::regclass and tgisinternal = false",
@@ -171,5 +177,38 @@ impl Table {
         }
 
         Ok(())
+    }
+
+    /// Hash
+    pub fn hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.schema.as_bytes());
+        hasher.update(self.name.as_bytes());
+        hasher.update(self.owner.as_bytes());
+        if let Some(space) = &self.space {
+            hasher.update(space.as_bytes());
+        }
+        hasher.update(self.has_indexes.to_string().as_bytes());
+        hasher.update(self.has_triggers.to_string().as_bytes());
+        hasher.update(self.has_rules.to_string().as_bytes());
+        hasher.update(self.has_rowsecurity.to_string().as_bytes());
+
+        for column in &self.columns {
+            column.add_to_hasher(&mut hasher);
+        }
+
+        for constraint in &self.constraints {
+            constraint.add_to_hasher(&mut hasher);
+        }
+
+        for index in &self.indexes {
+            index.add_to_hasher(&mut hasher);
+        }
+
+        for trigger in &self.triggers {
+            trigger.add_to_hasher(&mut hasher);
+        }
+
+        format!("{:x}", hasher.finalize())
     }
 }

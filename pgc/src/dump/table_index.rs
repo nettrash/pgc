@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,4 +9,17 @@ pub struct TableIndex {
     pub name: String,            // Index name
     pub catalog: Option<String>, // Catalog name
     pub indexdef: String,        // Index definition
+}
+
+impl TableIndex {
+    /// Hash
+    pub fn add_to_hasher(&self, hasher: &mut Sha256) {
+        hasher.update(self.schema.as_bytes());
+        hasher.update(self.table.as_bytes());
+        hasher.update(self.name.as_bytes());
+        if let Some(catalog) = &self.catalog {
+            hasher.update(catalog.as_bytes());
+        }
+        hasher.update(self.indexdef.as_bytes());
+    }
 }

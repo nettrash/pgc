@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,4 +48,54 @@ pub struct TableColumn {
     pub is_generated: String,                  // Whether the column is generated
     pub generation_expression: Option<String>, // Generation expression for the column
     pub is_updatable: bool,                    // Whether the column is updatable
+}
+
+impl TableColumn {
+    /// Hash
+    pub fn add_to_hasher(&self, hasher: &mut Sha256) {
+        hasher.update(self.catalog.as_bytes());
+        hasher.update(self.schema.as_bytes());
+        hasher.update(self.table.as_bytes());
+        hasher.update(self.name.as_bytes());
+        hasher.update(self.ordinal_position.to_string().as_bytes());
+        hasher.update(self.column_default.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.is_nullable.to_string().as_bytes());
+        hasher.update(self.data_type.as_bytes());
+        hasher.update(self.character_maximum_length.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.character_octet_length.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.numeric_precision.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.numeric_precision_radix.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.numeric_scale.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.datetime_precision.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.interval_type.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.interval_precision.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.character_set_catalog.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.character_set_schema.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.character_set_name.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.collation_catalog.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.collation_schema.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.collation_name.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.domain_catalog.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.domain_schema.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.domain_name.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.udt_catalog.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.udt_schema.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.udt_name.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.scope_catalog.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.scope_schema.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.scope_name.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.maximum_cardinality.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(self.dtd_identifier.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.is_self_referencing.to_string().as_bytes());
+        hasher.update(self.is_identity.to_string().as_bytes());
+        hasher.update(self.identity_generation.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.identity_start.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.identity_increment.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.identity_maximum.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.identity_minimum.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.identity_cycle.to_string().as_bytes());
+        hasher.update(self.is_generated.as_bytes());
+        hasher.update(self.generation_expression.as_deref().unwrap_or("").as_bytes());
+        hasher.update(self.is_updatable.to_string().as_bytes());
+    }
 }
