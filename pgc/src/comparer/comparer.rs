@@ -44,6 +44,7 @@ impl Comparer {
         self.compare_extensions().await?;
         self.compare_types().await?;
         self.compare_enums().await?;
+        self.compare_sequences().await?;
         self.compare_routines().await?;
         self.compare_tables().await?;
 
@@ -70,20 +71,34 @@ impl Comparer {
         // and add them to the script.
         // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
         for ext in &self.to.extensions {
-            if let Some(_from_ext) = self.from.extensions.iter().find(|r| r.name == ext.name && r.schema == ext.schema) {
+            if let Some(_from_ext) = self
+                .from
+                .extensions
+                .iter()
+                .find(|r| r.name == ext.name && r.schema == ext.schema)
+            {
                 continue; // Extension is present in both dumps, we already processed it
             } else {
-                    self.script.push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
-                    self.script.push_str(ext.get_script().as_str());
+                self.script
+                    .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
+                self.script.push_str(ext.get_script().as_str());
             }
         }
 
         for ext in &self.from.extensions {
-            if let Some(_to_ext) = self.to.extensions.iter().find(|r| r.name == ext.name && r.schema == ext.schema) {
+            if let Some(_to_ext) = self
+                .to
+                .extensions
+                .iter()
+                .find(|r| r.name == ext.name && r.schema == ext.schema)
+            {
                 continue; // Routine is present in both dumps, we already processed it
             } else {
-                self.script.push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
-                self.script.push_str("/* Extension is not present in 'to' dump and should be dropped. */\n");
+                self.script
+                    .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
+                self.script.push_str(
+                    "/* Extension is not present in 'to' dump and should be dropped. */\n",
+                );
                 self.script.push_str(ext.get_drop_script().as_str());
             }
         }
@@ -104,6 +119,57 @@ impl Comparer {
         Ok(())
     }
 
+    // Comparing sequences
+    async fn compare_sequences(&mut self) -> Result<(), Error> {
+        self.script.push_str("/* Sequences: Start section */\n");
+
+        // We will find all new sequences from "to" dump that are not in "from" dump
+        // and we will find all existing sequences in both dumps with different hashes
+        // and add them to the script.
+        for sequence in &self.to.sequences {
+            if let Some(from_sequence) = self
+                .from
+                .sequences
+                .iter()
+                .find(|s| s.name == sequence.name && s.schema == sequence.schema)
+            {
+                if from_sequence.hash() != sequence.hash() {
+                    self.script.push_str(
+                        format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
+                    );
+                    self.script.push_str(sequence.get_alter_script().as_str());
+                }
+            } else {
+                self.script.push_str(
+                    format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
+                );
+                self.script.push_str(sequence.get_script().as_str());
+            }
+        }
+
+        for sequence in &self.from.sequences {
+            if let Some(_to_sequence) = self
+                .to
+                .sequences
+                .iter()
+                .find(|s| s.name == sequence.name && s.schema == sequence.schema)
+            {
+                continue; // Sequence is present in both dumps, we already processed it
+            } else {
+                self.script.push_str(
+                    format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
+                );
+                self.script.push_str(
+                    "/* Sequence is not present in 'to' dump and should be dropped. */\n",
+                );
+                self.script.push_str(sequence.get_drop_script().as_str());
+            }
+        }
+
+        self.script.push_str("/* Sequences: End section */\n");
+        Ok(())
+    }
+
     // Comparing routines
     async fn compare_routines(&mut self) -> Result<(), Error> {
         self.script.push_str("/* Routines: Start section */\n");
@@ -112,23 +178,40 @@ impl Comparer {
         // and we will find all existing routines in both dumps with different hashes
         // and add them to the script.
         for routine in &self.to.routines {
-            if let Some(from_routine) = self.from.routines.iter().find(|r| r.name == routine.name && r.schema == routine.schema) {
+            if let Some(from_routine) = self
+                .from
+                .routines
+                .iter()
+                .find(|r| r.name == routine.name && r.schema == routine.schema)
+            {
                 if from_routine.hash() != routine.hash() {
-                    self.script.push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+                    self.script.push_str(
+                        format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    );
                     self.script.push_str(routine.get_script().as_str());
                 }
             } else {
-                    self.script.push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
-                    self.script.push_str(routine.get_script().as_str());
+                self.script.push_str(
+                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                );
+                self.script.push_str(routine.get_script().as_str());
             }
         }
 
         for routine in &self.from.routines {
-            if let Some(_to_routine) = self.to.routines.iter().find(|r| r.name == routine.name && r.schema == routine.schema) {
+            if let Some(_to_routine) = self
+                .to
+                .routines
+                .iter()
+                .find(|r| r.name == routine.name && r.schema == routine.schema)
+            {
                 continue; // Routine is present in both dumps, we already processed it
             } else {
-                self.script.push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
-                self.script.push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(
+                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                );
+                self.script
+                    .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
                 self.script.push_str(routine.get_drop_script().as_str());
             }
         }
@@ -139,7 +222,43 @@ impl Comparer {
 
     // Comparing tables
     async fn compare_tables(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Tables */\n");
+        self.script.push_str("/* Tables: Start section */\n");
+        // We will drop all tables that exists just in "from" dump.
+        for table in &self.from.tables {
+            if let Some(_to_table) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+            {
+                continue; // Table is present in both dumps, we already processed it
+            } else {
+                self.script
+                    .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
+                self.script
+                    .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(table.get_drop_script().as_str());
+            }
+        }
+        // We will find all new tables from "to" dump that are not in "from" dump
+        // and add them to the script.
+        for table in &self.to.tables {
+            if let Some(from_table) = self
+                .from
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+            {
+                if from_table.hash() != table.hash() {
+                    // Jsut create an alter script for the table
+                }
+            } else {
+                self.script
+                    .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
+                self.script.push_str(table.get_script().as_str());
+            }
+        }
+        self.script.push_str("/* Tables: End section */\n");
         Ok(())
     }
 }

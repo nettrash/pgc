@@ -98,4 +98,93 @@ impl TableColumn {
         hasher.update(self.generation_expression.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.is_updatable.to_string().as_bytes());
     }
+
+    /// Returns a string representation of the column
+    pub fn get_script(&self) -> String {
+        let mut script = String::new();
+        // Name
+        script.push_str(&format!("\"{}\" ", self.name));
+
+        // Data type with length/precision/scale if applicable
+        script.push_str(&self.data_type);
+        // Character length
+        if let Some(length) = self.character_maximum_length {
+            // Only append for character types
+            if self.data_type.to_lowercase().contains("char") {
+                script.push_str(&format!("({})", length));
+            }
+        } else if let (Some(precision), Some(scale)) = (self.numeric_precision, self.numeric_scale) {
+            // Numeric(precision, scale)
+            if self.data_type.to_lowercase().contains("numeric") || self.data_type.to_lowercase().contains("decimal") {
+                script.push_str(&format!("({}, {})", precision, scale));
+            }
+        } else if let Some(precision) = self.numeric_precision {
+            // Numeric(precision)
+            if self.data_type.to_lowercase().contains("numeric") || self.data_type.to_lowercase().contains("decimal") {
+                script.push_str(&format!("({})", precision));
+            }
+        }
+        // Datetime precision
+        if let Some(dt_precision) = self.datetime_precision {
+            if self.data_type.to_lowercase().contains("timestamp") || self.data_type.to_lowercase().contains("time") {
+                script.push_str(&format!("({})", dt_precision));
+            }
+        }
+        // Interval type
+        if let Some(interval_type) = &self.interval_type {
+            if self.data_type.to_lowercase().contains("interval") {
+                script.push_str(&format!(" {}", interval_type));
+            }
+        }
+
+        // Collation
+        if let Some(collation) = &self.collation_name {
+            if !collation.is_empty() {
+                script.push_str(&format!(" collate \"{}\"", collation));
+            }
+        }
+
+        // Identity
+        if self.is_identity {
+            script.push_str(" generated ");
+            if let Some(ref generation) = self.identity_generation {
+                script.push_str(&generation.to_uppercase());
+            } else {
+                script.push_str("by default");
+            }
+            script.push_str(" as identity");
+            // Identity options
+            let mut opts = Vec::new();
+            if let Some(ref v) = self.identity_start { opts.push(format!("start with {}", v)); }
+            if let Some(ref v) = self.identity_increment { opts.push(format!("increment by {}", v)); }
+            if let Some(ref v) = self.identity_minimum { opts.push(format!("minvalue {}", v)); }
+            if let Some(ref v) = self.identity_maximum { opts.push(format!("maxvalue {}", v)); }
+            if self.identity_cycle { opts.push("cycle".to_string()); }
+            if !opts.is_empty() {
+                script.push_str(&format!(" ({})", opts.join(" ")));
+            }
+            script.push(' ');
+        }
+
+        // Generated always as (expression)
+        if self.is_generated.to_lowercase() == "always" {
+            if let Some(expr) = &self.generation_expression {
+                script.push_str(&format!(" generated always as ({}) stored ", expr));
+            }
+        }
+
+        // Default
+        if let Some(default) = &self.column_default {
+            script.push_str(&format!(" default {}", default));
+        }
+
+        // Nullability
+        if self.is_nullable {
+            script.push_str(" null");
+        } else {
+            script.push_str(" not null");
+        }
+
+        script.trim_end().to_string()
+    }
 }

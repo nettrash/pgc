@@ -1,6 +1,7 @@
 use crate::dump::pg_enum::PgEnum;
 use crate::dump::pg_type::PgType;
 use crate::dump::routine::Routine;
+use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,8 @@ use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::types::Oid;
 use std::fs::File;
-use std::io::{Error, Read};
 use std::io::Write;
+use std::io::{Error, Read};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -29,6 +30,9 @@ pub struct Dump {
     // List of PostgreSQL enums in the dump.
     pub enums: Vec<PgEnum>,
 
+    // List of sequences in the dump.
+    pub sequences: Vec<Sequence>,
+
     // List of routines in the dump.
     pub routines: Vec<Routine>,
 
@@ -44,6 +48,7 @@ impl Dump {
             extensions: Vec::new(),
             types: Vec::new(),
             enums: Vec::new(),
+            sequences: Vec::new(),
             routines: Vec::new(),
             tables: Vec::new(),
         }
@@ -100,6 +105,7 @@ impl Dump {
         self.get_extensions(pool).await?;
         self.get_types(pool).await?;
         self.get_enums(pool).await?;
+        self.get_sequences(pool).await?;
         self.get_routines(pool).await?;
         self.get_tables(pool).await?;
         Ok(())
@@ -274,6 +280,68 @@ impl Dump {
         Ok(())
     }
 
+    // Fetch sequences from the database and populate the dump.
+    async fn get_sequences(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query(
+            format!(
+                "
+        SELECT 
+            schemaname, 
+            sequencename, 
+            sequenceowner, 
+            data_type::varchar as sequencedatatype, 
+            start_value, 
+            min_value, 
+            max_value, 
+            increment_by, 
+            cycle, 
+            cache_size, 
+            last_value 
+        FROM 
+            pg_sequences 
+        WHERE 
+            schemaname like '%{}%'",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+
+        if result.is_err() {
+            return Err(Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to fetch sequences: {}.", result.err().unwrap()),
+            ));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No sequences found.");
+        } else {
+            println!("Sequences found:");
+            for row in rows {
+                let seq = Sequence {
+                    schema: row.get("schemaname"),
+                    name: row.get("sequencename"),
+                    owner: row.get("sequenceowner"),
+                    data_type: row.get("sequencedatatype"),
+                    start_value: row.get::<Option<i64>, _>("start_value"),
+                    min_value: row.get::<Option<i64>, _>("min_value"),
+                    max_value: row.get::<Option<i64>, _>("max_value"),
+                    increment_by: row.get::<Option<i64>, _>("increment_by"),
+                    cycle: row.get("cycle"),
+                    cache_size: row.get::<Option<i64>, _>("cache_size"),
+                    last_value: row.get::<Option<i64>, _>("last_value"),
+                };
+                self.sequences.push(seq.clone());
+                println!(" - name {} (type: {})", seq.name, seq.data_type);
+            }
+        }
+
+        Ok(())
+    }
+
     // Fetch routines from the database and populate the dump.
     async fn get_routines(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
@@ -386,6 +454,7 @@ impl Dump {
                     constraints: Vec::new(),
                     indexes: Vec::new(),
                     triggers: Vec::new(),
+                    definition: None,
                 };
                 table.fill(pool).await.map_err(|e| {
                     Error::new(
@@ -410,14 +479,19 @@ impl Dump {
         let mut serialized_data = String::new();
         dump_file.read_to_string(&mut serialized_data)?;
 
-        let dump: Dump = serde_json::from_str(&serialized_data)
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("Failed to deserialize dump: {}.", e)))?;
-        
+        let dump: Dump = serde_json::from_str(&serialized_data).map_err(|e| {
+            Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to deserialize dump: {}.", e),
+            )
+        })?;
+
         Ok(dump)
     }
 
     pub fn get_info(&self) -> String {
-        format!("{}\n{}",
+        format!(
+            "{}\n{}",
             format!(
                 "\tConnection Info:\n\t\t- Host: {}\n\t\t- Port: {}\n\t\t- User: {}\n\t\t- Database: {}\n\t\t- Scheme: {}\n\t\t- SSL: {}",
                 self.configuration.host,
@@ -427,7 +501,8 @@ impl Dump {
                 self.configuration.scheme,
                 self.configuration.ssl
             ),
-            format!("\tDump Info:\n\t\t- File: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+            format!(
+                "\tDump Info:\n\t\t- File: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
                 self.configuration.file,
                 self.extensions.len(),
                 self.types.len(),

@@ -22,4 +22,12 @@ impl TableIndex {
         }
         hasher.update(self.indexdef.as_bytes());
     }
+
+    /// Returns a string representation of the index
+    pub fn get_script(&self) -> String {
+        let mut script = String::new();
+        script.push_str(&self.indexdef.to_lowercase());
+        script.push_str(";\n");
+        script
+    }
 }

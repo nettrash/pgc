@@ -34,4 +34,29 @@ impl TableConstraint {
             hasher.update(nulls_distinct.to_string().as_bytes());
         }
     }
+
+    /// Returns a string representation of the constraint
+    pub fn get_script(&self) -> String {
+        let mut script = String::new();
+        script.push_str(&format!("alter table {}.{} add constraint {} ", self.table_schema, self.table_name, self.name));
+        script.push_str(&format!("{} ", self.constraint_type.to_lowercase()));
+        if self.is_deferrable {
+            script.push_str("deferrable ");
+        }
+        if self.initially_deferred {
+            script.push_str("initially deferred ");
+        }
+        if !self.enforced {
+            script.push_str("not enforced ");
+        }
+        if let Some(nulls_distinct) = self.nulls_distinct {
+            if nulls_distinct {
+                script.push_str("nulls distinct ");
+            } else {
+                script.push_str("nulls not distinct ");
+            }
+        }
+        script.push_str(";\n");
+        script
+    }
 }

@@ -17,4 +17,13 @@ impl TableTrigger {
         hasher.update(self.name.as_bytes());
         hasher.update(self.definition.as_bytes());
     }
+
+    /// Returns a string representation of the trigger
+    pub fn get_script(&self) -> String {
+        let mut script = String::new();
+        script.push_str(&format!("create trigger {} ", self.name));
+        script.push_str(&self.definition);
+        script.push(';');
+        script
+    }
 }
