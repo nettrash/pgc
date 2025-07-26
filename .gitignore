@@ -27,3 +27,8 @@ to.dump
 dump.io
 output.sql
 test.conf
+
+# Docker
+docker-compose.override.yml
+.env
+*.dump
