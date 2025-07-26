@@ -33,6 +33,7 @@ usage() {
     echo ""
     echo "Commands:"
     echo "  build      Build the Docker image"
+    echo "  buildx     Build multi-platform Docker image (requires buildx)"
     echo "  test       Run the test environment with docker-compose"
     echo "  clean      Clean up Docker containers and images"
     echo "  demo       Run a full demo comparison"
@@ -42,6 +43,7 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $0 build"
+    echo "  $0 buildx"
     echo "  $0 test"
     echo "  $0 demo"
 }
@@ -50,6 +52,34 @@ build_image() {
     log "Building Docker image: ${IMAGE_NAME}"
     docker build -t "${IMAGE_NAME}" .
     log "Build completed successfully!"
+}
+
+build_multiplatform() {
+    log "Building multi-platform Docker image: ${IMAGE_NAME}"
+    
+    # Check if buildx is available
+    if ! docker buildx version > /dev/null 2>&1; then
+        error "Docker buildx is not available. Please install Docker Desktop or enable buildx."
+        exit 1
+    fi
+    
+    # Create builder if it doesn't exist
+    docker buildx create --name pgc-builder --use 2>/dev/null || docker buildx use pgc-builder 2>/dev/null || true
+    
+    # Build for multiple platforms
+    docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        -t "${IMAGE_NAME}" \
+        --load \
+        . 2>/dev/null || {
+        warn "Multi-platform build with --load failed, building without load"
+        docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t "${IMAGE_NAME}" \
+            .
+    }
+    
+    log "Multi-platform build completed successfully!"
 }
 
 test_environment() {
@@ -142,6 +172,9 @@ fi
 case "${1:-help}" in
     build)
         build_image
+        ;;
+    buildx)
+        build_multiplatform
         ;;
     test)
         build_image

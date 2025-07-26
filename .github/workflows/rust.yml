@@ -61,13 +61,13 @@ jobs:
           type=sha,prefix={{branch}}-
           type=raw,value=latest,enable={{is_default_branch}}
     
-    - name: Build Docker image
+    - name: Build Docker image for testing (single platform)
       uses: docker/build-push-action@v5
       with:
         context: .
-        platforms: linux/amd64,linux/arm64
+        platforms: linux/amd64
         push: false
-        tags: ${{ steps.meta.outputs.tags }}
+        tags: pgc:test
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
@@ -75,12 +75,10 @@ jobs:
     
     - name: Test Docker image locally
       run: |
-        # Get the first tag for testing
-        IMAGE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
-        echo "Testing image: $IMAGE_TAG"
-        docker run --rm "$IMAGE_TAG" pgc --help
+        echo "Testing image: pgc:test"
+        docker run --rm pgc:test pgc --help
     
-    - name: Push Docker image to registry
+    - name: Build and push Docker image (multi-platform)
       if: github.event_name != 'pull_request'
       uses: docker/build-push-action@v5
       with:

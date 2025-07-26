@@ -95,9 +95,16 @@ If you see authentication errors:
 ### Build Issues
 
 If the Docker build fails:
-1. Test the build locally: `docker build -t pgc:test .`
-2. Check the Dockerfile for syntax errors
-3. Ensure all required files are included (not in `.dockerignore`)
+
+1. **Multi-platform build errors**: 
+   ```
+   ERROR: failed to build: docker exporter does not currently support exporting manifest lists
+   ```
+   This is expected when building for multiple platforms locally. The GitHub Actions workflow handles this correctly by building single-platform for testing and multi-platform for publishing.
+
+2. **Local testing**: `docker build -t pgc:test .`
+3. **Check Dockerfile syntax**: Ensure all COPY paths and commands are correct
+4. **Check file inclusion**: Ensure all required files are included (not in `.dockerignore`)
 4. Check the GitHub Actions logs for specific error messages
 
 ### Permission Issues

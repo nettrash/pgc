@@ -161,14 +161,38 @@ Mount a specific output directory:
 The Dockerfile supports multiple architectures. To build for specific platforms:
 
 ```bash
-# Build for AMD64
+# Build for current platform (default)
+docker build -t pgc:latest .
+
+# Build for AMD64 specifically
 docker build --platform linux/amd64 -t pgc:amd64 .
 
-# Build for ARM64
+# Build for ARM64 specifically
 docker build --platform linux/arm64 -t pgc:arm64 .
 
 # Build multi-platform (requires buildx)
 docker buildx build --platform linux/amd64,linux/arm64 -t pgc:latest .
+
+# Or use the convenience script
+./docker-build.sh buildx
+```
+
+### Multi-Platform Build Notes
+
+When building for multiple platforms:
+- Use `docker buildx` instead of `docker build`
+- Cannot use `--load` with multiple platforms
+- Images are built but not loaded to local Docker daemon
+- Suitable for pushing to registries, not local testing
+
+For local testing, use single-platform builds:
+
+```bash
+# For local testing
+./docker-build.sh build
+
+# For multi-platform distribution
+./docker-build.sh buildx
 ```
 
 ## Production Usage
@@ -229,7 +253,17 @@ compare-schemas:
 
 ### Common Issues
 
-1. **Permission Denied**
+1. **Multi-Platform Build Error**
+   ```bash
+   # Error: "docker exporter does not currently support exporting manifest lists"
+   # Solution: Use single platform for local testing
+   docker build -t pgc:latest .
+   
+   # Or use buildx without --load
+   docker buildx build --platform linux/amd64,linux/arm64 -t pgc:latest .
+   ```
+
+2. **Permission Denied**
    ```bash
    # Fix file permissions
    sudo chown -R $(id -u):$(id -g) data/
