@@ -34,6 +34,7 @@ usage() {
     echo "Commands:"
     echo "  build      Build the Docker image"
     echo "  buildx     Build multi-platform Docker image (requires buildx)"
+    echo "  test-rust  Test local Rust build before Docker"
     echo "  test       Run the test environment with docker-compose"
     echo "  clean      Clean up Docker containers and images"
     echo "  demo       Run a full demo comparison"
@@ -42,14 +43,44 @@ usage() {
     echo "  help       Show this help message"
     echo ""
     echo "Examples:"
+    echo "  $0 test-rust    # Test Rust build locally first"
     echo "  $0 build"
     echo "  $0 buildx"
     echo "  $0 test"
     echo "  $0 demo"
 }
 
+test_rust_build() {
+    log "Running local Rust build test..."
+    if [ -f "./test-build.sh" ]; then
+        ./test-build.sh
+    else
+        error "test-build.sh not found. Running basic test..."
+        if [ -d "./app" ]; then
+            cd app
+            if command -v cargo &> /dev/null; then
+                log "Testing cargo check..."
+                cargo check || error "Cargo check failed"
+                log "Local Rust environment looks good!"
+            else
+                warn "Cargo not found. Install Rust to test locally."
+            fi
+            cd ..
+        else
+            error "app directory not found"
+        fi
+    fi
+}
+
 build_image() {
     log "Building Docker image: ${IMAGE_NAME}"
+    
+    # Optional: Run local test first
+    if command -v cargo &> /dev/null && [ -d "./app" ]; then
+        log "Running quick Rust syntax check..."
+        (cd app && cargo check) || warn "Local cargo check failed, but continuing with Docker build..."
+    fi
+    
     docker build -t "${IMAGE_NAME}" .
     log "Build completed successfully!"
 }
@@ -156,6 +187,12 @@ clean_up() {
     log "Cleanup completed!"
 }
 
+# Check command early to avoid unnecessary Docker checks for test-rust
+if [ "${1:-help}" = "test-rust" ]; then
+    test_rust_build
+    exit 0
+fi
+
 # Check if Docker is running
 if ! docker info > /dev/null 2>&1; then
     error "Docker is not running. Please start Docker and try again."
@@ -170,6 +207,9 @@ fi
 
 # Main command handling
 case "${1:-help}" in
+    test-rust)
+        # Already handled above
+        ;;
     build)
         build_image
         ;;

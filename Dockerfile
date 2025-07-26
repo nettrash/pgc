@@ -12,19 +12,22 @@ RUN apt-get update && apt-get install -y \
 # Set work directory
 WORKDIR /usr/src/app
 
-# Copy Cargo files
+# Copy Cargo files first for better dependency caching
 COPY app/Cargo.toml app/Cargo.lock ./
 
-# Create a dummy main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create src directory and a dummy main.rs to build dependencies
+RUN mkdir src && \
+    echo "// Dummy main for dependency caching" > src/main.rs && \
+    echo "fn main() {}" >> src/main.rs
 
-# Build dependencies (this layer will be cached)
-RUN cargo build --release && rm -rf src
+# Build dependencies only (this will be cached)
+RUN cargo build --release && \
+    rm -f target/release/deps/pgc*
 
-# Copy the actual source code
+# Copy the real source code
 COPY app/src ./src
 
-# Build the application
+# Build the actual application
 RUN cargo build --release
 
 # Runtime stage
