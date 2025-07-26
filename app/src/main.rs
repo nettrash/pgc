@@ -14,7 +14,7 @@ pub mod dump;
 #[derive(Parser, Debug)]
 #[command(
     name = "pgc",
-    author = "Paysend",
+    author = "nettrash",
     version = "1.0.0",
     about = "PostgreSQL Database Schema Comparer.",
     long_about = None,
@@ -118,7 +118,7 @@ pub async fn main() -> Result<(), Error> {
 // Function to print the version information.
 fn pgc_version() {
     println!("pgc v1.0.0");
-    println!("(c) 2025 Paysend. All rights reserved.");
+    println!("(c) 2025 nettrash. All rights reserved.");
     println!("This program is licensed under the GPL v3 License.");
     println!();
 }

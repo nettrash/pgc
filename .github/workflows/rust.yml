@@ -5,6 +5,7 @@ on:
     branches: [ "*" ]
   pull_request:
     branches: [ "*" ]
+  workflow_dispatch:  # Enable manual triggering
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +43,8 @@ jobs:
   docker:
     needs: build
     runs-on: ubuntu-latest
+    # Only run automatically on master branch, or when manually triggered
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     
     steps:
     - uses: actions/checkout@v4
@@ -86,7 +89,8 @@ jobs:
         docker run --rm pgc:test pgc --help
     
     - name: Build and push Docker image (multi-platform)
-      if: github.event_name != 'pull_request'
+      # Push to registry if: not a PR AND (on master branch OR manually triggered)
+      if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
       uses: docker/build-push-action@v5
       with:
         context: .
