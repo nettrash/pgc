@@ -180,9 +180,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
     }
 }
 
-async fn create_dump(
-    dump_config: DumpConfig,
-) -> Result<(), Error> {
+async fn create_dump(dump_config: DumpConfig) -> Result<(), Error> {
     let mut dump = Dump::new(dump_config);
     println!("Creating dump...");
     let result = dump.process().await;

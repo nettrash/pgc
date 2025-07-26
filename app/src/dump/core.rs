@@ -59,13 +59,11 @@ impl Dump {
         let pool = PgPool::connect(self.configuration.get_connection_string().as_str())
             .await
             .map_err(|e| {
-                Error::other(
-                    format!(
-                        "Failed to connect to database ({}): {}.",
-                        self.configuration.get_masked_connection_string(),
-                        e
-                    ),
-                )
+                Error::other(format!(
+                    "Failed to connect to database ({}): {}.",
+                    self.configuration.get_masked_connection_string(),
+                    e
+                ))
             })?;
 
         // Fill the dump.
@@ -76,9 +74,10 @@ impl Dump {
         // Serialize the dump to a file.
         let serialized = serde_json::to_string(&self);
         if serialized.is_err() {
-            return Err(Error::other(
-                format!("Failed to serialize dump: {}.", serialized.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to serialize dump: {}.",
+                serialized.err().unwrap()
+            )));
         }
         let serialized_data = serialized.unwrap();
         let serialized_bytes = serialized_data.as_bytes();
@@ -115,9 +114,10 @@ impl Dump {
             .fetch_all(pool)
             .await;
         if result.is_err() {
-            return Err(Error::other(
-                format!("Failed to fetch extensions: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch extensions: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -191,12 +191,10 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::other(
-                format!(
-                    "Failed to fetch user-defined types: {}.",
-                    result.err().unwrap()
-                ),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch user-defined types: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -248,9 +246,10 @@ impl Dump {
     async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query("SELECT * FROM pg_enum").fetch_all(pool).await;
         if result.is_err() {
-            return Err(Error::other(
-                format!("Failed to fetch enums: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch enums: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -304,9 +303,10 @@ impl Dump {
         .await;
 
         if result.is_err() {
-            return Err(Error::other(
-                format!("Failed to fetch sequences: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch sequences: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -368,9 +368,10 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::other(
-                format!("Failed to fetch routines: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch routines: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -422,9 +423,10 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::other(
-                format!("Failed to fetch tables: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch tables: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -449,9 +451,7 @@ impl Dump {
                     definition: None,
                 };
                 table.fill(pool).await.map_err(|e| {
-                    Error::other(
-                        format!("Failed to fill table {}: {}.", table.name, e),
-                    )
+                    Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
 
                 self.tables.push(table.clone());
@@ -470,11 +470,8 @@ impl Dump {
         let mut serialized_data = String::new();
         dump_file.read_to_string(&mut serialized_data)?;
 
-        let dump: Dump = serde_json::from_str(&serialized_data).map_err(|e| {
-            Error::other(
-                format!("Failed to deserialize dump: {e}."),
-            )
-        })?;
+        let dump: Dump = serde_json::from_str(&serialized_data)
+            .map_err(|e| Error::other(format!("Failed to deserialize dump: {e}.")))?;
 
         Ok(dump)
     }

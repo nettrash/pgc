@@ -25,7 +25,6 @@ pub struct Routine {
 }
 
 impl Routine {
-
     /// Hash
     pub fn hash(&self) -> String {
         format!(
