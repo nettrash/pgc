@@ -1,4 +1,4 @@
-pub mod dump;
+pub mod core;
 pub mod extension;
 pub mod pg_enum;
 pub mod pg_type;

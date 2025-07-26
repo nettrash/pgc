@@ -161,8 +161,8 @@ impl Table {
     /// Fill information about triggers.
     async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}'::regclass and tgisinternal = false",
-            format!("{}.{}", self.schema, self.name)
+            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}.{}'::regclass and tgisinternal = false",
+            self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -300,7 +300,7 @@ impl Table {
                                     "    primary key ({})",
                                     pk_cols
                                         .iter()
-                                        .map(|c| format!("\"{}\"", c))
+                                        .map(|c| format!("\"{c}\""))
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 );

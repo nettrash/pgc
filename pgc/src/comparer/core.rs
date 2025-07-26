@@ -1,4 +1,4 @@
-use crate::dump::dump::Dump;
+use crate::dump::core::Dump;
 use std::{
     fs::File,
     io::{Error, Write},

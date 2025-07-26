@@ -25,30 +25,6 @@ pub struct Routine {
 }
 
 impl Routine {
-    /// Creates a new `Routine` instance.
-    pub fn new(
-        schema: String,
-        oid: Oid,
-        name: String,
-        lang: String,
-        kind: String,
-        return_type: String,
-        arguments: String,
-        arguments_defaults: Option<String>,
-        source_code: String,
-    ) -> Self {
-        Self {
-            schema,
-            oid,
-            name,
-            lang,
-            kind,
-            return_type,
-            arguments,
-            arguments_defaults,
-            source_code,
-        }
-    }
 
     /// Hash
     pub fn hash(&self) -> String {
@@ -82,7 +58,7 @@ impl Routine {
         );
 
         if let Some(defaults) = &self.arguments_defaults {
-            script.push_str(&format!("-- Defaults: {}\n", defaults));
+            script.push_str(&format!("-- Defaults: {defaults}\n"));
         }
 
         script

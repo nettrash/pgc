@@ -1,1 +1,1 @@
-pub mod comparer;
+pub mod core;

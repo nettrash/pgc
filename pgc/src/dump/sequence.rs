@@ -59,26 +59,26 @@ impl Sequence {
 
         // Add START WITH clause
         if let Some(start_value) = self.start_value {
-            script.push_str(&format!(" start with {}", start_value));
+            script.push_str(&format!(" start with {start_value}"));
         }
 
         // Add INCREMENT BY clause
         if let Some(increment_by) = self.increment_by {
             if increment_by != 1 {
-                script.push_str(&format!(" increment by {}", increment_by));
+                script.push_str(&format!(" increment by {increment_by}"));
             }
         }
 
         // Add MINVALUE clause
         if let Some(min_value) = self.min_value {
-            script.push_str(&format!(" minvalue {}", min_value));
+            script.push_str(&format!(" minvalue {min_value}"));
         } else {
             script.push_str(" no minvalue");
         }
 
         // Add MAXVALUE clause
         if let Some(max_value) = self.max_value {
-            script.push_str(&format!(" maxvalue {}", max_value));
+            script.push_str(&format!(" maxvalue {max_value}"));
         } else {
             script.push_str(" no maxvalue");
         }
@@ -86,7 +86,7 @@ impl Sequence {
         // Add CACHE clause
         if let Some(cache_size) = self.cache_size {
             if cache_size != 1 {
-                script.push_str(&format!(" cache {}", cache_size));
+                script.push_str(&format!(" cache {cache_size}"));
             }
         }
 
@@ -111,23 +111,23 @@ impl Sequence {
         script.push_str(&format!("alter sequence {}.{} ", self.schema, self.name));
 
         if let Some(start_value) = self.start_value {
-            script.push_str(&format!("start with {} ", start_value));
+            script.push_str(&format!("start with {start_value} "));
         }
         if let Some(increment_by) = self.increment_by {
-            script.push_str(&format!("increment by {} ", increment_by));
+            script.push_str(&format!("increment by {increment_by} "));
         }
         if let Some(min_value) = self.min_value {
-            script.push_str(&format!("minvalue {} ", min_value));
+            script.push_str(&format!("minvalue {min_value} "));
         } else {
             script.push_str("no minvalue ");
         }
         if let Some(max_value) = self.max_value {
-            script.push_str(&format!("maxvalue {} ", max_value));
+            script.push_str(&format!("maxvalue {max_value} "));
         } else {
             script.push_str("no maxvalue ");
         }
         if let Some(cache_size) = self.cache_size {
-            script.push_str(&format!("cache {} ", cache_size));
+            script.push_str(&format!("cache {cache_size} "));
         }
         if self.cycle {
             script.push_str("cycle ");

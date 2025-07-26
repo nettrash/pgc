@@ -51,11 +51,11 @@ impl Config {
                 continue; // Skip empty lines and comments
             }
             if line.split('=').count() != 2 {
-                panic!("Invalid configuration line: {}", line);
+                panic!("Invalid configuration line: {line}");
             }
             let parts: Vec<&str> = line.split('=').collect();
             if parts[0].trim().is_empty() || parts[1].trim().is_empty() {
-                panic!("Invalid configuration line: {}", line);
+                panic!("Invalid configuration line: {line}");
             }
             if parts[0].trim().to_uppercase() != "FROM_HOST"
                 && parts[0].trim() != "FROM_PORT"
@@ -173,12 +173,12 @@ mod tests {
         assert_eq!(config.from.host, "localhost");
         assert_eq!(config.from.database, "testdb");
         assert_eq!(config.from.scheme, "postgres");
-        assert_eq!(config.from.ssl, true);
+        assert!(config.from.ssl);
         assert_eq!(config.from.file, "from.dump");
         assert_eq!(config.to.host, "remotehost");
         assert_eq!(config.to.database, "remotedb");
         assert_eq!(config.to.scheme, "postgres");
-        assert_eq!(config.to.ssl, false);
+        assert!(!config.to.ssl);
         assert_eq!(config.to.file, "to.dump");
         assert_eq!(config.output, "result.out");
         let _ = std::fs::remove_file(file);

@@ -59,8 +59,7 @@ impl Dump {
         let pool = PgPool::connect(self.configuration.get_connection_string().as_str())
             .await
             .map_err(|e| {
-                Error::new(
-                    std::io::ErrorKind::Other,
+                Error::other(
                     format!(
                         "Failed to connect to database ({}): {}.",
                         self.configuration.get_masked_connection_string(),
@@ -77,8 +76,7 @@ impl Dump {
         // Serialize the dump to a file.
         let serialized = serde_json::to_string(&self);
         if serialized.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!("Failed to serialize dump: {}.", serialized.err().unwrap()),
             ));
         }
@@ -117,8 +115,7 @@ impl Dump {
             .fetch_all(pool)
             .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!("Failed to fetch extensions: {}.", result.err().unwrap()),
             ));
         }
@@ -194,8 +191,7 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!(
                     "Failed to fetch user-defined types: {}.",
                     result.err().unwrap()
@@ -252,8 +248,7 @@ impl Dump {
     async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query("SELECT * FROM pg_enum").fetch_all(pool).await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!("Failed to fetch enums: {}.", result.err().unwrap()),
             ));
         }
@@ -309,8 +304,7 @@ impl Dump {
         .await;
 
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!("Failed to fetch sequences: {}.", result.err().unwrap()),
             ));
         }
@@ -374,8 +368,7 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!("Failed to fetch routines: {}.", result.err().unwrap()),
             ));
         }
@@ -429,8 +422,7 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::other(
                 format!("Failed to fetch tables: {}.", result.err().unwrap()),
             ));
         }
@@ -457,8 +449,7 @@ impl Dump {
                     definition: None,
                 };
                 table.fill(pool).await.map_err(|e| {
-                    Error::new(
-                        std::io::ErrorKind::Other,
+                    Error::other(
                         format!("Failed to fill table {}: {}.", table.name, e),
                     )
                 })?;
@@ -480,9 +471,8 @@ impl Dump {
         dump_file.read_to_string(&mut serialized_data)?;
 
         let dump: Dump = serde_json::from_str(&serialized_data).map_err(|e| {
-            Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to deserialize dump: {}.", e),
+            Error::other(
+                format!("Failed to deserialize dump: {e}."),
             )
         })?;
 

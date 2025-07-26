@@ -146,7 +146,7 @@ impl TableColumn {
         if let Some(length) = self.character_maximum_length {
             // Only append for character types
             if self.data_type.to_lowercase().contains("char") {
-                script.push_str(&format!("({})", length));
+                script.push_str(&format!("({length})"));
             }
         } else if let (Some(precision), Some(scale)) = (self.numeric_precision, self.numeric_scale)
         {
@@ -154,14 +154,14 @@ impl TableColumn {
             if self.data_type.to_lowercase().contains("numeric")
                 || self.data_type.to_lowercase().contains("decimal")
             {
-                script.push_str(&format!("({}, {})", precision, scale));
+                script.push_str(&format!("({precision}, {scale})"));
             }
         } else if let Some(precision) = self.numeric_precision {
             // Numeric(precision)
             if self.data_type.to_lowercase().contains("numeric")
                 || self.data_type.to_lowercase().contains("decimal")
             {
-                script.push_str(&format!("({})", precision));
+                script.push_str(&format!("({precision})"));
             }
         }
         // Datetime precision
@@ -173,14 +173,14 @@ impl TableColumn {
         // Interval type
         if let Some(interval_type) = &self.interval_type {
             if self.data_type.to_lowercase().contains("interval") {
-                script.push_str(&format!(" {}", interval_type));
+                script.push_str(&format!(" {interval_type}"));
             }
         }
 
         // Collation
         if let Some(collation) = &self.collation_name {
             if !collation.is_empty() {
-                script.push_str(&format!(" collate \"{}\"", collation));
+                script.push_str(&format!(" collate \"{collation}\""));
             }
         }
 
@@ -196,16 +196,16 @@ impl TableColumn {
             // Identity options
             let mut opts = Vec::new();
             if let Some(ref v) = self.identity_start {
-                opts.push(format!("start with {}", v));
+                opts.push(format!("start with {v}"));
             }
             if let Some(ref v) = self.identity_increment {
-                opts.push(format!("increment by {}", v));
+                opts.push(format!("increment by {v}"));
             }
             if let Some(ref v) = self.identity_minimum {
-                opts.push(format!("minvalue {}", v));
+                opts.push(format!("minvalue {v}"));
             }
             if let Some(ref v) = self.identity_maximum {
-                opts.push(format!("maxvalue {}", v));
+                opts.push(format!("maxvalue {v}"));
             }
             if self.identity_cycle {
                 opts.push("cycle".to_string());
@@ -219,13 +219,13 @@ impl TableColumn {
         // Generated always as (expression)
         if self.is_generated.to_lowercase() == "always" {
             if let Some(expr) = &self.generation_expression {
-                script.push_str(&format!(" generated always as ({}) stored ", expr));
+                script.push_str(&format!(" generated always as ({expr}) stored "));
             }
         }
 
         // Default
         if let Some(default) = &self.column_default {
-            script.push_str(&format!(" default {}", default));
+            script.push_str(&format!(" default {default}"));
         }
 
         // Nullability

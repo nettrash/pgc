@@ -1,7 +1,7 @@
 use crate::{
-    comparer::comparer::Comparer,
-    config::{config::Config, dump_config::DumpConfig},
-    dump::dump::Dump,
+    comparer::core::Comparer,
+    config::{core::Config, dump_config::DumpConfig},
+    dump::core::Dump,
 };
 use clap::{CommandFactory, Parser, command};
 use std::{io::Error, path::Path};
@@ -89,16 +89,16 @@ pub async fn main() -> Result<(), Error> {
         match args.command.as_deref() {
             Some("dump") => {
                 println!("Dumping database...");
-                return create_dump(
-                    args.server.unwrap(),
-                    args.port.unwrap(),
-                    args.user.unwrap(),
-                    args.password.unwrap(),
-                    args.database.unwrap(),
-                    args.scheme.unwrap(),
-                    args.use_ssl,
-                    args.output.unwrap(),
-                )
+                return create_dump(DumpConfig {
+                    host: args.server.unwrap(),
+                    port: args.port.unwrap(),
+                    user: args.user.unwrap(),
+                    password: args.password.unwrap(),
+                    database: args.database.unwrap(),
+                    scheme: args.scheme.unwrap(),
+                    ssl: args.use_ssl,
+                    file: args.output.unwrap(),
+                })
                 .await;
             }
             Some("compare") => {
@@ -120,62 +120,59 @@ fn pgc_version() {
     println!("pgc v1.0.0");
     println!("(c) 2025 Paysend. All rights reserved.");
     println!("This program is licensed under the GPL v3 License.");
-    println!("");
+    println!();
 }
 
 async fn run_by_config(config: String) -> Result<(), Error> {
     // Here you would read the config file and execute the appropriate command.
     // For now, we just print the config file name.
     if Path::new(&config).exists() {
-        println!("Running with config: {}", config);
+        println!("Running with config: {config}");
         let cfg: Config = Config::new(config.clone());
 
         let from_file = cfg.from.file.clone();
         let to_file = cfg.to.file.clone();
         let output_file = cfg.output.clone();
 
-        let result = create_dump(
-            cfg.from.host,
-            cfg.from.port,
-            cfg.from.user,
-            cfg.from.password,
-            cfg.from.database,
-            cfg.from.scheme,
-            cfg.from.ssl,
-            from_file.clone(),
-        )
+        let result = create_dump(DumpConfig {
+            host: cfg.from.host,
+            port: cfg.from.port,
+            user: cfg.from.user,
+            password: cfg.from.password,
+            database: cfg.from.database,
+            scheme: cfg.from.scheme,
+            ssl: cfg.from.ssl,
+            file: from_file.clone(),
+        })
         .await;
-        if result.is_err() {
-            eprintln!("Error creating dump: {}", result.as_ref().unwrap_err());
-            return Err(result.unwrap_err());
+        if let Err(e) = result {
+            eprintln!("Error creating dump: {e}");
+            return Err(e);
         }
-        let result = create_dump(
-            cfg.to.host,
-            cfg.to.port,
-            cfg.to.user,
-            cfg.to.password,
-            cfg.to.database,
-            cfg.to.scheme,
-            cfg.to.ssl,
-            to_file.clone(),
-        )
+        let result = create_dump(DumpConfig {
+            host: cfg.to.host,
+            port: cfg.to.port,
+            user: cfg.to.user,
+            password: cfg.to.password,
+            database: cfg.to.database,
+            scheme: cfg.to.scheme,
+            ssl: cfg.to.ssl,
+            file: to_file.clone(),
+        })
         .await;
-        if result.is_err() {
-            eprintln!("Error creating dump: {}", result.as_ref().unwrap_err());
-            return Err(result.unwrap_err());
+        if let Err(e) = result {
+            eprintln!("Error creating dump: {e}");
+            return Err(e);
         }
         println!("Dumps created successfully. Now comparing...");
         let compare_result = compare_dumps(from_file, to_file, output_file).await;
-        if compare_result.is_err() {
-            eprintln!(
-                "Error comparing dumps: {}",
-                compare_result.as_ref().unwrap_err()
-            );
-            return Err(compare_result.unwrap_err());
+        if let Err(e) = compare_result {
+            eprintln!("Error comparing dumps: {e}");
+            return Err(e);
         }
         Ok(())
     } else {
-        eprintln!("Config file does not exist: {}", config);
+        eprintln!("Config file does not exist: {config}");
         Err(Error::new(
             std::io::ErrorKind::NotFound,
             "Config file not found",
@@ -184,30 +181,13 @@ async fn run_by_config(config: String) -> Result<(), Error> {
 }
 
 async fn create_dump(
-    server: String,
-    port: String,
-    user: String,
-    password: String,
-    database: String,
-    scheme: String,
-    use_ssl: bool,
-    output: String,
+    dump_config: DumpConfig,
 ) -> Result<(), Error> {
-    let dump_config: DumpConfig = DumpConfig {
-        host: server,
-        port,
-        user,
-        password,
-        database,
-        scheme,
-        ssl: use_ssl,
-        file: output.clone(),
-    };
     let mut dump = Dump::new(dump_config);
     println!("Creating dump...");
     let result = dump.process().await;
     if let Err(e) = result {
-        eprintln!("Error creating dump: {}", e);
+        eprintln!("Error creating dump: {e}");
         return Err(e);
     }
     Ok(())
@@ -223,6 +203,6 @@ async fn compare_dumps(from: String, to: String, output: String) -> Result<(), E
     let mut comparer = Comparer::new(from, to);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
-    println!("Dump compared successfully. Result script: {}", output);
+    println!("Dump compared successfully. Result script: {output}");
     Ok(())
 }
