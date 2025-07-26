@@ -1118,6 +1118,7 @@ dependencies = [
  "md5",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "zip",

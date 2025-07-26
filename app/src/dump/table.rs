@@ -3,6 +3,7 @@ use crate::dump::{
     table_trigger::TableTrigger,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{Error, PgPool, Row};
 
 // This is an information about a PostgreSQL table.
@@ -20,17 +21,21 @@ pub struct Table {
     pub constraints: Vec<TableConstraint>, // Constraint names
     pub indexes: Vec<TableIndex>,          // Index names
     pub triggers: Vec<TableTrigger>,       // Trigger names
+    pub definition: Option<String>,        // Table definition (optional)
 }
 
 impl Table {
+    /// Fill information about table.
     pub async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         self.fill_columns(pool).await?;
         self.fill_indexes(pool).await?;
         self.fill_constraints(pool).await?;
         self.fill_triggers(pool).await?;
+        self.fill_definition(pool).await?;
         Ok(())
     }
 
+    /// Fill information about columns.
     async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT * FROM information_schema.columns WHERE table_schema = '{}' AND table_name = '{}'",
@@ -94,6 +99,7 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT * FROM pg_indexes WHERE schemaname = '{}' AND tablename = '{}'",
@@ -118,6 +124,7 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT * FROM information_schema.table_constraints WHERE table_schema = '{}' AND table_name = '{}'",
@@ -151,10 +158,11 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about triggers.
     async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}'::regclass and tgisinternal = false",
-            format!("{}.{}", self.schema, self.name)
+            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}.{}'::regclass and tgisinternal = false",
+            self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -171,5 +179,168 @@ impl Table {
         }
 
         Ok(())
+    }
+
+    /// Fill table definition.
+    async fn fill_definition(&mut self, pool: &PgPool) -> Result<(), Error> {
+        // Check if pg_get_tabledef exists
+        let check_func = "select proname from pg_proc where proname = 'pg_get_tabledef';";
+        let func_row = sqlx::query(check_func).fetch_optional(pool).await?;
+        if func_row.is_some() {
+            let query = format!(
+                "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '{}'::regnamespace;",
+                self.name, self.schema
+            );
+            let row = sqlx::query(&query).fetch_one(pool).await?;
+            if let Some(definition) = row.get::<Option<String>, _>("definition") {
+                self.definition = Some(definition);
+            } else {
+                self.definition = None;
+            }
+        } else {
+            self.definition = None;
+        }
+        Ok(())
+    }
+
+    /// Hash
+    pub fn hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.schema.as_bytes());
+        hasher.update(self.name.as_bytes());
+        hasher.update(self.owner.as_bytes());
+        if let Some(space) = &self.space {
+            hasher.update(space.as_bytes());
+        }
+        hasher.update(self.has_indexes.to_string().as_bytes());
+        hasher.update(self.has_triggers.to_string().as_bytes());
+        hasher.update(self.has_rules.to_string().as_bytes());
+        hasher.update(self.has_rowsecurity.to_string().as_bytes());
+
+        for column in &self.columns {
+            column.add_to_hasher(&mut hasher);
+        }
+
+        for constraint in &self.constraints {
+            constraint.add_to_hasher(&mut hasher);
+        }
+
+        for index in &self.indexes {
+            index.add_to_hasher(&mut hasher);
+        }
+
+        for trigger in &self.triggers {
+            trigger.add_to_hasher(&mut hasher);
+        }
+
+        hasher.update(self.definition.as_deref().unwrap_or("").as_bytes());
+
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Get script for the table
+    pub fn get_script(&self) -> String {
+        // 1. Build CREATE TABLE statement
+        let mut script = format!("create table {}.{} (\n", self.schema, self.name);
+
+        // 2. Add column definitions
+        let mut column_definitions = Vec::new();
+        for column in &self.columns {
+            let mut col_def = String::new();
+
+            // Column name
+            col_def.push_str(&format!("    \"{}\" ", column.name));
+
+            // Handle identity columns as serial/bigserial
+            if column.is_identity {
+                if column.data_type == "integer" || column.data_type == "int4" {
+                    col_def.push_str("serial");
+                } else if column.data_type == "bigint" || column.data_type == "int8" {
+                    col_def.push_str("bigserial");
+                } else {
+                    // Use standard column definition with identity
+                    let col_script = column.get_script();
+                    // Extract just the type and constraints part (skip the quoted name)
+                    if let Some(type_start) = col_script.find(' ') {
+                        col_def.push_str(&col_script[type_start + 1..]);
+                    }
+                }
+            } else {
+                // Use standard column definition
+                let col_script = column.get_script();
+                // Extract just the type and constraints part (skip the quoted name)
+                if let Some(type_start) = col_script.find(' ') {
+                    col_def.push_str(&col_script[type_start + 1..]);
+                }
+            }
+
+            column_definitions.push(col_def);
+        }
+
+        // 4. Add primary key constraint if exists
+        let has_pk_constraint = self
+            .constraints
+            .iter()
+            .any(|c| c.constraint_type.to_lowercase() == "primary key");
+
+        if has_pk_constraint {
+            // Find PK columns from indexes if available
+            for index in &self.indexes {
+                if index.indexdef.to_lowercase().contains("primary key") {
+                    if let Some(start) = index.indexdef.to_lowercase().find("primary key (") {
+                        let after = &index.indexdef[start + "primary key (".len()..];
+                        if let Some(end) = after.find(')') {
+                            let cols_part = &after[..end];
+                            let pk_cols: Vec<&str> = cols_part
+                                .split(',')
+                                .map(|c| c.trim().trim_matches('"'))
+                                .collect();
+                            if !pk_cols.is_empty() {
+                                let pk_def = format!(
+                                    "    primary key ({})",
+                                    pk_cols
+                                        .iter()
+                                        .map(|c| format!("\"{c}\""))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                                column_definitions.push(pk_def);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Join all column definitions
+        script.push_str(&column_definitions.join(",\n"));
+        script.push_str("\n);\n\n");
+
+        // 5. Add other constraints (excluding primary key)
+        for constraint in &self.constraints {
+            if constraint.constraint_type.to_lowercase() != "primary key" {
+                script.push_str(&constraint.get_script());
+            }
+        }
+
+        // 6. Add indexes (excluding primary key indexes)
+        for index in &self.indexes {
+            if !index.indexdef.to_lowercase().contains("primary key") {
+                script.push_str(&index.get_script());
+            }
+        }
+
+        // 7. Add triggers
+        for trigger in &self.triggers {
+            script.push_str(&trigger.get_script());
+        }
+
+        script
+    }
+
+    /// Get drop script for the table
+    pub fn get_drop_script(&self) -> String {
+        format!("drop table if exists {}.{};\n", self.schema, self.name)
     }
 }

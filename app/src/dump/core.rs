@@ -1,6 +1,7 @@
 use crate::dump::pg_enum::PgEnum;
 use crate::dump::pg_type::PgType;
 use crate::dump::routine::Routine;
+use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,8 @@ use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::types::Oid;
 use std::fs::File;
-use std::io::{Error, Read};
 use std::io::Write;
+use std::io::{Error, Read};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -18,22 +19,25 @@ use zip::write::SimpleFileOptions;
 pub struct Dump {
     // Configuration of the dump.
     #[serde(skip_serializing, skip_deserializing)]
-    configuration: DumpConfig,
+    pub configuration: DumpConfig,
 
     // List of extensions in the dump.
-    extensions: Vec<Extension>,
+    pub extensions: Vec<Extension>,
 
     // List of PostgreSQL types in the dump.
-    types: Vec<PgType>,
+    pub types: Vec<PgType>,
 
     // List of PostgreSQL enums in the dump.
-    enums: Vec<PgEnum>,
+    pub enums: Vec<PgEnum>,
+
+    // List of sequences in the dump.
+    pub sequences: Vec<Sequence>,
 
     // List of routines in the dump.
-    routines: Vec<Routine>,
+    pub routines: Vec<Routine>,
 
     // List of tables in the dump.
-    tables: Vec<Table>,
+    pub tables: Vec<Table>,
 }
 
 impl Dump {
@@ -44,6 +48,7 @@ impl Dump {
             extensions: Vec::new(),
             types: Vec::new(),
             enums: Vec::new(),
+            sequences: Vec::new(),
             routines: Vec::new(),
             tables: Vec::new(),
         }
@@ -54,14 +59,11 @@ impl Dump {
         let pool = PgPool::connect(self.configuration.get_connection_string().as_str())
             .await
             .map_err(|e| {
-                Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to connect to database ({}): {}.",
-                        self.configuration.get_masked_connection_string(),
-                        e
-                    ),
-                )
+                Error::other(format!(
+                    "Failed to connect to database ({}): {}.",
+                    self.configuration.get_masked_connection_string(),
+                    e
+                ))
             })?;
 
         // Fill the dump.
@@ -72,10 +74,10 @@ impl Dump {
         // Serialize the dump to a file.
         let serialized = serde_json::to_string(&self);
         if serialized.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize dump: {}.", serialized.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to serialize dump: {}.",
+                serialized.err().unwrap()
+            )));
         }
         let serialized_data = serialized.unwrap();
         let serialized_bytes = serialized_data.as_bytes();
@@ -100,6 +102,7 @@ impl Dump {
         self.get_extensions(pool).await?;
         self.get_types(pool).await?;
         self.get_enums(pool).await?;
+        self.get_sequences(pool).await?;
         self.get_routines(pool).await?;
         self.get_tables(pool).await?;
         Ok(())
@@ -107,14 +110,14 @@ impl Dump {
 
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND n.nspname LIKE '{}'", self.configuration.scheme).as_str())
+        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND n.nspname LIKE '{}' OR n.nspname = 'public'", self.configuration.scheme).as_str())
             .fetch_all(pool)
             .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to fetch extensions: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch extensions: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -188,13 +191,10 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Failed to fetch user-defined types: {}.",
-                    result.err().unwrap()
-                ),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch user-defined types: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -246,10 +246,10 @@ impl Dump {
     async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query("SELECT * FROM pg_enum").fetch_all(pool).await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to fetch enums: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch enums: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -271,6 +271,68 @@ impl Dump {
                 );
             }
         }
+        Ok(())
+    }
+
+    // Fetch sequences from the database and populate the dump.
+    async fn get_sequences(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query(
+            format!(
+                "
+        SELECT 
+            schemaname, 
+            sequencename, 
+            sequenceowner, 
+            data_type::varchar as sequencedatatype, 
+            start_value, 
+            min_value, 
+            max_value, 
+            increment_by, 
+            cycle, 
+            cache_size, 
+            last_value 
+        FROM 
+            pg_sequences 
+        WHERE 
+            schemaname like '%{}%'",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+
+        if result.is_err() {
+            return Err(Error::other(format!(
+                "Failed to fetch sequences: {}.",
+                result.err().unwrap()
+            )));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No sequences found.");
+        } else {
+            println!("Sequences found:");
+            for row in rows {
+                let seq = Sequence {
+                    schema: row.get("schemaname"),
+                    name: row.get("sequencename"),
+                    owner: row.get("sequenceowner"),
+                    data_type: row.get("sequencedatatype"),
+                    start_value: row.get::<Option<i64>, _>("start_value"),
+                    min_value: row.get::<Option<i64>, _>("min_value"),
+                    max_value: row.get::<Option<i64>, _>("max_value"),
+                    increment_by: row.get::<Option<i64>, _>("increment_by"),
+                    cycle: row.get("cycle"),
+                    cache_size: row.get::<Option<i64>, _>("cache_size"),
+                    last_value: row.get::<Option<i64>, _>("last_value"),
+                };
+                self.sequences.push(seq.clone());
+                println!(" - name {} (type: {})", seq.name, seq.data_type);
+            }
+        }
+
         Ok(())
     }
 
@@ -306,10 +368,10 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to fetch routines: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch routines: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -361,10 +423,10 @@ impl Dump {
         .fetch_all(pool)
         .await;
         if result.is_err() {
-            return Err(Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to fetch tables: {}.", result.err().unwrap()),
-            ));
+            return Err(Error::other(format!(
+                "Failed to fetch tables: {}.",
+                result.err().unwrap()
+            )));
         }
         let rows = result.unwrap();
 
@@ -386,12 +448,10 @@ impl Dump {
                     constraints: Vec::new(),
                     indexes: Vec::new(),
                     triggers: Vec::new(),
+                    definition: None,
                 };
                 table.fill(pool).await.map_err(|e| {
-                    Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to fill table {}: {}.", table.name, e),
-                    )
+                    Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
 
                 self.tables.push(table.clone());
@@ -411,30 +471,19 @@ impl Dump {
         dump_file.read_to_string(&mut serialized_data)?;
 
         let dump: Dump = serde_json::from_str(&serialized_data)
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("Failed to deserialize dump: {}.", e)))?;
-        
+            .map_err(|e| Error::other(format!("Failed to deserialize dump: {e}.")))?;
+
         Ok(dump)
     }
 
     pub fn get_info(&self) -> String {
-        format!("{}\n{}",
-            format!(
-                "\tConnection Info:\n\t\t- Host: {}\n\t\t- Port: {}\n\t\t- User: {}\n\t\t- Database: {}\n\t\t- Scheme: {}\n\t\t- SSL: {}",
-                self.configuration.host,
-                self.configuration.port,
-                self.configuration.user,
-                self.configuration.database,
-                self.configuration.scheme,
-                self.configuration.ssl
-            ),
-            format!("\tDump Info:\n\t\t- File: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
-                self.configuration.file,
-                self.extensions.len(),
-                self.types.len(),
-                self.enums.len(),
-                self.routines.len(),
-                self.tables.len()
-            )
+        format!(
+            "\tDump Info:\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+            self.extensions.len(),
+            self.types.len(),
+            self.enums.len(),
+            self.routines.len(),
+            self.tables.len()
         )
     }
 }

@@ -22,7 +22,6 @@ pub struct DumpConfig {
 }
 
 impl DumpConfig {
- 
     // Returns the connection string for the database.
     pub fn get_connection_string(&self) -> String {
         format!(

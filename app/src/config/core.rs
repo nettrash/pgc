@@ -17,10 +17,14 @@ impl Config {
         // Load the configuration from the file.
         let config_data = std::fs::read_to_string(file);
         if config_data.is_err() {
-            panic!("Error reading configuration file: {}", config_data.err().unwrap());
+            panic!(
+                "Error reading configuration file: {}",
+                config_data.err().unwrap()
+            );
         }
         let binding = config_data.unwrap();
-        let config_data = binding.split('\n')
+        let config_data = binding
+            .split('\n')
             .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
             .collect::<Vec<&str>>();
 
@@ -47,29 +51,42 @@ impl Config {
                 continue; // Skip empty lines and comments
             }
             if line.split('=').count() != 2 {
-                panic!("Invalid configuration line: {}", line);
+                panic!("Invalid configuration line: {line}");
             }
             let parts: Vec<&str> = line.split('=').collect();
             if parts[0].trim().is_empty() || parts[1].trim().is_empty() {
-                panic!("Invalid configuration line: {}", line);
+                panic!("Invalid configuration line: {line}");
             }
-            if parts[0].trim().to_uppercase() != "FROM_HOST" && parts[0].trim() != "FROM_PORT" &&
-               parts[0].trim().to_uppercase() != "FROM_USER" && parts[0].trim() != "FROM_PASSWORD" &&
-               parts[0].trim() != "FROM_DATABASE" &&
-               parts[0].trim() != "FROM_SCHEME" && parts[0].trim() != "FROM_SSL" &&
-               parts[0].trim() != "FROM_DUMP" &&
-               parts[0].trim().to_uppercase() != "TO_HOST" && parts[0].trim() != "TO_PORT" &&
-               parts[0].trim().to_uppercase() != "TO_USER" && parts[0].trim() != "TO_PASSWORD" &&
-               parts[0].trim() != "TO_DATABASE" &&
-               parts[0].trim() != "TO_SCHEME" && parts[0].trim() != "TO_SSL" &&
-               parts[0].trim() != "TO_DUMP" &&
-               parts[0].trim() != "OUTPUT" {
+            if parts[0].trim().to_uppercase() != "FROM_HOST"
+                && parts[0].trim() != "FROM_PORT"
+                && parts[0].trim().to_uppercase() != "FROM_USER"
+                && parts[0].trim() != "FROM_PASSWORD"
+                && parts[0].trim() != "FROM_DATABASE"
+                && parts[0].trim() != "FROM_SCHEME"
+                && parts[0].trim() != "FROM_SSL"
+                && parts[0].trim() != "FROM_DUMP"
+                && parts[0].trim().to_uppercase() != "TO_HOST"
+                && parts[0].trim() != "TO_PORT"
+                && parts[0].trim().to_uppercase() != "TO_USER"
+                && parts[0].trim() != "TO_PASSWORD"
+                && parts[0].trim() != "TO_DATABASE"
+                && parts[0].trim() != "TO_SCHEME"
+                && parts[0].trim() != "TO_SSL"
+                && parts[0].trim() != "TO_DUMP"
+                && parts[0].trim() != "OUTPUT"
+            {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
-            if parts[0].trim().to_uppercase() == "FROM_SSL" && parts[1].trim().to_uppercase() != "TRUE" && parts[1].trim().to_uppercase() != "FALSE" {
+            if parts[0].trim().to_uppercase() == "FROM_SSL"
+                && parts[1].trim().to_uppercase() != "TRUE"
+                && parts[1].trim().to_uppercase() != "FALSE"
+            {
                 panic!("Invalid value for FROM_SSL: {}", parts[1]);
             }
-            if parts[0].trim().to_uppercase() == "TO_SSL" && parts[1].trim().to_uppercase() != "TRUE" && parts[1].trim().to_uppercase() != "FALSE" {
+            if parts[0].trim().to_uppercase() == "TO_SSL"
+                && parts[1].trim().to_uppercase() != "TRUE"
+                && parts[1].trim().to_uppercase() != "FALSE"
+            {
                 panic!("Invalid value for TO_SSL: {}", parts[1]);
             }
 
@@ -120,10 +137,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::env;
     use std::fs::File;
     use std::io::Write;
-    use std::env;
-    use super::*;
 
     fn write_temp_config(contents: &str, file_name: &str) -> String {
         let dir = env::temp_dir();
@@ -156,12 +173,12 @@ mod tests {
         assert_eq!(config.from.host, "localhost");
         assert_eq!(config.from.database, "testdb");
         assert_eq!(config.from.scheme, "postgres");
-        assert_eq!(config.from.ssl, true);
+        assert!(config.from.ssl);
         assert_eq!(config.from.file, "from.dump");
         assert_eq!(config.to.host, "remotehost");
         assert_eq!(config.to.database, "remotedb");
         assert_eq!(config.to.scheme, "postgres");
-        assert_eq!(config.to.ssl, false);
+        assert!(!config.to.ssl);
         assert_eq!(config.to.file, "to.dump");
         assert_eq!(config.output, "result.out");
         let _ = std::fs::remove_file(file);
@@ -214,7 +231,10 @@ mod tests {
             TO_DUMP=to.dump
             OUTPUT=result.out
         "#;
-        let file = write_temp_config(config_content, "test_comments_and_empty_lines_are_ignored.cfg");
+        let file = write_temp_config(
+            config_content,
+            "test_comments_and_empty_lines_are_ignored.cfg",
+        );
         let config = Config::new(file.clone());
         assert_eq!(config.from.host, "localhost");
         assert_eq!(config.to.host, "remotehost");
