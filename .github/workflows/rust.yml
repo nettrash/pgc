@@ -16,6 +16,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Check format
+      run: 
+        cd ${{ github.workspace }}/pgc ;
+          cargo fmt -- --check
+    - name: Check clippy
+      run: 
+        cd ${{ github.workspace }}/pgc ;
+          cargo clippy --all-targets --all-features
     - name: Build
       run: 
         cd ${{ github.workspace }}/pgc ;
