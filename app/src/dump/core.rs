@@ -5,14 +5,14 @@ use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::types::Oid;
 use sqlx::PgPool;
 use sqlx::Row;
+use sqlx::postgres::types::Oid;
 use std::fs::File;
 use std::io::Write;
 use std::io::{Error, Read};
-use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
