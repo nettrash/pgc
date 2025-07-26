@@ -1,0 +1,48 @@
+# Ignore build artifacts
+target/
+app/target/
+
+# Ignore git files
+.git/
+.gitignore
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore temporary files
+*.tmp
+*.log
+
+# Ignore test dumps
+*.dump
+dump.out
+dump.io
+output.sql
+
+# Ignore documentation (except README)
+docs/
+*.md
+!README.md
+
+# Ignore CI/CD files
+.github/
+
+# Ignore Rust backup files
+**/*.rs.bk
+
+# Ignore lock files from package managers other than Cargo
+package-lock.json
+yarn.lock
+
+# Keep only essential files for building
+!app/
+!data/pgc.conf
+!data/test/
+!LICENSE

@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database for testing
+  postgres-from:
+    image: postgres:15-alpine
+    container_name: pgc-postgres-from
+    environment:
+      POSTGRES_DB: testdb_from
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_from_data:/var/lib/postgresql/data
+      - ./data/test/schema_a.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    networks:
+      - pgc-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb_from"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Second PostgreSQL Database for testing
+  postgres-to:
+    image: postgres:15-alpine
+    container_name: pgc-postgres-to
+    environment:
+      POSTGRES_DB: testdb_to
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_to_data:/var/lib/postgresql/data
+      - ./data/test/schema_b.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    networks:
+      - pgc-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb_to"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PGC Application
+  pgc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pgc-app
+    volumes:
+      - ./data:/home/pgc/data
+      - pgc_output:/home/pgc/output
+    networks:
+      - pgc-network
+    depends_on:
+      postgres-from:
+        condition: service_healthy
+      postgres-to:
+        condition: service_healthy
+    environment:
+      - PGC_DATA_DIR=/home/pgc/data
+    # Override default command to keep container running
+    command: tail -f /dev/null
+    # Alternative: run a specific comparison
+    # command: >
+    #   sh -c "
+    #     sleep 10 &&
+    #     pgc --command dump --server postgres-from --database testdb_from --scheme test_schema --output /home/pgc/output/from.dump &&
+    #     pgc --command dump --server postgres-to --database testdb_to --scheme test_schema --output /home/pgc/output/to.dump &&
+    #     pgc --command compare --from /home/pgc/output/from.dump --to /home/pgc/output/to.dump --output /home/pgc/output/comparison.sql
+    #   "
+
+volumes:
+  postgres_from_data:
+  postgres_to_data:
+  pgc_output:
+
+networks:
+  pgc-network:
+    driver: bridge
