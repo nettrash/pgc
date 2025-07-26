@@ -3,7 +3,7 @@ use crate::{
     config::{core::Config, dump_config::DumpConfig},
     dump::core::Dump,
 };
-use clap::{CommandFactory, Parser, command};
+use clap::{command, CommandFactory, Parser};
 use std::{io::Error, path::Path};
 
 pub mod comparer;
