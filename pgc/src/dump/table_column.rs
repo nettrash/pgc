@@ -61,16 +61,41 @@ impl TableColumn {
         hasher.update(self.column_default.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.is_nullable.to_string().as_bytes());
         hasher.update(self.data_type.as_bytes());
-        hasher.update(self.character_maximum_length.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(self.character_octet_length.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(
+            self.character_maximum_length
+                .unwrap_or(-1)
+                .to_string()
+                .as_bytes(),
+        );
+        hasher.update(
+            self.character_octet_length
+                .unwrap_or(-1)
+                .to_string()
+                .as_bytes(),
+        );
         hasher.update(self.numeric_precision.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(self.numeric_precision_radix.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(
+            self.numeric_precision_radix
+                .unwrap_or(-1)
+                .to_string()
+                .as_bytes(),
+        );
         hasher.update(self.numeric_scale.unwrap_or(-1).to_string().as_bytes());
         hasher.update(self.datetime_precision.unwrap_or(-1).to_string().as_bytes());
         hasher.update(self.interval_type.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.interval_precision.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(self.character_set_catalog.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.character_set_schema.as_deref().unwrap_or("").as_bytes());
+        hasher.update(
+            self.character_set_catalog
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        hasher.update(
+            self.character_set_schema
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         hasher.update(self.character_set_name.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.collation_catalog.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.collation_schema.as_deref().unwrap_or("").as_bytes());
@@ -84,7 +109,12 @@ impl TableColumn {
         hasher.update(self.scope_catalog.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.scope_schema.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.scope_name.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.maximum_cardinality.unwrap_or(-1).to_string().as_bytes());
+        hasher.update(
+            self.maximum_cardinality
+                .unwrap_or(-1)
+                .to_string()
+                .as_bytes(),
+        );
         hasher.update(self.dtd_identifier.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.is_self_referencing.to_string().as_bytes());
         hasher.update(self.is_identity.to_string().as_bytes());
@@ -95,7 +125,12 @@ impl TableColumn {
         hasher.update(self.identity_minimum.as_deref().unwrap_or("").as_bytes());
         hasher.update(self.identity_cycle.to_string().as_bytes());
         hasher.update(self.is_generated.as_bytes());
-        hasher.update(self.generation_expression.as_deref().unwrap_or("").as_bytes());
+        hasher.update(
+            self.generation_expression
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         hasher.update(self.is_updatable.to_string().as_bytes());
     }
 
@@ -113,23 +148,28 @@ impl TableColumn {
             if self.data_type.to_lowercase().contains("char") {
                 script.push_str(&format!("({})", length));
             }
-        } else if let (Some(precision), Some(scale)) = (self.numeric_precision, self.numeric_scale) {
+        } else if let (Some(precision), Some(scale)) = (self.numeric_precision, self.numeric_scale)
+        {
             // Numeric(precision, scale)
-            if self.data_type.to_lowercase().contains("numeric") || self.data_type.to_lowercase().contains("decimal") {
+            if self.data_type.to_lowercase().contains("numeric")
+                || self.data_type.to_lowercase().contains("decimal")
+            {
                 script.push_str(&format!("({}, {})", precision, scale));
             }
         } else if let Some(precision) = self.numeric_precision {
             // Numeric(precision)
-            if self.data_type.to_lowercase().contains("numeric") || self.data_type.to_lowercase().contains("decimal") {
+            if self.data_type.to_lowercase().contains("numeric")
+                || self.data_type.to_lowercase().contains("decimal")
+            {
                 script.push_str(&format!("({})", precision));
             }
         }
         // Datetime precision
-        if let Some(dt_precision) = self.datetime_precision {
-            if self.data_type.to_lowercase().contains("timestamp") || self.data_type.to_lowercase().contains("time") {
-                script.push_str(&format!("({})", dt_precision));
-            }
-        }
+        //        if let Some(dt_precision) = self.datetime_precision {
+        //            if self.data_type.to_lowercase().contains("timestamp") || self.data_type.to_lowercase().contains("time") {
+        //                script.push_str(&format!("({})", dt_precision));
+        //            }
+        //        }
         // Interval type
         if let Some(interval_type) = &self.interval_type {
             if self.data_type.to_lowercase().contains("interval") {
@@ -155,11 +195,21 @@ impl TableColumn {
             script.push_str(" as identity");
             // Identity options
             let mut opts = Vec::new();
-            if let Some(ref v) = self.identity_start { opts.push(format!("start with {}", v)); }
-            if let Some(ref v) = self.identity_increment { opts.push(format!("increment by {}", v)); }
-            if let Some(ref v) = self.identity_minimum { opts.push(format!("minvalue {}", v)); }
-            if let Some(ref v) = self.identity_maximum { opts.push(format!("maxvalue {}", v)); }
-            if self.identity_cycle { opts.push("cycle".to_string()); }
+            if let Some(ref v) = self.identity_start {
+                opts.push(format!("start with {}", v));
+            }
+            if let Some(ref v) = self.identity_increment {
+                opts.push(format!("increment by {}", v));
+            }
+            if let Some(ref v) = self.identity_minimum {
+                opts.push(format!("minvalue {}", v));
+            }
+            if let Some(ref v) = self.identity_maximum {
+                opts.push(format!("maxvalue {}", v));
+            }
+            if self.identity_cycle {
+                opts.push("cycle".to_string());
+            }
             if !opts.is_empty() {
                 script.push_str(&format!(" ({})", opts.join(" ")));
             }
@@ -179,9 +229,7 @@ impl TableColumn {
         }
 
         // Nullability
-        if self.is_nullable {
-            script.push_str(" null");
-        } else {
+        if !self.is_nullable {
             script.push_str(" not null");
         }
 

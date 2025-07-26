@@ -491,25 +491,12 @@ impl Dump {
 
     pub fn get_info(&self) -> String {
         format!(
-            "{}\n{}",
-            format!(
-                "\tConnection Info:\n\t\t- Host: {}\n\t\t- Port: {}\n\t\t- User: {}\n\t\t- Database: {}\n\t\t- Scheme: {}\n\t\t- SSL: {}",
-                self.configuration.host,
-                self.configuration.port,
-                self.configuration.user,
-                self.configuration.database,
-                self.configuration.scheme,
-                self.configuration.ssl
-            ),
-            format!(
-                "\tDump Info:\n\t\t- File: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
-                self.configuration.file,
-                self.extensions.len(),
-                self.types.len(),
-                self.enums.len(),
-                self.routines.len(),
-                self.tables.len()
-            )
+            "\tDump Info:\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+            self.extensions.len(),
+            self.types.len(),
+            self.enums.len(),
+            self.routines.len(),
+            self.tables.len()
         )
     }
 }

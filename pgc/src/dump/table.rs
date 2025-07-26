@@ -247,10 +247,10 @@ impl Table {
         let mut column_definitions = Vec::new();
         for column in &self.columns {
             let mut col_def = String::new();
-            
+
             // Column name
             col_def.push_str(&format!("    \"{}\" ", column.name));
-            
+
             // Handle identity columns as serial/bigserial
             if column.is_identity {
                 if column.data_type == "integer" || column.data_type == "int4" {
@@ -273,14 +273,16 @@ impl Table {
                     col_def.push_str(&col_script[type_start + 1..]);
                 }
             }
-            
+
             column_definitions.push(col_def);
         }
 
         // 4. Add primary key constraint if exists
-        let has_pk_constraint = self.constraints.iter()
+        let has_pk_constraint = self
+            .constraints
+            .iter()
             .any(|c| c.constraint_type.to_lowercase() == "primary key");
-        
+
         if has_pk_constraint {
             // Find PK columns from indexes if available
             for index in &self.indexes {
@@ -289,15 +291,19 @@ impl Table {
                         let after = &index.indexdef[start + "primary key (".len()..];
                         if let Some(end) = after.find(')') {
                             let cols_part = &after[..end];
-                            let pk_cols: Vec<&str> = cols_part.split(',')
+                            let pk_cols: Vec<&str> = cols_part
+                                .split(',')
                                 .map(|c| c.trim().trim_matches('"'))
                                 .collect();
                             if !pk_cols.is_empty() {
-                                let pk_def = format!("    primary key ({})", 
-                                    pk_cols.iter()
+                                let pk_def = format!(
+                                    "    primary key ({})",
+                                    pk_cols
+                                        .iter()
                                         .map(|c| format!("\"{}\"", c))
                                         .collect::<Vec<_>>()
-                                        .join(", "));
+                                        .join(", ")
+                                );
                                 column_definitions.push(pk_def);
                             }
                         }

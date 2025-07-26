@@ -52,17 +52,20 @@ impl Routine {
 
     /// Hash
     pub fn hash(&self) -> String {
-        format!("{:x}", md5::compute(format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}",
-            self.schema,
-            self.name,
-            self.lang,
-            self.kind,
-            self.return_type,
-            self.arguments,
-            self.arguments_defaults.as_deref().unwrap_or(""),
-            self.source_code
-        )))
+        format!(
+            "{:x}",
+            md5::compute(format!(
+                "{}.{}.{}.{}.{}.{}.{}.{}",
+                self.schema,
+                self.name,
+                self.lang,
+                self.kind,
+                self.return_type,
+                self.arguments,
+                self.arguments_defaults.as_deref().unwrap_or(""),
+                self.source_code
+            ))
+        )
     }
 
     /// Returns a string to create the routine.

@@ -38,7 +38,10 @@ impl TableConstraint {
     /// Returns a string representation of the constraint
     pub fn get_script(&self) -> String {
         let mut script = String::new();
-        script.push_str(&format!("alter table {}.{} add constraint {} ", self.table_schema, self.table_name, self.name));
+        script.push_str(&format!(
+            "alter table {}.{} add constraint {} ",
+            self.table_schema, self.table_name, self.name
+        ));
         script.push_str(&format!("{} ", self.constraint_type.to_lowercase()));
         if self.is_deferrable {
             script.push_str("deferrable ");
