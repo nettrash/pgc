@@ -2,7 +2,7 @@
 
 This guide helps troubleshoot common Docker build issues with the PGC project.
 
-## Common Error: Cargo Build Failed (Exit Code 101)
+## ✅ RESOLVED: Cargo Build Failed (Exit Code 101)
 
 **Error Message:**
 ```
@@ -11,21 +11,41 @@ buildx failed with: ERROR: failed to build: failed to solve: process "/bin/sh -c
 
 ### Root Causes and Solutions
 
-#### 1. **Invalid Rust Edition in Cargo.toml**
+#### 1. **✅ FIXED: Cargo Lock File Version Mismatch**
+
+**Problem:** The `Cargo.lock` file was generated with Rust 1.88, but the Docker image was using Rust 1.75, which couldn't understand lock file version 4.
+
+**Error Details:**
+```
+error: failed to parse lock file at: /usr/src/app/Cargo.lock
+Caused by:
+  lock file version `4` was found, but this version of Cargo does not understand this lock file, perhaps Cargo needs to be updated?
+```
+
+**Solution Applied:** Updated Dockerfile to use matching Rust version:
+```dockerfile
+# Build stage - UPDATED to match local environment
+FROM rust:1.88-slim AS builder
+```
+
+**Verification:**
+- Local Rust version: `1.88.0 (6b00bc388 2025-06-23)`
+- Docker Rust version: Now matches `1.88-slim`
+- Build Status: ✅ Success
+
+#### 2. **✅ FIXED: Invalid Rust Edition in Cargo.toml**
 
 **Problem:** Using an invalid Rust edition (like "2024").
 
-**Solution:** Use a valid Rust edition in `app/Cargo.toml`:
+**Solution Applied:** Updated `app/Cargo.toml` to use valid edition:
 ```toml
 [package]
 name = "pgc"
 version = "1.0.0"
-edition = "2021"  # Valid editions: "2015", "2018", "2021"
+edition = "2021"  # Changed from invalid "2024"
 ```
 
-#### 2. **Missing Dependencies**
-
-**Problem:** System dependencies not available in the Docker container.
+#### 3. **✅ VERIFIED: Docker Build Dependencies**
 
 **Current Dependencies in Dockerfile:**
 - `pkg-config`
