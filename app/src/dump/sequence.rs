@@ -140,3 +140,529 @@ impl Sequence {
         script
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_sequence() -> Sequence {
+        Sequence {
+            schema: "public".to_string(),
+            name: "test_seq".to_string(),
+            owner: "postgres".to_string(),
+            data_type: "bigint".to_string(),
+            start_value: Some(1),
+            min_value: Some(1),
+            max_value: Some(9223372036854775807),
+            increment_by: Some(1),
+            cycle: false,
+            cache_size: Some(1),
+            last_value: Some(100),
+        }
+    }
+
+    fn create_custom_sequence() -> Sequence {
+        Sequence {
+            schema: "app".to_string(),
+            name: "custom_seq".to_string(),
+            owner: "app_user".to_string(),
+            data_type: "integer".to_string(),
+            start_value: Some(100),
+            min_value: Some(10),
+            max_value: Some(1000),
+            increment_by: Some(5),
+            cycle: true,
+            cache_size: Some(20),
+            last_value: Some(150),
+        }
+    }
+
+    fn create_minimal_sequence() -> Sequence {
+        Sequence {
+            schema: "test".to_string(),
+            name: "minimal_seq".to_string(),
+            owner: "test_user".to_string(),
+            data_type: "bigint".to_string(),
+            start_value: None,
+            min_value: None,
+            max_value: None,
+            increment_by: None,
+            cycle: false,
+            cache_size: None,
+            last_value: None,
+        }
+    }
+
+    #[test]
+    fn test_sequence_creation() {
+        let sequence = create_test_sequence();
+
+        assert_eq!(sequence.schema, "public");
+        assert_eq!(sequence.name, "test_seq");
+        assert_eq!(sequence.owner, "postgres");
+        assert_eq!(sequence.data_type, "bigint");
+        assert_eq!(sequence.start_value, Some(1));
+        assert_eq!(sequence.min_value, Some(1));
+        assert_eq!(sequence.max_value, Some(9223372036854775807));
+        assert_eq!(sequence.increment_by, Some(1));
+        assert!(!sequence.cycle);
+        assert_eq!(sequence.cache_size, Some(1));
+        assert_eq!(sequence.last_value, Some(100));
+    }
+
+    #[test]
+    fn test_sequence_with_custom_values() {
+        let sequence = create_custom_sequence();
+
+        assert_eq!(sequence.schema, "app");
+        assert_eq!(sequence.name, "custom_seq");
+        assert_eq!(sequence.owner, "app_user");
+        assert_eq!(sequence.data_type, "integer");
+        assert_eq!(sequence.start_value, Some(100));
+        assert_eq!(sequence.min_value, Some(10));
+        assert_eq!(sequence.max_value, Some(1000));
+        assert_eq!(sequence.increment_by, Some(5));
+        assert!(sequence.cycle);
+        assert_eq!(sequence.cache_size, Some(20));
+        assert_eq!(sequence.last_value, Some(150));
+    }
+
+    #[test]
+    fn test_sequence_with_none_values() {
+        let sequence = create_minimal_sequence();
+
+        assert_eq!(sequence.schema, "test");
+        assert_eq!(sequence.name, "minimal_seq");
+        assert_eq!(sequence.owner, "test_user");
+        assert_eq!(sequence.data_type, "bigint");
+        assert_eq!(sequence.start_value, None);
+        assert_eq!(sequence.min_value, None);
+        assert_eq!(sequence.max_value, None);
+        assert_eq!(sequence.increment_by, None);
+        assert!(!sequence.cycle);
+        assert_eq!(sequence.cache_size, None);
+        assert_eq!(sequence.last_value, None);
+    }
+
+    #[test]
+    fn test_sequence_hash() {
+        let sequence = create_test_sequence();
+        let hash = sequence.hash();
+
+        // Hash should be consistent for the same input
+        assert_eq!(hash, sequence.hash());
+
+        // Hash should be a valid hex string
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // SHA256 hash should be 64 characters
+        assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn test_sequence_hash_consistency() {
+        let sequence1 = create_test_sequence();
+        let sequence2 = create_test_sequence();
+
+        // Hash should be the same for identical sequences
+        assert_eq!(sequence1.hash(), sequence2.hash());
+    }
+
+    #[test]
+    fn test_sequence_hash_different_for_different_content() {
+        let sequence1 = create_test_sequence();
+        let mut sequence2 = create_test_sequence();
+        sequence2.name = "different_seq".to_string();
+
+        // Hash should be different for different sequences
+        assert_ne!(sequence1.hash(), sequence2.hash());
+    }
+
+    #[test]
+    fn test_sequence_hash_includes_all_fields() {
+        let base_sequence = create_test_sequence();
+
+        // Test that changing each field affects the hash
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.schema = "different_schema".to_string();
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.name = "different_name".to_string();
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.data_type = "integer".to_string();
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.start_value = Some(10);
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.min_value = Some(10);
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.max_value = Some(1000);
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.increment_by = Some(5);
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.cycle = true;
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+
+        let mut test_sequence = base_sequence.clone();
+        test_sequence.cache_size = Some(20);
+        assert_ne!(base_sequence.hash(), test_sequence.hash());
+    }
+
+    #[test]
+    fn test_get_script_default_sequence() {
+        let sequence = create_test_sequence();
+        let script = sequence.get_script();
+
+        let expected = "create sequence public.test_seq start with 1 minvalue 1 maxvalue 9223372036854775807 no cycle;\n";
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_script_custom_sequence() {
+        let sequence = create_custom_sequence();
+        let script = sequence.get_script();
+
+        let expected = "create sequence app.custom_seq as integer start with 100 increment by 5 minvalue 10 maxvalue 1000 cache 20 cycle;\n";
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_script_minimal_sequence() {
+        let sequence = create_minimal_sequence();
+        let script = sequence.get_script();
+
+        let expected = "create sequence test.minimal_seq no minvalue no maxvalue no cycle;\n";
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_script_with_different_data_types() {
+        let mut sequence = create_test_sequence();
+
+        // Test with smallint
+        sequence.data_type = "smallint".to_string();
+        let script = sequence.get_script();
+        assert!(script.contains("as smallint"));
+
+        // Test with integer
+        sequence.data_type = "integer".to_string();
+        let script = sequence.get_script();
+        assert!(script.contains("as integer"));
+
+        // Test with bigint (default, should not include AS clause)
+        sequence.data_type = "bigint".to_string();
+        let script = sequence.get_script();
+        assert!(!script.contains("as bigint"));
+
+        // Test with empty data type (should not include AS clause)
+        sequence.data_type = "".to_string();
+        let script = sequence.get_script();
+        assert!(!script.contains(" as "));
+    }
+
+    #[test]
+    fn test_get_script_increment_by_handling() {
+        let mut sequence = create_test_sequence();
+
+        // Default increment (1) should not be included
+        sequence.increment_by = Some(1);
+        let script = sequence.get_script();
+        assert!(!script.contains("increment by"));
+
+        // Non-default increment should be included
+        sequence.increment_by = Some(5);
+        let script = sequence.get_script();
+        assert!(script.contains("increment by 5"));
+
+        // None increment should not be included
+        sequence.increment_by = None;
+        let script = sequence.get_script();
+        assert!(!script.contains("increment by"));
+    }
+
+    #[test]
+    fn test_get_script_cache_handling() {
+        let mut sequence = create_test_sequence();
+
+        // Default cache (1) should not be included
+        sequence.cache_size = Some(1);
+        let script = sequence.get_script();
+        assert!(!script.contains("cache"));
+
+        // Non-default cache should be included
+        sequence.cache_size = Some(20);
+        let script = sequence.get_script();
+        assert!(script.contains("cache 20"));
+
+        // None cache should not be included
+        sequence.cache_size = None;
+        let script = sequence.get_script();
+        assert!(!script.contains("cache"));
+    }
+
+    #[test]
+    fn test_get_drop_script() {
+        let sequence = create_test_sequence();
+        let drop_script = sequence.get_drop_script();
+
+        let expected = "drop sequence public.test_seq;\n";
+        assert_eq!(drop_script, expected);
+    }
+
+    #[test]
+    fn test_get_drop_script_with_different_schema() {
+        let sequence = create_custom_sequence();
+        let drop_script = sequence.get_drop_script();
+
+        let expected = "drop sequence app.custom_seq;\n";
+        assert_eq!(drop_script, expected);
+    }
+
+    #[test]
+    fn test_get_alter_script_full() {
+        let sequence = create_custom_sequence();
+        let alter_script = sequence.get_alter_script();
+
+        let expected = "alter sequence app.custom_seq start with 100 increment by 5 minvalue 10 maxvalue 1000 cache 20 cycle ;\n";
+        assert_eq!(alter_script, expected);
+    }
+
+    #[test]
+    fn test_get_alter_script_minimal() {
+        let sequence = create_minimal_sequence();
+        let alter_script = sequence.get_alter_script();
+
+        let expected = "alter sequence test.minimal_seq no minvalue no maxvalue no cycle ;\n";
+        assert_eq!(alter_script, expected);
+    }
+
+    #[test]
+    fn test_get_alter_script_no_cycle() {
+        let sequence = create_test_sequence();
+        let alter_script = sequence.get_alter_script();
+
+        let expected = "alter sequence public.test_seq start with 1 increment by 1 minvalue 1 maxvalue 9223372036854775807 cache 1 no cycle ;\n";
+        assert_eq!(alter_script, expected);
+    }
+
+    #[test]
+    fn test_sequence_clone() {
+        let original = create_test_sequence();
+        let cloned = original.clone();
+
+        assert_eq!(original.schema, cloned.schema);
+        assert_eq!(original.name, cloned.name);
+        assert_eq!(original.owner, cloned.owner);
+        assert_eq!(original.data_type, cloned.data_type);
+        assert_eq!(original.start_value, cloned.start_value);
+        assert_eq!(original.min_value, cloned.min_value);
+        assert_eq!(original.max_value, cloned.max_value);
+        assert_eq!(original.increment_by, cloned.increment_by);
+        assert_eq!(original.cycle, cloned.cycle);
+        assert_eq!(original.cache_size, cloned.cache_size);
+        assert_eq!(original.last_value, cloned.last_value);
+        assert_eq!(original.hash(), cloned.hash());
+    }
+
+    #[test]
+    fn test_sequence_debug_format() {
+        let sequence = create_test_sequence();
+        let debug_string = format!("{sequence:?}");
+
+        // Verify that the debug string contains all fields
+        assert!(debug_string.contains("Sequence"));
+        assert!(debug_string.contains("schema"));
+        assert!(debug_string.contains("public"));
+        assert!(debug_string.contains("name"));
+        assert!(debug_string.contains("test_seq"));
+        assert!(debug_string.contains("owner"));
+        assert!(debug_string.contains("postgres"));
+        assert!(debug_string.contains("data_type"));
+        assert!(debug_string.contains("bigint"));
+        assert!(debug_string.contains("start_value"));
+        assert!(debug_string.contains("min_value"));
+        assert!(debug_string.contains("max_value"));
+        assert!(debug_string.contains("increment_by"));
+        assert!(debug_string.contains("cycle"));
+        assert!(debug_string.contains("cache_size"));
+        assert!(debug_string.contains("last_value"));
+    }
+
+    #[test]
+    fn test_serde_serialization() {
+        let sequence = create_test_sequence();
+
+        // Test serialization
+        let json = serde_json::to_string(&sequence).expect("Failed to serialize");
+        assert!(json.contains("public"));
+        assert!(json.contains("test_seq"));
+        assert!(json.contains("postgres"));
+        assert!(json.contains("bigint"));
+        assert!(json.contains("9223372036854775807"));
+
+        // Test deserialization
+        let deserialized: Sequence = serde_json::from_str(&json).expect("Failed to deserialize");
+        assert_eq!(sequence.schema, deserialized.schema);
+        assert_eq!(sequence.name, deserialized.name);
+        assert_eq!(sequence.owner, deserialized.owner);
+        assert_eq!(sequence.data_type, deserialized.data_type);
+        assert_eq!(sequence.start_value, deserialized.start_value);
+        assert_eq!(sequence.min_value, deserialized.min_value);
+        assert_eq!(sequence.max_value, deserialized.max_value);
+        assert_eq!(sequence.increment_by, deserialized.increment_by);
+        assert_eq!(sequence.cycle, deserialized.cycle);
+        assert_eq!(sequence.cache_size, deserialized.cache_size);
+        assert_eq!(sequence.last_value, deserialized.last_value);
+    }
+
+    #[test]
+    fn test_edge_cases_empty_strings() {
+        let sequence = Sequence {
+            schema: "".to_string(),
+            name: "".to_string(),
+            owner: "".to_string(),
+            data_type: "".to_string(),
+            start_value: None,
+            min_value: None,
+            max_value: None,
+            increment_by: None,
+            cycle: false,
+            cache_size: None,
+            last_value: None,
+        };
+
+        // Should handle empty strings gracefully
+        assert_eq!(sequence.schema, "");
+        assert_eq!(sequence.name, "");
+        assert_eq!(sequence.owner, "");
+        assert_eq!(sequence.data_type, "");
+
+        // Hash should still work with empty strings
+        let hash = sequence.hash();
+        assert_eq!(hash.len(), 64);
+
+        // Scripts should work with empty strings
+        let script = sequence.get_script();
+        assert_eq!(
+            script,
+            "create sequence . no minvalue no maxvalue no cycle;\n"
+        );
+
+        let drop_script = sequence.get_drop_script();
+        assert_eq!(drop_script, "drop sequence .;\n");
+
+        let alter_script = sequence.get_alter_script();
+        assert_eq!(
+            alter_script,
+            "alter sequence . no minvalue no maxvalue no cycle ;\n"
+        );
+    }
+
+    #[test]
+    fn test_sequence_with_special_characters() {
+        let sequence = Sequence {
+            schema: "test-schema".to_string(),
+            name: "test_seq$name".to_string(),
+            owner: "user@domain".to_string(),
+            data_type: "bigint".to_string(),
+            start_value: Some(-100),
+            min_value: Some(-1000),
+            max_value: Some(1000),
+            increment_by: Some(-1),
+            cycle: true,
+            cache_size: Some(50),
+            last_value: Some(-50),
+        };
+
+        // Should handle special characters and negative values
+        let hash = sequence.hash();
+        assert_eq!(hash.len(), 64);
+
+        let script = sequence.get_script();
+        assert!(script.contains("test-schema.test_seq$name"));
+        assert!(script.contains("start with -100"));
+        assert!(script.contains("increment by -1"));
+        assert!(script.contains("minvalue -1000"));
+        assert!(script.contains("maxvalue 1000"));
+        assert!(script.contains("cache 50"));
+        assert!(script.contains("cycle"));
+
+        let drop_script = sequence.get_drop_script();
+        assert!(drop_script.contains("test-schema.test_seq$name"));
+
+        let alter_script = sequence.get_alter_script();
+        assert!(alter_script.contains("test-schema.test_seq$name"));
+        assert!(alter_script.contains("start with -100"));
+        assert!(alter_script.contains("increment by -1"));
+    }
+
+    #[test]
+    fn test_known_sha256_hash() {
+        let sequence = Sequence {
+            schema: "test".to_string(),
+            name: "seq".to_string(),
+            owner: "user".to_string(),
+            data_type: "bigint".to_string(),
+            start_value: Some(1),
+            min_value: None,
+            max_value: None,
+            increment_by: Some(1),
+            cycle: false,
+            cache_size: None,
+            last_value: None,
+        };
+
+        // Create the same hash as the implementation
+        let mut hasher = Sha256::new();
+        hasher.update("test".as_bytes());
+        hasher.update("seq".as_bytes());
+        hasher.update("bigint".as_bytes());
+        hasher.update("1".as_bytes()); // start_value
+        hasher.update("1".as_bytes()); // increment_by
+        hasher.update("false".as_bytes()); // cycle
+
+        let expected_hash = format!("{:x}", hasher.finalize());
+        assert_eq!(sequence.hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_sequence_with_large_values() {
+        let sequence = Sequence {
+            schema: "test".to_string(),
+            name: "large_seq".to_string(),
+            owner: "test_user".to_string(),
+            data_type: "bigint".to_string(),
+            start_value: Some(i64::MAX),
+            min_value: Some(i64::MIN),
+            max_value: Some(i64::MAX),
+            increment_by: Some(i64::MAX),
+            cycle: false,
+            cache_size: Some(i64::MAX),
+            last_value: Some(i64::MAX),
+        };
+
+        // Should handle large values correctly
+        let script = sequence.get_script();
+        assert!(script.contains(&format!("start with {}", i64::MAX)));
+        assert!(script.contains(&format!("increment by {}", i64::MAX)));
+        assert!(script.contains(&format!("minvalue {}", i64::MIN)));
+        assert!(script.contains(&format!("maxvalue {}", i64::MAX)));
+        assert!(script.contains(&format!("cache {}", i64::MAX)));
+
+        let alter_script = sequence.get_alter_script();
+        assert!(alter_script.contains(&format!("start with {}", i64::MAX)));
+        assert!(alter_script.contains(&format!("increment by {}", i64::MAX)));
+    }
+}
