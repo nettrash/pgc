@@ -63,3 +63,19 @@ impl TableConstraint {
         script
     }
 }
+
+impl PartialEq for TableConstraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.catalog == other.catalog
+            && self.schema == other.schema
+            && self.name == other.name
+            && self.table_catalog == other.table_catalog
+            && self.table_schema == other.table_schema
+            && self.table_name == other.table_name
+            && self.constraint_type == other.constraint_type
+            && self.is_deferrable == other.is_deferrable
+            && self.initially_deferred == other.initially_deferred
+            && self.enforced == other.enforced
+            && self.nulls_distinct == other.nulls_distinct
+    }
+}

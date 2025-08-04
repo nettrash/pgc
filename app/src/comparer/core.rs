@@ -258,6 +258,25 @@ impl Comparer {
                 self.script.push_str(table.get_script().as_str());
             }
         }
+        // We will find all existing tables in both dumps with different hashes
+        for table in &self.from.tables {
+            if let Some(to_table) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+            {
+                if to_table.hash() != table.hash() {
+                    self.script.push_str(
+                        format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
+                    );
+                    self.script
+                        .push_str(table.get_alter_script(to_table).as_str());
+                }
+            } else {
+                continue; // Table is present in both dumps, we already processed it
+            }
+        }
         self.script.push_str("/* Tables: End section */\n");
         Ok(())
     }

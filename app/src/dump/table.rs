@@ -343,4 +343,95 @@ impl Table {
     pub fn get_drop_script(&self) -> String {
         format!("drop table if exists {}.{};\n", self.schema, self.name)
     }
+
+    pub fn get_alter_script(&self, to_table: &Table) -> String {
+        let mut script = String::new();
+
+        // 1. Columns - Check for new columns, altered columns, and dropped columns
+        for new_col in &to_table.columns {
+            if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
+                if old_col != new_col {
+                    script.push_str(&format!(
+                        "alter table {}.{} alter column \"{}\" type {};\n",
+                        self.schema,
+                        self.name,
+                        new_col.name,
+                        new_col.data_type // You may want to use new_col.get_script() or similar
+                    ));
+                }
+            } else {
+                script.push_str(&format!(
+                    "alter table {}.{} add column \"{}\" {};\n",
+                    self.schema,
+                    self.name,
+                    new_col.name,
+                    new_col
+                        .get_script()
+                        .split_once(' ')
+                        .map(|x| x.1)
+                        .unwrap_or("") // Only type and constraints
+                ));
+            }
+        }
+
+        for old_col in &self.columns {
+            if !to_table.columns.iter().any(|c| c.name == old_col.name) {
+                script.push_str(&format!(
+                    "alter table {}.{} drop column \"{}\";\n",
+                    self.schema, self.name, old_col.name
+                ));
+            }
+        }
+
+        // 2. Constraints - Check for new constraints, altered constraints, and dropped constraints
+        for new_constraint in &to_table.constraints {
+            if let Some(old_constraint) = self
+                .constraints
+                .iter()
+                .find(|c| c.name == new_constraint.name)
+            {
+                if old_constraint != new_constraint {
+                    script.push_str(&format!(
+                        "alter table {}.{} drop constraint \"{}\";\n",
+                        self.schema, self.name, old_constraint.name
+                    ));
+                    script.push_str(&new_constraint.get_script());
+                }
+            } else {
+                script.push_str(&new_constraint.get_script());
+            }
+        }
+
+        // 3. Indexes - Check for new indexes, altered indexes, and dropped indexes
+        for new_index in &to_table.indexes {
+            if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
+                if old_index != new_index {
+                    script.push_str(&format!(
+                        "drop index if exists {}.{};\n",
+                        new_index.schema, new_index.name
+                    ));
+                    script.push_str(&new_index.get_script());
+                }
+            } else {
+                script.push_str(&new_index.get_script());
+            }
+        }
+
+        // 4. Triggers - Check for new triggers, altered triggers, and dropped triggers
+        for new_trigger in &to_table.triggers {
+            if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
+                if old_trigger != new_trigger {
+                    script.push_str(&format!(
+                        "drop trigger if exists {} on {}.{};\n",
+                        old_trigger.name, self.schema, self.name
+                    ));
+                    script.push_str(&new_trigger.get_script());
+                }
+            } else {
+                script.push_str(&new_trigger.get_script());
+            }
+        }
+
+        script
+    }
 }

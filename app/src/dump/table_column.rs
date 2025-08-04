@@ -236,3 +236,58 @@ impl TableColumn {
         script.trim_end().to_string()
     }
 }
+
+impl PartialEq for TableColumn {
+    fn eq(&self, other: &Self) -> bool {
+        self.catalog == other.catalog
+            && self.schema == other.schema
+            && self.table == other.table
+            && self.name == other.name
+            && self.ordinal_position == other.ordinal_position
+            && self.column_default == other.column_default
+            && self.is_nullable == other.is_nullable
+            && self.data_type == other.data_type
+            && self.character_maximum_length == other.character_maximum_length
+            && self.character_octet_length == other.character_octet_length
+            && self.numeric_precision == other.numeric_precision
+            && self.numeric_precision_radix == other.numeric_precision_radix
+            && self.numeric_scale == other.numeric_scale
+            && self.datetime_precision == other.datetime_precision
+            && self.interval_type == other.interval_type
+            && self.interval_precision == other.interval_precision
+            && self.character_set_catalog == other.character_set_catalog
+            && self.character_set_schema == other.character_set_schema
+            && self.character_set_name == other.character_set_name
+            && self.collation_catalog == other.collation_catalog
+            && self.collation_schema == other.collation_schema
+            && self.collation_name == other.collation_name
+            && self.domain_catalog == other.domain_catalog
+            && self.domain_schema == other.domain_schema
+            && self.domain_name == other.domain_name
+            && self.udt_catalog == other.udt_catalog
+            && self.udt_schema == other.udt_schema
+            && self.udt_name == other.udt_name
+            && self.scope_catalog == other.scope_catalog
+            && self.scope_schema == other.scope_schema
+            && self.scope_name == other.scope_name
+            && self.maximum_cardinality == other.maximum_cardinality
+            && self.dtd_identifier == other.dtd_identifier
+            && self.is_self_referencing == other.is_self_referencing
+            && self.is_identity == other.is_identity
+            && self.identity_generation == other.identity_generation
+            && self.identity_start == other.identity_start
+            && self.identity_increment == other.identity_increment
+            && self.identity_maximum == other.identity_maximum
+            && self.identity_minimum == other.identity_minimum
+            && self.identity_cycle == other.identity_cycle
+            // is_generated is a string, so we compare it directly.
+            // If it contains "ALWAYS" or "BY DEFAULT", we consider them equal.
+            // This is a workaround for the fact that
+            // PostgreSQL uses different strings for generated columns.
+            && (self.is_generated.to_uppercase() == other.is_generated.to_uppercase()
+                || self.is_generated.to_uppercase().contains("ALWAYS")
+                || self.is_generated.to_uppercase().contains("BY DEFAULT"))
+            && self.generation_expression == other.generation_expression
+            && self.is_updatable == other.is_updatable
+    }
+}

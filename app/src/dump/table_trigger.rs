@@ -27,3 +27,9 @@ impl TableTrigger {
         script
     }
 }
+
+impl PartialEq for TableTrigger {
+    fn eq(&self, other: &Self) -> bool {
+        self.oid == other.oid && self.name == other.name && self.definition == other.definition
+    }
+}

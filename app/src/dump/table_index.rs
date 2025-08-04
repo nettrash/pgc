@@ -31,3 +31,13 @@ impl TableIndex {
         script
     }
 }
+
+impl PartialEq for TableIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.table == other.table
+            && self.name == other.name
+            && self.catalog == other.catalog
+            && self.indexdef == other.indexdef
+    }
+}
