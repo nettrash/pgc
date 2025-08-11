@@ -101,9 +101,8 @@ impl Comparer {
                 continue; // Routine is present in both dumps, we already processed it
             } else if self.use_drop {
                 // Just if we're using DROP statements
-                self.script.push_str(
-                    format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
-                );
+                self.script
+                    .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
                 self.script.push_str(
                     "/* Extension is not present in 'to' dump and should be dropped. */\n",
                 );
@@ -220,9 +219,8 @@ impl Comparer {
                 self.script.push_str(
                     format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                 );
-                self.script.push_str(
-                    "/* Routine is not present in 'to' dump and should be dropped. */\n",
-                );
+                self.script
+                    .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
                 self.script.push_str(routine.get_drop_script().as_str());
             }
         }
@@ -245,12 +243,10 @@ impl Comparer {
                 continue; // Table is present in both dumps, we already processed it
             } else if self.use_drop {
                 // Just if we're using DROP statements
-                self.script.push_str(
-                    format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
-                );
-                self.script.push_str(
-                    "/* Table is not present in 'to' dump and should be dropped. */\n",
-                );
+                self.script
+                    .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
+                self.script
+                    .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
                 self.script.push_str(table.get_drop_script().as_str());
             }
         }
