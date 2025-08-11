@@ -136,7 +136,12 @@ impl Config {
             ssl: to_ssl,
             file: to_dump,
         };
-        Config { from, to, output, use_drop }
+        Config {
+            from,
+            to,
+            output,
+            use_drop,
+        }
     }
 }
 

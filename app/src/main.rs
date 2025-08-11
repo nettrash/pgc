@@ -107,8 +107,13 @@ pub async fn main() -> Result<(), Error> {
             }
             Some("compare") => {
                 println!("Comparing databases...");
-                return compare_dumps(args.from.unwrap(), args.to.unwrap(), args.output.unwrap(), args.use_drop)
-                    .await;
+                return compare_dumps(
+                    args.from.unwrap(),
+                    args.to.unwrap(),
+                    args.output.unwrap(),
+                    args.use_drop,
+                )
+                .await;
             }
             _ => {
                 eprintln!("Unknown command: {}", args.command.unwrap());
@@ -196,7 +201,12 @@ async fn create_dump(dump_config: DumpConfig) -> Result<(), Error> {
     Ok(())
 }
 
-async fn compare_dumps(from: String, to: String, output: String, use_drop: bool) -> Result<(), Error> {
+async fn compare_dumps(
+    from: String,
+    to: String,
+    output: String,
+    use_drop: bool,
+) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
     let to = Dump::read_from_file(&to).await?;
