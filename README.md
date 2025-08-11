@@ -71,10 +71,12 @@ As a result if this command we will have a dump file with all needed information
 ### Create delta script between two dumps
 
 ```bash
-pgc --command compare --from {from_dump} --to {to_dump} --output {file}
+pgc --command compare --from {from_dump} --to {to_dump} --output {file} --use-drop
 ```
 
 This command comparing two dumps and produce SQL script for the `FROM` database to be equal to `TO` database after applying it.
+If we add `--use-drop` argument comparer will add drop scripts for all items that non exists in target database, otherwise drop scripts will be ignored.  
+By default, comparer ignore drops.
 
 ## Configuration file
 

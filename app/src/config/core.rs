@@ -9,6 +9,8 @@ pub struct Config {
     pub to: DumpConfig,
     // Output file name for the comparison result
     pub output: String,
+    // Whether to use DROP statements in the output
+    pub use_drop: bool,
 }
 
 impl Config {
@@ -45,6 +47,7 @@ impl Config {
         let mut to_ssl = false;
         let mut to_dump = "dump.to".to_string();
         let mut output = "data.out".to_string();
+        let mut use_drop = false;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -74,6 +77,7 @@ impl Config {
                 && parts[0].trim() != "TO_SSL"
                 && parts[0].trim() != "TO_DUMP"
                 && parts[0].trim() != "OUTPUT"
+                && parts[0].trim() != "USE_DROP"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -108,6 +112,7 @@ impl Config {
                 "TO_SSL" => to_ssl = parts[1].trim().to_uppercase() == "TRUE",
                 "TO_DUMP" => to_dump = parts[1].trim().to_string(),
                 "OUTPUT" => output = parts[1].trim().to_string(),
+                "USE_DROP" => use_drop = parts[1].trim().to_uppercase() == "TRUE",
                 _ => {}
             }
         }
@@ -131,7 +136,7 @@ impl Config {
             ssl: to_ssl,
             file: to_dump,
         };
-        Config { from, to, output }
+        Config { from, to, output, use_drop }
     }
 }
 

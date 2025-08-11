@@ -11,6 +11,8 @@ pub struct Comparer {
     from: Dump,
     // The dump to compare to
     to: Dump,
+    // Whether to use DROP statements in the output
+    use_drop: bool,
 
     // The script that will be generated
     script: String,
@@ -18,10 +20,11 @@ pub struct Comparer {
 
 impl Comparer {
     // Creates a new Comparer with the given dumps
-    pub fn new(from: Dump, to: Dump) -> Self {
+    pub fn new(from: Dump, to: Dump, use_drop: bool) -> Self {
         let mut comparer = Self {
             from,
             to,
+            use_drop,
             script: String::new(),
         };
 
@@ -33,7 +36,7 @@ impl Comparer {
         comparer.script.push_str(&comparer.from.get_info());
         comparer.script.push_str("\n\n To dump:\n");
         comparer.script.push_str(&comparer.to.get_info());
-        comparer.script.push_str("\n\n Comparison results:\n");
+        comparer.script.push_str(format!("\n\n Comparison results (use_drop: {}):\n", comparer.use_drop));
         comparer.script.push_str("*/\n\n");
 
         comparer
@@ -94,12 +97,14 @@ impl Comparer {
             {
                 continue; // Routine is present in both dumps, we already processed it
             } else {
-                self.script
-                    .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
-                self.script.push_str(
-                    "/* Extension is not present in 'to' dump and should be dropped. */\n",
-                );
-                self.script.push_str(ext.get_drop_script().as_str());
+                if self.use_drop { // Just if we're using DROP statements
+                    self.script
+                        .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
+                    self.script.push_str(
+                        "/* Extension is not present in 'to' dump and should be dropped. */\n",
+                    );
+                    self.script.push_str(ext.get_drop_script().as_str());
+                }
             }
         }
 
@@ -156,13 +161,15 @@ impl Comparer {
             {
                 continue; // Sequence is present in both dumps, we already processed it
             } else {
-                self.script.push_str(
-                    format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
-                );
-                self.script.push_str(
-                    "/* Sequence is not present in 'to' dump and should be dropped. */\n",
-                );
-                self.script.push_str(sequence.get_drop_script().as_str());
+                if self.use_drop { // Just if we're using DROP statements
+                    self.script.push_str(
+                        format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
+                    );
+                    self.script.push_str(
+                        "/* Sequence is not present in 'to' dump and should be dropped. */\n",
+                    );
+                    self.script.push_str(sequence.get_drop_script().as_str());
+                }
             }
         }
 
@@ -207,12 +214,14 @@ impl Comparer {
             {
                 continue; // Routine is present in both dumps, we already processed it
             } else {
-                self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
-                );
-                self.script
-                    .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
-                self.script.push_str(routine.get_drop_script().as_str());
+                if self.use_drop { // Just if we're using DROP statements
+                    self.script.push_str(
+                        format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    );
+                    self.script
+                        .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
+                    self.script.push_str(routine.get_drop_script().as_str());
+                }
             }
         }
 
@@ -233,11 +242,13 @@ impl Comparer {
             {
                 continue; // Table is present in both dumps, we already processed it
             } else {
-                self.script
-                    .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
-                self.script
-                    .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
-                self.script.push_str(table.get_drop_script().as_str());
+                if self.use_drop { // Just if we're using DROP statements
+                    self.script
+                        .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
+                    self.script
+                        .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
+                    self.script.push_str(table.get_drop_script().as_str());
+                }
             }
         }
         // We will find all new tables from "to" dump that are not in "from" dump
@@ -250,7 +261,8 @@ impl Comparer {
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
                 if from_table.hash() != table.hash() {
-                    // Jsut create an alter script for the table
+                    // Just create an alter script for the table
+                    // Will be added in next comparision (below)
                 }
             } else {
                 self.script
