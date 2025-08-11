@@ -36,7 +36,7 @@ impl Comparer {
         comparer.script.push_str(&comparer.from.get_info());
         comparer.script.push_str("\n\n To dump:\n");
         comparer.script.push_str(&comparer.to.get_info());
-        comparer.script.push_str(format!("\n\n Comparison results (use_drop: {}):\n", comparer.use_drop));
+        comparer.script.push_str(&format!("\n\n Comparison results (use_drop: {}):\n", comparer.use_drop));
         comparer.script.push_str("*/\n\n");
 
         comparer

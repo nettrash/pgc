@@ -69,7 +69,7 @@ struct Args {
     use_ssl: bool,
 
     /// Use DROP statements in the output
-    #[arg(long, default_value = false)]
+    #[arg(long, default_value = "false")]
     use_drop: bool,
 }
 
