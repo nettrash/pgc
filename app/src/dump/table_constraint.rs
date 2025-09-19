@@ -4,17 +4,13 @@ use sha2::{Digest, Sha256};
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableConstraint {
-    pub catalog: String,              // Catalog name
-    pub schema: String,               // Schema name
-    pub name: String,                 // Constraint name
-    pub table_catalog: String,        // Table catalog
-    pub table_schema: String,         // Table schema
-    pub table_name: String,           // Table name
+    pub catalog: String,            // Catalog name
+    pub schema: String,             // Schema name
+    pub name: String,               // Constraint name
+    pub table_name: String,         // Table name
     pub constraint_type: String, // Type of the constraint (e.g., PRIMARY KEY, FOREIGN KEY, UNIQUE)
     pub is_deferrable: bool,     // Whether the constraint is deferrable
     pub initially_deferred: bool, // Whether the constraint is initially deferred
-    pub enforced: bool,          // Whether the constraint is enforced
-    pub nulls_distinct: Option<bool>, // Whether the constraint allows nulls to be distinct
     pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
 }
 
@@ -24,16 +20,10 @@ impl TableConstraint {
         hasher.update(self.catalog.as_bytes());
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
-        hasher.update(self.table_catalog.as_bytes());
-        hasher.update(self.table_schema.as_bytes());
         hasher.update(self.table_name.as_bytes());
         hasher.update(self.constraint_type.as_bytes());
         hasher.update(self.is_deferrable.to_string().as_bytes());
         hasher.update(self.initially_deferred.to_string().as_bytes());
-        hasher.update(self.enforced.to_string().as_bytes());
-        if let Some(nulls_distinct) = self.nulls_distinct {
-            hasher.update(nulls_distinct.to_string().as_bytes());
-        }
         if let Some(definition) = &self.definition {
             hasher.update(definition.as_bytes());
         }
@@ -44,40 +34,17 @@ impl TableConstraint {
         let mut script = String::new();
         script.push_str(&format!(
             "alter table {}.{} add constraint {} ",
-            self.table_schema, self.table_name, self.name
+            self.schema, self.table_name, self.name
         ));
 
         // If a definition is provided, start from that (lowercased) and optionally append flags.
         // Otherwise, build from constraint_type and attribute flags.
         let clause = if let Some(def) = &self.definition {
             let mut base = def.to_lowercase();
-            // UNIQUE extras
-            if self.constraint_type.eq_ignore_ascii_case("UNIQUE") {
-                if let Some(true) = self.nulls_distinct {
-                    if !base.contains("nulls distinct") {
-                        base.push_str(" nulls distinct");
-                    }
-                } else if let Some(false) = self.nulls_distinct
-                    && !base.contains("nulls not distinct") {
-                        base.push_str(" nulls not distinct");
-                    }
-            }
-            // CHECK extras
-            if self.constraint_type.eq_ignore_ascii_case("CHECK") {
-                if !self.enforced && !base.contains("not enforced") {
-                    base.push_str(" not enforced");
-                }
-                if let Some(true) = self.nulls_distinct {
-                    if !base.contains("nulls distinct") {
-                        base.push_str(" nulls distinct");
-                    }
-                } else if let Some(false) = self.nulls_distinct
-                    && !base.contains("nulls not distinct") {
-                        base.push_str(" nulls not distinct");
-                    }
-            }
-            // FOREIGN KEY extras
-            if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY") {
+            // Append deferrable flags for foreign key or unique if flags set
+            if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
+                || self.constraint_type.eq_ignore_ascii_case("UNIQUE")
+            {
                 if self.is_deferrable && !base.contains("deferrable") {
                     base.push_str(" deferrable");
                 }
@@ -99,27 +66,8 @@ impl TableConstraint {
                         parts.push("initially deferred".to_string());
                     }
                 }
-                "UNIQUE" => {
-                    parts.push("unique".to_string());
-                    if let Some(true) = self.nulls_distinct {
-                        parts.push("nulls distinct".to_string());
-                    }
-                    if let Some(false) = self.nulls_distinct {
-                        parts.push("nulls not distinct".to_string());
-                    }
-                }
-                "CHECK" => {
-                    parts.push("check".to_string());
-                    if !self.enforced {
-                        parts.push("not enforced".to_string());
-                    }
-                    if let Some(true) = self.nulls_distinct {
-                        parts.push("nulls distinct".to_string());
-                    }
-                    if let Some(false) = self.nulls_distinct {
-                        parts.push("nulls not distinct".to_string());
-                    }
-                }
+                "UNIQUE" => parts.push("unique".to_string()),
+                "CHECK" => parts.push("check".to_string()),
                 _ => {}
             }
             parts.join(" ")
@@ -136,14 +84,10 @@ impl PartialEq for TableConstraint {
         self.catalog == other.catalog
             && self.schema == other.schema
             && self.name == other.name
-            && self.table_catalog == other.table_catalog
-            && self.table_schema == other.table_schema
             && self.table_name == other.table_name
             && self.constraint_type == other.constraint_type
             && self.is_deferrable == other.is_deferrable
             && self.initially_deferred == other.initially_deferred
-            && self.enforced == other.enforced
-            && self.nulls_distinct == other.nulls_distinct
             && self.definition == other.definition
     }
 }
@@ -158,14 +102,10 @@ mod tests {
             catalog: "postgres".to_string(),
             schema: "public".to_string(),
             name: "pk_users_id".to_string(),
-            table_catalog: "postgres".to_string(),
-            table_schema: "public".to_string(),
             table_name: "users".to_string(),
             constraint_type: "PRIMARY KEY".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: None,
             definition: None,
         }
     }
@@ -175,14 +115,10 @@ mod tests {
             catalog: "postgres".to_string(),
             schema: "app".to_string(),
             name: "fk_orders_user_id".to_string(),
-            table_catalog: "postgres".to_string(),
-            table_schema: "app".to_string(),
             table_name: "orders".to_string(),
             constraint_type: "FOREIGN KEY".to_string(),
             is_deferrable: true,
             initially_deferred: true,
-            enforced: true,
-            nulls_distinct: None,
             definition: None,
         }
     }
@@ -192,14 +128,10 @@ mod tests {
             catalog: "analytics".to_string(),
             schema: "analytics".to_string(),
             name: "uk_products_sku".to_string(),
-            table_catalog: "analytics".to_string(),
-            table_schema: "analytics".to_string(),
             table_name: "products".to_string(),
             constraint_type: "UNIQUE".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: Some(true),
             definition: None,
         }
     }
@@ -209,14 +141,10 @@ mod tests {
             catalog: "test".to_string(),
             schema: "test".to_string(),
             name: "chk_age_positive".to_string(),
-            table_catalog: "test".to_string(),
-            table_schema: "test".to_string(),
             table_name: "persons".to_string(),
             constraint_type: "CHECK".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: false,
-            nulls_distinct: Some(false),
             definition: None,
         }
     }
@@ -228,14 +156,10 @@ mod tests {
         assert_eq!(constraint.catalog, "postgres");
         assert_eq!(constraint.schema, "public");
         assert_eq!(constraint.name, "pk_users_id");
-        assert_eq!(constraint.table_catalog, "postgres");
-        assert_eq!(constraint.table_schema, "public");
         assert_eq!(constraint.table_name, "users");
         assert_eq!(constraint.constraint_type, "PRIMARY KEY");
         assert!(!constraint.is_deferrable);
         assert!(!constraint.initially_deferred);
-        assert!(constraint.enforced);
-        assert_eq!(constraint.nulls_distinct, None);
         assert_eq!(constraint.definition, None);
     }
 
@@ -246,14 +170,10 @@ mod tests {
         assert_eq!(constraint.catalog, "postgres");
         assert_eq!(constraint.schema, "app");
         assert_eq!(constraint.name, "fk_orders_user_id");
-        assert_eq!(constraint.table_catalog, "postgres");
-        assert_eq!(constraint.table_schema, "app");
         assert_eq!(constraint.table_name, "orders");
         assert_eq!(constraint.constraint_type, "FOREIGN KEY");
         assert!(constraint.is_deferrable);
         assert!(constraint.initially_deferred);
-        assert!(constraint.enforced);
-        assert_eq!(constraint.nulls_distinct, None);
         assert_eq!(constraint.definition, None);
     }
 
@@ -264,14 +184,10 @@ mod tests {
         assert_eq!(constraint.catalog, "analytics");
         assert_eq!(constraint.schema, "analytics");
         assert_eq!(constraint.name, "uk_products_sku");
-        assert_eq!(constraint.table_catalog, "analytics");
-        assert_eq!(constraint.table_schema, "analytics");
         assert_eq!(constraint.table_name, "products");
         assert_eq!(constraint.constraint_type, "UNIQUE");
         assert!(!constraint.is_deferrable);
         assert!(!constraint.initially_deferred);
-        assert!(constraint.enforced);
-        assert_eq!(constraint.nulls_distinct, Some(true));
         assert_eq!(constraint.definition, None);
     }
 
@@ -282,14 +198,10 @@ mod tests {
         assert_eq!(constraint.catalog, "test");
         assert_eq!(constraint.schema, "test");
         assert_eq!(constraint.name, "chk_age_positive");
-        assert_eq!(constraint.table_catalog, "test");
-        assert_eq!(constraint.table_schema, "test");
         assert_eq!(constraint.table_name, "persons");
         assert_eq!(constraint.constraint_type, "CHECK");
         assert!(!constraint.is_deferrable);
         assert!(!constraint.initially_deferred);
-        assert!(!constraint.enforced);
-        assert_eq!(constraint.nulls_distinct, Some(false));
         assert_eq!(constraint.definition, None);
     }
 
@@ -345,12 +257,6 @@ mod tests {
         let mut constraint_diff_name = base_constraint.clone();
         constraint_diff_name.name = "different_name".to_string();
 
-        let mut constraint_diff_table_catalog = base_constraint.clone();
-        constraint_diff_table_catalog.table_catalog = "different_table_catalog".to_string();
-
-        let mut constraint_diff_table_schema = base_constraint.clone();
-        constraint_diff_table_schema.table_schema = "different_table_schema".to_string();
-
         let mut constraint_diff_table_name = base_constraint.clone();
         constraint_diff_table_name.table_name = "different_table_name".to_string();
 
@@ -363,12 +269,6 @@ mod tests {
         let mut constraint_diff_deferred = base_constraint.clone();
         constraint_diff_deferred.initially_deferred = true;
 
-        let mut constraint_diff_enforced = base_constraint.clone();
-        constraint_diff_enforced.enforced = false;
-
-        let mut constraint_diff_nulls = base_constraint.clone();
-        constraint_diff_nulls.nulls_distinct = Some(true);
-
         // Get base hash
         let mut hasher_base = Sha256::new();
         base_constraint.add_to_hasher(&mut hasher_base);
@@ -379,14 +279,10 @@ mod tests {
             constraint_diff_catalog,
             constraint_diff_schema,
             constraint_diff_name,
-            constraint_diff_table_catalog,
-            constraint_diff_table_schema,
             constraint_diff_table_name,
             constraint_diff_type,
             constraint_diff_deferrable,
             constraint_diff_deferred,
-            constraint_diff_enforced,
-            constraint_diff_nulls,
         ];
 
         for constraint in constraints {
@@ -416,20 +312,20 @@ mod tests {
     }
 
     #[test]
-    fn test_get_script_unique_nulls_distinct() {
+    fn test_get_script_unique() {
         let constraint = create_unique_constraint();
         let script = constraint.get_script();
-
-        let expected = "alter table analytics.products add constraint uk_products_sku unique nulls distinct ;\n";
+        // With reduced fields/behavior we no longer append null handling
+        let expected = "alter table analytics.products add constraint uk_products_sku unique ;\n";
         assert_eq!(script, expected);
     }
 
     #[test]
-    fn test_get_script_check_not_enforced_nulls_not_distinct() {
+    fn test_get_script_check() {
         let constraint = create_check_constraint();
         let script = constraint.get_script();
-
-        let expected = "alter table test.persons add constraint chk_age_positive check not enforced nulls not distinct ;\n";
+        // Simplified behavior: just the base type
+        let expected = "alter table test.persons add constraint chk_age_positive check ;\n";
         assert_eq!(script, expected);
     }
 
@@ -439,19 +335,15 @@ mod tests {
             catalog: "test".to_string(),
             schema: "test".to_string(),
             name: "test_constraint".to_string(),
-            table_catalog: "test".to_string(),
-            table_schema: "test".to_string(),
             table_name: "test_table".to_string(),
             constraint_type: "UNIQUE".to_string(),
             is_deferrable: true,
             initially_deferred: true,
-            enforced: false,
-            nulls_distinct: Some(false),
             definition: Some("UNIQUE (id)".to_string()),
         };
 
         let script = constraint.get_script();
-        let expected = "alter table test.test_table add constraint test_constraint unique (id) nulls not distinct ;\n";
+        let expected = "alter table test.test_table add constraint test_constraint unique (id) deferrable initially deferred ;\n";
         assert_eq!(script, expected);
     }
 
@@ -461,14 +353,10 @@ mod tests {
             catalog: "TEST".to_string(),
             schema: "PUBLIC".to_string(),
             name: "CONSTRAINT_NAME".to_string(),
-            table_catalog: "TEST".to_string(),
-            table_schema: "PUBLIC".to_string(),
             table_name: "USERS".to_string(),
             constraint_type: "PRIMARY KEY".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: None,
             definition: Some("PRIMARY KEY (id)".to_string()),
         };
 
@@ -484,14 +372,10 @@ mod tests {
             catalog: "".to_string(),
             schema: "".to_string(),
             name: "".to_string(),
-            table_catalog: "".to_string(),
-            table_schema: "".to_string(),
             table_name: "".to_string(),
             constraint_type: "".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: None,
             definition: None,
         };
 
@@ -541,36 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_eq_different_table_catalog() {
-        let constraint1 = create_primary_key_constraint();
-        let mut constraint2 = create_primary_key_constraint();
-        constraint2.table_catalog = "different_table_catalog".to_string();
-
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
-    }
-
-    #[test]
-    fn test_partial_eq_different_table_schema() {
-        let constraint1 = create_primary_key_constraint();
-        let mut constraint2 = create_primary_key_constraint();
-        constraint2.table_schema = "different_table_schema".to_string();
-
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
-    }
-
-    #[test]
-    fn test_partial_eq_different_table_name() {
-        let constraint1 = create_primary_key_constraint();
-        let mut constraint2 = create_primary_key_constraint();
-        constraint2.table_name = "different_table_name".to_string();
-
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
-    }
-
-    #[test]
     fn test_partial_eq_different_constraint_type() {
         let constraint1 = create_primary_key_constraint();
         let mut constraint2 = create_primary_key_constraint();
@@ -601,67 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_eq_different_enforced() {
-        let constraint1 = create_primary_key_constraint();
-        let mut constraint2 = create_primary_key_constraint();
-        constraint2.enforced = false;
-
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
-    }
-
-    #[test]
-    fn test_partial_eq_different_nulls_distinct() {
-        let constraint1 = create_primary_key_constraint();
-        let mut constraint2 = create_primary_key_constraint();
-        constraint2.nulls_distinct = Some(true);
-
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
-    }
-
-    #[test]
-    fn test_partial_eq_nulls_distinct_some_vs_none() {
-        let mut constraint1 = create_primary_key_constraint();
-        let mut constraint2 = create_primary_key_constraint();
-
-        constraint1.nulls_distinct = Some(true);
-        constraint2.nulls_distinct = None;
-
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
-    }
-
-    #[test]
-    fn test_table_constraint_clone() {
-        let original = create_primary_key_constraint();
-        let cloned = original.clone();
-
-        assert_eq!(original.catalog, cloned.catalog);
-        assert_eq!(original.schema, cloned.schema);
-        assert_eq!(original.name, cloned.name);
-        assert_eq!(original.table_catalog, cloned.table_catalog);
-        assert_eq!(original.table_schema, cloned.table_schema);
-        assert_eq!(original.table_name, cloned.table_name);
-        assert_eq!(original.constraint_type, cloned.constraint_type);
-        assert_eq!(original.is_deferrable, cloned.is_deferrable);
-        assert_eq!(original.initially_deferred, cloned.initially_deferred);
-        assert_eq!(original.enforced, cloned.enforced);
-        assert_eq!(original.nulls_distinct, cloned.nulls_distinct);
-        assert_eq!(original, cloned);
-
-        // Verify hash consistency
-        let mut hasher_original = Sha256::new();
-        let mut hasher_cloned = Sha256::new();
-        original.add_to_hasher(&mut hasher_original);
-        cloned.add_to_hasher(&mut hasher_cloned);
-
-        let hash_original = format!("{:x}", hasher_original.finalize());
-        let hash_cloned = format!("{:x}", hasher_cloned.finalize());
-        assert_eq!(hash_original, hash_cloned);
-    }
-
-    #[test]
     fn test_table_constraint_debug_format() {
         let constraint = create_primary_key_constraint();
         let debug_string = format!("{constraint:?}");
@@ -674,16 +467,12 @@ mod tests {
         assert!(debug_string.contains("public"));
         assert!(debug_string.contains("name"));
         assert!(debug_string.contains("pk_users_id"));
-        assert!(debug_string.contains("table_catalog"));
-        assert!(debug_string.contains("table_schema"));
         assert!(debug_string.contains("table_name"));
         assert!(debug_string.contains("users"));
         assert!(debug_string.contains("constraint_type"));
         assert!(debug_string.contains("PRIMARY KEY"));
         assert!(debug_string.contains("is_deferrable"));
         assert!(debug_string.contains("initially_deferred"));
-        assert!(debug_string.contains("enforced"));
-        assert!(debug_string.contains("nulls_distinct"));
     }
 
     #[test]
@@ -704,8 +493,6 @@ mod tests {
         assert_eq!(constraint.catalog, deserialized.catalog);
         assert_eq!(constraint.schema, deserialized.schema);
         assert_eq!(constraint.name, deserialized.name);
-        assert_eq!(constraint.table_catalog, deserialized.table_catalog);
-        assert_eq!(constraint.table_schema, deserialized.table_schema);
         assert_eq!(constraint.table_name, deserialized.table_name);
         assert_eq!(constraint.constraint_type, deserialized.constraint_type);
         assert_eq!(constraint.is_deferrable, deserialized.is_deferrable);
@@ -713,8 +500,6 @@ mod tests {
             constraint.initially_deferred,
             deserialized.initially_deferred
         );
-        assert_eq!(constraint.enforced, deserialized.enforced);
-        assert_eq!(constraint.nulls_distinct, deserialized.nulls_distinct);
         assert_eq!(constraint, deserialized);
     }
 
@@ -724,14 +509,10 @@ mod tests {
             catalog: "test-db".to_string(),
             schema: "app$schema".to_string(),
             name: "constraint@name".to_string(),
-            table_catalog: "test-db".to_string(),
-            table_schema: "app$schema".to_string(),
             table_name: "table#name".to_string(),
             constraint_type: "UNIQUE".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: Some(true),
             definition: Some("UNIQUE (column1, column2)".to_string()),
         };
 
@@ -745,7 +526,6 @@ mod tests {
         assert!(script.contains("app$schema.table#name"));
         assert!(script.contains("constraint@name"));
         assert!(script.contains("unique"));
-        assert!(script.contains("nulls distinct"));
         assert!(script.ends_with(";\n"));
     }
 
@@ -756,56 +536,40 @@ mod tests {
                 catalog: "db".to_string(),
                 schema: "public".to_string(),
                 name: "pk_test".to_string(),
-                table_catalog: "db".to_string(),
-                table_schema: "public".to_string(),
                 table_name: "test".to_string(),
                 constraint_type: "PRIMARY KEY".to_string(),
                 is_deferrable: false,
                 initially_deferred: false,
-                enforced: true,
-                nulls_distinct: None,
                 definition: Some("PRIMARY KEY (id)".to_string()),
             },
             TableConstraint {
                 catalog: "db".to_string(),
                 schema: "public".to_string(),
                 name: "fk_test".to_string(),
-                table_catalog: "db".to_string(),
-                table_schema: "public".to_string(),
                 table_name: "test".to_string(),
                 constraint_type: "FOREIGN KEY".to_string(),
                 is_deferrable: true,
                 initially_deferred: false,
-                enforced: true,
-                nulls_distinct: None,
                 definition: Some("FOREIGN KEY (user_id) REFERENCES users(id)".to_string()),
             },
             TableConstraint {
                 catalog: "db".to_string(),
                 schema: "public".to_string(),
                 name: "uk_test".to_string(),
-                table_catalog: "db".to_string(),
-                table_schema: "public".to_string(),
                 table_name: "test".to_string(),
                 constraint_type: "UNIQUE".to_string(),
                 is_deferrable: false,
                 initially_deferred: false,
-                enforced: true,
-                nulls_distinct: Some(true),
                 definition: Some("UNIQUE (column1, column2)".to_string()),
             },
             TableConstraint {
                 catalog: "db".to_string(),
                 schema: "public".to_string(),
                 name: "chk_test".to_string(),
-                table_catalog: "db".to_string(),
-                table_schema: "public".to_string(),
                 table_name: "test".to_string(),
                 constraint_type: "CHECK".to_string(),
                 is_deferrable: false,
                 initially_deferred: false,
-                enforced: false,
-                nulls_distinct: None,
                 definition: Some("CHECK (age > 0)".to_string()),
             },
         ];
@@ -831,14 +595,10 @@ mod tests {
             catalog: "cat".to_string(),
             schema: "sch".to_string(),
             name: "name".to_string(),
-            table_catalog: "tcat".to_string(),
-            table_schema: "tsch".to_string(),
             table_name: "table".to_string(),
             constraint_type: "PK".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: Some(true),
             definition: None,
         };
 
@@ -847,14 +607,10 @@ mod tests {
         hasher.update("cat".as_bytes()); // catalog
         hasher.update("sch".as_bytes()); // schema
         hasher.update("name".as_bytes()); // name
-        hasher.update("tcat".as_bytes()); // table_catalog
-        hasher.update("tsch".as_bytes()); // table_schema
         hasher.update("table".as_bytes()); // table_name
         hasher.update("PK".as_bytes()); // constraint_type
         hasher.update("false".as_bytes()); // is_deferrable
         hasher.update("false".as_bytes()); // initially_deferred
-        hasher.update("true".as_bytes()); // enforced
-        hasher.update("true".as_bytes()); // nulls_distinct (Some(true))
 
         let expected_hash = format!("{:x}", hasher.finalize());
 
@@ -871,14 +627,10 @@ mod tests {
             catalog: "cat".to_string(),
             schema: "sch".to_string(),
             name: "name".to_string(),
-            table_catalog: "tcat".to_string(),
-            table_schema: "tsch".to_string(),
             table_name: "table".to_string(),
             constraint_type: "PK".to_string(),
             is_deferrable: false,
             initially_deferred: false,
-            enforced: true,
-            nulls_distinct: None,
             definition: None,
         };
 
@@ -887,13 +639,10 @@ mod tests {
         hasher.update("cat".as_bytes()); // catalog
         hasher.update("sch".as_bytes()); // schema
         hasher.update("name".as_bytes()); // name
-        hasher.update("tcat".as_bytes()); // table_catalog
-        hasher.update("tsch".as_bytes()); // table_schema
         hasher.update("table".as_bytes()); // table_name
         hasher.update("PK".as_bytes()); // constraint_type
         hasher.update("false".as_bytes()); // is_deferrable
         hasher.update("false".as_bytes()); // initially_deferred
-        hasher.update("true".as_bytes()); // enforced
         // No nulls_distinct update for None
 
         let expected_hash = format!("{:x}", hasher.finalize());

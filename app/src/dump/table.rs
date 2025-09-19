@@ -127,7 +127,7 @@ impl Table {
     /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT *, pg_get_constraintdef(oid, true) AS definition FROM information_schema.table_constraints WHERE table_schema = '{}' AND table_name = '{}'",
+            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, c.contype::text AS constraint_type, c.condeferrable::text AS is_deferrable, c.condeferred::text AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') ORDER BY n.nspname, t.relname, c.conname;",
             self.schema, self.name
         );
 
@@ -136,19 +136,13 @@ impl Table {
         if !rows.is_empty() {
             for row in rows {
                 let table_constraint = TableConstraint {
-                    catalog: row.get("constraint_catalog"),
-                    schema: row.get("constraint_schema"),
+                    catalog: row.get("catalog"),
+                    schema: row.get("schema"),
                     name: row.get("constraint_name"),
-                    table_catalog: row.get("table_catalog"),
-                    table_schema: row.get("table_schema"),
                     table_name: row.get("table_name"),
                     constraint_type: row.get("constraint_type"),
                     is_deferrable: row.get::<&str, _>("is_deferrable") == "YES", // Convert to boolean
                     initially_deferred: row.get::<&str, _>("initially_deferred") == "YES", // Convert to boolean
-                    enforced: row.get::<&str, _>("enforced") == "YES", // Convert to boolean
-                    nulls_distinct: row
-                        .try_get::<Option<&str>, _>("nulls_distinct")?
-                        .map(|v| v == "YES"), // Convert to boolean
                     definition: row.get("definition"),
                 };
 
