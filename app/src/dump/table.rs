@@ -102,7 +102,7 @@ impl Table {
     /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT * FROM pg_indexes WHERE schemaname = '{}' AND tablename = '{}'",
+            "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique",
             self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
