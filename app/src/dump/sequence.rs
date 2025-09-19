@@ -63,10 +63,10 @@ impl Sequence {
         }
 
         // Add INCREMENT BY clause
-        if let Some(increment_by) = self.increment_by {
-            if increment_by != 1 {
-                script.push_str(&format!(" increment by {increment_by}"));
-            }
+        if let Some(increment_by) = self.increment_by
+            && increment_by != 1
+        {
+            script.push_str(&format!(" increment by {increment_by}"));
         }
 
         // Add MINVALUE clause
@@ -84,10 +84,10 @@ impl Sequence {
         }
 
         // Add CACHE clause
-        if let Some(cache_size) = self.cache_size {
-            if cache_size != 1 {
-                script.push_str(&format!(" cache {cache_size}"));
-            }
+        if let Some(cache_size) = self.cache_size
+            && cache_size != 1
+        {
+            script.push_str(&format!(" cache {cache_size}"));
         }
 
         // Add CYCLE clause

@@ -3,6 +3,7 @@ use crate::{
     config::{core::Config, dump_config::DumpConfig},
     dump::core::Dump,
 };
+use chrono::Datelike;
 use clap::{CommandFactory, Parser, command};
 use std::{io::Error, path::Path};
 
@@ -126,8 +127,10 @@ pub async fn main() -> Result<(), Error> {
 
 // Function to print the version information.
 fn pgc_version() {
-    println!("pgc v1.0.0");
-    println!("(c) 2025 nettrash. All rights reserved.");
+    let version = env!("CARGO_PKG_VERSION");
+    println!("pgc v{version}");
+    let year = chrono::Utc::now().year();
+    println!("(c) 2025-{year} nettrash. All rights reserved.");
     println!("This program is licensed under the GPL v3 License.");
     println!();
 }

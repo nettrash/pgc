@@ -171,17 +171,17 @@ impl TableColumn {
         //            }
         //        }
         // Interval type
-        if let Some(interval_type) = &self.interval_type {
-            if self.data_type.to_lowercase().contains("interval") {
-                script.push_str(&format!(" {interval_type}"));
-            }
+        if let Some(interval_type) = &self.interval_type
+            && self.data_type.to_lowercase().contains("interval")
+        {
+            script.push_str(&format!(" {interval_type}"));
         }
 
         // Collation
-        if let Some(collation) = &self.collation_name {
-            if !collation.is_empty() {
-                script.push_str(&format!(" collate \"{collation}\""));
-            }
+        if let Some(collation) = &self.collation_name
+            && !collation.is_empty()
+        {
+            script.push_str(&format!(" collate \"{collation}\""));
         }
 
         // Identity
@@ -217,10 +217,10 @@ impl TableColumn {
         }
 
         // Generated always as (expression)
-        if self.is_generated.to_lowercase() == "always" {
-            if let Some(expr) = &self.generation_expression {
-                script.push_str(&format!(" generated always as ({expr}) stored "));
-            }
+        if self.is_generated.to_lowercase() == "always"
+            && let Some(expr) = &self.generation_expression
+        {
+            script.push_str(&format!(" generated always as ({expr}) stored "));
         }
 
         // Default
