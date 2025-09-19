@@ -127,7 +127,7 @@ impl Table {
     /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT * FROM information_schema.table_constraints WHERE table_schema = '{}' AND table_name = '{}'",
+            "SELECT *, pg_get_constraintdef(oid, true) AS definition FROM information_schema.table_constraints WHERE table_schema = '{}' AND table_name = '{}'",
             self.schema, self.name
         );
 
@@ -149,6 +149,7 @@ impl Table {
                     nulls_distinct: row
                         .try_get::<Option<&str>, _>("nulls_distinct")?
                         .map(|v| v == "YES"), // Convert to boolean
+                    definition: row.get("definition"),
                 };
 
                 self.constraints.push(table_constraint.clone());

@@ -1,6 +1,7 @@
 use crate::dump::pg_enum::PgEnum;
 use crate::dump::pg_type::PgType;
 use crate::dump::routine::Routine;
+use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
@@ -20,6 +21,9 @@ pub struct Dump {
     // Configuration of the dump.
     #[serde(skip_serializing, skip_deserializing)]
     pub configuration: DumpConfig,
+
+    // List of schemas in the dump.
+    pub schemas: Vec<Schema>,
 
     // List of extensions in the dump.
     pub extensions: Vec<Extension>,
@@ -45,6 +49,7 @@ impl Dump {
     pub fn new(config: DumpConfig) -> Self {
         Dump {
             configuration: config,
+            schemas: Vec::new(),
             extensions: Vec::new(),
             types: Vec::new(),
             enums: Vec::new(),
@@ -99,6 +104,7 @@ impl Dump {
     // Fill the Dump with data from the database.
     async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         // Fetch extensions from the database.
+        self.get_schemas(pool).await?;
         self.get_extensions(pool).await?;
         self.get_types(pool).await?;
         self.get_enums(pool).await?;
@@ -108,9 +114,37 @@ impl Dump {
         Ok(())
     }
 
+    async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query(
+            format!("SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE '{}' AND schema_name NOT IN ('pg_catalog', 'information_schema')", self.configuration.scheme).as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+        if result.is_err() {
+            return Err(Error::other(format!(
+                "Failed to fetch schemas: {}.",
+                result.err().unwrap()
+            )));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No schemas found.");
+        } else {
+            println!("Schemas found:");
+            for row in rows {
+                let schema = row.get("schema_name");
+                let sch = Schema::new(schema);
+                self.schemas.push(sch.clone());
+                println!(" - {}", sch.name);
+            }
+        }
+        Ok(())
+    }
+
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND n.nspname LIKE '{}' OR n.nspname = 'public'", self.configuration.scheme).as_str())
+        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND (n.nspname LIKE '{}' OR n.nspname = 'public')", self.configuration.scheme).as_str())
             .fetch_all(pool)
             .await;
         if result.is_err() {
@@ -478,7 +512,8 @@ impl Dump {
 
     pub fn get_info(&self) -> String {
         format!(
-            "\tDump Info:\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+            "\tDump Info:\n\t\t- Schemas: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+            self.schemas.len(),
             self.extensions.len(),
             self.types.len(),
             self.enums.len(),

@@ -47,12 +47,13 @@ impl Comparer {
 
     // Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
+        self.compare_schemas().await?;
         self.compare_extensions().await?;
         self.compare_types().await?;
         self.compare_enums().await?;
         self.compare_sequences().await?;
-        self.compare_routines().await?;
         self.compare_tables().await?;
+        self.compare_routines().await?;
 
         Ok(())
     }
@@ -69,9 +70,56 @@ impl Comparer {
         Ok(())
     }
 
+    async fn compare_schemas(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Schemas: Start section --------------- */\n\n");
+
+        // We will find all new schemas from "to" dump that are not in "from" dump
+        // and add them to the script.
+        for schema in &self.to.schemas {
+            if let Some(_from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
+                continue; // Schema is present in both dumps, we already processed it
+            } else {
+                self.script
+                    .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
+                self.script.push_str(schema.get_script().as_str());
+            }
+        }
+
+        // We will find all schemas that exists just in "from" dump.
+        // Drop will be added just if use_drop is true
+        // TODO: We need to drop schema only if it's empty (no objects inside) Maybe the best way is to just skip dropping.
+        /*
+        for schema in &self.from.schemas {
+            if let Some(_to_schema) = self
+                .to
+                .schemas
+                .iter()
+                .find(|s| s.name == schema.name)
+            {
+                continue; // Schema is present in both dumps, we already processed it
+            } else if self.use_drop {
+                // Just if we're using DROP statements
+                self.script
+                    .push_str(format!("/* Schema: {}*/
+\n", schema.name).as_str());
+                self.script.push_str(
+        " /* Schema is not present in 'to' dump and should be dropped. */
+\n",
+                );
+                self.script.push_str(schema.get_drop_script().as_str());
+            }
+        }*/
+
+        self.script
+            .push_str("\n/* ---> Schemas: End section --------------- */\n\n");
+        Ok(())
+    }
+
     // Comparing extentions
     async fn compare_extensions(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Extensions: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Extensions: Start section --------------- */\n\n");
 
         // We will find all new extensions from "to" dump that are not in "from" dump
         // and add them to the script.
@@ -110,25 +158,29 @@ impl Comparer {
             }
         }
 
-        self.script.push_str("/* Extensions: End section */\n");
+        self.script
+            .push_str("\n/* ---> Extensions: End section --------------- */\n\n");
         Ok(())
     }
 
     // Comparing types
     async fn compare_types(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* User-defined types */\n");
+        self.script
+            .push_str("\n/* ---> User-defined types --------------- */\n\n");
         Ok(())
     }
 
     // Comparing enums
     async fn compare_enums(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Enums */\n");
+        self.script
+            .push_str("\n/* ---> Enums --------------- */\n\n");
         Ok(())
     }
 
     // Comparing sequences
     async fn compare_sequences(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Sequences: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Sequences: Start section --------------- */\n\n");
 
         // We will find all new sequences from "to" dump that are not in "from" dump
         // and we will find all existing sequences in both dumps with different hashes
@@ -174,13 +226,15 @@ impl Comparer {
             }
         }
 
-        self.script.push_str("/* Sequences: End section */\n");
+        self.script
+            .push_str("\n/* ---> Sequences: End section --------------- */\n\n");
         Ok(())
     }
 
     // Comparing routines
     async fn compare_routines(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Routines: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Routines: Start section --------------- */\n\n");
 
         // We will find all new routines from "to" dump that are not in "from" dump
         // and we will find all existing routines in both dumps with different hashes
@@ -225,13 +279,15 @@ impl Comparer {
             }
         }
 
-        self.script.push_str("/* Routines: End section */\n");
+        self.script
+            .push_str("\n/* ---> Routines: End section --------------- */\n\n");
         Ok(())
     }
 
     // Comparing tables
     async fn compare_tables(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Tables: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Tables: Start section --------------- */\n\n");
         // We will drop all tables that exists just in "from" dump.
         for table in &self.from.tables {
             if let Some(_to_table) = self
@@ -288,7 +344,8 @@ impl Comparer {
                 continue; // Table is present in both dumps, we already processed it
             }
         }
-        self.script.push_str("/* Tables: End section */\n");
+        self.script
+            .push_str("\n/* ---> Tables: End section --------------- */\n\n");
         Ok(())
     }
 }

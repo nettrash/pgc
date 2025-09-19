@@ -3,6 +3,7 @@ pub mod extension;
 pub mod pg_enum;
 pub mod pg_type;
 pub mod routine;
+pub mod schema;
 pub mod sequence;
 pub mod table;
 pub mod table_column;

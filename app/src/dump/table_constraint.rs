@@ -15,6 +15,7 @@ pub struct TableConstraint {
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub enforced: bool,          // Whether the constraint is enforced
     pub nulls_distinct: Option<bool>, // Whether the constraint allows nulls to be distinct
+    pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
 }
 
 impl TableConstraint {
@@ -33,6 +34,9 @@ impl TableConstraint {
         if let Some(nulls_distinct) = self.nulls_distinct {
             hasher.update(nulls_distinct.to_string().as_bytes());
         }
+        if let Some(definition) = &self.definition {
+            hasher.update(definition.as_bytes());
+        }
     }
 
     /// Returns a string representation of the constraint
@@ -42,23 +46,86 @@ impl TableConstraint {
             "alter table {}.{} add constraint {} ",
             self.table_schema, self.table_name, self.name
         ));
-        script.push_str(&format!("{} ", self.constraint_type.to_lowercase()));
-        if self.is_deferrable {
-            script.push_str("deferrable ");
-        }
-        if self.initially_deferred {
-            script.push_str("initially deferred ");
-        }
-        if !self.enforced {
-            script.push_str("not enforced ");
-        }
-        if let Some(nulls_distinct) = self.nulls_distinct {
-            if nulls_distinct {
-                script.push_str("nulls distinct ");
-            } else {
-                script.push_str("nulls not distinct ");
+
+        // If a definition is provided, start from that (lowercased) and optionally append flags.
+        // Otherwise, build from constraint_type and attribute flags.
+        let clause = if let Some(def) = &self.definition {
+            let mut base = def.to_lowercase();
+            // UNIQUE extras
+            if self.constraint_type.eq_ignore_ascii_case("UNIQUE") {
+                if let Some(true) = self.nulls_distinct {
+                    if !base.contains("nulls distinct") {
+                        base.push_str(" nulls distinct");
+                    }
+                } else if let Some(false) = self.nulls_distinct
+                    && !base.contains("nulls not distinct") {
+                        base.push_str(" nulls not distinct");
+                    }
             }
-        }
+            // CHECK extras
+            if self.constraint_type.eq_ignore_ascii_case("CHECK") {
+                if !self.enforced && !base.contains("not enforced") {
+                    base.push_str(" not enforced");
+                }
+                if let Some(true) = self.nulls_distinct {
+                    if !base.contains("nulls distinct") {
+                        base.push_str(" nulls distinct");
+                    }
+                } else if let Some(false) = self.nulls_distinct
+                    && !base.contains("nulls not distinct") {
+                        base.push_str(" nulls not distinct");
+                    }
+            }
+            // FOREIGN KEY extras
+            if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY") {
+                if self.is_deferrable && !base.contains("deferrable") {
+                    base.push_str(" deferrable");
+                }
+                if self.initially_deferred && !base.contains("initially deferred") {
+                    base.push_str(" initially deferred");
+                }
+            }
+            base
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            match self.constraint_type.to_uppercase().as_str() {
+                "PRIMARY KEY" => parts.push("primary key".to_string()),
+                "FOREIGN KEY" => {
+                    parts.push("foreign key".to_string());
+                    if self.is_deferrable {
+                        parts.push("deferrable".to_string());
+                    }
+                    if self.initially_deferred {
+                        parts.push("initially deferred".to_string());
+                    }
+                }
+                "UNIQUE" => {
+                    parts.push("unique".to_string());
+                    if let Some(true) = self.nulls_distinct {
+                        parts.push("nulls distinct".to_string());
+                    }
+                    if let Some(false) = self.nulls_distinct {
+                        parts.push("nulls not distinct".to_string());
+                    }
+                }
+                "CHECK" => {
+                    parts.push("check".to_string());
+                    if !self.enforced {
+                        parts.push("not enforced".to_string());
+                    }
+                    if let Some(true) = self.nulls_distinct {
+                        parts.push("nulls distinct".to_string());
+                    }
+                    if let Some(false) = self.nulls_distinct {
+                        parts.push("nulls not distinct".to_string());
+                    }
+                }
+                _ => {}
+            }
+            parts.join(" ")
+        };
+
+        script.push_str(&format!("{} ", clause));
         script.push_str(";\n");
         script
     }
@@ -77,6 +144,7 @@ impl PartialEq for TableConstraint {
             && self.initially_deferred == other.initially_deferred
             && self.enforced == other.enforced
             && self.nulls_distinct == other.nulls_distinct
+            && self.definition == other.definition
     }
 }
 
@@ -98,6 +166,7 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: None,
+            definition: None,
         }
     }
 
@@ -114,6 +183,7 @@ mod tests {
             initially_deferred: true,
             enforced: true,
             nulls_distinct: None,
+            definition: None,
         }
     }
 
@@ -130,6 +200,7 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: Some(true),
+            definition: None,
         }
     }
 
@@ -146,6 +217,7 @@ mod tests {
             initially_deferred: false,
             enforced: false,
             nulls_distinct: Some(false),
+            definition: None,
         }
     }
 
@@ -164,6 +236,7 @@ mod tests {
         assert!(!constraint.initially_deferred);
         assert!(constraint.enforced);
         assert_eq!(constraint.nulls_distinct, None);
+        assert_eq!(constraint.definition, None);
     }
 
     #[test]
@@ -181,6 +254,7 @@ mod tests {
         assert!(constraint.initially_deferred);
         assert!(constraint.enforced);
         assert_eq!(constraint.nulls_distinct, None);
+        assert_eq!(constraint.definition, None);
     }
 
     #[test]
@@ -198,6 +272,7 @@ mod tests {
         assert!(!constraint.initially_deferred);
         assert!(constraint.enforced);
         assert_eq!(constraint.nulls_distinct, Some(true));
+        assert_eq!(constraint.definition, None);
     }
 
     #[test]
@@ -215,6 +290,7 @@ mod tests {
         assert!(!constraint.initially_deferred);
         assert!(!constraint.enforced);
         assert_eq!(constraint.nulls_distinct, Some(false));
+        assert_eq!(constraint.definition, None);
     }
 
     #[test]
@@ -371,10 +447,11 @@ mod tests {
             initially_deferred: true,
             enforced: false,
             nulls_distinct: Some(false),
+            definition: Some("UNIQUE (id)".to_string()),
         };
 
         let script = constraint.get_script();
-        let expected = "alter table test.test_table add constraint test_constraint unique deferrable initially deferred not enforced nulls not distinct ;\n";
+        let expected = "alter table test.test_table add constraint test_constraint unique (id) nulls not distinct ;\n";
         assert_eq!(script, expected);
     }
 
@@ -392,10 +469,12 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: None,
+            definition: Some("PRIMARY KEY (id)".to_string()),
         };
 
         let script = constraint.get_script();
-        let expected = "alter table PUBLIC.USERS add constraint CONSTRAINT_NAME primary key ;\n";
+        let expected =
+            "alter table PUBLIC.USERS add constraint CONSTRAINT_NAME primary key (id) ;\n";
         assert_eq!(script, expected);
     }
 
@@ -413,6 +492,7 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: None,
+            definition: None,
         };
 
         let script = constraint.get_script();
@@ -652,6 +732,7 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: Some(true),
+            definition: Some("UNIQUE (column1, column2)".to_string()),
         };
 
         // Should handle special characters in all fields
@@ -683,6 +764,7 @@ mod tests {
                 initially_deferred: false,
                 enforced: true,
                 nulls_distinct: None,
+                definition: Some("PRIMARY KEY (id)".to_string()),
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -696,6 +778,7 @@ mod tests {
                 initially_deferred: false,
                 enforced: true,
                 nulls_distinct: None,
+                definition: Some("FOREIGN KEY (user_id) REFERENCES users(id)".to_string()),
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -709,6 +792,7 @@ mod tests {
                 initially_deferred: false,
                 enforced: true,
                 nulls_distinct: Some(true),
+                definition: Some("UNIQUE (column1, column2)".to_string()),
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -722,6 +806,7 @@ mod tests {
                 initially_deferred: false,
                 enforced: false,
                 nulls_distinct: None,
+                definition: Some("CHECK (age > 0)".to_string()),
             },
         ];
 
@@ -754,6 +839,7 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: Some(true),
+            definition: None,
         };
 
         // Create the same hash as the implementation
@@ -793,6 +879,7 @@ mod tests {
             initially_deferred: false,
             enforced: true,
             nulls_distinct: None,
+            definition: None,
         };
 
         // Create the same hash as the implementation (nulls_distinct=None means no update)
