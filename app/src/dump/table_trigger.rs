@@ -184,7 +184,8 @@ mod tests {
         let trigger = create_test_trigger();
         let script = trigger.get_script();
 
-        let expected = "create trigger test_trigger before insert or update on test_table for each row execute function test_function();";
+        let expected =
+            "before insert or update on test_table for each row execute function test_function();";
         assert_eq!(script, expected);
     }
 
@@ -193,7 +194,7 @@ mod tests {
         let trigger = create_simple_trigger();
         let script = trigger.get_script();
 
-        let expected = "create trigger simple_trigger after delete on users for each row execute function audit_delete();";
+        let expected = "after delete on users for each row execute function audit_delete();";
         assert_eq!(script, expected);
     }
 
@@ -202,7 +203,7 @@ mod tests {
         let trigger = create_complex_trigger();
         let script = trigger.get_script();
 
-        let expected = "create trigger complex_trigger before insert or update of name, email on users for each row when (new.active = true) execute function validate_user();";
+        let expected = "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user();";
         assert_eq!(script, expected);
     }
 
@@ -215,7 +216,8 @@ mod tests {
         };
 
         let script = trigger.get_script();
-        let expected = "create trigger test_trigger$name before insert on \"special-table\" for each row execute function \"validate_data\"();";
+        let expected =
+            "before insert on \"special-table\" for each row execute function \"validate_data\"();";
         assert_eq!(script, expected);
     }
 
@@ -228,7 +230,7 @@ mod tests {
         };
 
         let script = trigger.get_script();
-        let expected = "create trigger empty_trigger ;";
+        let expected = ";";
         assert_eq!(script, expected);
     }
 
@@ -349,7 +351,7 @@ mod tests {
 
         // Script should work with empty strings
         let script = trigger.get_script();
-        assert_eq!(script, "create trigger  ;");
+        assert_eq!(script, ";");
 
         // Equality should work
         let trigger2 = TableTrigger {
@@ -369,7 +371,7 @@ mod tests {
         };
 
         let script = trigger.get_script();
-        let expected = "create trigger multiline_trigger before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email();";
+        let expected = "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email();";
         assert_eq!(script, expected);
 
         // Hash should work with multiline definitions
@@ -396,9 +398,7 @@ mod tests {
         assert_eq!(trigger.definition, long_definition);
 
         let script = trigger.get_script();
-        assert!(script.contains("create trigger long_trigger"));
-        assert!(script.contains(&long_definition));
-        assert!(script.ends_with(";"));
+        assert_eq!(script, format!("{};", long_definition));
 
         // Hash should work with very long definitions
         let mut hasher = Sha256::new();
@@ -461,11 +461,9 @@ mod tests {
         ];
 
         for trigger in triggers {
-            // Each should produce a valid script
+            // Each should produce a valid script (definition + semicolon)
             let script = trigger.get_script();
-            assert!(script.starts_with(&format!("create trigger {}", trigger.name)));
-            assert!(script.ends_with(";"));
-            assert!(script.contains(&trigger.definition));
+            assert_eq!(script, format!("{};", trigger.definition));
 
             // Each should produce a valid hash
             let mut hasher = Sha256::new();
