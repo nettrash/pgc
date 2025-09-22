@@ -10,3 +10,4 @@ pub mod table_column;
 pub mod table_constraint;
 pub mod table_index;
 pub mod table_trigger;
+pub mod view;

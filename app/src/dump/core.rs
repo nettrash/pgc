@@ -4,6 +4,7 @@ use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
+use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -42,6 +43,9 @@ pub struct Dump {
 
     // List of tables in the dump.
     pub tables: Vec<Table>,
+
+    // List of views in the dump.
+    pub views: Vec<View>,
 }
 
 impl Dump {
@@ -56,6 +60,7 @@ impl Dump {
             sequences: Vec::new(),
             routines: Vec::new(),
             tables: Vec::new(),
+            views: Vec::new(),
         }
     }
 
@@ -111,12 +116,13 @@ impl Dump {
         self.get_sequences(pool).await?;
         self.get_routines(pool).await?;
         self.get_tables(pool).await?;
+        self.get_views(pool).await?;
         Ok(())
     }
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
-            format!("SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE '{}' AND schema_name NOT IN ('pg_catalog', 'information_schema')", self.configuration.scheme).as_str(),
+            format!("select schema_name from information_schema.schemata where schema_name like '{}' and schema_name not in ('pg_catalog', 'information_schema')", self.configuration.scheme).as_str(),
         )
         .fetch_all(pool)
         .await;
@@ -144,7 +150,7 @@ impl Dump {
 
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(format!("SELECT n.nspname, e.* from pg_extension e JOIN pg_namespace n ON e.extnamespace = n.oid AND (n.nspname LIKE '{}' OR n.nspname = 'public')", self.configuration.scheme).as_str())
+        let result = sqlx::query(format!("select n.nspname, e.* from pg_extension e join pg_namespace n on e.extnamespace = n.oid and (n.nspname like '{}' or n.nspname = 'public')", self.configuration.scheme).as_str())
             .fetch_all(pool)
             .await;
         if result.is_err() {
@@ -179,7 +185,7 @@ impl Dump {
     async fn get_types(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
             format!(
-                "SELECT 
+                "select 
                 n.nspname, 
                 t.typname,
                 t.typnamespace,
@@ -210,14 +216,14 @@ impl Dump {
                 t.typndims,
                 t.typcollation,
                 t.typdefault
-            FROM 
+            from 
                 pg_type t 
-                JOIN pg_namespace n ON t.typnamespace = n.oid 
-            WHERE 
-                n.nspname LIKE '{}' 
-                AND t.typtype IN ('d', 'e', 'r', 'm') 
-                AND t.typcategory = 'U'
-                AND t.typisdefined = true",
+                join pg_namespace n on t.typnamespace = n.oid 
+            where 
+                n.nspname like '{}' 
+                and t.typtype in ('d', 'e', 'r', 'm') 
+                and t.typcategory = 'U'
+                and t.typisdefined = true",
                 self.configuration.scheme
             )
             .as_str(),
@@ -278,7 +284,7 @@ impl Dump {
 
     // Fetch enums from the database and populate the dump.
     async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query("SELECT * FROM pg_enum").fetch_all(pool).await;
+        let result = sqlx::query("select * from pg_enum").fetch_all(pool).await;
         if result.is_err() {
             return Err(Error::other(format!(
                 "Failed to fetch enums: {}.",
@@ -313,22 +319,22 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "
-        SELECT 
-            schemaname, 
-            sequencename, 
-            sequenceowner, 
-            data_type::varchar as sequencedatatype, 
-            start_value, 
-            min_value, 
-            max_value, 
-            increment_by, 
-            cycle, 
-            cache_size, 
-            last_value 
-        FROM 
-            pg_sequences 
-        WHERE 
-            schemaname like '%{}%'",
+                select 
+                    schemaname, 
+                    sequencename, 
+                    sequenceowner, 
+                    data_type::varchar as sequencedatatype, 
+                    start_value, 
+                    min_value, 
+                    max_value, 
+                    increment_by, 
+                    cycle, 
+                    cache_size, 
+                    last_value 
+                from 
+                    pg_sequences 
+                where 
+                    schemaname like '%{}%'",
                 self.configuration.scheme
             )
             .as_str(),
@@ -440,16 +446,13 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "
-                    SELECT * 
-                    FROM 
+                    select * 
+                    from 
                         pg_tables 
-                    WHERE 
-                        schemaname NOT IN ('pg_catalog', 'information_schema') 
-                        AND schemaname LIKE '{}' 
-                        AND tablename NOT LIKE 'pg_%' 
-                    ORDER BY 
-                        schemaname, 
-                        tablename;",
+                    where 
+                        schemaname not in ('pg_catalog', 'information_schema') 
+                        and schemaname like '{}' 
+                        and tablename not like 'pg_%';",
                 self.configuration.scheme
             )
             .as_str(),
@@ -496,6 +499,49 @@ impl Dump {
         Ok(())
     }
 
+    async fn get_views(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let result = sqlx::query(
+            format!(
+                "select v.table_schema, v.table_name, v.view_definition, array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation
+                from information_schema.views v
+                join information_schema.view_table_usage vtu on v.table_name = vtu.view_name
+                where
+                    v.table_schema not in ('pg_catalog', 'information_schema')
+                    and v.table_schema like '{}'
+                group by v.table_schema, v.table_name, v.view_definition;",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+        if result.is_err() {
+            return Err(Error::other(format!(
+                "Failed to fetch views: {}.",
+                result.err().unwrap()
+            )));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No views found.");
+        } else {
+            println!("Views found:");
+            for row in rows {
+                let view = View {
+                    schema: row.get("table_schema"),
+                    name: row.get("table_name"),
+                    definition: row.get("view_definition"),
+                    table_relation: row.get("table_relation"),
+                };
+                self.views.push(view.clone());
+
+                println!(" - {}.{}", view.schema, view.name);
+            }
+        }
+        Ok(())
+    }
+
     // Read a dump from a file and deserialize it.
     pub async fn read_from_file(file: &str) -> Result<Self, Error> {
         let file = File::open(file)?;
@@ -512,13 +558,14 @@ impl Dump {
 
     pub fn get_info(&self) -> String {
         format!(
-            "\tDump Info:\n\t\t- Schemas: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}",
+            "\tDump Info:\n\t\t- Schemas: {}\n\t\t- Extensions: {}\n\t\t- Types: {}\n\t\t- Enums: {}\n\t\t- Routines: {}\n\t\t- Tables: {}\n\t\t- Views: {}",
             self.schemas.len(),
             self.extensions.len(),
             self.types.len(),
             self.enums.len(),
             self.routines.len(),
-            self.tables.len()
+            self.tables.len(),
+            self.views.len()
         )
     }
 }
