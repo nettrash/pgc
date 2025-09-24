@@ -16,7 +16,7 @@ pub mod dump;
 #[command(
     name = "pgc",
     author = "nettrash",
-    version = "1.0.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "PostgreSQL Database Schema Comparer.",
     long_about = None,
 )]
