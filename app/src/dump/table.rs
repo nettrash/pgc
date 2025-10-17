@@ -38,7 +38,17 @@ impl Table {
     /// Fill information about columns.
     async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT * FROM information_schema.columns WHERE table_schema = '{}' AND table_name = '{}'",
+            "SELECT
+                c.*,
+                (
+                    SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
+                    FROM information_schema.view_column_usage v
+                    WHERE v.table_schema = c.table_schema
+                      AND v.table_name  = c.table_name
+                      AND v.column_name = c.column_name
+                ) AS related_views
+             FROM information_schema.columns c
+             WHERE c.table_schema = '{}' AND c.table_name = '{}'",
             self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -90,6 +100,9 @@ impl Table {
                     is_generated: row.get("is_generated"),
                     generation_expression: row.get("generation_expression"),
                     is_updatable: row.get::<&str, _>("is_updatable") == "YES", // Convert to boolean
+                    related_views: row
+                        .get::<Option<String>, _>("related_views")
+                        .map(|s| s.split(',').map(|v| v.trim().to_string()).collect()),
                 };
 
                 self.columns.push(table_column.clone());

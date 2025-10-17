@@ -48,6 +48,7 @@ pub struct TableColumn {
     pub is_generated: String,                  // Whether the column is generated
     pub generation_expression: Option<String>, // Generation expression for the column
     pub is_updatable: bool,                    // Whether the column is updatable
+    pub related_views: Option<Vec<String>>,    // Related views (optional)
 }
 
 impl TableColumn {
@@ -132,6 +133,13 @@ impl TableColumn {
                 .as_bytes(),
         );
         hasher.update(self.is_updatable.to_string().as_bytes());
+        hasher.update(
+            match &self.related_views {
+                Some(views) => views.join(","),
+                None => "".to_string(),
+            }
+            .as_bytes(),
+        );
     }
 
     /// Returns a string representation of the column
@@ -344,6 +352,7 @@ mod tests {
             is_generated: "NEVER".to_string(),
             generation_expression: None,
             is_updatable: true,
+            related_views: None,
         }
     }
 
@@ -431,6 +440,42 @@ mod tests {
         column.add_to_hasher(&mut hasher);
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn test_related_views_changes_hash() {
+        let column1 = create_test_column();
+        let mut column2 = create_test_column();
+
+        // No related views by default -> same hash
+        let mut h1 = Sha256::new();
+        column1.add_to_hasher(&mut h1);
+        let d1 = h1.finalize();
+
+        let mut h2 = Sha256::new();
+        column2.add_to_hasher(&mut h2);
+        let d2 = h2.finalize();
+        assert_eq!(d1, d2);
+
+        // Now set related views and verify hash changes
+        column2.related_views = Some(vec!["public.v_a".to_string(), "sales.v_b".to_string()]);
+        let mut h3 = Sha256::new();
+        column2.add_to_hasher(&mut h3);
+        let d3 = h3.finalize();
+        assert_ne!(format!("{d1:x}"), format!("{d3:x}"));
+    }
+
+    #[test]
+    fn test_related_views_serde_roundtrip() {
+        let mut column = create_test_column();
+        column.related_views = Some(vec![
+            "public.view_one".to_string(),
+            "analytics.view_two".to_string(),
+        ]);
+
+        let json = serde_json::to_string(&column).expect("serialize");
+        let de: TableColumn = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(de.related_views, column.related_views);
     }
 
     #[test]
