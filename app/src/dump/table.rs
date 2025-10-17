@@ -359,35 +359,16 @@ impl Table {
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
                 if old_col != new_col {
-                    script.push_str(&format!(
-                        "alter table {}.{} alter column \"{}\" type {};\n",
-                        self.schema,
-                        self.name,
-                        new_col.name,
-                        new_col.data_type // You may want to use new_col.get_script() or similar
-                    ));
+                    script.push_str(&new_col.get_alter_script());
                 }
             } else {
-                script.push_str(&format!(
-                    "alter table {}.{} add column \"{}\" {};\n",
-                    self.schema,
-                    self.name,
-                    new_col.name,
-                    new_col
-                        .get_script()
-                        .split_once(' ')
-                        .map(|x| x.1)
-                        .unwrap_or("") // Only type and constraints
-                ));
+                script.push_str(&new_col.get_add_script());
             }
         }
 
         for old_col in &self.columns {
             if !to_table.columns.iter().any(|c| c.name == old_col.name) {
-                script.push_str(&format!(
-                    "alter table {}.{} drop column \"{}\";\n",
-                    self.schema, self.name, old_col.name
-                ));
+                script.push_str(&old_col.get_drop_script());
             }
         }
 
