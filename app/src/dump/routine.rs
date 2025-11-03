@@ -45,16 +45,25 @@ impl Routine {
 
     /// Returns a string to create the routine.
     pub fn get_script(&self) -> String {
-        let mut script = format!(
-            "create or replace {} {}.{}({}) returns {} as $${}$$ language {};\n",
-            self.kind.to_lowercase(),
-            self.schema,
-            self.name,
-            self.arguments,
-            self.return_type,
-            self.source_code,
-            self.lang
-        );
+        let kind = self.kind.to_lowercase();
+        let script_body = match kind.as_str() {
+            "procedure" => format!(
+                "create or replace procedure {}.{}({}) language {} as $${}$$;\n",
+                self.schema, self.name, self.arguments, self.lang, self.source_code
+            ),
+            _ => format!(
+                "create or replace {} {}.{}({}) returns {} language {} as $${}$$;\n",
+                kind,
+                self.schema,
+                self.name,
+                self.arguments,
+                self.return_type,
+                self.lang,
+                self.source_code
+            ),
+        };
+
+        let mut script = script_body;
 
         if let Some(defaults) = &self.arguments_defaults {
             script.push_str(&format!("-- Defaults: {defaults}\n"));
@@ -224,7 +233,7 @@ mod tests {
         let routine = create_test_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace function public.test_function(param1 integer, param2 text) returns integer as $$BEGIN RETURN param1 + length(param2); END;$$ language plpgsql;\n-- Defaults: param1 default 0\n";
+        let expected = "create or replace function public.test_function(param1 integer, param2 text) returns integer language plpgsql as $$BEGIN RETURN param1 + length(param2); END;$$;\n-- Defaults: param1 default 0\n";
         assert_eq!(script, expected);
     }
 
@@ -233,7 +242,7 @@ mod tests {
         let routine = create_test_procedure();
         let script = routine.get_script();
 
-        let expected = "create or replace procedure app.test_procedure() returns void as $$INSERT INTO test_table VALUES (1, 'test');$$ language sql;\n";
+        let expected = "create or replace procedure app.test_procedure() language sql as $$INSERT INTO test_table VALUES (1, 'test');$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -252,7 +261,7 @@ mod tests {
         };
 
         let script = routine.get_script();
-        let expected = "create or replace function utils.complex_function(search_term text) returns table(id integer, name text) as $$BEGIN\n    RETURN QUERY\n    SELECT t.id, t.name\n    FROM test_table t\n    WHERE t.name ILIKE '%' || search_term || '%';\nEND;$$ language plpgsql;\n";
+        let expected = "create or replace function utils.complex_function(search_term text) returns table(id integer, name text) language plpgsql as $$BEGIN\n    RETURN QUERY\n    SELECT t.id, t.name\n    FROM test_table t\n    WHERE t.name ILIKE '%' || search_term || '%';\nEND;$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -395,7 +404,7 @@ mod tests {
         let script = routine.get_script();
         assert_eq!(
             script,
-            "create or replace  .() returns  as $$$$ language ;\n"
+            "create or replace  .() returns  language  as $$$$;\n"
         );
 
         let drop_script = routine.get_drop_script();
