@@ -32,7 +32,7 @@ impl Extension {
     /// Returns a string to create the extension.
     pub fn get_script(&self) -> String {
         let script = format!(
-            "create extension {} with schema {};\n",
+            "create extension if not exists {} with schema {};\n",
             self.name, self.schema
         );
 
@@ -151,8 +151,8 @@ mod tests {
             "public".to_string(),
         );
 
-        let script = extension.get_script();
-        let expected = "create extension uuid-ossp with schema public;\n";
+    let script = extension.get_script();
+    let expected = "create extension if not exists uuid-ossp with schema public;\n";
 
         assert_eq!(script, expected);
     }
@@ -165,8 +165,8 @@ mod tests {
             "extensions".to_string(),
         );
 
-        let script = extension.get_script();
-        let expected = "create extension postgis with schema extensions;\n";
+    let script = extension.get_script();
+    let expected = "create extension if not exists postgis with schema extensions;\n";
 
         assert_eq!(script, expected);
     }
@@ -179,8 +179,8 @@ mod tests {
             "custom_schema".to_string(),
         );
 
-        let script = extension.get_script();
-        let expected = "create extension test-ext_name with schema custom_schema;\n";
+    let script = extension.get_script();
+    let expected = "create extension if not exists test-ext_name with schema custom_schema;\n";
 
         assert_eq!(script, expected);
     }
@@ -298,8 +298,8 @@ mod tests {
         assert_eq!(hash.len(), 32);
 
         // Scripts should work with empty strings
-        let script = extension.get_script();
-        assert_eq!(script, "create extension  with schema ;\n");
+    let script = extension.get_script();
+    assert_eq!(script, "create extension if not exists  with schema ;\n");
 
         let drop_script = extension.get_drop_script();
         assert_eq!(drop_script, "drop extension if exists ;\n");

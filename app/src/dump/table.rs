@@ -37,20 +37,78 @@ impl Table {
 
     /// Fill information about columns.
     async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let query = format!(
-            "SELECT
-                c.*,
-                (
-                    SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
-                    FROM information_schema.view_column_usage v
-                    WHERE v.table_schema = c.table_schema
-                      AND v.table_name  = c.table_name
-                      AND v.column_name = c.column_name
-                ) AS related_views
-             FROM information_schema.columns c
-             WHERE c.table_schema = '{}' AND c.table_name = '{}'",
-            self.schema, self.name
-        );
+                let query = format!(
+                        "SELECT
+                                c.table_catalog,
+                                c.table_schema,
+                                c.table_name,
+                                c.column_name,
+                                c.ordinal_position,
+                                c.column_default,
+                                c.is_nullable,
+                                CASE
+                                        WHEN c.data_type IN ('USER-DEFINED', 'ARRAY')
+                                                THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                                        ELSE c.data_type
+                                END AS formatted_data_type,
+                                c.character_maximum_length,
+                                c.character_octet_length,
+                                c.numeric_precision,
+                                c.numeric_precision_radix,
+                                c.numeric_scale,
+                                c.datetime_precision,
+                                c.interval_type,
+                                c.interval_precision,
+                                c.character_set_catalog,
+                                c.character_set_schema,
+                                c.character_set_name,
+                                c.collation_catalog,
+                                c.collation_schema,
+                                c.collation_name,
+                                c.domain_catalog,
+                                c.domain_schema,
+                                c.domain_name,
+                                c.udt_catalog,
+                                c.udt_schema,
+                                c.udt_name,
+                                c.scope_catalog,
+                                c.scope_schema,
+                                c.scope_name,
+                                c.maximum_cardinality,
+                                c.dtd_identifier,
+                                c.is_self_referencing,
+                                c.is_identity,
+                                c.identity_generation,
+                                c.identity_start,
+                                c.identity_increment,
+                                c.identity_maximum,
+                                c.identity_minimum,
+                                c.identity_cycle,
+                                c.is_generated,
+                                c.generation_expression,
+                                c.is_updatable,
+                                (
+                                        SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
+                                        FROM information_schema.view_column_usage v
+                                        WHERE v.table_schema = c.table_schema
+                                            AND v.table_name  = c.table_name
+                                            AND v.column_name = c.column_name
+                                ) AS related_views
+                         FROM information_schema.columns c
+                         JOIN pg_catalog.pg_namespace ns
+                             ON ns.nspname = c.table_schema
+                         JOIN pg_catalog.pg_class cls
+                             ON cls.relnamespace = ns.oid
+                            AND cls.relname = c.table_name
+                         JOIN pg_catalog.pg_attribute a
+                             ON a.attrelid = cls.oid
+                            AND a.attname = c.column_name
+                            AND a.attnum > 0
+                            AND a.attisdropped = false
+                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
+                         ORDER BY c.ordinal_position",
+                        self.schema, self.name
+                );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         if !rows.is_empty() {
@@ -63,7 +121,7 @@ impl Table {
                     ordinal_position: row.get("ordinal_position"),
                     column_default: row.get("column_default"),
                     is_nullable: row.get::<&str, _>("is_nullable") == "YES", // Convert to boolean
-                    data_type: row.get("data_type"),
+                    data_type: row.get("formatted_data_type"),
                     character_maximum_length: row.get("character_maximum_length"),
                     character_octet_length: row.get("character_octet_length"),
                     numeric_precision: row.get("numeric_precision"),
