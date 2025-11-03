@@ -37,7 +37,7 @@ impl Table {
 
     /// Fill information about columns.
     async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
-                let query = format!(
+        let query = format!(
                         "SELECT
                                 c.table_catalog,
                                 c.table_schema,
