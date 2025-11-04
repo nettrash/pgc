@@ -490,4 +490,121 @@ mod tests {
         assert!(!script_without_defaults.contains("-- Defaults:"));
         assert!(!script_without_defaults.contains("param1 default 0"));
     }
+
+    #[test]
+    fn test_routine_json_serialization_format() {
+        let routine = create_test_routine();
+
+        let json = serde_json::to_string(&routine).expect("serialization should succeed");
+        assert_eq!(
+            json,
+            "{\"schema\":\"public\",\"oid\":12345,\"name\":\"test_function\",\"lang\":\"plpgsql\",\"kind\":\"FUNCTION\",\"return_type\":\"integer\",\"arguments\":\"param1 integer, param2 text\",\"arguments_defaults\":\"param1 default 0\",\"source_code\":\"BEGIN RETURN param1 + length(param2); END;\"}"
+        );
+    }
+
+    #[test]
+    fn test_routine_deserialize_with_extra_fields() {
+        let json = "{\"schema\":\"public\",\"oid\":1,\"name\":\"func\",\"lang\":\"sql\",\"kind\":\"FUNCTION\",\"return_type\":\"void\",\"arguments\":\"\",\"arguments_defaults\":null,\"source_code\":\"SELECT 1;\",\"extra\":\"ignored\"}";
+        let routine: Routine =
+            serde_json::from_str(json).expect("unknown fields should be ignored");
+
+        assert_eq!(routine.schema, "public");
+        assert_eq!(routine.oid, Oid(1));
+        assert_eq!(routine.name, "func");
+        assert_eq!(routine.arguments_defaults, None);
+    }
+
+    #[test]
+    fn test_routine_deserialize_missing_field_fails() {
+        let json_missing_lang = "{\"schema\":\"public\",\"oid\":1,\"name\":\"func\",\"kind\":\"FUNCTION\",\"return_type\":\"void\",\"arguments\":\"\",\"arguments_defaults\":null,\"source_code\":\"SELECT 1;\"}";
+        let result: Result<Routine, _> = serde_json::from_str(json_missing_lang);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_routine_deserialize_with_wrong_type_fails() {
+        let json_wrong_oid = "{\"schema\":\"public\",\"oid\":\"not-a-number\",\"name\":\"func\",\"lang\":\"sql\",\"kind\":\"FUNCTION\",\"return_type\":\"void\",\"arguments\":\"\",\"arguments_defaults\":null,\"source_code\":\"SELECT 1;\"}";
+        let result: Result<Routine, _> = serde_json::from_str(json_wrong_oid);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_routine_hash_roundtrip_serialization() {
+        let original = create_test_routine();
+
+        let json = serde_json::to_string(&original).expect("serialization should succeed");
+        let restored: Routine =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        assert_eq!(original.hash(), restored.hash());
+    }
+
+    #[test]
+    fn test_routine_hash_case_sensitivity() {
+        let lower = Routine {
+            schema: "public".to_string(),
+            oid: Oid(1),
+            name: "example".to_string(),
+            lang: "sql".to_string(),
+            kind: "FUNCTION".to_string(),
+            return_type: "void".to_string(),
+            arguments: "".to_string(),
+            arguments_defaults: None,
+            source_code: "SELECT 1;".to_string(),
+        };
+
+        let upper_name = Routine {
+            name: "EXAMPLE".to_string(),
+            ..lower.clone()
+        };
+        assert_ne!(lower.hash(), upper_name.hash());
+
+        let upper_schema = Routine {
+            schema: "PUBLIC".to_string(),
+            ..lower.clone()
+        };
+        assert_ne!(lower.hash(), upper_schema.hash());
+    }
+
+    #[test]
+    fn test_procedure_with_defaults_comment() {
+        let routine = Routine {
+            schema: "app".to_string(),
+            oid: Oid(24680),
+            name: "proc_with_defaults".to_string(),
+            lang: "plpgsql".to_string(),
+            kind: "PROCEDURE".to_string(),
+            return_type: "void".to_string(),
+            arguments: "param1 integer".to_string(),
+            arguments_defaults: Some("param1 default 10".to_string()),
+            source_code: "BEGIN RETURN; END;".to_string(),
+        };
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("create or replace procedure app.proc_with_defaults(param1 integer)")
+        );
+        assert!(script.contains("-- Defaults: param1 default 10"));
+    }
+
+    #[test]
+    fn test_procedure_with_arguments_and_defaults_drop_script() {
+        let routine = Routine {
+            schema: "app".to_string(),
+            oid: Oid(24681),
+            name: "proc_with_args".to_string(),
+            lang: "sql".to_string(),
+            kind: "PROCEDURE".to_string(),
+            return_type: "void".to_string(),
+            arguments: "param1 integer, param2 text".to_string(),
+            arguments_defaults: Some("param2 default 'x'".to_string()),
+            source_code: "SELECT param2;".to_string(),
+        };
+
+        let drop_script = routine.get_drop_script();
+        assert_eq!(
+            drop_script,
+            "drop procedure if exists app.proc_with_args (param1 integer, param2 text);\n"
+        );
+    }
 }

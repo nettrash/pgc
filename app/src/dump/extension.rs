@@ -334,4 +334,90 @@ mod tests {
         let expected_hash = format!("{:x}", md5::compute("public.test"));
         assert_eq!(extension.hash(), expected_hash);
     }
+
+    #[test]
+    fn test_extension_json_serialization_format() {
+        let extension = Extension::new(
+            "uuid-ossp".to_string(),
+            "1.1".to_string(),
+            "public".to_string(),
+        );
+
+        let json = serde_json::to_string(&extension).expect("serialization should succeed");
+        assert_eq!(
+            json,
+            r#"{"name":"uuid-ossp","version":"1.1","schema":"public"}"#
+        );
+    }
+
+    #[test]
+    fn test_extension_deserialize_with_extra_fields() {
+        let json =
+            r#"{"name":"postgis","version":"3.3.2","schema":"extensions","extra":"ignored"}"#;
+
+        let extension: Extension =
+            serde_json::from_str(json).expect("deserialization should ignore unknown fields");
+
+        assert_eq!(extension.name, "postgis");
+        assert_eq!(extension.version, "3.3.2");
+        assert_eq!(extension.schema, "extensions");
+    }
+
+    #[test]
+    fn test_extension_deserialize_missing_field_fails() {
+        let json_missing_version = r#"{"name":"uuid-ossp","schema":"public"}"#;
+        let result: Result<Extension, _> = serde_json::from_str(json_missing_version);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extension_deserialize_with_wrong_type_fails() {
+        let json_wrong_type = r#"{"name":42,"version":"1.0","schema":"public"}"#;
+        let result: Result<Extension, _> = serde_json::from_str(json_wrong_type);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extension_hash_roundtrip_serialization() {
+        let original = Extension::new(
+            "postgis".to_string(),
+            "3.3.2".to_string(),
+            "extensions".to_string(),
+        );
+
+        let json = serde_json::to_string(&original).expect("serialization should succeed");
+        let restored: Extension =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        assert_eq!(original.hash(), restored.hash());
+    }
+
+    #[test]
+    fn test_extension_hash_case_sensitivity() {
+        let lower = Extension::new(
+            "example".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+        let upper = Extension::new(
+            "EXAMPLE".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+
+        assert_ne!(lower.hash(), upper.hash());
+
+        let lower_schema = Extension::new(
+            "sample".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+        let upper_schema = Extension::new(
+            "sample".to_string(),
+            "1.0".to_string(),
+            "PUBLIC".to_string(),
+        );
+
+        assert_ne!(lower_schema.hash(), upper_schema.hash());
+    }
 }
