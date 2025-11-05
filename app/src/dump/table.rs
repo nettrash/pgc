@@ -438,14 +438,28 @@ impl Table {
                 .find(|c| c.name == new_constraint.name)
             {
                 if old_constraint != new_constraint {
-                    script.push_str(&format!(
-                        "alter table {}.{} drop constraint \"{}\";\n",
-                        self.schema, self.name, old_constraint.name
-                    ));
-                    script.push_str(&new_constraint.get_script());
+                    // Try to alter the constraint instead of dropping/recreating
+                    if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
+                        script.push_str(&alter_script);
+                    } else {
+                        // Drop and recreate the constraint
+                        script.push_str(&old_constraint.get_drop_script());
+                        script.push_str(&new_constraint.get_script());
+                    }
                 }
             } else {
                 script.push_str(&new_constraint.get_script());
+            }
+        }
+
+        // Handle dropped constraints
+        for old_constraint in &self.constraints {
+            if !to_table
+                .constraints
+                .iter()
+                .any(|c| c.name == old_constraint.name)
+            {
+                script.push_str(&old_constraint.get_drop_script());
             }
         }
 
@@ -476,6 +490,26 @@ impl Table {
                 }
             } else {
                 script.push_str(&new_trigger.get_script());
+            }
+        }
+
+        // Handle dropped indexes
+        for old_index in &self.indexes {
+            if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
+                script.push_str(&format!(
+                    "drop index if exists {}.{};\n",
+                    old_index.schema, old_index.name
+                ));
+            }
+        }
+
+        // Handle dropped triggers
+        for old_trigger in &self.triggers {
+            if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
+                script.push_str(&format!(
+                    "drop trigger if exists {} on {}.{};\n",
+                    old_trigger.name, self.schema, self.name
+                ));
             }
         }
 

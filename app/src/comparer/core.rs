@@ -52,7 +52,9 @@ impl Comparer {
         self.compare_types().await?;
         self.compare_enums().await?;
         self.compare_sequences().await?;
+        self.drop_views().await?;
         self.compare_tables().await?;
+        self.create_views().await?;
         self.compare_routines().await?;
 
         Ok(())
@@ -346,6 +348,40 @@ impl Comparer {
         }
         self.script
             .push_str("\n/* ---> Tables: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    // Drop existing in FROM dump views
+    async fn drop_views(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Views DROP: Start section --------------- */\n\n");
+
+        // We will drop all views that exists in "from" dump.
+        for from_view in &self.from.views {
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str());
+            self.script.push_str(from_view.get_drop_script().as_str());
+        }
+
+        self.script
+            .push_str("\n/* ---> Views DROP: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    // Create views from TO dump
+    async fn create_views(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Views CREATE: Start section --------------- */\n\n");
+
+        // We will create all views that exists in "to" dump.
+        for to_view in &self.to.views {
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+            self.script.push_str(to_view.get_script().as_str());
+        }
+
+        self.script
+            .push_str("\n/* ---> Views CREATE: End section --------------- */\n\n");
         Ok(())
     }
 }

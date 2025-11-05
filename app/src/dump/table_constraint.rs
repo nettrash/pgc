@@ -30,6 +30,7 @@ impl TableConstraint {
     }
 
     /// Returns a string representation of the constraint
+    /// ALTER TABLE ... ADD CONSTRAINT ...
     pub fn get_script(&self) -> String {
         let mut script = String::new();
         script.push_str(&format!(
@@ -76,6 +77,76 @@ impl TableConstraint {
         script.push_str(&format!("{} ", clause));
         script.push_str(";\n");
         script
+    }
+
+    /// Get alter script to change this constraint to match the target constraint
+    /// Returns None if the constraint needs to be dropped and recreated
+    pub fn get_alter_script(&self, target: &TableConstraint) -> Option<String> {
+        // Only FOREIGN KEY constraints can have their deferrable properties altered
+        // All other changes require drop/recreate
+        if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
+            && target.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
+            && self.can_be_altered_to(target)
+        {
+            let mut script = String::new();
+
+            // Handle FOREIGN KEY deferrable property changes
+            if self.is_deferrable != target.is_deferrable
+                || self.initially_deferred != target.initially_deferred
+            {
+                if target.is_deferrable {
+                    if target.initially_deferred {
+                        script.push_str(&format!(
+                            "alter table {}.{} alter constraint \"{}\" deferrable initially deferred;\n",
+                            self.schema, self.table_name, target.name
+                        ));
+                    } else {
+                        script.push_str(&format!(
+                            "alter table {}.{} alter constraint \"{}\" deferrable initially immediate;\n",
+                            self.schema, self.table_name, target.name
+                        ));
+                    }
+                } else {
+                    script.push_str(&format!(
+                        "alter table {}.{} alter constraint \"{}\" not deferrable;\n",
+                        self.schema, self.table_name, target.name
+                    ));
+                }
+            }
+
+            Some(script)
+        } else {
+            None
+        }
+    }
+
+    /// Check if this constraint can be altered to match the target constraint
+    /// without dropping and recreating
+    pub fn can_be_altered_to(&self, target: &TableConstraint) -> bool {
+        // Only FOREIGN KEY constraints can have their deferrable properties altered
+        // All other changes require drop/recreate
+        if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
+            && target.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
+        {
+            // Check if only deferrable properties changed
+            self.catalog == target.catalog
+                && self.schema == target.schema
+                && self.name == target.name
+                && self.table_name == target.table_name
+                && self.constraint_type == target.constraint_type
+                && self.definition == target.definition
+            // Only is_deferrable and initially_deferred can differ
+        } else {
+            false
+        }
+    }
+
+    /// Get drop script for this constraint
+    pub fn get_drop_script(&self) -> String {
+        format!(
+            "alter table {}.{} drop constraint \"{}\";\n",
+            self.schema, self.table_name, self.name
+        )
     }
 }
 
@@ -652,5 +723,106 @@ mod tests {
         let actual_hash = format!("{:x}", test_hasher.finalize());
 
         assert_eq!(actual_hash, expected_hash);
+    }
+
+    #[test]
+    fn test_can_be_altered_to_foreign_key_deferrable_change() {
+        let mut old_fk = create_foreign_key_constraint();
+        old_fk.is_deferrable = false;
+        old_fk.initially_deferred = false;
+
+        let mut new_fk = old_fk.clone();
+        new_fk.is_deferrable = true;
+        new_fk.initially_deferred = true;
+
+        assert!(old_fk.can_be_altered_to(&new_fk));
+    }
+
+    #[test]
+    fn test_can_be_altered_to_foreign_key_definition_change() {
+        let mut old_fk = create_foreign_key_constraint();
+        old_fk.definition = Some("FOREIGN KEY (user_id) REFERENCES users(id)".to_string());
+
+        let mut new_fk = old_fk.clone();
+        new_fk.definition = Some("FOREIGN KEY (user_id) REFERENCES customers(id)".to_string());
+
+        // Definition change requires drop/recreate
+        assert!(!old_fk.can_be_altered_to(&new_fk));
+    }
+
+    #[test]
+    fn test_can_be_altered_to_non_foreign_key() {
+        let old_pk = create_primary_key_constraint();
+        let mut new_pk = old_pk.clone();
+        new_pk.is_deferrable = true; // This change is not supported for PK
+
+        assert!(!old_pk.can_be_altered_to(&new_pk));
+    }
+
+    #[test]
+    fn test_get_alter_script_foreign_key_to_deferrable() {
+        let mut old_fk = create_foreign_key_constraint();
+        old_fk.is_deferrable = false;
+        old_fk.initially_deferred = false;
+
+        let mut new_fk = old_fk.clone();
+        new_fk.is_deferrable = true;
+        new_fk.initially_deferred = true;
+
+        let alter_script = old_fk.get_alter_script(&new_fk);
+        assert!(alter_script.is_some());
+
+        let script = alter_script.unwrap();
+        assert!(script.contains("alter table app.orders alter constraint \"fk_orders_user_id\" deferrable initially deferred"));
+    }
+
+    #[test]
+    fn test_get_alter_script_foreign_key_to_not_deferrable() {
+        let old_fk = create_foreign_key_constraint(); // is_deferrable = true
+
+        let mut new_fk = old_fk.clone();
+        new_fk.is_deferrable = false;
+        new_fk.initially_deferred = false;
+
+        let alter_script = old_fk.get_alter_script(&new_fk);
+        assert!(alter_script.is_some());
+
+        let script = alter_script.unwrap();
+        assert!(script.contains(
+            "alter table app.orders alter constraint \"fk_orders_user_id\" not deferrable"
+        ));
+    }
+
+    #[test]
+    fn test_get_alter_script_no_change_needed() {
+        let old_fk = create_foreign_key_constraint();
+        let new_fk = old_fk.clone();
+
+        let alter_script = old_fk.get_alter_script(&new_fk);
+        assert!(alter_script.is_some());
+
+        let script = alter_script.unwrap();
+        assert!(script.is_empty()); // No changes needed
+    }
+
+    #[test]
+    fn test_get_alter_script_non_foreign_key() {
+        let old_pk = create_primary_key_constraint();
+        let mut new_pk = old_pk.clone();
+        new_pk.is_deferrable = true;
+
+        let alter_script = old_pk.get_alter_script(&new_pk);
+        assert!(alter_script.is_none()); // Cannot alter non-FK constraints
+    }
+
+    #[test]
+    fn test_get_drop_script() {
+        let constraint = create_foreign_key_constraint();
+        let drop_script = constraint.get_drop_script();
+
+        assert_eq!(
+            drop_script,
+            "alter table app.orders drop constraint \"fk_orders_user_id\";\n"
+        );
     }
 }
