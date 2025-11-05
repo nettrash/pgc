@@ -222,7 +222,6 @@ impl TableColumn {
 
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
-        hasher.update(self.catalog.as_bytes());
         hasher.update(self.schema.as_bytes());
         hasher.update(self.table.as_bytes());
         hasher.update(self.name.as_bytes());
@@ -546,8 +545,7 @@ impl TableColumn {
 
 impl PartialEq for TableColumn {
     fn eq(&self, other: &Self) -> bool {
-        self.catalog == other.catalog
-            && self.schema == other.schema
+        self.schema == other.schema
             && self.table == other.table
             && self.name == other.name
             && self.ordinal_position == other.ordinal_position
@@ -721,6 +719,23 @@ mod tests {
         let hash2 = hasher2.finalize();
 
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_add_to_hasher_ignores_catalog() {
+        let column1 = create_test_column();
+        let mut column2 = create_test_column();
+        column2.catalog = "different_catalog".to_string();
+
+        let mut hasher1 = Sha256::new();
+        column1.add_to_hasher(&mut hasher1);
+        let hash1 = hasher1.finalize();
+
+        let mut hasher2 = Sha256::new();
+        column2.add_to_hasher(&mut hasher2);
+        let hash2 = hasher2.finalize();
+
+        assert_eq!(hash1, hash2);
     }
 
     #[test]
@@ -935,11 +950,11 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_eq_different_catalog() {
+    fn test_partial_eq_ignores_catalog() {
         let column1 = create_test_column();
         let mut column2 = create_test_column();
         column2.catalog = "different_catalog".to_string();
-        assert_ne!(column1, column2);
+        assert_eq!(column1, column2);
     }
 
     #[test]
@@ -1141,7 +1156,7 @@ mod tests {
         // This is a known hash for the test data - if the hashing logic changes, this will fail
         assert_eq!(
             hash_hex,
-            "cb40160dc86bb7817e35c1bad617312a42d5fd1603194e07a6f0912c4bcef716"
+            "5b03561cda07a076a2e12112a1b205d7113f4335b61a65b7c03336ce4015b4e1"
         );
     }
 

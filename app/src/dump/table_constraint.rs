@@ -17,7 +17,6 @@ pub struct TableConstraint {
 impl TableConstraint {
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
-        hasher.update(self.catalog.as_bytes());
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
         hasher.update(self.table_name.as_bytes());
@@ -152,8 +151,7 @@ impl TableConstraint {
 
 impl PartialEq for TableConstraint {
     fn eq(&self, other: &Self) -> bool {
-        self.catalog == other.catalog
-            && self.schema == other.schema
+        self.schema == other.schema
             && self.name == other.name
             && self.table_name == other.table_name
             && self.constraint_type == other.constraint_type
@@ -319,9 +317,6 @@ mod tests {
         let base_constraint = create_primary_key_constraint();
 
         // Test that changing each field affects the hash
-        let mut constraint_diff_catalog = base_constraint.clone();
-        constraint_diff_catalog.catalog = "different_catalog".to_string();
-
         let mut constraint_diff_schema = base_constraint.clone();
         constraint_diff_schema.schema = "different_schema".to_string();
 
@@ -347,7 +342,6 @@ mod tests {
 
         // Test each variation produces different hash
         let constraints = vec![
-            constraint_diff_catalog,
             constraint_diff_schema,
             constraint_diff_name,
             constraint_diff_table_name,
@@ -362,6 +356,23 @@ mod tests {
             let hash = format!("{:x}", hasher.finalize());
             assert_ne!(hash_base, hash);
         }
+    }
+
+    #[test]
+    fn test_add_to_hasher_ignores_catalog() {
+        let base_constraint = create_primary_key_constraint();
+        let mut diff_catalog = base_constraint.clone();
+        diff_catalog.catalog = "different_catalog".to_string();
+
+        let mut hasher1 = Sha256::new();
+        base_constraint.add_to_hasher(&mut hasher1);
+        let hash1 = hasher1.finalize();
+
+        let mut hasher2 = Sha256::new();
+        diff_catalog.add_to_hasher(&mut hasher2);
+        let hash2 = hasher2.finalize();
+
+        assert_eq!(hash1, hash2);
     }
 
     #[test]
@@ -466,13 +477,13 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_eq_different_catalog() {
+    fn test_partial_eq_ignores_catalog() {
         let constraint1 = create_primary_key_constraint();
         let mut constraint2 = create_primary_key_constraint();
         constraint2.catalog = "different_catalog".to_string();
 
-        assert_ne!(constraint1, constraint2);
-        assert!(!constraint1.eq(&constraint2));
+        assert_eq!(constraint1, constraint2);
+        assert!(constraint1.eq(&constraint2));
     }
 
     #[test]
@@ -675,7 +686,6 @@ mod tests {
 
         // Create the same hash as the implementation
         let mut hasher = Sha256::new();
-        hasher.update("cat".as_bytes()); // catalog
         hasher.update("sch".as_bytes()); // schema
         hasher.update("name".as_bytes()); // name
         hasher.update("table".as_bytes()); // table_name
@@ -707,7 +717,6 @@ mod tests {
 
         // Create the same hash as the implementation (nulls_distinct=None means no update)
         let mut hasher = Sha256::new();
-        hasher.update("cat".as_bytes()); // catalog
         hasher.update("sch".as_bytes()); // schema
         hasher.update("name".as_bytes()); // name
         hasher.update("table".as_bytes()); // table_name
