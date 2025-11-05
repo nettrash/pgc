@@ -416,8 +416,10 @@ impl Table {
         // 1. Columns - Check for new columns, altered columns, and dropped columns
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
-                if old_col != new_col {
-                    script.push_str(&new_col.get_alter_script());
+                if old_col != new_col
+                    && let Some(alter_col_script) = new_col.get_alter_script(old_col)
+                {
+                    script.push_str(&alter_col_script);
                 }
             } else {
                 script.push_str(&new_col.get_add_script());

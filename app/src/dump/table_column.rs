@@ -52,6 +52,174 @@ pub struct TableColumn {
 }
 
 impl TableColumn {
+    /// Render the type clause for alter statements (data type, length, collation, interval)
+    fn render_type_clause(&self) -> String {
+        let mut clause = String::new();
+        clause.push_str(&self.data_type);
+
+        let data_type_lower = self.data_type.to_lowercase();
+
+        if let Some(length) = self.character_maximum_length {
+            if data_type_lower.contains("char") {
+                clause.push_str(&format!("({length})"));
+            }
+        } else if data_type_lower.contains("numeric") || data_type_lower.contains("decimal") {
+            if let (Some(precision), Some(scale)) = (self.numeric_precision, self.numeric_scale) {
+                clause.push_str(&format!("({precision}, {scale})"));
+            } else if let Some(precision) = self.numeric_precision {
+                clause.push_str(&format!("({precision})"));
+            }
+        }
+
+        if data_type_lower.contains("interval")
+            && let Some(interval_type) = &self.interval_type
+            && !interval_type.is_empty()
+        {
+            clause.push(' ');
+            clause.push_str(interval_type);
+        }
+
+        if let Some(collation) = &self.collation_name
+            && !collation.is_empty()
+        {
+            clause.push_str(&format!(" collate \"{collation}\""));
+        }
+
+        clause
+    }
+
+    fn type_clause_differs(&self, other: &TableColumn) -> bool {
+        self.render_type_clause() != other.render_type_clause()
+    }
+
+    fn normalized_identity_generation(value: Option<&String>) -> String {
+        value
+            .and_then(|v| {
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_uppercase())
+                }
+            })
+            .unwrap_or_else(|| "BY DEFAULT".to_string())
+    }
+
+    fn build_identity_add_statement(&self, existing: &TableColumn) -> String {
+        let generation = Self::normalized_identity_generation(self.identity_generation.as_ref());
+        let mut statement = format!(
+            "alter table {}.{} alter column \"{}\" add generated {} as identity",
+            self.schema, self.table, self.name, generation
+        );
+
+        let mut options = Vec::new();
+        if let Some(start) = &self.identity_start
+            && Some(start) != existing.identity_start.as_ref()
+        {
+            options.push(format!("start with {start}"));
+        }
+        if let Some(increment) = &self.identity_increment
+            && Some(increment) != existing.identity_increment.as_ref()
+        {
+            options.push(format!("increment by {increment}"));
+        }
+        if let Some(min_val) = &self.identity_minimum {
+            if Some(min_val) != existing.identity_minimum.as_ref() {
+                options.push(format!("minvalue {min_val}"));
+            }
+        } else if existing.identity_minimum.is_some() {
+            options.push("no minvalue".to_string());
+        }
+        if let Some(max_val) = &self.identity_maximum {
+            if Some(max_val) != existing.identity_maximum.as_ref() {
+                options.push(format!("maxvalue {max_val}"));
+            }
+        } else if existing.identity_maximum.is_some() {
+            options.push("no maxvalue".to_string());
+        }
+        if self.identity_cycle != existing.identity_cycle {
+            options.push(if self.identity_cycle {
+                "cycle".to_string()
+            } else {
+                "no cycle".to_string()
+            });
+        }
+
+        if !options.is_empty() {
+            let opts = options
+                .iter()
+                .map(|opt| opt.to_uppercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+            statement.push_str(&format!(" ({opts})"));
+        }
+
+        statement.push_str(";\n");
+        statement
+    }
+
+    fn build_identity_update_statements(
+        &self,
+        existing: &TableColumn,
+        statements: &mut Vec<String>,
+    ) {
+        let new_generation =
+            Self::normalized_identity_generation(self.identity_generation.as_ref());
+        let old_generation =
+            Self::normalized_identity_generation(existing.identity_generation.as_ref());
+        if new_generation != old_generation {
+            statements.push(format!(
+                "alter table {}.{} alter column \"{}\" set generated {};\n",
+                self.schema, self.table, self.name, new_generation
+            ));
+        }
+
+        let mut options = Vec::new();
+        if self.identity_start != existing.identity_start
+            && let Some(start) = &self.identity_start
+        {
+            options.push(format!("start with {start}"));
+        }
+        if self.identity_increment != existing.identity_increment
+            && let Some(increment) = &self.identity_increment
+        {
+            options.push(format!("increment by {increment}"));
+        }
+        if self.identity_minimum != existing.identity_minimum {
+            match &self.identity_minimum {
+                Some(min_val) => options.push(format!("minvalue {min_val}")),
+                None => options.push("no minvalue".to_string()),
+            }
+        }
+        if self.identity_maximum != existing.identity_maximum {
+            match &self.identity_maximum {
+                Some(max_val) => options.push(format!("maxvalue {max_val}")),
+                None => options.push("no maxvalue".to_string()),
+            }
+        }
+        if self.identity_cycle != existing.identity_cycle {
+            options.push(if self.identity_cycle {
+                "cycle".to_string()
+            } else {
+                "no cycle".to_string()
+            });
+        }
+
+        if !options.is_empty() {
+            statements.push(format!(
+                "alter table {}.{} alter column \"{}\" set ({});\n",
+                self.schema,
+                self.table,
+                self.name,
+                options
+                    .iter()
+                    .map(|opt| opt.to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.catalog.as_bytes());
@@ -244,11 +412,64 @@ impl TableColumn {
         script.trim_end().to_string()
     }
 
-    pub fn get_alter_script(&self) -> String {
-        format!(
-            "alter table {}.{} alter column \"{}\" type {};\n",
-            self.schema, self.table, self.name, self.data_type
-        )
+    pub fn get_alter_script(&self, existing: &TableColumn) -> Option<String> {
+        let mut statements = Vec::new();
+
+        if self.type_clause_differs(existing) {
+            statements.push(format!(
+                "alter table {}.{} alter column \"{}\" type {};\n",
+                self.schema,
+                self.table,
+                self.name,
+                self.render_type_clause()
+            ));
+        }
+
+        if self.column_default != existing.column_default {
+            match &self.column_default {
+                Some(default) => statements.push(format!(
+                    "alter table {}.{} alter column \"{}\" set default {};\n",
+                    self.schema, self.table, self.name, default
+                )),
+                None => statements.push(format!(
+                    "alter table {}.{} alter column \"{}\" drop default;\n",
+                    self.schema, self.table, self.name
+                )),
+            }
+        }
+
+        if self.is_nullable != existing.is_nullable {
+            if self.is_nullable {
+                statements.push(format!(
+                    "alter table {}.{} alter column \"{}\" drop not null;\n",
+                    self.schema, self.table, self.name
+                ));
+            } else {
+                statements.push(format!(
+                    "alter table {}.{} alter column \"{}\" set not null;\n",
+                    self.schema, self.table, self.name
+                ));
+            }
+        }
+
+        if self.is_identity != existing.is_identity {
+            if self.is_identity {
+                statements.push(self.build_identity_add_statement(existing));
+            } else {
+                statements.push(format!(
+                    "alter table {}.{} alter column \"{}\" drop identity if exists;\n",
+                    self.schema, self.table, self.name
+                ));
+            }
+        } else if self.is_identity {
+            self.build_identity_update_statements(existing, &mut statements);
+        }
+
+        if statements.is_empty() {
+            None
+        } else {
+            Some(statements.join(""))
+        }
     }
 
     pub fn get_add_script(&self) -> String {
@@ -890,20 +1111,73 @@ mod tests {
 
     // --- Script methods: alter/add/drop ---
     #[test]
-    fn test_get_alter_script_basic() {
-        let column = create_test_column();
-        let expected = "alter table public.test_table alter column \"test_column\" type varchar;\n";
-        assert_eq!(column.get_alter_script(), expected);
+    fn test_get_alter_script_type_change() {
+        let existing = create_test_column();
+        let mut updated = existing.clone();
+        updated.data_type = "integer".to_string();
+        updated.character_maximum_length = None;
+        let script = updated
+            .get_alter_script(&existing)
+            .expect("expected alter statement for type change");
+        assert_eq!(
+            script,
+            "alter table public.test_table alter column \"test_column\" type integer;\n"
+        );
     }
 
     #[test]
-    fn test_get_alter_script_different_schema_table() {
-        let mut column = create_test_column();
-        column.schema = "app".to_string();
-        column.table = "users".to_string();
-        column.data_type = "integer".to_string();
-        let expected = "alter table app.users alter column \"test_column\" type integer;\n";
-        assert_eq!(column.get_alter_script(), expected);
+    fn test_get_alter_script_type_change_different_schema() {
+        let existing = create_test_column();
+        let mut updated = existing.clone();
+        updated.schema = "app".to_string();
+        updated.table = "users".to_string();
+        updated.data_type = "integer".to_string();
+        updated.character_maximum_length = None;
+        let script = updated
+            .get_alter_script(&existing)
+            .expect("expected alter statement for type change");
+        assert_eq!(
+            script,
+            "alter table app.users alter column \"test_column\" type integer;\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_default_change() {
+        let mut existing = create_test_column();
+        existing.column_default = None;
+        let mut updated = existing.clone();
+        updated.column_default = Some("'default_value'".to_string());
+
+        let script = updated
+            .get_alter_script(&existing)
+            .expect("expected alter statement for default change");
+        assert_eq!(
+            script,
+            "alter table public.test_table alter column \"test_column\" set default 'default_value';\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_nullability_change() {
+        let mut existing = create_test_column();
+        existing.is_nullable = true;
+        let mut updated = existing.clone();
+        updated.is_nullable = false;
+
+        let script = updated
+            .get_alter_script(&existing)
+            .expect("expected alter statement for nullability change");
+        assert_eq!(
+            script,
+            "alter table public.test_table alter column \"test_column\" set not null;\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_returns_none_when_no_change() {
+        let column = create_test_column();
+        assert!(column.get_alter_script(&column).is_none());
     }
 
     #[test]
