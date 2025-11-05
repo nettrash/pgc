@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 // This is an information about a PostgreSQL schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
-    /// Name of the extension
+    /// Name of the schema
     pub name: String,
 }
 
