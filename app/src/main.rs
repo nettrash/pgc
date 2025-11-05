@@ -3,6 +3,7 @@ use crate::{
     config::{core::Config, dump_config::DumpConfig},
     dump::core::Dump,
 };
+use chrono::Datelike;
 use clap::{CommandFactory, Parser, command};
 use std::{io::Error, path::Path};
 
@@ -15,7 +16,7 @@ pub mod dump;
 #[command(
     name = "pgc",
     author = "nettrash",
-    version = "1.0.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "PostgreSQL Database Schema Comparer.",
     long_about = None,
 )]
@@ -67,6 +68,10 @@ struct Args {
     /// Use SSL for PostgreSQL connection
     #[arg(long)]
     use_ssl: bool,
+
+    /// Use DROP statements in the output
+    #[arg(long, default_value = "false")]
+    use_drop: bool,
 }
 
 // Main entry point for the program.
@@ -103,8 +108,13 @@ pub async fn main() -> Result<(), Error> {
             }
             Some("compare") => {
                 println!("Comparing databases...");
-                return compare_dumps(args.from.unwrap(), args.to.unwrap(), args.output.unwrap())
-                    .await;
+                return compare_dumps(
+                    args.from.unwrap(),
+                    args.to.unwrap(),
+                    args.output.unwrap(),
+                    args.use_drop,
+                )
+                .await;
             }
             _ => {
                 eprintln!("Unknown command: {}", args.command.unwrap());
@@ -117,8 +127,10 @@ pub async fn main() -> Result<(), Error> {
 
 // Function to print the version information.
 fn pgc_version() {
-    println!("pgc v1.0.0");
-    println!("(c) 2025 nettrash. All rights reserved.");
+    let version = env!("CARGO_PKG_VERSION");
+    println!("pgc v{version}");
+    let year = chrono::Utc::now().year();
+    println!("(c) 2025-{year} nettrash. All rights reserved.");
     println!("This program is licensed under the GPL v3 License.");
     println!();
 }
@@ -133,6 +145,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
         let from_file = cfg.from.file.clone();
         let to_file = cfg.to.file.clone();
         let output_file = cfg.output.clone();
+        let use_drop = cfg.use_drop;
 
         let result = create_dump(DumpConfig {
             host: cfg.from.host,
@@ -165,7 +178,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             return Err(e);
         }
         println!("Dumps created successfully. Now comparing...");
-        let compare_result = compare_dumps(from_file, to_file, output_file).await;
+        let compare_result = compare_dumps(from_file, to_file, output_file, use_drop).await;
         if let Err(e) = compare_result {
             eprintln!("Error comparing dumps: {e}");
             return Err(e);
@@ -191,14 +204,19 @@ async fn create_dump(dump_config: DumpConfig) -> Result<(), Error> {
     Ok(())
 }
 
-async fn compare_dumps(from: String, to: String, output: String) -> Result<(), Error> {
+async fn compare_dumps(
+    from: String,
+    to: String,
+    output: String,
+    use_drop: bool,
+) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
     let to = Dump::read_from_file(&to).await?;
     println!("--> Dump from:\n{}\n", from.get_info());
     println!("--> Dump to:\n{}\n", to.get_info());
     println!("Comparing dumps...");
-    let mut comparer = Comparer::new(from, to);
+    let mut comparer = Comparer::new(from, to, use_drop);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");

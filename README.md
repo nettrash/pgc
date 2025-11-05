@@ -8,6 +8,11 @@ We're faced with vital need to have a proper working free tool for comparing two
 
 We have multiple PostgreSQL database repositories and need to have a properly working deployment pipelines for our databases.
 
+## Glossary
+
+- `FROM` - this database we will use a target database, we want to apply final patch here.
+- `TO` - this database we will use as an etalon schema, and prepare delta script that can be applied on FROM database to make schema equals to schema of database `TO`.
+
 ## How to build
 
 ```bash
@@ -71,10 +76,12 @@ As a result if this command we will have a dump file with all needed information
 ### Create delta script between two dumps
 
 ```bash
-pgc --command compare --from {from_dump} --to {to_dump} --output {file}
+pgc --command compare --from {from_dump} --to {to_dump} --output {file} --use-drop
 ```
 
 This command comparing two dumps and produce SQL script for the `FROM` database to be equal to `TO` database after applying it.
+If we add `--use-drop` argument comparer will add drop scripts for all items that non exists in target database, otherwise drop scripts will be ignored.  
+By default, comparer ignore drops.
 
 ## Configuration file
 

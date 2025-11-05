@@ -11,6 +11,8 @@ pub struct Comparer {
     from: Dump,
     // The dump to compare to
     to: Dump,
+    // Whether to use DROP statements in the output
+    use_drop: bool,
 
     // The script that will be generated
     script: String,
@@ -18,10 +20,11 @@ pub struct Comparer {
 
 impl Comparer {
     // Creates a new Comparer with the given dumps
-    pub fn new(from: Dump, to: Dump) -> Self {
+    pub fn new(from: Dump, to: Dump, use_drop: bool) -> Self {
         let mut comparer = Self {
             from,
             to,
+            use_drop,
             script: String::new(),
         };
 
@@ -33,7 +36,10 @@ impl Comparer {
         comparer.script.push_str(&comparer.from.get_info());
         comparer.script.push_str("\n\n To dump:\n");
         comparer.script.push_str(&comparer.to.get_info());
-        comparer.script.push_str("\n\n Comparison results:\n");
+        comparer.script.push_str(&format!(
+            "\n\n Comparison results (use_drop: {}):\n",
+            comparer.use_drop
+        ));
         comparer.script.push_str("*/\n\n");
 
         comparer
@@ -41,12 +47,15 @@ impl Comparer {
 
     // Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
+        self.compare_schemas().await?;
         self.compare_extensions().await?;
         self.compare_types().await?;
         self.compare_enums().await?;
         self.compare_sequences().await?;
-        self.compare_routines().await?;
+        self.drop_views().await?;
         self.compare_tables().await?;
+        self.create_views().await?;
+        self.compare_routines().await?;
 
         Ok(())
     }
@@ -63,9 +72,56 @@ impl Comparer {
         Ok(())
     }
 
+    async fn compare_schemas(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Schemas: Start section --------------- */\n\n");
+
+        // We will find all new schemas from "to" dump that are not in "from" dump
+        // and add them to the script.
+        for schema in &self.to.schemas {
+            if let Some(_from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
+                continue; // Schema is present in both dumps, we already processed it
+            } else {
+                self.script
+                    .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
+                self.script.push_str(schema.get_script().as_str());
+            }
+        }
+
+        // We will find all schemas that exists just in "from" dump.
+        // Drop will be added just if use_drop is true
+        // TODO: We need to drop schema only if it's empty (no objects inside) Maybe the best way is to just skip dropping.
+        /*
+        for schema in &self.from.schemas {
+            if let Some(_to_schema) = self
+                .to
+                .schemas
+                .iter()
+                .find(|s| s.name == schema.name)
+            {
+                continue; // Schema is present in both dumps, we already processed it
+            } else if self.use_drop {
+                // Just if we're using DROP statements
+                self.script
+                    .push_str(format!("/* Schema: {}*/
+\n", schema.name).as_str());
+                self.script.push_str(
+        " /* Schema is not present in 'to' dump and should be dropped. */
+\n",
+                );
+                self.script.push_str(schema.get_drop_script().as_str());
+            }
+        }*/
+
+        self.script
+            .push_str("\n/* ---> Schemas: End section --------------- */\n\n");
+        Ok(())
+    }
+
     // Comparing extentions
     async fn compare_extensions(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Extensions: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Extensions: Start section --------------- */\n\n");
 
         // We will find all new extensions from "to" dump that are not in "from" dump
         // and add them to the script.
@@ -93,7 +149,8 @@ impl Comparer {
                 .find(|r| r.name == ext.name && r.schema == ext.schema)
             {
                 continue; // Routine is present in both dumps, we already processed it
-            } else {
+            } else if self.use_drop {
+                // Just if we're using DROP statements
                 self.script
                     .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
                 self.script.push_str(
@@ -103,25 +160,29 @@ impl Comparer {
             }
         }
 
-        self.script.push_str("/* Extensions: End section */\n");
+        self.script
+            .push_str("\n/* ---> Extensions: End section --------------- */\n\n");
         Ok(())
     }
 
     // Comparing types
     async fn compare_types(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* User-defined types */\n");
+        self.script
+            .push_str("\n/* ---> User-defined types --------------- */\n\n");
         Ok(())
     }
 
     // Comparing enums
     async fn compare_enums(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Enums */\n");
+        self.script
+            .push_str("\n/* ---> Enums --------------- */\n\n");
         Ok(())
     }
 
     // Comparing sequences
     async fn compare_sequences(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Sequences: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Sequences: Start section --------------- */\n\n");
 
         // We will find all new sequences from "to" dump that are not in "from" dump
         // and we will find all existing sequences in both dumps with different hashes
@@ -155,7 +216,8 @@ impl Comparer {
                 .find(|s| s.name == sequence.name && s.schema == sequence.schema)
             {
                 continue; // Sequence is present in both dumps, we already processed it
-            } else {
+            } else if self.use_drop {
+                // Just if we're using DROP statements
                 self.script.push_str(
                     format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                 );
@@ -166,13 +228,15 @@ impl Comparer {
             }
         }
 
-        self.script.push_str("/* Sequences: End section */\n");
+        self.script
+            .push_str("\n/* ---> Sequences: End section --------------- */\n\n");
         Ok(())
     }
 
     // Comparing routines
     async fn compare_routines(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Routines: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Routines: Start section --------------- */\n\n");
 
         // We will find all new routines from "to" dump that are not in "from" dump
         // and we will find all existing routines in both dumps with different hashes
@@ -206,7 +270,8 @@ impl Comparer {
                 .find(|r| r.name == routine.name && r.schema == routine.schema)
             {
                 continue; // Routine is present in both dumps, we already processed it
-            } else {
+            } else if self.use_drop {
+                // Just if we're using DROP statements
                 self.script.push_str(
                     format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                 );
@@ -216,13 +281,15 @@ impl Comparer {
             }
         }
 
-        self.script.push_str("/* Routines: End section */\n");
+        self.script
+            .push_str("\n/* ---> Routines: End section --------------- */\n\n");
         Ok(())
     }
 
     // Comparing tables
     async fn compare_tables(&mut self) -> Result<(), Error> {
-        self.script.push_str("/* Tables: Start section */\n");
+        self.script
+            .push_str("\n/* ---> Tables: Start section --------------- */\n\n");
         // We will drop all tables that exists just in "from" dump.
         for table in &self.from.tables {
             if let Some(_to_table) = self
@@ -232,7 +299,8 @@ impl Comparer {
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
                 continue; // Table is present in both dumps, we already processed it
-            } else {
+            } else if self.use_drop {
+                // Just if we're using DROP statements
                 self.script
                     .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
                 self.script
@@ -250,7 +318,8 @@ impl Comparer {
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
                 if from_table.hash() != table.hash() {
-                    // Jsut create an alter script for the table
+                    // Just create an alter script for the table
+                    // Will be added in next comparision (below)
                 }
             } else {
                 self.script
@@ -258,7 +327,61 @@ impl Comparer {
                 self.script.push_str(table.get_script().as_str());
             }
         }
-        self.script.push_str("/* Tables: End section */\n");
+        // We will find all existing tables in both dumps with different hashes
+        for table in &self.from.tables {
+            if let Some(to_table) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+            {
+                if to_table.hash() != table.hash() {
+                    self.script.push_str(
+                        format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
+                    );
+                    self.script
+                        .push_str(table.get_alter_script(to_table).as_str());
+                }
+            } else {
+                continue; // Table is present in both dumps, we already processed it
+            }
+        }
+        self.script
+            .push_str("\n/* ---> Tables: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    // Drop existing in FROM dump views
+    async fn drop_views(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Views DROP: Start section --------------- */\n\n");
+
+        // We will drop all views that exists in "from" dump.
+        for from_view in &self.from.views {
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str());
+            self.script.push_str(from_view.get_drop_script().as_str());
+        }
+
+        self.script
+            .push_str("\n/* ---> Views DROP: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    // Create views from TO dump
+    async fn create_views(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Views CREATE: Start section --------------- */\n\n");
+
+        // We will create all views that exists in "to" dump.
+        for to_view in &self.to.views {
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+            self.script.push_str(to_view.get_script().as_str());
+        }
+
+        self.script
+            .push_str("\n/* ---> Views CREATE: End section --------------- */\n\n");
         Ok(())
     }
 }
