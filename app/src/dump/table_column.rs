@@ -473,13 +473,67 @@ impl TableColumn {
     }
 
     pub fn get_add_script(&self) -> String {
-        format!(
-            "alter table {}.{} add column \"{}\" {};\n",
+        let mut statement = format!(
+            "alter table {}.{} add column \"{}\" {}",
             self.schema,
             self.table,
             self.name,
-            self.get_script().split_once(' ').map(|x| x.1).unwrap_or("") // Only type and constraints
-        )
+            self.render_type_clause()
+        );
+
+        if self.is_identity {
+            let generation =
+                Self::normalized_identity_generation(self.identity_generation.as_ref());
+            statement.push_str(" generated ");
+            statement.push_str(&generation);
+            statement.push_str(" as identity");
+
+            let mut options = Vec::new();
+            if let Some(start) = &self.identity_start {
+                options.push(format!("start with {start}"));
+            }
+            if let Some(increment) = &self.identity_increment {
+                options.push(format!("increment by {increment}"));
+            }
+            if let Some(min_val) = &self.identity_minimum {
+                options.push(format!("minvalue {min_val}"));
+            }
+            if let Some(max_val) = &self.identity_maximum {
+                options.push(format!("maxvalue {max_val}"));
+            }
+            if self.identity_cycle {
+                options.push("cycle".to_string());
+            }
+
+            if !options.is_empty() {
+                statement.push_str(" (");
+                statement.push_str(
+                    &options
+                        .iter()
+                        .map(|opt| opt.to_uppercase())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                statement.push(')');
+            }
+        }
+
+        if self.is_generated.to_lowercase() == "always"
+            && let Some(expr) = &self.generation_expression
+        {
+            statement.push_str(&format!(" generated always as ({expr}) stored"));
+        }
+
+        if let Some(default) = &self.column_default {
+            statement.push_str(&format!(" default {default}"));
+        }
+
+        if !self.is_nullable {
+            statement.push_str(" not null");
+        }
+
+        statement.push_str(";\n");
+        statement
     }
 
     pub fn get_drop_script(&self) -> String {
