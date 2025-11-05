@@ -40,7 +40,7 @@ impl View {
     /// Returns a string to create the view.
     pub fn get_script(&self) -> String {
         let script = format!(
-            "create view {}.{} as {};\n",
+            "create view {}.{} as {}\n",
             self.schema, self.name, self.definition
         );
 

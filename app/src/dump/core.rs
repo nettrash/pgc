@@ -319,22 +319,34 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "
-                select 
-                    schemaname, 
-                    sequencename, 
-                    sequenceowner, 
-                    data_type::varchar as sequencedatatype, 
-                    start_value, 
-                    min_value, 
-                    max_value, 
-                    increment_by, 
-                    cycle, 
-                    cache_size, 
-                    last_value 
-                from 
-                    pg_sequences 
-                where 
-                    schemaname like '%{}%'",
+                select
+                    seq.schemaname,
+                    seq.sequencename,
+                    seq.sequenceowner,
+                    seq.data_type::varchar as sequencedatatype,
+                    seq.start_value,
+                    seq.min_value,
+                    seq.max_value,
+                    seq.increment_by,
+                    seq.cycle,
+                    seq.cache_size,
+                    seq.last_value,
+                    owner_ns.nspname as owned_by_schema,
+                    owner_table.relname as owned_by_table,
+                    owner_attr.attname as owned_by_column
+                from
+                    pg_sequences seq
+                    left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
+                    left join pg_class seq_class on seq_class.relname = seq.sequencename
+                        and seq_class.relnamespace = seq_ns.oid
+                    left join pg_depend dep on dep.objid = seq_class.oid
+                        and dep.deptype = 'a'
+                    left join pg_class owner_table on owner_table.oid = dep.refobjid
+                    left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
+                    left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
+                        and owner_attr.attnum = dep.refobjsubid
+                where
+                    seq.schemaname like '%{}%'",
                 self.configuration.scheme
             )
             .as_str(),
@@ -367,6 +379,9 @@ impl Dump {
                     cycle: row.get("cycle"),
                     cache_size: row.get::<Option<i64>, _>("cache_size"),
                     last_value: row.get::<Option<i64>, _>("last_value"),
+                    owned_by_schema: row.get::<Option<String>, _>("owned_by_schema"),
+                    owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
+                    owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
                 };
                 self.sequences.push(seq.clone());
                 println!(" - name {} (type: {})", seq.name, seq.data_type);
