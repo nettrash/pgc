@@ -38,9 +38,77 @@ impl Table {
     /// Fill information about columns.
     async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT * FROM information_schema.columns WHERE table_schema = '{}' AND table_name = '{}'",
-            self.schema, self.name
-        );
+                        "SELECT
+                                c.table_catalog,
+                                c.table_schema,
+                                c.table_name,
+                                c.column_name,
+                                c.ordinal_position,
+                                c.column_default,
+                                c.is_nullable,
+                                CASE
+                                        WHEN c.data_type IN ('USER-DEFINED', 'ARRAY')
+                                                THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                                        ELSE c.data_type
+                                END AS formatted_data_type,
+                                c.character_maximum_length,
+                                c.character_octet_length,
+                                c.numeric_precision,
+                                c.numeric_precision_radix,
+                                c.numeric_scale,
+                                c.datetime_precision,
+                                c.interval_type,
+                                c.interval_precision,
+                                c.character_set_catalog,
+                                c.character_set_schema,
+                                c.character_set_name,
+                                c.collation_catalog,
+                                c.collation_schema,
+                                c.collation_name,
+                                c.domain_catalog,
+                                c.domain_schema,
+                                c.domain_name,
+                                c.udt_catalog,
+                                c.udt_schema,
+                                c.udt_name,
+                                c.scope_catalog,
+                                c.scope_schema,
+                                c.scope_name,
+                                c.maximum_cardinality,
+                                c.dtd_identifier,
+                                c.is_self_referencing,
+                                c.is_identity,
+                                c.identity_generation,
+                                c.identity_start,
+                                c.identity_increment,
+                                c.identity_maximum,
+                                c.identity_minimum,
+                                c.identity_cycle,
+                                c.is_generated,
+                                c.generation_expression,
+                                c.is_updatable,
+                                (
+                                        SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
+                                        FROM information_schema.view_column_usage v
+                                        WHERE v.table_schema = c.table_schema
+                                            AND v.table_name  = c.table_name
+                                            AND v.column_name = c.column_name
+                                ) AS related_views
+                         FROM information_schema.columns c
+                         JOIN pg_catalog.pg_namespace ns
+                             ON ns.nspname = c.table_schema
+                         JOIN pg_catalog.pg_class cls
+                             ON cls.relnamespace = ns.oid
+                            AND cls.relname = c.table_name
+                         JOIN pg_catalog.pg_attribute a
+                             ON a.attrelid = cls.oid
+                            AND a.attname = c.column_name
+                            AND a.attnum > 0
+                            AND a.attisdropped = false
+                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
+                         ORDER BY c.ordinal_position",
+                        self.schema, self.name
+                );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         if !rows.is_empty() {
@@ -53,7 +121,7 @@ impl Table {
                     ordinal_position: row.get("ordinal_position"),
                     column_default: row.get("column_default"),
                     is_nullable: row.get::<&str, _>("is_nullable") == "YES", // Convert to boolean
-                    data_type: row.get("data_type"),
+                    data_type: row.get("formatted_data_type"),
                     character_maximum_length: row.get("character_maximum_length"),
                     character_octet_length: row.get("character_octet_length"),
                     numeric_precision: row.get("numeric_precision"),
@@ -90,6 +158,9 @@ impl Table {
                     is_generated: row.get("is_generated"),
                     generation_expression: row.get("generation_expression"),
                     is_updatable: row.get::<&str, _>("is_updatable") == "YES", // Convert to boolean
+                    related_views: row
+                        .get::<Option<String>, _>("related_views")
+                        .map(|s| s.split(',').map(|v| v.trim().to_string()).collect()),
                 };
 
                 self.columns.push(table_column.clone());
@@ -102,7 +173,7 @@ impl Table {
     /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT * FROM pg_indexes WHERE schemaname = '{}' AND tablename = '{}'",
+            "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique",
             self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -127,7 +198,7 @@ impl Table {
     /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT * FROM information_schema.table_constraints WHERE table_schema = '{}' AND table_name = '{}'",
+            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, c.contype::text AS constraint_type, c.condeferrable::text AS is_deferrable, c.condeferred::text AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') ORDER BY n.nspname, t.relname, c.conname;",
             self.schema, self.name
         );
 
@@ -136,19 +207,14 @@ impl Table {
         if !rows.is_empty() {
             for row in rows {
                 let table_constraint = TableConstraint {
-                    catalog: row.get("constraint_catalog"),
-                    schema: row.get("constraint_schema"),
+                    catalog: row.get("catalog"),
+                    schema: row.get("schema"),
                     name: row.get("constraint_name"),
-                    table_catalog: row.get("table_catalog"),
-                    table_schema: row.get("table_schema"),
                     table_name: row.get("table_name"),
                     constraint_type: row.get("constraint_type"),
                     is_deferrable: row.get::<&str, _>("is_deferrable") == "YES", // Convert to boolean
                     initially_deferred: row.get::<&str, _>("initially_deferred") == "YES", // Convert to boolean
-                    enforced: row.get::<&str, _>("enforced") == "YES", // Convert to boolean
-                    nulls_distinct: row
-                        .try_get::<Option<&str>, _>("nulls_distinct")?
-                        .map(|v| v == "YES"), // Convert to boolean
+                    definition: row.get("definition"),
                 };
 
                 self.constraints.push(table_constraint.clone());
@@ -342,5 +408,113 @@ impl Table {
     /// Get drop script for the table
     pub fn get_drop_script(&self) -> String {
         format!("drop table if exists {}.{};\n", self.schema, self.name)
+    }
+
+    pub fn get_alter_script(&self, to_table: &Table) -> String {
+        let mut script = String::new();
+
+        // 1. Columns - Check for new columns, altered columns, and dropped columns
+        for new_col in &to_table.columns {
+            if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
+                if old_col != new_col
+                    && let Some(alter_col_script) = new_col.get_alter_script(old_col)
+                {
+                    script.push_str(&alter_col_script);
+                }
+            } else {
+                script.push_str(&new_col.get_add_script());
+            }
+        }
+
+        for old_col in &self.columns {
+            if !to_table.columns.iter().any(|c| c.name == old_col.name) {
+                script.push_str(&old_col.get_drop_script());
+            }
+        }
+
+        // 2. Constraints - Check for new constraints, altered constraints, and dropped constraints
+        for new_constraint in &to_table.constraints {
+            if let Some(old_constraint) = self
+                .constraints
+                .iter()
+                .find(|c| c.name == new_constraint.name)
+            {
+                if old_constraint != new_constraint {
+                    // Try to alter the constraint instead of dropping/recreating
+                    if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
+                        script.push_str(&alter_script);
+                    } else {
+                        // Drop and recreate the constraint
+                        script.push_str(&old_constraint.get_drop_script());
+                        script.push_str(&new_constraint.get_script());
+                    }
+                }
+            } else {
+                script.push_str(&new_constraint.get_script());
+            }
+        }
+
+        // Handle dropped constraints
+        for old_constraint in &self.constraints {
+            if !to_table
+                .constraints
+                .iter()
+                .any(|c| c.name == old_constraint.name)
+            {
+                script.push_str(&old_constraint.get_drop_script());
+            }
+        }
+
+        // 3. Indexes - Check for new indexes, altered indexes, and dropped indexes
+        for new_index in &to_table.indexes {
+            if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
+                if old_index != new_index {
+                    script.push_str(&format!(
+                        "drop index if exists {}.{};\n",
+                        new_index.schema, new_index.name
+                    ));
+                    script.push_str(&new_index.get_script());
+                }
+            } else {
+                script.push_str(&new_index.get_script());
+            }
+        }
+
+        // 4. Triggers - Check for new triggers, altered triggers, and dropped triggers
+        for new_trigger in &to_table.triggers {
+            if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
+                if old_trigger != new_trigger {
+                    script.push_str(&format!(
+                        "drop trigger if exists {} on {}.{};\n",
+                        old_trigger.name, self.schema, self.name
+                    ));
+                    script.push_str(&new_trigger.get_script());
+                }
+            } else {
+                script.push_str(&new_trigger.get_script());
+            }
+        }
+
+        // Handle dropped indexes
+        for old_index in &self.indexes {
+            if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
+                script.push_str(&format!(
+                    "drop index if exists {}.{};\n",
+                    old_index.schema, old_index.name
+                ));
+            }
+        }
+
+        // Handle dropped triggers
+        for old_trigger in &self.triggers {
+            if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
+                script.push_str(&format!(
+                    "drop trigger if exists {} on {}.{};\n",
+                    old_trigger.name, self.schema, self.name
+                ));
+            }
+        }
+
+        script
     }
 }

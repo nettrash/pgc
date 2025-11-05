@@ -6,6 +6,6 @@ use sqlx::postgres::types::Oid;
 pub struct PgEnum {
     pub oid: Oid,           // Oid of Enum type
     pub enumtypid: Oid,     // Oid of the Enum type
-    pub enumsortorder: i32, // Sort order of the enum value
+    pub enumsortorder: f32, // Sort order of the enum value
     pub enumlabel: String,  // Label of the enum value
 }

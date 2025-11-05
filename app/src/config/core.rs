@@ -9,6 +9,8 @@ pub struct Config {
     pub to: DumpConfig,
     // Output file name for the comparison result
     pub output: String,
+    // Whether to use DROP statements in the output
+    pub use_drop: bool,
 }
 
 impl Config {
@@ -45,6 +47,7 @@ impl Config {
         let mut to_ssl = false;
         let mut to_dump = "dump.to".to_string();
         let mut output = "data.out".to_string();
+        let mut use_drop = false;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -74,6 +77,7 @@ impl Config {
                 && parts[0].trim() != "TO_SSL"
                 && parts[0].trim() != "TO_DUMP"
                 && parts[0].trim() != "OUTPUT"
+                && parts[0].trim() != "USE_DROP"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -108,6 +112,7 @@ impl Config {
                 "TO_SSL" => to_ssl = parts[1].trim().to_uppercase() == "TRUE",
                 "TO_DUMP" => to_dump = parts[1].trim().to_string(),
                 "OUTPUT" => output = parts[1].trim().to_string(),
+                "USE_DROP" => use_drop = parts[1].trim().to_uppercase() == "TRUE",
                 _ => {}
             }
         }
@@ -131,7 +136,12 @@ impl Config {
             ssl: to_ssl,
             file: to_dump,
         };
-        Config { from, to, output }
+        Config {
+            from,
+            to,
+            output,
+            use_drop,
+        }
     }
 }
 
@@ -167,6 +177,7 @@ mod tests {
             TO_SSL=false
             TO_DUMP=to.dump
             OUTPUT=result.out
+            USE_DROP=true
         "#;
         let file = write_temp_config(config_content, "test_valid_config_parsing.cfg");
         let config = Config::new(file.clone());
@@ -181,6 +192,7 @@ mod tests {
         assert!(!config.to.ssl);
         assert_eq!(config.to.file, "to.dump");
         assert_eq!(config.output, "result.out");
+        assert!(config.use_drop);
         let _ = std::fs::remove_file(file);
     }
 
@@ -230,6 +242,8 @@ mod tests {
             TO_SSL=false
             TO_DUMP=to.dump
             OUTPUT=result.out
+            # Comment about USE_DROP
+            USE_DROP=true
         "#;
         let file = write_temp_config(
             config_content,
@@ -238,6 +252,7 @@ mod tests {
         let config = Config::new(file.clone());
         assert_eq!(config.from.host, "localhost");
         assert_eq!(config.to.host, "remotehost");
+        assert!(config.use_drop);
         let _ = std::fs::remove_file(file);
     }
 
@@ -249,6 +264,7 @@ mod tests {
         assert_eq!(config.from.file, "dump.from");
         assert_eq!(config.to.file, "dump.to");
         assert_eq!(config.output, "data.out");
+        assert!(!config.use_drop);
         let _ = std::fs::remove_file(file);
     }
 
@@ -257,5 +273,59 @@ mod tests {
     fn test_missing_file_panics() {
         let file = "/tmp/non_existent_config_file.cfg".to_string();
         let _ = Config::new(file);
+    }
+
+    #[test]
+    fn test_use_drop_true_value() {
+        let config_content = r#"
+            FROM_HOST=localhost
+            FROM_DATABASE=testdb
+            FROM_DUMP=from.dump
+            TO_HOST=localhost
+            TO_DATABASE=testdb
+            TO_DUMP=to.dump
+            OUTPUT=result.out
+            USE_DROP=true
+        "#;
+        let file = write_temp_config(config_content, "test_use_drop_true_value.cfg");
+        let config = Config::new(file.clone());
+        assert!(config.use_drop);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_use_drop_false_value() {
+        let config_content = r#"
+            FROM_HOST=localhost
+            FROM_DATABASE=testdb
+            FROM_DUMP=from.dump
+            TO_HOST=localhost
+            TO_DATABASE=testdb
+            TO_DUMP=to.dump
+            OUTPUT=result.out
+            USE_DROP=false
+        "#;
+        let file = write_temp_config(config_content, "test_use_drop_false_value.cfg");
+        let config = Config::new(file.clone());
+        assert!(!config.use_drop);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_use_drop_case_insensitive() {
+        let config_content = r#"
+            FROM_HOST=localhost
+            FROM_DATABASE=testdb
+            FROM_DUMP=from.dump
+            TO_HOST=localhost
+            TO_DATABASE=testdb
+            TO_DUMP=to.dump
+            OUTPUT=result.out
+            USE_DROP=TRUE
+        "#;
+        let file = write_temp_config(config_content, "test_use_drop_case_insensitive.cfg");
+        let config = Config::new(file.clone());
+        assert!(config.use_drop);
+        let _ = std::fs::remove_file(file);
     }
 }

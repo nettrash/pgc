@@ -21,12 +21,11 @@ target/
 .DS_Store
 
 # Dumps
-dump.out
-from.dump
-to.dump
-dump.io
+dump.*
+*.dump
 output.sql
 test.conf
+database.sql
 
 # Docker
 docker-compose.override.yml
