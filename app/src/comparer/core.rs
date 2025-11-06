@@ -345,7 +345,7 @@ impl Comparer {
             }
         }
 
-        create_alter_section.push_str("\n/* ---> Enums: End section --------------- */\n\n");
+        create_alter_section.push_str("\n/* ---> Enums: End --------------- */\n\n");
         if self.use_drop && !drop_section.is_empty() {
             drop_section.push_str("\n/* ---> Enums: Drop section end --------------- */\n\n");
         }
