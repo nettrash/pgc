@@ -204,6 +204,9 @@ impl Comparer {
             .push_str("\n/* ---> User-defined types: Start section --------------- */\n\n");
 
         for to_type in &self.to.types {
+            if (to_type.typtype as u8 as char) == 'e' {
+                continue;
+            }
             if let Some(from_type) = self
                 .from
                 .types
@@ -233,6 +236,9 @@ impl Comparer {
 
         if self.use_drop {
             for from_type in &self.from.types {
+                if (from_type.typtype as u8 as char) == 'e' {
+                    continue;
+                }
                 if self
                     .to
                     .types
@@ -259,7 +265,69 @@ impl Comparer {
     // Comparing enums
     async fn compare_enums(&mut self) -> Result<(), Error> {
         self.script
-            .push_str("\n/* ---> Enums --------------- */\n\n");
+            .push_str("\n/* ---> Enums: Start section --------------- */\n\n");
+
+        let to_enums = self
+            .to
+            .types
+            .iter()
+            .filter(|t| (t.typtype as u8 as char) == 'e');
+
+        for to_enum in to_enums {
+            if let Some(from_enum) = self
+                .from
+                .types
+                .iter()
+                .find(|t| t.schema == to_enum.schema && t.typname == to_enum.typname)
+            {
+                if from_enum.hash() != to_enum.hash() {
+                    self.script.push_str(
+                        format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
+                    );
+                    let alter_script = from_enum.get_alter_script(to_enum);
+                    if alter_script.trim().is_empty() {
+                        self.script.push_str(
+                            "-- No supported alterations for this enum; manual review required.\n",
+                        );
+                    } else {
+                        self.script.push_str(alter_script.as_str());
+                    }
+                }
+            } else {
+                self.script.push_str(
+                    format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
+                );
+                self.script.push_str(to_enum.get_script().as_str());
+            }
+        }
+
+        if self.use_drop {
+            for from_enum in self
+                .from
+                .types
+                .iter()
+                .filter(|t| (t.typtype as u8 as char) == 'e')
+            {
+                if self
+                    .to
+                    .types
+                    .iter()
+                    .any(|t| t.schema == from_enum.schema && t.typname == from_enum.typname)
+                {
+                    continue;
+                }
+
+                self.script.push_str(
+                    format!("/* Enum: {}.{} */\n", from_enum.schema, from_enum.typname).as_str(),
+                );
+                self.script
+                    .push_str("/* Enum is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(from_enum.get_drop_script().as_str());
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> Enums: End section --------------- */\n\n");
         Ok(())
     }
 
