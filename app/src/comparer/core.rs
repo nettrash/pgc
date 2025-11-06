@@ -201,7 +201,58 @@ impl Comparer {
     // Comparing types
     async fn compare_types(&mut self) -> Result<(), Error> {
         self.script
-            .push_str("\n/* ---> User-defined types --------------- */\n\n");
+            .push_str("\n/* ---> User-defined types: Start section --------------- */\n\n");
+
+        for to_type in &self.to.types {
+            if let Some(from_type) = self
+                .from
+                .types
+                .iter()
+                .find(|t| t.schema == to_type.schema && t.typname == to_type.typname)
+            {
+                if from_type.hash() != to_type.hash() {
+                    self.script.push_str(
+                        format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
+                    );
+                    let alter_script = from_type.get_alter_script(to_type);
+                    if alter_script.trim().is_empty() {
+                        self.script.push_str(
+                            "-- No supported alterations for this type; manual review required.\n",
+                        );
+                    } else {
+                        self.script.push_str(alter_script.as_str());
+                    }
+                }
+            } else {
+                self.script.push_str(
+                    format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
+                );
+                self.script.push_str(to_type.get_script().as_str());
+            }
+        }
+
+        if self.use_drop {
+            for from_type in &self.from.types {
+                if self
+                    .to
+                    .types
+                    .iter()
+                    .any(|t| t.schema == from_type.schema && t.typname == from_type.typname)
+                {
+                    continue;
+                }
+
+                self.script.push_str(
+                    format!("/* Type: {}.{} */\n", from_type.schema, from_type.typname).as_str(),
+                );
+                self.script
+                    .push_str("/* Type is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(from_type.get_drop_script().as_str());
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> User-defined types: End section --------------- */\n\n");
         Ok(())
     }
 

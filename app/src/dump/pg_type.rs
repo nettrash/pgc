@@ -153,9 +153,10 @@ impl PgType {
                 let mut clauses = Vec::new();
 
                 if let Some(default) = &self.typdefault
-                    && !default.trim().is_empty() {
-                        clauses.push(format!("default {}", default));
-                    }
+                    && !default.trim().is_empty()
+                {
+                    clauses.push(format!("default {}", default));
+                }
 
                 if self.typnotnull {
                     clauses.push("not null".to_string());
