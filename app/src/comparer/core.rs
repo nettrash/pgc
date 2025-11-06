@@ -356,11 +356,19 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Views DROP: Start section --------------- */\n\n");
 
-        // We will drop all views that exists in "from" dump.
+        // Drop only views that also exist in the target dump to avoid interfering with table changes.
         for from_view in &self.from.views {
-            self.script
-                .push_str(format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str());
-            self.script.push_str(from_view.get_drop_script().as_str());
+            if self
+                .to
+                .views
+                .iter()
+                .any(|v| v.name == from_view.name && v.schema == from_view.schema)
+            {
+                self.script.push_str(
+                    format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
+                );
+                self.script.push_str(from_view.get_drop_script().as_str());
+            }
         }
 
         self.script
@@ -373,11 +381,23 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Views CREATE: Start section --------------- */\n\n");
 
-        // We will create all views that exists in "to" dump.
         for to_view in &self.to.views {
             self.script
                 .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
-            self.script.push_str(to_view.get_script().as_str());
+
+            let mut view_script = to_view.get_script();
+            if !view_script
+                .to_uppercase()
+                .contains("CREATE OR REPLACE VIEW")
+            {
+                if view_script.contains("CREATE VIEW") {
+                    view_script = view_script.replacen("CREATE VIEW", "CREATE OR REPLACE VIEW", 1);
+                } else if view_script.contains("create view") {
+                    view_script = view_script.replacen("create view", "create or replace view", 1);
+                }
+            }
+
+            self.script.push_str(&view_script);
         }
 
         self.script
