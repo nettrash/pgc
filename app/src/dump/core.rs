@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::types::Oid;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::io::{Error, Read};
@@ -187,6 +189,7 @@ impl Dump {
             format!(
                 "select 
                 n.nspname, 
+                t.oid as type_oid,
                 t.typname,
                 t.typnamespace,
                 t.typowner,
@@ -215,7 +218,8 @@ impl Dump {
                 t.typtypmod,
                 t.typndims,
                 t.typcollation,
-                t.typdefault
+                t.typdefault,
+                pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype
             from 
                 pg_type t 
                 join pg_namespace n on t.typnamespace = n.oid 
@@ -244,6 +248,7 @@ impl Dump {
             println!("User-defined types found:");
             for row in rows {
                 let pgtype = PgType {
+                    oid: row.get("type_oid"),
                     schema: row.get("nspname"),
                     typname: row.get("typname"),
                     typnamespace: row.get("typnamespace"),
@@ -274,6 +279,8 @@ impl Dump {
                     typndims: row.get("typndims"),
                     typcollation: row.get::<Option<Oid>, _>("typcollation"),
                     typdefault: row.get::<Option<String>, _>("typdefault"),
+                    formatted_basetype: row.get::<Option<String>, _>("formatted_basetype"),
+                    enum_labels: Vec::new(),
                 };
                 self.types.push(pgtype.clone());
                 println!(" - {} (namespace: {})", pgtype.typname, pgtype.schema);
@@ -309,6 +316,22 @@ impl Dump {
                     " - enumtypid {} (label: {})",
                     pgenum.enumtypid.0, pgenum.enumlabel
                 );
+            }
+
+            let mut labels_by_type: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
+            for enum_value in &self.enums {
+                labels_by_type
+                    .entry(enum_value.enumtypid.0)
+                    .or_default()
+                    .push((enum_value.enumsortorder, enum_value.enumlabel.clone()));
+            }
+
+            for (type_oid, mut labels) in labels_by_type {
+                labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
+                if let Some(pg_type) = self.types.iter_mut().find(|t| t.oid.0 == type_oid) {
+                    pg_type.enum_labels = labels.into_iter().map(|(_, label)| label).collect();
+                }
             }
         }
         Ok(())
