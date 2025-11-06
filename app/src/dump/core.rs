@@ -1,5 +1,5 @@
 use crate::dump::pg_enum::PgEnum;
-use crate::dump::pg_type::PgType;
+use crate::dump::pg_type::{DomainConstraint, PgType};
 use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::types::Oid;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::io::{Error, Read};
@@ -113,6 +115,7 @@ impl Dump {
         self.get_extensions(pool).await?;
         self.get_types(pool).await?;
         self.get_enums(pool).await?;
+        self.get_domain_constraints(pool).await?;
         self.get_sequences(pool).await?;
         self.get_routines(pool).await?;
         self.get_tables(pool).await?;
@@ -187,6 +190,7 @@ impl Dump {
             format!(
                 "select 
                 n.nspname, 
+                t.oid as type_oid,
                 t.typname,
                 t.typnamespace,
                 t.typowner,
@@ -215,14 +219,14 @@ impl Dump {
                 t.typtypmod,
                 t.typndims,
                 t.typcollation,
-                t.typdefault
+                t.typdefault,
+                pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype
             from 
                 pg_type t 
                 join pg_namespace n on t.typnamespace = n.oid 
             where 
                 n.nspname like '{}' 
                 and t.typtype in ('d', 'e', 'r', 'm') 
-                and t.typcategory = 'U'
                 and t.typisdefined = true",
                 self.configuration.scheme
             )
@@ -244,6 +248,7 @@ impl Dump {
             println!("User-defined types found:");
             for row in rows {
                 let pgtype = PgType {
+                    oid: row.get("type_oid"),
                     schema: row.get("nspname"),
                     typname: row.get("typname"),
                     typnamespace: row.get("typnamespace"),
@@ -274,6 +279,9 @@ impl Dump {
                     typndims: row.get("typndims"),
                     typcollation: row.get::<Option<Oid>, _>("typcollation"),
                     typdefault: row.get::<Option<String>, _>("typdefault"),
+                    formatted_basetype: row.get::<Option<String>, _>("formatted_basetype"),
+                    enum_labels: Vec::new(),
+                    domain_constraints: Vec::new(),
                 };
                 self.types.push(pgtype.clone());
                 println!(" - {} (namespace: {})", pgtype.typname, pgtype.schema);
@@ -310,7 +318,78 @@ impl Dump {
                     pgenum.enumtypid.0, pgenum.enumlabel
                 );
             }
+
+            let mut labels_by_type: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
+            for enum_value in &self.enums {
+                labels_by_type
+                    .entry(enum_value.enumtypid.0)
+                    .or_default()
+                    .push((enum_value.enumsortorder, enum_value.enumlabel.clone()));
+            }
+
+            for (type_oid, mut labels) in labels_by_type {
+                labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
+                if let Some(pg_type) = self.types.iter_mut().find(|t| t.oid.0 == type_oid) {
+                    pg_type.enum_labels = labels.into_iter().map(|(_, label)| label).collect();
+                }
+            }
         }
+        Ok(())
+    }
+
+    async fn get_domain_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let query = format!(
+            "select
+                c.contypid as domain_oid,
+                c.conname,
+                pg_get_constraintdef(c.oid) as definition
+            from pg_constraint c
+            join pg_type t on t.oid = c.contypid
+            join pg_namespace n on n.oid = t.typnamespace
+            where c.contype = 'c'
+              and c.contypid <> 0
+              and n.nspname like '{}'
+            order by c.contypid, c.conname",
+            self.configuration.scheme
+        );
+
+        let result = sqlx::query(query.as_str()).fetch_all(pool).await;
+        if result.is_err() {
+            return Err(Error::other(format!(
+                "Failed to fetch domain constraints: {}.",
+                result.err().unwrap()
+            )));
+        }
+        let rows = result.unwrap();
+
+        if rows.is_empty() {
+            println!("No domain constraints found.");
+        } else {
+            println!("Domain constraints found:");
+        }
+
+        let mut constraints_by_type: HashMap<u32, Vec<DomainConstraint>> = HashMap::new();
+        for row in rows {
+            let type_oid: Oid = row.get("domain_oid");
+            let constraint = DomainConstraint {
+                name: row.get("conname"),
+                definition: row.get("definition"),
+            };
+            constraints_by_type
+                .entry(type_oid.0)
+                .or_default()
+                .push(constraint.clone());
+            println!(" - {} on type {}", constraint.name, type_oid.0);
+        }
+
+        for pg_type in &mut self.types {
+            if let Some(mut constraints) = constraints_by_type.remove(&pg_type.oid.0) {
+                constraints.sort_by(|a, b| a.name.cmp(&b.name));
+                pg_type.domain_constraints = constraints;
+            }
+        }
+
         Ok(())
     }
 

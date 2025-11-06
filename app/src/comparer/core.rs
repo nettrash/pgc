@@ -17,6 +17,8 @@ pub struct Comparer {
 
     // The script that will be generated
     script: String,
+    enum_pre_script: String,
+    enum_post_script: String,
 }
 
 impl Comparer {
@@ -27,6 +29,8 @@ impl Comparer {
             to,
             use_drop,
             script: String::new(),
+            enum_pre_script: String::new(),
+            enum_post_script: String::new(),
         };
 
         comparer.script.push_str("/*\n");
@@ -50,8 +54,16 @@ impl Comparer {
     pub async fn compare(&mut self) -> Result<(), Error> {
         self.compare_schemas().await?;
         self.compare_extensions().await?;
-        self.compare_types().await?;
         self.compare_enums().await?;
+        if !self.enum_pre_script.is_empty() {
+            self.script.push_str(&self.enum_pre_script);
+            self.enum_pre_script.clear();
+        }
+        self.compare_types().await?;
+        if !self.enum_post_script.is_empty() {
+            self.script.push_str(&self.enum_post_script);
+            self.enum_post_script.clear();
+        }
         self.compare_sequences().await?;
         self.drop_views().await?;
         self.compare_tables().await?;
@@ -201,14 +213,149 @@ impl Comparer {
     // Comparing types
     async fn compare_types(&mut self) -> Result<(), Error> {
         self.script
-            .push_str("\n/* ---> User-defined types --------------- */\n\n");
+            .push_str("\n/* ---> User-defined types: Start --------------- */\n\n");
+
+        for to_type in &self.to.types {
+            if (to_type.typtype as u8 as char) == 'e' {
+                continue;
+            }
+            if let Some(from_type) = self
+                .from
+                .types
+                .iter()
+                .find(|t| t.schema == to_type.schema && t.typname == to_type.typname)
+            {
+                if from_type.hash() != to_type.hash() {
+                    self.script.push_str(
+                        format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
+                    );
+                    let alter_script = from_type.get_alter_script(to_type);
+                    if alter_script.trim().is_empty() {
+                        self.script.push_str(
+                            "-- No supported alterations for this type; manual review required.\n",
+                        );
+                    } else {
+                        self.script.push_str(alter_script.as_str());
+                    }
+                }
+            } else {
+                self.script.push_str(
+                    format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
+                );
+                self.script.push_str(to_type.get_script().as_str());
+            }
+        }
+
+        if self.use_drop {
+            for from_type in &self.from.types {
+                if (from_type.typtype as u8 as char) == 'e' {
+                    continue;
+                }
+                if self
+                    .to
+                    .types
+                    .iter()
+                    .any(|t| t.schema == from_type.schema && t.typname == from_type.typname)
+                {
+                    continue;
+                }
+
+                self.script.push_str(
+                    format!("/* Type: {}.{} */\n", from_type.schema, from_type.typname).as_str(),
+                );
+                self.script
+                    .push_str("/* Type is not present in 'to' dump and should be dropped. */\n");
+                self.script.push_str(from_type.get_drop_script().as_str());
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> User-defined types: End --------------- */\n\n");
         Ok(())
     }
 
     // Comparing enums
     async fn compare_enums(&mut self) -> Result<(), Error> {
-        self.script
-            .push_str("\n/* ---> Enums --------------- */\n\n");
+        let mut create_alter_section = String::new();
+        create_alter_section.push_str("\n/* ---> Enums: Start --------------- */\n\n");
+
+        let mut drop_section = String::new();
+
+        let to_enums = self
+            .to
+            .types
+            .iter()
+            .filter(|t| (t.typtype as u8 as char) == 'e');
+
+        for to_enum in to_enums {
+            if let Some(from_enum) = self
+                .from
+                .types
+                .iter()
+                .find(|t| t.schema == to_enum.schema && t.typname == to_enum.typname)
+            {
+                if from_enum.hash() != to_enum.hash() {
+                    create_alter_section.push_str(
+                        format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
+                    );
+                    let alter_script = from_enum.get_alter_script(to_enum);
+                    if alter_script.trim().is_empty() {
+                        create_alter_section.push_str(
+                            "-- No supported alterations for this enum; manual review required.\n",
+                        );
+                    } else {
+                        create_alter_section.push_str(alter_script.as_str());
+                    }
+                }
+            } else {
+                create_alter_section.push_str(
+                    format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
+                );
+                create_alter_section.push_str(to_enum.get_script().as_str());
+            }
+        }
+
+        if self.use_drop {
+            for from_enum in self
+                .from
+                .types
+                .iter()
+                .filter(|t| (t.typtype as u8 as char) == 'e')
+            {
+                if self
+                    .to
+                    .types
+                    .iter()
+                    .any(|t| t.schema == from_enum.schema && t.typname == from_enum.typname)
+                {
+                    continue;
+                }
+
+                if drop_section.is_empty() {
+                    drop_section.push_str(
+                        "\n/* ---> Enums: Drop section (execute after dependent types) --------------- */\n\n",
+                    );
+                }
+                drop_section.push_str(
+                    format!("/* Enum: {}.{} */\n", from_enum.schema, from_enum.typname).as_str(),
+                );
+                drop_section
+                    .push_str("/* Enum is not present in 'to' dump and should be dropped. */\n");
+                drop_section.push_str(from_enum.get_drop_script().as_str());
+            }
+        }
+
+        create_alter_section.push_str("\n/* ---> Enums: End --------------- */\n\n");
+        if self.use_drop && !drop_section.is_empty() {
+            drop_section.push_str("\n/* ---> Enums: Drop section end --------------- */\n\n");
+        }
+
+        if !create_alter_section.trim().is_empty() {
+            self.enum_pre_script.push_str(&create_alter_section);
+        }
+        if self.use_drop && !drop_section.is_empty() {
+            self.enum_post_script.push_str(&drop_section);
+        }
         Ok(())
     }
 
