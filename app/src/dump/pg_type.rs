@@ -128,17 +128,17 @@ impl PgType {
             hasher.update(value.as_bytes());
         });
 
-        hasher.update((self.enum_labels.len() as u32).to_le_bytes());
+        hasher.update((self.enum_labels.len() as u32).to_be_bytes());
         for label in &self.enum_labels {
-            hasher.update((label.len() as u32).to_le_bytes());
+            hasher.update((label.len() as u32).to_be_bytes());
             hasher.update(label.as_bytes());
         }
 
-        hasher.update((self.domain_constraints.len() as u32).to_le_bytes());
+        hasher.update((self.domain_constraints.len() as u32).to_be_bytes());
         for constraint in &self.domain_constraints {
-            hasher.update((constraint.name.len() as u32).to_le_bytes());
+            hasher.update((constraint.name.len() as u32).to_be_bytes());
             hasher.update(constraint.name.as_bytes());
-            hasher.update((constraint.definition.len() as u32).to_le_bytes());
+            hasher.update((constraint.definition.len() as u32).to_be_bytes());
             hasher.update(constraint.definition.as_bytes());
         }
 
