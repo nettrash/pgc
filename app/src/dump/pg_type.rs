@@ -60,7 +60,10 @@ pub struct PgType {
 }
 
 impl PgType {
-    /// Hash
+    /// Computes a SHA256 hash of the type definition.
+    ///
+    /// This hash can be used for change detection, caching, or verifying the integrity
+    /// of the type's metadata. It includes all relevant fields of the `PgType` struct.
     pub fn hash(&self) -> String {
         let mut hasher = Sha256::new();
 
