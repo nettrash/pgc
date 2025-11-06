@@ -433,10 +433,11 @@ impl Comparer {
                 .to_uppercase()
                 .contains("CREATE OR REPLACE VIEW")
             {
-                if view_script.contains("CREATE VIEW") {
-                    view_script = view_script.replacen("CREATE VIEW", "CREATE OR REPLACE VIEW", 1);
-                } else if view_script.contains("create view") {
-                    view_script = view_script.replacen("create view", "create or replace view", 1);
+                const TARGET: &str = "create view";
+                const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
+
+                if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
+                    view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
                 }
             }
 
