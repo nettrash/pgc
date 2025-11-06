@@ -270,7 +270,7 @@ impl Comparer {
         }
 
         self.script
-            .push_str("\n/* ---> User-defined types: End section --------------- */\n\n");
+            .push_str("\n/* ---> User-defined types: End --------------- */\n\n");
         Ok(())
     }
 
