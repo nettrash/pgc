@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::types::Oid;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainConstraint {
+    pub name: String,
+    pub definition: String,
+}
+
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
 
 fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
@@ -44,6 +55,8 @@ pub struct PgType {
     pub formatted_basetype: Option<String>, // Human-readable base type (for domains)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enum_labels: Vec<String>, // Enum labels ordered by sort order
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_constraints: Vec<DomainConstraint>, // Domain constraints (check, etc.)
 }
 
 impl PgType {
@@ -121,6 +134,14 @@ impl PgType {
             hasher.update(label.as_bytes());
         }
 
+        hasher.update((self.domain_constraints.len() as u32).to_le_bytes());
+        for constraint in &self.domain_constraints {
+            hasher.update((constraint.name.len() as u32).to_le_bytes());
+            hasher.update(constraint.name.as_bytes());
+            hasher.update((constraint.definition.len() as u32).to_le_bytes());
+            hasher.update(constraint.definition.as_bytes());
+        }
+
         format!("{:x}", hasher.finalize())
     }
 
@@ -173,6 +194,16 @@ impl PgType {
                 }
 
                 script.push_str(";\n");
+
+                for constraint in &self.domain_constraints {
+                    script.push_str(&format!(
+                        "alter domain {}.{} add constraint {} {};\n",
+                        self.schema,
+                        self.typname,
+                        quote_ident(&constraint.name),
+                        constraint.definition
+                    ));
+                }
                 script
             }
             'r' => format!(
@@ -311,6 +342,65 @@ impl PgType {
                     }
                 }
 
+                let current_constraints: BTreeMap<_, _> = self
+                    .domain_constraints
+                    .iter()
+                    .map(|constraint| (constraint.name.as_str(), constraint))
+                    .collect();
+                let target_constraints: BTreeMap<_, _> = target
+                    .domain_constraints
+                    .iter()
+                    .map(|constraint| (constraint.name.as_str(), constraint))
+                    .collect();
+                let mut replaced_or_added = BTreeSet::new();
+
+                for (name, current_constraint) in &current_constraints {
+                    match target_constraints.get(name) {
+                        Some(target_constraint) => {
+                            if current_constraint.definition != target_constraint.definition {
+                                statements.push(format!(
+                                    "alter domain {}.{} drop constraint {};",
+                                    self.schema,
+                                    self.typname,
+                                    quote_ident(name)
+                                ));
+                                statements.push(format!(
+                                    "alter domain {}.{} add constraint {} {};",
+                                    self.schema,
+                                    self.typname,
+                                    quote_ident(name),
+                                    target_constraint.definition
+                                ));
+                                replaced_or_added.insert((*name).to_string());
+                            }
+                        }
+                        None => {
+                            statements.push(format!(
+                                "alter domain {}.{} drop constraint {};",
+                                self.schema,
+                                self.typname,
+                                quote_ident(name)
+                            ));
+                        }
+                    }
+                }
+
+                for (name, target_constraint) in &target_constraints {
+                    if replaced_or_added.contains(*name) {
+                        continue;
+                    }
+
+                    if !current_constraints.contains_key(name) {
+                        statements.push(format!(
+                            "alter domain {}.{} add constraint {} {};",
+                            self.schema,
+                            self.typname,
+                            quote_ident(name),
+                            target_constraint.definition
+                        ));
+                    }
+                }
+
                 if statements.is_empty() {
                     format!(
                         "-- Domain {}.{} requires no supported changes.\n",
@@ -393,6 +483,7 @@ mod tests {
             typdefault: Some("default".to_string()),
             formatted_basetype: None,
             enum_labels: Vec::new(),
+            domain_constraints: Vec::new(),
         }
     }
 
@@ -458,6 +549,28 @@ mod tests {
     }
 
     #[test]
+    fn domain_type_get_script_includes_constraints() {
+        let mut pg_type = sample_pg_type();
+        pg_type.schema = "public".to_string();
+        pg_type.typname = "positive_integer".to_string();
+        pg_type.typtype = b'd' as i8;
+        pg_type.formatted_basetype = Some("integer".to_string());
+        pg_type.typdefault = Some("0".to_string());
+        pg_type.typnotnull = true;
+        pg_type.domain_constraints = vec![DomainConstraint {
+            name: "positive_integer_check".to_string(),
+            definition: "CHECK ((VALUE >= 0))".to_string(),
+        }];
+
+        let script = pg_type.get_script();
+        assert_eq!(
+            script,
+            "create domain public.positive_integer as integer default 0 not null;\n".to_string()
+                + "alter domain public.positive_integer add constraint \"positive_integer_check\" CHECK ((VALUE >= 0));\n"
+        );
+    }
+
+    #[test]
     fn enum_type_get_alter_script_adds_new_label() {
         let mut current = sample_pg_type();
         current.schema = "public".to_string();
@@ -470,6 +583,41 @@ mod tests {
 
         let script = current.get_alter_script(&target);
         assert!(script.contains("add value if not exists 'pending'"));
+    }
+
+    #[test]
+    fn domain_type_get_alter_script_updates_constraints() {
+        let mut current = sample_pg_type();
+        current.schema = "public".to_string();
+        current.typname = "positive_integer".to_string();
+        current.typtype = b'd' as i8;
+        current.formatted_basetype = Some("integer".to_string());
+        current.typdefault = None;
+        current.typnotnull = false;
+        current.domain_constraints = vec![DomainConstraint {
+            name: "is_positive".to_string(),
+            definition: "CHECK ((VALUE > 0))".to_string(),
+        }];
+
+        let mut target = current.clone();
+        target.domain_constraints = vec![
+            DomainConstraint {
+                name: "is_positive".to_string(),
+                definition: "CHECK ((VALUE >= 0))".to_string(),
+            },
+            DomainConstraint {
+                name: "less_than_max".to_string(),
+                definition: "CHECK ((VALUE < 100))".to_string(),
+            },
+        ];
+
+        let script = current.get_alter_script(&target);
+        assert_eq!(
+            script,
+            "alter domain public.positive_integer drop constraint \"is_positive\";\n".to_string()
+                + "alter domain public.positive_integer add constraint \"is_positive\" CHECK ((VALUE >= 0));\n"
+                + "alter domain public.positive_integer add constraint \"less_than_max\" CHECK ((VALUE < 100));\n"
+        );
     }
 
     #[test]
