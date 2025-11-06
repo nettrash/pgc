@@ -226,7 +226,6 @@ impl Dump {
             where 
                 n.nspname like '{}' 
                 and t.typtype in ('d', 'e', 'r', 'm') 
-                and t.typcategory = 'U'
                 and t.typisdefined = true",
                 self.configuration.scheme
             )
