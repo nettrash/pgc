@@ -213,7 +213,7 @@ impl Comparer {
     // Comparing types
     async fn compare_types(&mut self) -> Result<(), Error> {
         self.script
-            .push_str("\n/* ---> User-defined types: Start section --------------- */\n\n");
+            .push_str("\n/* ---> User-defined types: Start --------------- */\n\n");
 
         for to_type in &self.to.types {
             if (to_type.typtype as u8 as char) == 'e' {
