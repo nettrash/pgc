@@ -277,7 +277,7 @@ impl Comparer {
     // Comparing enums
     async fn compare_enums(&mut self) -> Result<(), Error> {
         let mut create_alter_section = String::new();
-        create_alter_section.push_str("\n/* ---> Enums: Start section --------------- */\n\n");
+        create_alter_section.push_str("\n/* ---> Enums: Start --------------- */\n\n");
 
         let mut drop_section = String::new();
 
