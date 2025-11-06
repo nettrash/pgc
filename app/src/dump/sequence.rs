@@ -123,12 +123,6 @@ impl Sequence {
             script.push_str(" no cycle");
         }
 
-        /* Removed owned by clause from creation script
-        if let Some(owned_by) = self.render_owned_by_clause() {
-            script.push(' ');
-            script.push_str(&owned_by);
-        }*/
-
         script.push_str(";\n");
 
         script
@@ -674,7 +668,6 @@ mod tests {
         assert!(script.contains("maxvalue 1000"));
         assert!(script.contains("cache 50"));
         assert!(script.contains("cycle"));
-        //assert!(script.contains("owned by \"test-schema\".\"test$table\".\"Col\""));
 
         let drop_script = sequence.get_drop_script();
         assert!(drop_script.contains("test-schema.test_seq$name"));
