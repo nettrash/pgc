@@ -396,11 +396,16 @@ impl Comparer {
             let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
 
             if dependent_views.contains(&normalized_view)
-                && self
-                    .to
+                && (self
+                    .from
                     .views
                     .iter()
                     .any(|v| Self::normalized_view_key(&v.schema, &v.name) == normalized_view)
+                    || self
+                        .to
+                        .views
+                        .iter()
+                        .any(|v| Self::normalized_view_key(&v.schema, &v.name) == normalized_view))
             {
                 self.script.push_str(
                     format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
