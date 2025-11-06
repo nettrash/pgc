@@ -123,11 +123,6 @@ impl Sequence {
             script.push_str(" no cycle");
         }
 
-        if let Some(owned_by) = self.render_owned_by_clause() {
-            script.push(' ');
-            script.push_str(&owned_by);
-        }
-
         script.push_str(";\n");
 
         script
@@ -385,7 +380,7 @@ mod tests {
         let sequence = create_test_sequence();
         let script = sequence.get_script();
 
-        let expected = "create sequence public.test_seq start with 1 minvalue 1 maxvalue 9223372036854775807 no cycle owned by \"public\".\"test_table\".\"id\";\n";
+        let expected = "create sequence public.test_seq start with 1 minvalue 1 maxvalue 9223372036854775807 no cycle;\n";
         assert_eq!(script, expected);
     }
 
@@ -394,7 +389,7 @@ mod tests {
         let sequence = create_custom_sequence();
         let script = sequence.get_script();
 
-        let expected = "create sequence app.custom_seq as integer start with 100 increment by 5 minvalue 10 maxvalue 1000 cache 20 cycle owned by \"app\".\"orders\".\"custom_seq\";\n";
+        let expected = "create sequence app.custom_seq as integer start with 100 increment by 5 minvalue 10 maxvalue 1000 cache 20 cycle;\n";
         assert_eq!(script, expected);
     }
 
@@ -673,7 +668,6 @@ mod tests {
         assert!(script.contains("maxvalue 1000"));
         assert!(script.contains("cache 50"));
         assert!(script.contains("cycle"));
-        assert!(script.contains("owned by \"test-schema\".\"test$table\".\"Col\""));
 
         let drop_script = sequence.get_drop_script();
         assert!(drop_script.contains("test-schema.test_seq$name"));
