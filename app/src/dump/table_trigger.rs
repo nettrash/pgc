@@ -13,7 +13,6 @@ pub struct TableTrigger {
 impl TableTrigger {
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
-        hasher.update(self.oid.0.to_string().as_bytes());
         hasher.update(self.name.as_bytes());
         hasher.update(self.definition.as_bytes());
     }
@@ -29,7 +28,7 @@ impl TableTrigger {
 
 impl PartialEq for TableTrigger {
     fn eq(&self, other: &Self) -> bool {
-        self.oid == other.oid && self.name == other.name && self.definition == other.definition
+        self.name == other.name && self.definition == other.definition
     }
 }
 
@@ -141,10 +140,7 @@ mod tests {
     fn test_add_to_hasher_includes_all_fields() {
         let base_trigger = create_test_trigger();
 
-        // Test that changing each field affects the hash
-        let mut trigger_diff_oid = base_trigger.clone();
-        trigger_diff_oid.oid = Oid(99999);
-
+        // Test that changing name or definition affects the hash
         let mut trigger_diff_name = base_trigger.clone();
         trigger_diff_name.name = "different_name".to_string();
 
@@ -158,10 +154,6 @@ mod tests {
         base_trigger.add_to_hasher(&mut hasher_base);
         let hash_base = format!("{:x}", hasher_base.finalize());
 
-        let mut hasher_oid = Sha256::new();
-        trigger_diff_oid.add_to_hasher(&mut hasher_oid);
-        let hash_oid = format!("{:x}", hasher_oid.finalize());
-
         let mut hasher_name = Sha256::new();
         trigger_diff_name.add_to_hasher(&mut hasher_name);
         let hash_name = format!("{:x}", hasher_name.finalize());
@@ -171,11 +163,8 @@ mod tests {
         let hash_definition = format!("{:x}", hasher_definition.finalize());
 
         // All hashes should be different
-        assert_ne!(hash_base, hash_oid);
         assert_ne!(hash_base, hash_name);
         assert_ne!(hash_base, hash_definition);
-        assert_ne!(hash_oid, hash_name);
-        assert_ne!(hash_oid, hash_definition);
         assert_ne!(hash_name, hash_definition);
     }
 
@@ -239,16 +228,6 @@ mod tests {
 
         assert_eq!(trigger1, trigger2);
         assert!(trigger1.eq(&trigger2));
-    }
-
-    #[test]
-    fn test_partial_eq_different_oid() {
-        let trigger1 = create_test_trigger();
-        let mut trigger2 = create_test_trigger();
-        trigger2.oid = Oid(99999);
-
-        assert_ne!(trigger1, trigger2);
-        assert!(!trigger1.eq(&trigger2));
     }
 
     #[test]
@@ -415,7 +394,6 @@ mod tests {
 
         // Create the same hash as the implementation
         let mut hasher = Sha256::new();
-        hasher.update("1".as_bytes()); // oid.0.to_string()
         hasher.update("test".as_bytes()); // name
         hasher.update("definition".as_bytes()); // definition
 

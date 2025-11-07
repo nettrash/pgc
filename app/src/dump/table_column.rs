@@ -222,91 +222,30 @@ impl TableColumn {
 
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
-        hasher.update(self.schema.as_bytes());
-        hasher.update(self.table.as_bytes());
         hasher.update(self.name.as_bytes());
-        hasher.update(self.ordinal_position.to_string().as_bytes());
-        hasher.update(self.column_default.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.is_nullable.to_string().as_bytes());
         hasher.update(self.data_type.as_bytes());
-        hasher.update(
-            self.character_maximum_length
-                .unwrap_or(-1)
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(
-            self.character_octet_length
-                .unwrap_or(-1)
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.numeric_precision.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(
-            self.numeric_precision_radix
-                .unwrap_or(-1)
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.numeric_scale.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(self.datetime_precision.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(self.interval_type.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.interval_precision.unwrap_or(-1).to_string().as_bytes());
-        hasher.update(
-            self.character_set_catalog
-                .as_deref()
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        hasher.update(
-            self.character_set_schema
-                .as_deref()
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        hasher.update(self.character_set_name.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.collation_catalog.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.collation_schema.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.collation_name.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.domain_catalog.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.domain_schema.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.domain_name.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.udt_catalog.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.udt_schema.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.udt_name.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.scope_catalog.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.scope_schema.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.scope_name.as_deref().unwrap_or("").as_bytes());
-        hasher.update(
-            self.maximum_cardinality
-                .unwrap_or(-1)
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.dtd_identifier.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.is_self_referencing.to_string().as_bytes());
+        hasher.update(self.is_nullable.to_string().as_bytes());
+
+        if let Some(default) = &self.column_default {
+            hasher.update(default.as_bytes());
+        }
+        if let Some(len) = self.character_maximum_length {
+            hasher.update(len.to_string().as_bytes());
+        }
+        if let Some(precision) = self.numeric_precision {
+            hasher.update(precision.to_string().as_bytes());
+        }
+        if let Some(scale) = self.numeric_scale {
+            hasher.update(scale.to_string().as_bytes());
+        }
         hasher.update(self.is_identity.to_string().as_bytes());
-        hasher.update(self.identity_generation.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.identity_start.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.identity_increment.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.identity_maximum.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.identity_minimum.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.identity_cycle.to_string().as_bytes());
-        hasher.update(self.is_generated.as_bytes());
-        hasher.update(
-            self.generation_expression
-                .as_deref()
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        hasher.update(self.is_updatable.to_string().as_bytes());
-        hasher.update(
-            match &self.related_views {
-                Some(views) => views.join(","),
-                None => "".to_string(),
-            }
-            .as_bytes(),
-        );
+        if let Some(generation) = &self.identity_generation {
+            hasher.update(generation.as_bytes());
+        }
+        if let Some(expr) = &self.generation_expression {
+            hasher.update(expr.as_bytes());
+        }
+        // skip catalog/charset/related_views and other descriptive-only fields
     }
 
     /// Returns a string representation of the column
@@ -757,29 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn test_related_views_changes_hash() {
-        let column1 = create_test_column();
-        let mut column2 = create_test_column();
-
-        // No related views by default -> same hash
-        let mut h1 = Sha256::new();
-        column1.add_to_hasher(&mut h1);
-        let d1 = h1.finalize();
-
-        let mut h2 = Sha256::new();
-        column2.add_to_hasher(&mut h2);
-        let d2 = h2.finalize();
-        assert_eq!(d1, d2);
-
-        // Now set related views and verify hash changes
-        column2.related_views = Some(vec!["public.v_a".to_string(), "sales.v_b".to_string()]);
-        let mut h3 = Sha256::new();
-        column2.add_to_hasher(&mut h3);
-        let d3 = h3.finalize();
-        assert_ne!(format!("{d1:x}"), format!("{d3:x}"));
-    }
-
-    #[test]
     fn test_related_views_serde_roundtrip() {
         let mut column = create_test_column();
         column.related_views = Some(vec![
@@ -1156,7 +1072,7 @@ mod tests {
         // This is a known hash for the test data - if the hashing logic changes, this will fail
         assert_eq!(
             hash_hex,
-            "5b03561cda07a076a2e12112a1b205d7113f4335b61a65b7c03336ce4015b4e1"
+            "db78cc9acba9b94dc4dfd0bfebf0ba1a2bbf63fe7d1ef6d2b1a8291e222d6484"
         );
     }
 

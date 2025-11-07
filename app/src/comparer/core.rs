@@ -19,6 +19,7 @@ pub struct Comparer {
     script: String,
     enum_pre_script: String,
     enum_post_script: String,
+    dropped_views: HashSet<String>,
 }
 
 impl Comparer {
@@ -31,6 +32,7 @@ impl Comparer {
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
+            dropped_views: HashSet::new(),
         };
 
         comparer.script.push_str("/*\n");
@@ -95,6 +97,21 @@ impl Comparer {
         let mut dependent_views = HashSet::new();
 
         for table in &self.from.tables {
+            let matching_table = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.schema == table.schema && t.name == table.name);
+
+            let will_be_dropped = matching_table.is_none() && self.use_drop;
+            let will_be_altered = matching_table
+                .map(|target| target.hash() != table.hash())
+                .unwrap_or(false);
+
+            if !will_be_dropped && !will_be_altered {
+                continue;
+            }
+
             for column in &table.columns {
                 if let Some(related_views) = &column.related_views {
                     for view_ref in related_views {
@@ -537,6 +554,7 @@ impl Comparer {
             .push_str("\n/* ---> Views DROP: Start section --------------- */\n\n");
 
         let dependent_views = self.dependent_view_keys();
+        self.dropped_views.clear();
 
         // Drop views that are referenced by table columns in the source dump and exist in the target dump.
         for from_view in &self.from.views {
@@ -547,6 +565,7 @@ impl Comparer {
                     format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
                 );
                 self.script.push_str(from_view.get_drop_script().as_str());
+                self.dropped_views.insert(normalized_view);
             }
         }
 
@@ -561,6 +580,17 @@ impl Comparer {
             .push_str("\n/* ---> Views CREATE: Start section --------------- */\n\n");
 
         for to_view in &self.to.views {
+            let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
+            let existed_in_from = self
+                .from
+                .views
+                .iter()
+                .any(|view| view.schema == to_view.schema && view.name == to_view.name);
+
+            if existed_in_from && !self.dropped_views.contains(&normalized_view) {
+                continue;
+            }
+
             self.script
                 .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
 

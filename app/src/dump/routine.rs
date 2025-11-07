@@ -27,20 +27,17 @@ pub struct Routine {
 impl Routine {
     /// Hash
     pub fn hash(&self) -> String {
-        format!(
-            "{:x}",
-            md5::compute(format!(
-                "{}.{}.{}.{}.{}.{}.{}.{}",
-                self.schema,
-                self.name,
-                self.lang,
-                self.kind,
-                self.return_type,
-                self.arguments,
-                self.arguments_defaults.as_deref().unwrap_or(""),
-                self.source_code
-            ))
-        )
+        let src = format!(
+            "{}.{}.{}.{}.{}.{}.{}",
+            self.schema,
+            self.name,
+            self.lang,
+            self.kind,
+            self.return_type,
+            self.arguments,
+            self.source_code
+        );
+        format!("{:x}", md5::compute(src))
     }
 
     /// Returns a string to create the routine.
@@ -217,10 +214,6 @@ mod tests {
 
         let mut test_routine = base_routine.clone();
         test_routine.arguments = "param1 text".to_string();
-        assert_ne!(base_routine.hash(), test_routine.hash());
-
-        let mut test_routine = base_routine.clone();
-        test_routine.arguments_defaults = None;
         assert_ne!(base_routine.hash(), test_routine.hash());
 
         let mut test_routine = base_routine.clone();
@@ -457,23 +450,22 @@ mod tests {
 
         // Create the same hash string as the implementation
         let hash_input = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}",
             routine.schema,
             routine.name,
             routine.lang,
             routine.kind,
             routine.return_type,
             routine.arguments,
-            routine.arguments_defaults.as_deref().unwrap_or(""),
             routine.source_code
         );
 
         let expected_hash = format!("{:x}", md5::compute(&hash_input));
         assert_eq!(routine.hash(), expected_hash);
 
-        // Verify the actual hash input string: schema.name.lang.kind.return_type.arguments.arguments_defaults.source_code
-        // With empty arguments and None arguments_defaults, we get: "test.func.sql.FUNCTION.void...SELECT 1;"
-        assert_eq!(hash_input, "test.func.sql.FUNCTION.void...SELECT 1;");
+        // Verify the actual hash input string: schema.name.lang.kind.return_type.arguments.source_code
+        // With empty arguments, we get: "test.func.sql.FUNCTION.void..SELECT 1;"
+        assert_eq!(hash_input, "test.func.sql.FUNCTION.void..SELECT 1;");
     }
 
     #[test]

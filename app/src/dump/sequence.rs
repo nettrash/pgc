@@ -45,10 +45,6 @@ impl Sequence {
             hasher.update(cache_size.to_string().as_bytes());
         }
 
-        hasher.update(self.owned_by_schema.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.owned_by_table.as_deref().unwrap_or("").as_bytes());
-        hasher.update(self.owned_by_column.as_deref().unwrap_or("").as_bytes());
-
         format!("{:x}", hasher.finalize())
     }
 
@@ -360,18 +356,6 @@ mod tests {
 
         let mut test_sequence = base_sequence.clone();
         test_sequence.cache_size = Some(20);
-        assert_ne!(base_sequence.hash(), test_sequence.hash());
-
-        let mut test_sequence = base_sequence.clone();
-        test_sequence.owned_by_schema = Some("different_schema".to_string());
-        assert_ne!(base_sequence.hash(), test_sequence.hash());
-
-        let mut test_sequence = base_sequence.clone();
-        test_sequence.owned_by_table = Some("different_table".to_string());
-        assert_ne!(base_sequence.hash(), test_sequence.hash());
-
-        let mut test_sequence = base_sequence.clone();
-        test_sequence.owned_by_column = Some("different_column".to_string());
         assert_ne!(base_sequence.hash(), test_sequence.hash());
     }
 
