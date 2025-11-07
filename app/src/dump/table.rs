@@ -411,28 +411,36 @@ impl Table {
     }
 
     pub fn get_alter_script(&self, to_table: &Table) -> String {
-        let mut script = String::new();
+        let mut constraint_pre_script = String::new();
+        let mut column_alter_script = String::new();
+        let mut column_drop_script = String::new();
+        let mut constraint_post_script = String::new();
+        let mut index_script = String::new();
+        let mut trigger_script = String::new();
+        let mut index_drop_script = String::new();
+        let mut trigger_drop_script = String::new();
 
-        // 1. Columns - Check for new columns, altered columns, and dropped columns
+        // Collect column additions or alterations
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
                 if old_col != new_col
                     && let Some(alter_col_script) = new_col.get_alter_script(old_col)
                 {
-                    script.push_str(&alter_col_script);
+                    column_alter_script.push_str(&alter_col_script);
                 }
             } else {
-                script.push_str(&new_col.get_add_script());
+                column_alter_script.push_str(&new_col.get_add_script());
             }
         }
 
+        // Collect column drops separately so they happen after constraint drops
         for old_col in &self.columns {
             if !to_table.columns.iter().any(|c| c.name == old_col.name) {
-                script.push_str(&old_col.get_drop_script());
+                column_drop_script.push_str(&old_col.get_drop_script());
             }
         }
 
-        // 2. Constraints - Check for new constraints, altered constraints, and dropped constraints
+        // Collect constraint changes; drop statements run before column drops
         for new_constraint in &to_table.constraints {
             if let Some(old_constraint) = self
                 .constraints
@@ -440,81 +448,191 @@ impl Table {
                 .find(|c| c.name == new_constraint.name)
             {
                 if old_constraint != new_constraint {
-                    // Try to alter the constraint instead of dropping/recreating
                     if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
-                        script.push_str(&alter_script);
+                        constraint_post_script.push_str(&alter_script);
                     } else {
-                        // Drop and recreate the constraint
-                        script.push_str(&old_constraint.get_drop_script());
-                        script.push_str(&new_constraint.get_script());
+                        constraint_pre_script.push_str(&old_constraint.get_drop_script());
+                        constraint_post_script.push_str(&new_constraint.get_script());
                     }
                 }
             } else {
-                script.push_str(&new_constraint.get_script());
+                constraint_post_script.push_str(&new_constraint.get_script());
             }
         }
 
-        // Handle dropped constraints
         for old_constraint in &self.constraints {
             if !to_table
                 .constraints
                 .iter()
                 .any(|c| c.name == old_constraint.name)
             {
-                script.push_str(&old_constraint.get_drop_script());
+                constraint_pre_script.push_str(&old_constraint.get_drop_script());
             }
         }
 
-        // 3. Indexes - Check for new indexes, altered indexes, and dropped indexes
+        // Collect index updates
         for new_index in &to_table.indexes {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
-                    script.push_str(&format!(
+                    index_drop_script.push_str(&format!(
                         "drop index if exists {}.{};\n",
                         new_index.schema, new_index.name
                     ));
-                    script.push_str(&new_index.get_script());
+                    index_script.push_str(&new_index.get_script());
                 }
             } else {
-                script.push_str(&new_index.get_script());
+                index_script.push_str(&new_index.get_script());
             }
         }
 
-        // 4. Triggers - Check for new triggers, altered triggers, and dropped triggers
+        // Collect trigger updates
         for new_trigger in &to_table.triggers {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
-                    script.push_str(&format!(
+                    trigger_drop_script.push_str(&format!(
                         "drop trigger if exists {} on {}.{};\n",
                         old_trigger.name, self.schema, self.name
                     ));
-                    script.push_str(&new_trigger.get_script());
+                    trigger_script.push_str(&new_trigger.get_script());
                 }
             } else {
-                script.push_str(&new_trigger.get_script());
+                trigger_script.push_str(&new_trigger.get_script());
             }
         }
 
-        // Handle dropped indexes
         for old_index in &self.indexes {
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
-                script.push_str(&format!(
+                index_drop_script.push_str(&format!(
                     "drop index if exists {}.{};\n",
                     old_index.schema, old_index.name
                 ));
             }
         }
 
-        // Handle dropped triggers
         for old_trigger in &self.triggers {
             if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
-                script.push_str(&format!(
+                trigger_drop_script.push_str(&format!(
                     "drop trigger if exists {} on {}.{};\n",
                     old_trigger.name, self.schema, self.name
                 ));
             }
         }
 
+        let mut script = String::new();
+        script.push_str(&constraint_pre_script);
+        script.push_str(&column_alter_script);
+        script.push_str(&index_drop_script);
+        script.push_str(&trigger_drop_script);
+        script.push_str(&column_drop_script);
+        script.push_str(&constraint_post_script);
+        script.push_str(&index_script);
+        script.push_str(&trigger_script);
+
         script
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dump::{table_column::TableColumn, table_constraint::TableConstraint};
+
+    fn make_column(name: &str, ordinal: i32) -> TableColumn {
+        TableColumn {
+            catalog: "db".to_string(),
+            schema: "test_schema".to_string(),
+            table: "products".to_string(),
+            name: name.to_string(),
+            ordinal_position: ordinal,
+            column_default: None,
+            is_nullable: true,
+            data_type: "numeric".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: None,
+            numeric_precision_radix: None,
+            numeric_scale: None,
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        }
+    }
+
+    fn weight_constraint() -> TableConstraint {
+        TableConstraint {
+            catalog: "db".to_string(),
+            schema: "test_schema".to_string(),
+            name: "chk_products_weight_positive".to_string(),
+            table_name: "products".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK ((weight > 0))".to_string()),
+        }
+    }
+
+    fn base_table() -> Table {
+        Table {
+            schema: "test_schema".to_string(),
+            name: "products".to_string(),
+            owner: "owner".to_string(),
+            space: None,
+            has_indexes: false,
+            has_triggers: false,
+            has_rules: false,
+            has_rowsecurity: false,
+            columns: vec![make_column("id", 1), make_column("weight", 2)],
+            constraints: vec![weight_constraint()],
+            indexes: Vec::new(),
+            triggers: Vec::new(),
+            definition: None,
+        }
+    }
+
+    #[test]
+    fn constraint_drops_before_column_removal() {
+        let from_table = base_table();
+        let mut to_table = base_table();
+        to_table.columns.retain(|c| c.name != "weight");
+        to_table.constraints.clear();
+
+        let alter_script = from_table.get_alter_script(&to_table);
+        let constraint_pos = alter_script
+            .find("drop constraint \"chk_products_weight_positive\"")
+            .expect("drop constraint statement present");
+        let column_pos = alter_script
+            .find("drop column \"weight\"")
+            .expect("drop column statement present");
+
+        assert!(constraint_pos < column_pos);
     }
 }
