@@ -140,7 +140,7 @@ mod tests {
     fn test_add_to_hasher_includes_all_fields() {
         let base_trigger = create_test_trigger();
 
-        // Test that changing each field affects the hash
+        // Test that changing name or definition affects the hash
         let mut trigger_diff_name = base_trigger.clone();
         trigger_diff_name.name = "different_name".to_string();
 
