@@ -17,9 +17,6 @@ impl TableIndex {
         hasher.update(self.schema.as_bytes());
         hasher.update(self.table.as_bytes());
         hasher.update(self.name.as_bytes());
-        if let Some(catalog) = &self.catalog {
-            hasher.update(catalog.as_bytes());
-        }
         hasher.update(self.indexdef.as_bytes());
     }
 
@@ -181,9 +178,6 @@ mod tests {
         let mut index_diff_name = base_index.clone();
         index_diff_name.name = "different_name".to_string();
 
-        let mut index_diff_catalog = base_index.clone();
-        index_diff_catalog.catalog = Some("different_catalog".to_string());
-
         let mut index_diff_definition = base_index.clone();
         index_diff_definition.indexdef =
             "CREATE INDEX different_idx ON public.users (username)".to_string();
@@ -205,10 +199,6 @@ mod tests {
         index_diff_name.add_to_hasher(&mut hasher_name);
         let hash_name = format!("{:x}", hasher_name.finalize());
 
-        let mut hasher_catalog = Sha256::new();
-        index_diff_catalog.add_to_hasher(&mut hasher_catalog);
-        let hash_catalog = format!("{:x}", hasher_catalog.finalize());
-
         let mut hasher_definition = Sha256::new();
         index_diff_definition.add_to_hasher(&mut hasher_definition);
         let hash_definition = format!("{:x}", hasher_definition.finalize());
@@ -217,7 +207,6 @@ mod tests {
         assert_ne!(hash_base, hash_schema);
         assert_ne!(hash_base, hash_table);
         assert_ne!(hash_base, hash_name);
-        assert_ne!(hash_base, hash_catalog);
         assert_ne!(hash_base, hash_definition);
     }
 
@@ -570,7 +559,6 @@ mod tests {
         hasher.update("test".as_bytes()); // schema
         hasher.update("table".as_bytes()); // table
         hasher.update("idx".as_bytes()); // name
-        hasher.update("cat".as_bytes()); // catalog (Some)
         hasher.update("definition".as_bytes()); // indexdef
 
         let expected_hash = format!("{:x}", hasher.finalize());
