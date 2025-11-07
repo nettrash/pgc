@@ -521,12 +521,12 @@ impl Table {
         let mut script = String::new();
         script.push_str(&constraint_pre_script);
         script.push_str(&column_alter_script);
+        script.push_str(&index_drop_script);
+        script.push_str(&trigger_drop_script);
         script.push_str(&column_drop_script);
         script.push_str(&constraint_post_script);
         script.push_str(&index_script);
         script.push_str(&trigger_script);
-        script.push_str(&index_drop_script);
-        script.push_str(&trigger_drop_script);
 
         script
     }
