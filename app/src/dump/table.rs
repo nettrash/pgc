@@ -307,8 +307,6 @@ impl Table {
             trigger.add_to_hasher(&mut hasher);
         }
 
-        hasher.update(self.definition.as_deref().unwrap_or("").as_bytes());
-
         format!("{:x}", hasher.finalize())
     }
 
