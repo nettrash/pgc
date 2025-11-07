@@ -474,7 +474,7 @@ impl Table {
         for new_index in &to_table.indexes {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
-                    index_script.push_str(&format!(
+                    index_drop_script.push_str(&format!(
                         "drop index if exists {}.{};\n",
                         new_index.schema, new_index.name
                     ));
