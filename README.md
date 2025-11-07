@@ -63,6 +63,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--use_ssl` - specify this argument to use SSL for PostgreSQL connection.
 
+`--use-drop` - specify this argument if you want to use DROPs in output script, otherwise no DROPs will be used.
+
 ## Functionality
 
 ### Create database schema dump
@@ -110,4 +112,7 @@ TO_DUMP=to.dump
 
 # OUTPUT
 OUTPUT=delta.sql
+
+# ADDITIONAL PROPERTIES
+USE_DROP=true
 ```
