@@ -105,8 +105,8 @@ impl Table {
                             AND a.attname = c.column_name
                             AND a.attnum > 0
                             AND a.attisdropped = false
-                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
-                         ORDER BY c.ordinal_position",
+                        WHERE c.table_schema = '{}' AND c.table_name = '{}'
+                        ORDER BY c.table_schema, c.table_name, c.ordinal_position",
                         self.schema, self.name
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -160,11 +160,19 @@ impl Table {
                     is_updatable: row.get::<&str, _>("is_updatable") == "YES", // Convert to boolean
                     related_views: row
                         .get::<Option<String>, _>("related_views")
-                        .map(|s| s.split(',').map(|v| v.trim().to_string()).collect()),
+                        .map(|s| {
+                            let mut views: Vec<String> =
+                                s.split(',').map(|v| v.trim().to_string()).collect();
+                            views.sort_unstable();
+                            views
+                        }),
                 };
 
                 self.columns.push(table_column.clone());
             }
+
+            self.columns
+                .sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
         }
 
         Ok(())
@@ -173,7 +181,7 @@ impl Table {
     /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique",
+            "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique ORDER BY i.schemaname, i.tablename, i.indexname",
             self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -190,6 +198,8 @@ impl Table {
 
                 self.indexes.push(table_index.clone());
             }
+
+            self.indexes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
 
         Ok(())
@@ -227,7 +237,7 @@ impl Table {
     /// Fill information about triggers.
     async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}.{}'::regclass and tgisinternal = false",
+            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}.{}'::regclass and tgisinternal = false ORDER BY tgname",
             self.schema, self.name
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -242,6 +252,8 @@ impl Table {
 
                 self.triggers.push(table_trigger.clone());
             }
+
+            self.triggers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
 
         Ok(())
@@ -274,10 +286,6 @@ impl Table {
         let mut hasher = Sha256::new();
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
-        hasher.update(self.owner.as_bytes());
-        if let Some(space) = &self.space {
-            hasher.update(space.as_bytes());
-        }
         hasher.update(self.has_indexes.to_string().as_bytes());
         hasher.update(self.has_triggers.to_string().as_bytes());
         hasher.update(self.has_rules.to_string().as_bytes());

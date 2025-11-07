@@ -17,9 +17,6 @@ impl TableIndex {
         hasher.update(self.schema.as_bytes());
         hasher.update(self.table.as_bytes());
         hasher.update(self.name.as_bytes());
-        if let Some(catalog) = &self.catalog {
-            hasher.update(catalog.as_bytes());
-        }
         hasher.update(self.indexdef.as_bytes());
     }
 
