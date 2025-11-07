@@ -463,8 +463,8 @@ mod tests {
         let expected_hash = format!("{:x}", md5::compute(&hash_input));
         assert_eq!(routine.hash(), expected_hash);
 
-        // Verify the actual hash input string: schema.name.lang.kind.return_type.arguments.arguments_defaults.source_code
-        // With empty arguments and None arguments_defaults, we get: "test.func.sql.FUNCTION.void...SELECT 1;"
+        // Verify the actual hash input string: schema.name.lang.kind.return_type.arguments.source_code
+        // With empty arguments, we get: "test.func.sql.FUNCTION.void..SELECT 1;"
         assert_eq!(hash_input, "test.func.sql.FUNCTION.void..SELECT 1;");
     }
 
