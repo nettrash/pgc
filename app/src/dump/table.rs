@@ -489,7 +489,7 @@ impl Table {
         for new_trigger in &to_table.triggers {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
-                    trigger_script.push_str(&format!(
+                    trigger_drop_script.push_str(&format!(
                         "drop trigger if exists {} on {}.{};\n",
                         old_trigger.name, self.schema, self.name
                     ));
