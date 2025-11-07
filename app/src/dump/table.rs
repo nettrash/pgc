@@ -158,14 +158,12 @@ impl Table {
                     is_generated: row.get("is_generated"),
                     generation_expression: row.get("generation_expression"),
                     is_updatable: row.get::<&str, _>("is_updatable") == "YES", // Convert to boolean
-                    related_views: row
-                        .get::<Option<String>, _>("related_views")
-                        .map(|s| {
-                            let mut views: Vec<String> =
-                                s.split(',').map(|v| v.trim().to_string()).collect();
-                            views.sort_unstable();
-                            views
-                        }),
+                    related_views: row.get::<Option<String>, _>("related_views").map(|s| {
+                        let mut views: Vec<String> =
+                            s.split(',').map(|v| v.trim().to_string()).collect();
+                        views.sort_unstable();
+                        views
+                    }),
                 };
 
                 self.columns.push(table_column.clone());
@@ -199,7 +197,8 @@ impl Table {
                 self.indexes.push(table_index.clone());
             }
 
-            self.indexes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            self.indexes
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
 
         Ok(())
@@ -253,7 +252,8 @@ impl Table {
                 self.triggers.push(table_trigger.clone());
             }
 
-            self.triggers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            self.triggers
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
 
         Ok(())
