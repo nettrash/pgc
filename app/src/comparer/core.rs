@@ -97,6 +97,21 @@ impl Comparer {
         let mut dependent_views = HashSet::new();
 
         for table in &self.from.tables {
+            let matching_table = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.schema == table.schema && t.name == table.name);
+
+            let will_be_dropped = matching_table.is_none() && self.use_drop;
+            let will_be_altered = matching_table
+                .map(|target| target.hash() != table.hash())
+                .unwrap_or(false);
+
+            if !will_be_dropped && !will_be_altered {
+                continue;
+            }
+
             for column in &table.columns {
                 if let Some(related_views) = &column.related_views {
                     for view_ref in related_views {
