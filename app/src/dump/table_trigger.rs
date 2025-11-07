@@ -29,7 +29,7 @@ impl TableTrigger {
 
 impl PartialEq for TableTrigger {
     fn eq(&self, other: &Self) -> bool {
-        self.oid == other.oid && self.name == other.name && self.definition == other.definition
+        self.name == other.name && self.definition == other.definition
     }
 }
 
@@ -239,16 +239,6 @@ mod tests {
 
         assert_eq!(trigger1, trigger2);
         assert!(trigger1.eq(&trigger2));
-    }
-
-    #[test]
-    fn test_partial_eq_different_oid() {
-        let trigger1 = create_test_trigger();
-        let mut trigger2 = create_test_trigger();
-        trigger2.oid = Oid(99999);
-
-        assert_ne!(trigger1, trigger2);
-        assert!(!trigger1.eq(&trigger2));
     }
 
     #[test]
