@@ -305,12 +305,32 @@ impl Comparer {
             .filter(|t| (t.typtype as u8 as char) == 'e');
 
         for to_enum in to_enums {
+            if to_enum.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping enum {}.{} due to missing hash. */\n",
+                        to_enum.schema, to_enum.typname
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_enum) = self
                 .from
                 .types
                 .iter()
                 .find(|t| t.schema == to_enum.schema && t.typname == to_enum.typname)
             {
+                if from_enum.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping enum {}.{} due to missing hash. */\n",
+                            from_enum.schema, from_enum.typname
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
                 if from_enum.hash != to_enum.hash {
                     create_alter_section.push_str(
                         format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
