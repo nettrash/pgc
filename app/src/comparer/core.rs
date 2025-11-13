@@ -242,7 +242,7 @@ impl Comparer {
                 .iter()
                 .find(|t| t.schema == to_type.schema && t.typname == to_type.typname)
             {
-                if from_type.hash() != to_type.hash() {
+                if from_type.hash != to_type.hash {
                     self.script.push_str(
                         format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
                     );
@@ -311,7 +311,7 @@ impl Comparer {
                 .iter()
                 .find(|t| t.schema == to_enum.schema && t.typname == to_enum.typname)
             {
-                if from_enum.hash() != to_enum.hash() {
+                if from_enum.hash != to_enum.hash {
                     create_alter_section.push_str(
                         format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
                     );

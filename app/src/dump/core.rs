@@ -247,7 +247,7 @@ impl Dump {
         } else {
             println!("User-defined types found:");
             for row in rows {
-                let pgtype = PgType {
+                let mut pgtype = PgType {
                     oid: row.get("type_oid"),
                     schema: row.get("nspname"),
                     typname: row.get("typname"),
@@ -282,9 +282,16 @@ impl Dump {
                     formatted_basetype: row.get::<Option<String>, _>("formatted_basetype"),
                     enum_labels: Vec::new(),
                     domain_constraints: Vec::new(),
+                    hash: None,
                 };
+                pgtype.hash();
                 self.types.push(pgtype.clone());
-                println!(" - {} (namespace: {})", pgtype.typname, pgtype.schema);
+                println!(
+                    " - {} (namespace: {}, hash: {})",
+                    pgtype.typname,
+                    pgtype.schema,
+                    pgtype.hash.as_ref().unwrap()
+                );
             }
         }
         Ok(())
