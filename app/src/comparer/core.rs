@@ -405,13 +405,33 @@ impl Comparer {
         // and we will find all existing sequences in both dumps with different hashes
         // and add them to the script.
         for sequence in &self.to.sequences {
+            if sequence.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping sequence {}.{} due to missing hash. */\n",
+                        sequence.schema, sequence.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_sequence) = self
                 .from
                 .sequences
                 .iter()
                 .find(|s| s.name == sequence.name && s.schema == sequence.schema)
             {
-                if from_sequence.hash() != sequence.hash() {
+                if from_sequence.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping sequence {}.{} due to missing hash. */\n",
+                            from_sequence.schema, from_sequence.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_sequence.hash != sequence.hash {
                     self.script.push_str(
                         format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                     );

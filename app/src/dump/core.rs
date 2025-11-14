@@ -290,7 +290,7 @@ impl Dump {
                     " - {} (namespace: {}, hash: {})",
                     pgtype.typname,
                     pgtype.schema,
-                    pgtype.hash.as_ref().unwrap()
+                    pgtype.hash.as_deref().unwrap_or("None")
                 );
             }
         }
@@ -453,7 +453,7 @@ impl Dump {
         } else {
             println!("Sequences found:");
             for row in rows {
-                let seq = Sequence {
+                let mut seq = Sequence {
                     schema: row.get("schemaname"),
                     name: row.get("sequencename"),
                     owner: row.get("sequenceowner"),
@@ -468,9 +468,16 @@ impl Dump {
                     owned_by_schema: row.get::<Option<String>, _>("owned_by_schema"),
                     owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
                     owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
+                    hash: None,
                 };
+                seq.hash();
                 self.sequences.push(seq.clone());
-                println!(" - name {} (type: {})", seq.name, seq.data_type);
+                println!(
+                    " - name {} (type: {}, hash: {})",
+                    seq.name,
+                    seq.data_type,
+                    seq.hash.as_deref().unwrap_or("None")
+                );
             }
         }
 
@@ -542,7 +549,7 @@ impl Dump {
                     routine.name,
                     routine.lang,
                     routine.arguments,
-                    routine.hash.as_ref().unwrap()
+                    routine.hash.as_deref().unwrap_or("None")
                 );
             }
         }
