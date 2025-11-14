@@ -601,14 +601,21 @@ impl Dump {
                     indexes: Vec::new(),
                     triggers: Vec::new(),
                     definition: None,
+                    hash: None,
                 };
                 table.fill(pool).await.map_err(|e| {
                     Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
 
+                table.hash();
                 self.tables.push(table.clone());
 
-                println!(" - {}.{}", table.schema, table.name);
+                println!(
+                    " - {}.{} (hash: {})",
+                    table.schema,
+                    table.name,
+                    table.hash.as_deref().unwrap_or("None")
+                );
             }
         }
         Ok(())

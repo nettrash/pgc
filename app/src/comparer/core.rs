@@ -105,7 +105,9 @@ impl Comparer {
 
             let will_be_dropped = matching_table.is_none() && self.use_drop;
             let will_be_altered = matching_table
-                .map(|target| target.hash() != table.hash())
+                .map(|target| {
+                    target.hash.is_some() && table.hash.is_some() && target.hash != table.hash
+                })
                 .unwrap_or(false);
 
             if !will_be_dropped && !will_be_altered {
@@ -568,13 +570,33 @@ impl Comparer {
         // We will find all new tables from "to" dump that are not in "from" dump
         // and add them to the script.
         for table in &self.to.tables {
+            if table.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping table {}.{} due to missing hash. */\n",
+                        table.schema, table.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_table) = self
                 .from
                 .tables
                 .iter()
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
-                if from_table.hash() != table.hash() {
+                if from_table.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping table {}.{} due to missing hash. */\n",
+                            from_table.schema, from_table.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_table.hash != table.hash {
                     // Just create an alter script for the table
                     // Will be added in next comparision (below)
                 }
@@ -586,13 +608,33 @@ impl Comparer {
         }
         // We will find all existing tables in both dumps with different hashes
         for table in &self.from.tables {
+            if table.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping table {}.{} due to missing hash. */\n",
+                        table.schema, table.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(to_table) = self
                 .to
                 .tables
                 .iter()
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
-                if to_table.hash() != table.hash() {
+                if to_table.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping table {}.{} due to missing hash. */\n",
+                            to_table.schema, to_table.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if to_table.hash != table.hash {
                     self.script.push_str(
                         format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
                     );
