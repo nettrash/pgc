@@ -5,17 +5,17 @@ use serde::{Deserialize, Serialize};
 pub struct Schema {
     /// Name of the schema
     pub name: String,
+    /// Hash of the schema
+    pub hash: Option<String>,
 }
 
 impl Schema {
     /// Creates a new Schema with the given name
     pub fn new(name: String) -> Self {
-        Self { name }
-    }
-
-    /// Hash
-    pub fn hash(&self) -> String {
-        format!("{:x}", md5::compute(&self.name))
+        Self {
+            name: name.clone(),
+            hash: Some(format!("{:x}", md5::compute(&name))),
+        }
     }
 
     /// Returns a string to create the schema.
@@ -34,34 +34,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_schema_new() {
-        let s = Schema::new("public".to_string());
-        assert_eq!(s.name, "public");
+    fn test_schema_new_sets_fields() {
+        let name = "public".to_string();
+        let schema = Schema::new(name.clone());
+
+        assert_eq!(schema.name, name);
+        assert!(schema.hash.is_some());
+        assert_eq!(schema.hash.unwrap(), format!("{:x}", md5::compute(name)));
     }
 
     #[test]
-    fn test_schema_hash_consistency() {
-        let s1 = Schema::new("app".to_string());
-        let s2 = Schema::new("app".to_string());
-        assert_eq!(s1.hash(), s2.hash());
+    fn test_get_script_returns_create_statement() {
+        let schema = Schema::new("analytics".to_string());
+
+        assert_eq!(
+            schema.get_script(),
+            "create schema if not exists analytics;\n"
+        );
     }
 
     #[test]
-    fn test_schema_hash_differs() {
-        let s1 = Schema::new("a".to_string());
-        let s2 = Schema::new("b".to_string());
-        assert_ne!(s1.hash(), s2.hash());
-    }
+    fn test_get_drop_script_returns_drop_statement() {
+        let schema = Schema::new("archive".to_string());
 
-    #[test]
-    fn test_get_script() {
-        let s = Schema::new("custom".to_string());
-        assert_eq!(s.get_script(), "create schema if not exists custom;\n");
-    }
-
-    #[test]
-    fn test_get_drop_script() {
-        let s = Schema::new("public".to_string());
-        assert_eq!(s.get_drop_script(), "drop schema if exists public;\n");
+        assert_eq!(schema.get_drop_script(), "drop schema if exists archive;\n");
     }
 }
