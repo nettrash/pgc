@@ -521,7 +521,7 @@ impl Dump {
         } else {
             println!("Routines found:");
             for row in rows {
-                let routine = Routine {
+                let mut routine = Routine {
                     schema: row.get("nspname"),
                     oid: row.get("oid"),
                     name: row.get("proname"),
@@ -531,11 +531,18 @@ impl Dump {
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
                     source_code: row.get("prosrc"),
+                    hash: None,
                 };
+                routine.hash();
                 self.routines.push(routine.clone());
                 println!(
-                    " - {} {}.{} (lang: {}, arguments: {})",
-                    routine.kind, routine.schema, routine.name, routine.lang, routine.arguments
+                    " - {} {}.{} (lang: {}, arguments: {}, hash: {})",
+                    routine.kind,
+                    routine.schema,
+                    routine.name,
+                    routine.lang,
+                    routine.arguments,
+                    routine.hash.as_ref().unwrap()
                 );
             }
         }

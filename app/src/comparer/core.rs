@@ -459,13 +459,33 @@ impl Comparer {
         // and we will find all existing routines in both dumps with different hashes
         // and add them to the script.
         for routine in &self.to.routines {
+            if routine.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping routine {}.{} due to missing hash. */\n",
+                        routine.schema, routine.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_routine) = self
                 .from
                 .routines
                 .iter()
                 .find(|r| r.name == routine.name && r.schema == routine.schema)
             {
-                if from_routine.hash() != routine.hash() {
+                if from_routine.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping routine {}.{} due to missing hash. */\n",
+                            from_routine.schema, from_routine.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_routine.hash != routine.hash {
                     self.script.push_str(
                         format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                     );

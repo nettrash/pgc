@@ -61,6 +61,85 @@ pub struct PgType {
 }
 
 impl PgType {
+    /// Creates a new `PgType` instance with the provided parameters.
+    #[allow(clippy::too_many_arguments)] // Mapping every pg_type column keeps this constructor ergonomic for callers.
+    pub fn new(
+        oid: Oid,
+        schema: String,
+        typname: String,
+        typnamespace: Oid,
+        typowner: Oid,
+        typlen: i16,
+        typbyval: bool,
+        typtype: i8,
+        typcategory: i8,
+        typispreferred: bool,
+        typisdefined: bool,
+        typdelim: i8,
+        typrelid: Option<Oid>,
+        typsubscript: Option<String>,
+        typelem: Option<Oid>,
+        typarray: Option<Oid>,
+        typinput: String,
+        typoutput: String,
+        typreceive: Option<String>,
+        typsend: Option<String>,
+        typmodin: Option<String>,
+        typmodout: Option<String>,
+        typanalyze: Option<String>,
+        typalign: i8,
+        typstorage: i8,
+        typnotnull: bool,
+        typbasetype: Option<Oid>,
+        typtypmod: Option<i32>,
+        typndims: i32,
+        typcollation: Option<Oid>,
+        typdefault: Option<String>,
+        formatted_basetype: Option<String>,
+        enum_labels: Vec<String>,
+        domain_constraints: Vec<DomainConstraint>,
+    ) -> Self {
+        let mut pg_type = PgType {
+            oid,
+            schema,
+            typname,
+            typnamespace,
+            typowner,
+            typlen,
+            typbyval,
+            typtype,
+            typcategory,
+            typispreferred,
+            typisdefined,
+            typdelim,
+            typrelid,
+            typsubscript,
+            typelem,
+            typarray,
+            typinput,
+            typoutput,
+            typreceive,
+            typsend,
+            typmodin,
+            typmodout,
+            typanalyze,
+            typalign,
+            typstorage,
+            typnotnull,
+            typbasetype,
+            typtypmod,
+            typndims,
+            typcollation,
+            typdefault,
+            formatted_basetype,
+            enum_labels,
+            domain_constraints,
+            hash: None,
+        };
+        pg_type.hash();
+        pg_type
+    }
+
     /// Computes a SHA256 hash of the type definition.
     ///
     /// This hash can be used for change detection, caching, or verifying the integrity
