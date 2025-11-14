@@ -106,7 +106,11 @@ impl Comparer {
             let will_be_dropped = matching_table.is_none() && self.use_drop;
             let will_be_altered = matching_table
                 .map(|target| {
-                    target.hash.is_some() && table.hash.is_some() && target.hash != table.hash
+                    match (&target.hash, &table.hash) {
+                        (Some(target_hash), Some(table_hash)) => target_hash != table_hash,
+                        (Some(_), None) | (None, Some(_)) => true,
+                        (None, None) => false,
+                    }
                 })
                 .unwrap_or(false);
 
