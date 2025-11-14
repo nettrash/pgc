@@ -27,7 +27,7 @@ pub struct Table {
 
 impl Table {
     /// Creates a new Table with the given name
-    #[allow(clippy::too_many_arguments)] // Table metadata naturally includes these fields from pg_proc.
+    #[allow(clippy::too_many_arguments)] // Table metadata naturally includes these fields (from pg_class and related catalogs).
     pub fn new(
         schema: String,
         name: String,
