@@ -23,7 +23,7 @@ pub struct Sequence {
 
 impl Sequence {
     /// Creates a new Sequence with the given parameters
-    #[allow(clippy::too_many_arguments)] // Sequence metadata naturally includes these fields from pg_proc.
+    #[allow(clippy::too_many_arguments)] // Sequence metadata naturally includes these fields from pg_sequence and pg_class.
     pub fn new(
         schema: String,
         name: String,
