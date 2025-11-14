@@ -12,9 +12,10 @@ pub struct Schema {
 impl Schema {
     /// Creates a new Schema with the given name
     pub fn new(name: String) -> Self {
+        let hash = Some(format!("{:x}", md5::compute(&name)));
         Self {
-            name: name.clone(),
-            hash: Some(format!("{:x}", md5::compute(&name))),
+            name,
+            hash,
         }
     }
 
