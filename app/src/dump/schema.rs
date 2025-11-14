@@ -13,10 +13,7 @@ impl Schema {
     /// Creates a new Schema with the given name
     pub fn new(name: String) -> Self {
         let hash = Some(format!("{:x}", md5::compute(&name)));
-        Self {
-            name,
-            hash,
-        }
+        Self { name, hash }
     }
 
     /// Returns a string to create the schema.
