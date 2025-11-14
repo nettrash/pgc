@@ -11,6 +11,8 @@ pub struct View {
     pub definition: String,
     /// Table relation (list of tables that used by this view)
     pub table_relation: Vec<String>,
+    /// Hash of the view
+    pub hash: Option<String>,
 }
 
 impl View {
@@ -21,20 +23,23 @@ impl View {
         schema: String,
         table_relation: Vec<String>,
     ) -> Self {
-        Self {
+        let mut view = Self {
             schema,
             name,
             definition,
             table_relation,
-        }
+            hash: None,
+        };
+        view.hash();
+        view
     }
 
     /// Hash
-    pub fn hash(&self) -> String {
-        format!(
+    pub fn hash(&mut self) {
+        self.hash = Some(format!(
             "{:x}",
             md5::compute(format!("{}.{}.{}", self.schema, self.name, self.definition))
-        )
+        ));
     }
 
     /// Returns a string to create the view.
@@ -87,46 +92,109 @@ impl View {
 
 #[cfg(test)]
 mod tests {
-    use super::View;
+    use super::*;
 
-    fn make_view(definition: &str) -> View {
-        View {
-            schema: "public".to_string(),
-            name: "example_view".to_string(),
-            definition: definition.to_string(),
-            table_relation: vec!["public.example".to_string()],
-        }
+    fn create_view(definition: &str) -> View {
+        View::new(
+            "active_users".to_string(),
+            definition.to_string(),
+            "analytics".to_string(),
+            vec!["public.users".to_string(), "public.sessions".to_string()],
+        )
     }
 
     #[test]
-    fn alter_script_returns_comment_when_definitions_match() {
-        let current = make_view("select 1 as id");
-        let target = make_view("select 1 as id");
+    fn test_view_new_initializes_hash() {
+        let definition = "select id from public.users where active";
+        let view = create_view(definition);
 
-        let script = current.get_alter_script(&target);
+        let expected_hash = format!(
+            "{:x}",
+            md5::compute(format!("analytics.active_users.{definition}"))
+        );
 
-        assert!(script.contains("requires no changes"));
+        assert_eq!(view.hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(view.schema, "analytics");
+        assert_eq!(view.name, "active_users");
+        assert_eq!(view.definition, definition);
     }
 
     #[test]
-    fn alter_script_replaces_definition_when_changed() {
-        let current = make_view("select 1 as id");
-        let target = make_view("select 2 as id");
+    fn test_hash_updates_on_mutation() {
+        let mut view = create_view("select 1");
+        let original_hash = view.hash.clone();
 
-        let script = current.get_alter_script(&target);
+        view.definition = "select 2".to_string();
+        view.hash();
 
-        assert!(script.starts_with("CREATE OR REPLACE VIEW public.example_view AS"));
-        assert!(script.contains("select 2 as id"));
+        assert_ne!(view.hash, original_hash);
     }
 
     #[test]
-    fn alter_script_handles_mismatched_names() {
-        let current = make_view("select 1 as id");
-        let mut target = make_view("select 1 as id");
-        target.name = "other_view".to_string();
+    fn test_get_script_returns_create_statement() {
+        let view = create_view("select id from public.users");
+        assert_eq!(
+            view.get_script(),
+            "create view analytics.active_users as\nselect id from public.users\n"
+        );
+    }
 
-        let script = current.get_alter_script(&target);
+    #[test]
+    fn test_get_drop_script_returns_drop_statement() {
+        let view = create_view("select id from public.users");
+        assert_eq!(
+            view.get_drop_script(),
+            "drop view if exists analytics.active_users;\n"
+        );
+    }
 
-        assert!(script.contains("Cannot alter view"));
+    #[test]
+    fn test_get_alter_script_returns_noop_when_definitions_match() {
+        let view = create_view("select 1");
+        let mut target = view.clone();
+        target.definition = "select 1".to_string();
+
+        assert_eq!(
+            view.get_alter_script(&target),
+            "-- View analytics.active_users requires no changes.\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_returns_error_for_different_identifiers() {
+        let view = create_view("select 1");
+        let target = View::new(
+            "other".to_string(),
+            "select 2".to_string(),
+            "analytics".to_string(),
+            vec![],
+        );
+
+        assert_eq!(
+            view.get_alter_script(&target),
+            "-- Cannot alter view analytics.active_users because target is analytics.other\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_respects_create_or_replace_definition() {
+        let current = create_view("select 1");
+        let replacement = create_view("create or replace view analytics.active_users as select 2");
+
+        assert_eq!(
+            current.get_alter_script(&replacement),
+            "create view analytics.active_users as\ncreate or replace view analytics.active_users as select 2\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_generates_replace_statement() {
+        let current = create_view("select 1");
+        let target = create_view("select id, active from public.users where active");
+
+        assert_eq!(
+            current.get_alter_script(&target),
+            "CREATE OR REPLACE VIEW analytics.active_users AS\nselect id, active from public.users where active\n"
+        );
     }
 }

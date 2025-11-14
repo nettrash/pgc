@@ -247,7 +247,7 @@ impl Dump {
         } else {
             println!("User-defined types found:");
             for row in rows {
-                let pgtype = PgType {
+                let mut pgtype = PgType {
                     oid: row.get("type_oid"),
                     schema: row.get("nspname"),
                     typname: row.get("typname"),
@@ -282,9 +282,16 @@ impl Dump {
                     formatted_basetype: row.get::<Option<String>, _>("formatted_basetype"),
                     enum_labels: Vec::new(),
                     domain_constraints: Vec::new(),
+                    hash: None,
                 };
+                pgtype.hash();
                 self.types.push(pgtype.clone());
-                println!(" - {} (namespace: {})", pgtype.typname, pgtype.schema);
+                println!(
+                    " - {} (namespace: {}, hash: {})",
+                    pgtype.typname,
+                    pgtype.schema,
+                    pgtype.hash.as_deref().unwrap_or("None")
+                );
             }
         }
         Ok(())
@@ -446,7 +453,7 @@ impl Dump {
         } else {
             println!("Sequences found:");
             for row in rows {
-                let seq = Sequence {
+                let mut seq = Sequence {
                     schema: row.get("schemaname"),
                     name: row.get("sequencename"),
                     owner: row.get("sequenceowner"),
@@ -461,9 +468,16 @@ impl Dump {
                     owned_by_schema: row.get::<Option<String>, _>("owned_by_schema"),
                     owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
                     owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
+                    hash: None,
                 };
+                seq.hash();
                 self.sequences.push(seq.clone());
-                println!(" - name {} (type: {})", seq.name, seq.data_type);
+                println!(
+                    " - name {} (type: {}, hash: {})",
+                    seq.name,
+                    seq.data_type,
+                    seq.hash.as_deref().unwrap_or("None")
+                );
             }
         }
 
@@ -514,7 +528,7 @@ impl Dump {
         } else {
             println!("Routines found:");
             for row in rows {
-                let routine = Routine {
+                let mut routine = Routine {
                     schema: row.get("nspname"),
                     oid: row.get("oid"),
                     name: row.get("proname"),
@@ -524,11 +538,18 @@ impl Dump {
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
                     source_code: row.get("prosrc"),
+                    hash: None,
                 };
+                routine.hash();
                 self.routines.push(routine.clone());
                 println!(
-                    " - {} {}.{} (lang: {}, arguments: {})",
-                    routine.kind, routine.schema, routine.name, routine.lang, routine.arguments
+                    " - {} {}.{} (lang: {}, arguments: {}, hash: {})",
+                    routine.kind,
+                    routine.schema,
+                    routine.name,
+                    routine.lang,
+                    routine.arguments,
+                    routine.hash.as_deref().unwrap_or("None")
                 );
             }
         }
@@ -580,14 +601,21 @@ impl Dump {
                     indexes: Vec::new(),
                     triggers: Vec::new(),
                     definition: None,
+                    hash: None,
                 };
                 table.fill(pool).await.map_err(|e| {
                     Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
 
+                table.hash();
                 self.tables.push(table.clone());
 
-                println!(" - {}.{}", table.schema, table.name);
+                println!(
+                    " - {}.{} (hash: {})",
+                    table.schema,
+                    table.name,
+                    table.hash.as_deref().unwrap_or("None")
+                );
             }
         }
         Ok(())
@@ -622,15 +650,22 @@ impl Dump {
         } else {
             println!("Views found:");
             for row in rows {
-                let view = View {
+                let mut view = View {
                     schema: row.get("table_schema"),
                     name: row.get("table_name"),
                     definition: row.get("view_definition"),
                     table_relation: row.get("table_relation"),
+                    hash: None,
                 };
+                view.hash();
                 self.views.push(view.clone());
 
-                println!(" - {}.{}", view.schema, view.name);
+                println!(
+                    " - {}.{} (hash: {})",
+                    view.schema,
+                    view.name,
+                    view.hash.as_deref().unwrap_or("None")
+                );
             }
         }
         Ok(())
