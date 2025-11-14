@@ -650,15 +650,22 @@ impl Dump {
         } else {
             println!("Views found:");
             for row in rows {
-                let view = View {
+                let mut view = View {
                     schema: row.get("table_schema"),
                     name: row.get("table_name"),
                     definition: row.get("view_definition"),
                     table_relation: row.get("table_relation"),
+                    hash: None,
                 };
+                view.hash();
                 self.views.push(view.clone());
 
-                println!(" - {}.{}", view.schema, view.name);
+                println!(
+                    " - {}.{} (hash: {})",
+                    view.schema,
+                    view.name,
+                    view.hash.as_deref().unwrap_or("None")
+                );
             }
         }
         Ok(())
