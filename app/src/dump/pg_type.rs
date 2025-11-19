@@ -57,14 +57,94 @@ pub struct PgType {
     pub enum_labels: Vec<String>, // Enum labels ordered by sort order
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_constraints: Vec<DomainConstraint>, // Domain constraints (check, etc.)
+    pub hash: Option<String>,         // SHA256 hash of the type definition
 }
 
 impl PgType {
+    /// Creates a new `PgType` instance with the provided parameters.
+    #[allow(clippy::too_many_arguments)] // Mapping every pg_type column keeps this constructor ergonomic for callers.
+    pub fn new(
+        oid: Oid,
+        schema: String,
+        typname: String,
+        typnamespace: Oid,
+        typowner: Oid,
+        typlen: i16,
+        typbyval: bool,
+        typtype: i8,
+        typcategory: i8,
+        typispreferred: bool,
+        typisdefined: bool,
+        typdelim: i8,
+        typrelid: Option<Oid>,
+        typsubscript: Option<String>,
+        typelem: Option<Oid>,
+        typarray: Option<Oid>,
+        typinput: String,
+        typoutput: String,
+        typreceive: Option<String>,
+        typsend: Option<String>,
+        typmodin: Option<String>,
+        typmodout: Option<String>,
+        typanalyze: Option<String>,
+        typalign: i8,
+        typstorage: i8,
+        typnotnull: bool,
+        typbasetype: Option<Oid>,
+        typtypmod: Option<i32>,
+        typndims: i32,
+        typcollation: Option<Oid>,
+        typdefault: Option<String>,
+        formatted_basetype: Option<String>,
+        enum_labels: Vec<String>,
+        domain_constraints: Vec<DomainConstraint>,
+    ) -> Self {
+        let mut pg_type = PgType {
+            oid,
+            schema,
+            typname,
+            typnamespace,
+            typowner,
+            typlen,
+            typbyval,
+            typtype,
+            typcategory,
+            typispreferred,
+            typisdefined,
+            typdelim,
+            typrelid,
+            typsubscript,
+            typelem,
+            typarray,
+            typinput,
+            typoutput,
+            typreceive,
+            typsend,
+            typmodin,
+            typmodout,
+            typanalyze,
+            typalign,
+            typstorage,
+            typnotnull,
+            typbasetype,
+            typtypmod,
+            typndims,
+            typcollation,
+            typdefault,
+            formatted_basetype,
+            enum_labels,
+            domain_constraints,
+            hash: None,
+        };
+        pg_type.hash();
+        pg_type
+    }
+
     /// Computes a SHA256 hash of the type definition.
     ///
     /// This hash can be used for change detection, caching, or verifying the integrity
     /// of the type's metadata. It includes all relevant fields of the `PgType` struct.
-    pub fn hash(&self) -> String {
+    pub fn hash(&mut self) {
         let mut hasher = Sha256::new();
 
         hasher.update(self.schema.as_bytes());
@@ -145,7 +225,7 @@ impl PgType {
             hasher.update(constraint.definition.as_bytes());
         }
 
-        format!("{:x}", hasher.finalize())
+        self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
     /// Returns a string to create the user-defined type.
@@ -451,194 +531,200 @@ where
 mod tests {
     use super::*;
 
-    fn sample_pg_type() -> PgType {
+    fn base_pg_type(typtype: char) -> PgType {
         PgType {
             oid: Oid(1),
             schema: "public".to_string(),
-            typname: "custom_type".to_string(),
-            typnamespace: Oid(1234),
-            typowner: Oid(42),
-            typlen: 8,
+            typname: "my_type".to_string(),
+            typnamespace: Oid(2200),
+            typowner: Oid(10),
+            typlen: -1,
             typbyval: false,
-            typtype: b'c' as i8,
-            typcategory: b'U' as i8,
+            typtype: typtype as i8,
+            typcategory: 'U' as i8,
             typispreferred: false,
             typisdefined: true,
-            typdelim: b',' as i8,
+            typdelim: ',' as i8,
             typrelid: None,
             typsubscript: None,
-            typelem: Some(Oid(99)),
-            typarray: Some(Oid(100)),
-            typinput: "pg_catalog.custom_in".to_string(),
-            typoutput: "pg_catalog.custom_out".to_string(),
-            typreceive: Some("pg_catalog.custom_recv".to_string()),
-            typsend: Some("pg_catalog.custom_send".to_string()),
+            typelem: None,
+            typarray: None,
+            typinput: "record_in".to_string(),
+            typoutput: "record_out".to_string(),
+            typreceive: None,
+            typsend: None,
             typmodin: None,
             typmodout: None,
             typanalyze: None,
-            typalign: b'd' as i8,
-            typstorage: b'p' as i8,
+            typalign: 'd' as i8,
+            typstorage: 'p' as i8,
             typnotnull: false,
             typbasetype: None,
-            typtypmod: Some(-1),
+            typtypmod: None,
             typndims: 0,
             typcollation: None,
-            typdefault: Some("default".to_string()),
+            typdefault: None,
             formatted_basetype: None,
             enum_labels: Vec::new(),
             domain_constraints: Vec::new(),
+            hash: None,
         }
     }
 
     #[test]
-    fn hash_is_stable_and_hex() {
-        let pg_type = sample_pg_type();
-        let hash1 = pg_type.hash();
-        let hash2 = pg_type.hash();
+    fn hash_populates_hash_field() {
+        let mut pg_type = base_pg_type('e');
+        pg_type.enum_labels = vec!["alpha".to_string(), "beta".to_string()];
 
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 64);
-        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+        pg_type.hash();
+        let first = pg_type.hash.clone();
+
+        let value = first.as_ref().expect("hash should be present");
+        assert_eq!(value.len(), 64);
+        assert!(value.chars().all(|c| c.is_ascii_hexdigit()));
+
+        pg_type.hash();
+        assert_eq!(pg_type.hash, first);
     }
 
     #[test]
-    fn hash_changes_when_optional_value_differs() {
-        let base = sample_pg_type();
-        let mut other = base.clone();
-        other.typdefault = Some("something else".to_string());
+    fn hash_differs_when_fields_change() {
+        let mut left = base_pg_type('e');
+        left.enum_labels = vec!["alpha".to_string()];
+        left.hash();
+        let left_hash = left.hash.clone().unwrap();
 
-        assert_ne!(base.hash(), other.hash());
+        let mut right = base_pg_type('e');
+        right.enum_labels = vec!["alpha".to_string()];
+        right.typname = "different".to_string();
+        right.hash();
+        let right_hash = right.hash.clone().unwrap();
+
+        assert_ne!(left_hash, right_hash);
     }
 
     #[test]
-    fn hash_changes_when_oid_option_added() {
-        let base = sample_pg_type();
-        let mut other = base.clone();
-        other.typrelid = Some(Oid(555));
-
-        assert_ne!(base.hash(), other.hash());
-    }
-
-    #[test]
-    fn enum_type_get_script() {
-        let mut pg_type = sample_pg_type();
-        pg_type.schema = "public".to_string();
+    fn enum_get_script_generates_create_statement() {
+        let mut pg_type = base_pg_type('e');
         pg_type.typname = "status".to_string();
-        pg_type.typtype = b'e' as i8;
-        pg_type.enum_labels = vec!["active".to_string(), "inactive".to_string()];
+        pg_type.enum_labels = vec!["simple".to_string(), "O'Reilly".to_string()];
 
         let script = pg_type.get_script();
+
         assert_eq!(
             script,
-            "create type public.status as enum ('active', 'inactive');\n"
+            "create type public.status as enum ('simple', 'O''Reilly');\n"
         );
     }
 
     #[test]
-    fn domain_type_get_script() {
-        let mut pg_type = sample_pg_type();
-        pg_type.schema = "public".to_string();
-        pg_type.typname = "positive_integer".to_string();
-        pg_type.typtype = b'd' as i8;
-        pg_type.formatted_basetype = Some("integer".to_string());
-        pg_type.typdefault = Some("0".to_string());
-        pg_type.typnotnull = true;
+    fn enum_get_script_handles_missing_labels() {
+        let pg_type = base_pg_type('e');
 
         let script = pg_type.get_script();
+
         assert_eq!(
             script,
-            "create domain public.positive_integer as integer default 0 not null;\n"
+            "-- Enum public.my_type has no labels available in dump\n"
         );
     }
 
     #[test]
-    fn domain_type_get_script_includes_constraints() {
-        let mut pg_type = sample_pg_type();
-        pg_type.schema = "public".to_string();
-        pg_type.typname = "positive_integer".to_string();
-        pg_type.typtype = b'd' as i8;
+    fn domain_get_script_includes_constraints() {
+        let mut pg_type = base_pg_type('d');
+        pg_type.typname = "amount".to_string();
         pg_type.formatted_basetype = Some("integer".to_string());
-        pg_type.typdefault = Some("0".to_string());
+        pg_type.typdefault = Some("42".to_string());
         pg_type.typnotnull = true;
         pg_type.domain_constraints = vec![DomainConstraint {
-            name: "positive_integer_check".to_string(),
-            definition: "CHECK ((VALUE >= 0))".to_string(),
+            name: "ValueCheck".to_string(),
+            definition: "check (value > 0)".to_string(),
         }];
 
         let script = pg_type.get_script();
+
+        let expected = "create domain public.amount as integer default 42 not null;\n\
+alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn get_alter_script_enum_adds_missing_labels() {
+        let mut current = base_pg_type('e');
+        current.typname = "status".to_string();
+        current.enum_labels = vec!["pending".to_string(), "completed".to_string()];
+
+        let mut target = base_pg_type('e');
+        target.typname = "status".to_string();
+        target.enum_labels = vec![
+            "pending".to_string(),
+            "in_progress".to_string(),
+            "completed".to_string(),
+        ];
+
+        let script = current.get_alter_script(&target);
+
         assert_eq!(
             script,
-            "create domain public.positive_integer as integer default 0 not null;\n".to_string()
-                + "alter domain public.positive_integer add constraint \"positive_integer_check\" CHECK ((VALUE >= 0));\n"
+            "alter type public.status add value if not exists 'in_progress' before 'completed';\n"
         );
     }
 
     #[test]
-    fn enum_type_get_alter_script_adds_new_label() {
-        let mut current = sample_pg_type();
-        current.schema = "public".to_string();
-        current.typname = "status".to_string();
-        current.typtype = b'e' as i8;
-        current.enum_labels = vec!["active".to_string(), "inactive".to_string()];
-
-        let mut target = current.clone();
-        target.enum_labels.push("pending".to_string());
+    fn get_alter_script_enum_requires_no_changes() {
+        let mut current = base_pg_type('e');
+        current.enum_labels = vec!["pending".to_string(), "completed".to_string()];
+        let target = current.clone();
 
         let script = current.get_alter_script(&target);
-        assert!(script.contains("add value if not exists 'pending'"));
+
+        assert_eq!(script, "-- Enum public.my_type requires no changes.\n");
     }
 
     #[test]
-    fn domain_type_get_alter_script_updates_constraints() {
-        let mut current = sample_pg_type();
-        current.schema = "public".to_string();
-        current.typname = "positive_integer".to_string();
-        current.typtype = b'd' as i8;
+    fn get_alter_script_domain_handles_changes() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
         current.formatted_basetype = Some("integer".to_string());
-        current.typdefault = None;
-        current.typnotnull = false;
+        current.typdefault = Some("42".to_string());
+        current.typnotnull = true;
         current.domain_constraints = vec![DomainConstraint {
-            name: "is_positive".to_string(),
-            definition: "CHECK ((VALUE > 0))".to_string(),
+            name: "ValueCheck".to_string(),
+            definition: "check (value > 0)".to_string(),
         }];
 
         let mut target = current.clone();
+        target.typdefault = Some("84".to_string());
+        target.typnotnull = false;
         target.domain_constraints = vec![
             DomainConstraint {
-                name: "is_positive".to_string(),
-                definition: "CHECK ((VALUE >= 0))".to_string(),
+                name: "ValueCheck".to_string(),
+                definition: "check (value >= 0)".to_string(),
             },
             DomainConstraint {
-                name: "less_than_max".to_string(),
-                definition: "CHECK ((VALUE < 100))".to_string(),
+                name: "FreshConstraint".to_string(),
+                definition: "check (value <> 0)".to_string(),
             },
         ];
 
         let script = current.get_alter_script(&target);
-        assert_eq!(
-            script,
-            "alter domain public.positive_integer drop constraint \"is_positive\";\n".to_string()
-                + "alter domain public.positive_integer add constraint \"is_positive\" CHECK ((VALUE >= 0));\n"
-                + "alter domain public.positive_integer add constraint \"less_than_max\" CHECK ((VALUE < 100));\n"
-        );
+
+        let expected = "alter domain public.amount set default 84;\n\
+alter domain public.amount drop not null;\n\
+alter domain public.amount drop constraint \"ValueCheck\";\n\
+alter domain public.amount add constraint \"ValueCheck\" check (value >= 0);\n\
+alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0);\n";
+
+        assert_eq!(script, expected);
     }
 
     #[test]
-    fn domain_type_get_alter_script_updates_default_and_nullability() {
-        let mut current = sample_pg_type();
-        current.schema = "public".to_string();
-        current.typname = "positive_integer".to_string();
-        current.typtype = b'd' as i8;
-        current.formatted_basetype = Some("integer".to_string());
-        current.typdefault = None;
-        current.typnotnull = false;
+    fn get_drop_script_returns_drop_statement() {
+        let pg_type = base_pg_type('e');
 
-        let mut target = current.clone();
-        target.typdefault = Some("0".to_string());
-        target.typnotnull = true;
-
-        let script = current.get_alter_script(&target);
-        assert!(script.contains("set default 0"));
-        assert!(script.contains("set not null"));
+        assert_eq!(
+            pg_type.get_drop_script(),
+            "drop type if exists public.my_type;\n"
+        );
     }
 }

@@ -22,9 +22,42 @@ pub struct Table {
     pub indexes: Vec<TableIndex>,          // Index names
     pub triggers: Vec<TableTrigger>,       // Trigger names
     pub definition: Option<String>,        // Table definition (optional)
+    pub hash: Option<String>,              // Hash of the table
 }
 
 impl Table {
+    /// Creates a new Table with the given name
+    #[allow(clippy::too_many_arguments)] // Table metadata naturally includes these fields (from pg_class and related catalogs).
+    pub fn new(
+        schema: String,
+        name: String,
+        owner: String,
+        space: Option<String>,
+        columns: Vec<TableColumn>,
+        constraints: Vec<TableConstraint>,
+        indexes: Vec<TableIndex>,
+        triggers: Vec<TableTrigger>,
+        definition: Option<String>,
+    ) -> Self {
+        let mut table = Self {
+            schema,
+            name,
+            owner,
+            space,
+            has_indexes: !indexes.is_empty(),
+            has_triggers: !triggers.is_empty(),
+            has_rules: false,
+            has_rowsecurity: false,
+            columns,
+            constraints,
+            indexes,
+            triggers,
+            definition,
+            hash: None,
+        };
+        table.hash();
+        table
+    }
     /// Fill information about table.
     pub async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         self.fill_columns(pool).await?;
@@ -281,8 +314,8 @@ impl Table {
         Ok(())
     }
 
-    /// Hash
-    pub fn hash(&self) -> String {
+    /// Hash the table
+    pub fn hash(&mut self) {
         let mut hasher = Sha256::new();
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
@@ -307,7 +340,7 @@ impl Table {
             trigger.add_to_hasher(&mut hasher);
         }
 
-        format!("{:x}", hasher.finalize())
+        self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
     /// Get script for the table
@@ -541,18 +574,18 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dump::{table_column::TableColumn, table_constraint::TableConstraint};
+    use sqlx::postgres::types::Oid;
 
-    fn make_column(name: &str, ordinal: i32) -> TableColumn {
+    fn base_column(name: &str, ordinal_position: i32) -> TableColumn {
         TableColumn {
-            catalog: "db".to_string(),
-            schema: "test_schema".to_string(),
-            table: "products".to_string(),
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            table: "users".to_string(),
             name: name.to_string(),
-            ordinal_position: ordinal,
+            ordinal_position,
             column_default: None,
             is_nullable: true,
-            data_type: "numeric".to_string(),
+            data_type: "text".to_string(),
             character_maximum_length: None,
             character_octet_length: None,
             numeric_precision: None,
@@ -593,52 +626,326 @@ mod tests {
         }
     }
 
-    fn weight_constraint() -> TableConstraint {
-        TableConstraint {
-            catalog: "db".to_string(),
-            schema: "test_schema".to_string(),
-            name: "chk_products_weight_positive".to_string(),
-            table_name: "products".to_string(),
-            constraint_type: "CHECK".to_string(),
-            is_deferrable: false,
-            initially_deferred: false,
-            definition: Some("CHECK ((weight > 0))".to_string()),
-        }
+    fn identity_column(name: &str, ordinal_position: i32, data_type: &str) -> TableColumn {
+        let mut column = base_column(name, ordinal_position);
+        column.data_type = data_type.to_string();
+        column.is_identity = true;
+        column.is_nullable = false;
+        column.identity_generation = Some("BY DEFAULT".to_string());
+        column
     }
 
-    fn base_table() -> Table {
-        Table {
-            schema: "test_schema".to_string(),
-            name: "products".to_string(),
-            owner: "owner".to_string(),
-            space: None,
-            has_indexes: false,
-            has_triggers: false,
-            has_rules: false,
-            has_rowsecurity: false,
-            columns: vec![make_column("id", 1), make_column("weight", 2)],
-            constraints: vec![weight_constraint()],
-            indexes: Vec::new(),
-            triggers: Vec::new(),
+    fn name_column() -> TableColumn {
+        let mut column = base_column("name", 2);
+        column.is_nullable = false;
+        column
+    }
+
+    fn name_column_with_default() -> TableColumn {
+        let mut column = name_column();
+        column.column_default = Some("'unknown'::text".to_string());
+        column
+    }
+
+    fn legacy_column() -> TableColumn {
+        let mut column = base_column("legacy", 3);
+        column.is_nullable = true;
+        column
+    }
+
+    fn email_column() -> TableColumn {
+        let mut column = base_column("email", 3);
+        column.is_nullable = true;
+        column
+    }
+
+    fn primary_key_constraint() -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: "users_pkey".to_string(),
+            table_name: "users".to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
             definition: None,
         }
     }
 
+    fn check_constraint(name: &str, definition: &str) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: name.to_string(),
+            table_name: "users".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(definition.to_string()),
+        }
+    }
+
+    fn foreign_key_constraint(is_deferrable: bool, initially_deferred: bool) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: "users_account_fk".to_string(),
+            table_name: "users".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable,
+            initially_deferred,
+            definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
+        }
+    }
+
+    fn unique_constraint(name: &str, definition: &str) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: name.to_string(),
+            table_name: "users".to_string(),
+            constraint_type: "UNIQUE".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(definition.to_string()),
+        }
+    }
+
+    fn primary_key_index() -> TableIndex {
+        TableIndex {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: "users_pkey".to_string(),
+            catalog: None,
+            indexdef:
+                "create unique index users_pkey on public.users using btree (\"id\") primary key (\"id\")"
+                    .to_string(),
+        }
+    }
+
+    fn name_index(definition: &str) -> TableIndex {
+        TableIndex {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: "idx_users_name".to_string(),
+            catalog: None,
+            indexdef: definition.to_string(),
+        }
+    }
+
+    fn legacy_index() -> TableIndex {
+        TableIndex {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: "idx_users_old".to_string(),
+            catalog: None,
+            indexdef: "create index idx_users_old on public.users using btree (legacy)".to_string(),
+        }
+    }
+
+    fn email_index() -> TableIndex {
+        TableIndex {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: "idx_users_email".to_string(),
+            catalog: None,
+            indexdef: "create index idx_users_email on public.users using btree (email)"
+                .to_string(),
+        }
+    }
+
+    fn trigger(name: &str, definition: &str, oid: u32) -> TableTrigger {
+        TableTrigger {
+            oid: Oid(oid),
+            name: name.to_string(),
+            definition: definition.to_string(),
+        }
+    }
+
+    fn basic_table() -> Table {
+        Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            Some("pg_default".to_string()),
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                check_constraint("users_name_check", "CHECK (name <> '')"),
+            ],
+            vec![
+                primary_key_index(),
+                name_index("create index idx_users_name on public.users using btree (name)"),
+            ],
+            vec![trigger(
+                "audit_user",
+                "create trigger audit_user before insert on public.users for each row execute function log_user()",
+                1,
+            )],
+            None,
+        )
+    }
+
     #[test]
-    fn constraint_drops_before_column_removal() {
-        let from_table = base_table();
-        let mut to_table = base_table();
-        to_table.columns.retain(|c| c.name != "weight");
-        to_table.constraints.clear();
+    fn test_table_new_initializes_flags_and_hash() {
+        let table = basic_table();
 
-        let alter_script = from_table.get_alter_script(&to_table);
-        let constraint_pos = alter_script
-            .find("drop constraint \"chk_products_weight_positive\"")
-            .expect("drop constraint statement present");
-        let column_pos = alter_script
-            .find("drop column \"weight\"")
-            .expect("drop column statement present");
+        assert!(table.has_indexes);
+        assert!(table.has_triggers);
+        assert!(!table.has_rules);
+        assert!(!table.has_rowsecurity);
+        assert!(table.hash.is_some());
 
-        assert!(constraint_pos < column_pos);
+        let mut recomputed = table.clone();
+        recomputed.hash();
+        assert_eq!(table.hash, recomputed.hash);
+
+        let mut modified = table.clone();
+        if let Some(column) = modified.columns.iter_mut().find(|col| col.name == "name") {
+            column.column_default = Some("'anonymous'::text".to_string());
+        }
+        modified.hash();
+        assert_ne!(table.hash, modified.hash);
+    }
+
+    #[test]
+    fn test_get_script_generates_full_definition() {
+        let table = basic_table();
+
+        let script = table.get_script();
+
+        let expected = concat!(
+            "create table public.users (\n",
+            "    \"id\" serial,\n",
+            "    \"name\" text not null,\n",
+            "    primary key (\"id\")\n",
+            ");\n\n",
+            "alter table public.users add constraint users_name_check check (name <> '') ;\n",
+            "create index idx_users_name on public.users using btree (name);\n",
+            "create trigger audit_user before insert on public.users for each row execute function log_user();\n",
+        );
+
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_drop_script_returns_statement() {
+        let table = basic_table();
+        assert_eq!(
+            table.get_drop_script(),
+            "drop table if exists public.users;\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_handles_complex_differences() {
+        let from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            Some("pg_default".to_string()),
+            vec![
+                identity_column("id", 1, "integer"),
+                name_column(),
+                legacy_column(),
+            ],
+            vec![
+                primary_key_constraint(),
+                check_constraint("users_name_check", "CHECK (name <> '')"),
+                foreign_key_constraint(false, false),
+                check_constraint("users_legacy_check", "CHECK (legacy IS NOT NULL)"),
+            ],
+            vec![
+                primary_key_index(),
+                name_index("create index idx_users_name on public.users using btree (name)"),
+                legacy_index(),
+            ],
+            vec![
+                trigger(
+                    "audit_user",
+                    "create trigger audit_user before insert on public.users for each row execute function log_user()",
+                    1,
+                ),
+                trigger(
+                    "cleanup_user",
+                    "create trigger cleanup_user after delete on public.users for each row execute function cleanup()",
+                    2,
+                ),
+            ],
+            Some("create table public.users (...);".to_string()),
+        );
+
+        let to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            Some("pg_default".to_string()),
+            vec![
+                identity_column("id", 1, "integer"),
+                name_column_with_default(),
+                email_column(),
+            ],
+            vec![
+                primary_key_constraint(),
+                check_constraint("users_name_check", "CHECK (char_length(name) > 0)"),
+                foreign_key_constraint(true, true),
+                unique_constraint("users_email_unique", "UNIQUE (email)"),
+            ],
+            vec![
+                primary_key_index(),
+                name_index("create index idx_users_name on public.users using btree (lower(name))"),
+                email_index(),
+            ],
+            vec![
+                trigger(
+                    "audit_user",
+                    "create trigger audit_user after insert on public.users for each row execute function log_user_change()",
+                    3,
+                ),
+                trigger(
+                    "notify_user",
+                    "create trigger notify_user after insert on public.users for each row execute function notify()",
+                    4,
+                ),
+            ],
+            Some("create table public.users (...);".to_string()),
+        );
+
+        let script = from_table.get_alter_script(&to_table);
+
+        let expected_fragments = [
+            "alter table public.users drop constraint \"users_name_check\";\n",
+            "alter table public.users drop constraint \"users_legacy_check\";\n",
+            "alter table public.users alter column \"name\" set default 'unknown'::text;\n",
+            "alter table public.users add column \"email\" text;\n",
+            "drop index if exists public.idx_users_name;\n",
+            "drop index if exists public.idx_users_old;\n",
+            "drop trigger if exists audit_user on public.users;\n",
+            "drop trigger if exists cleanup_user on public.users;\n",
+            "alter table public.users drop column \"legacy\";\n",
+            "alter table public.users add constraint users_name_check check (char_length(name) > 0) ;\n",
+            "alter table public.users alter constraint \"users_account_fk\" deferrable initially deferred;\n",
+            "alter table public.users add constraint users_email_unique unique (email) ;\n",
+            "create index idx_users_name on public.users using btree (lower(name));\n",
+            "create index idx_users_email on public.users using btree (email);\n",
+            "create trigger audit_user after insert on public.users for each row execute function log_user_change();\n",
+            "create trigger notify_user after insert on public.users for each row execute function notify();\n",
+        ];
+
+        let mut last_position = 0usize;
+        for fragment in expected_fragments {
+            let position = script
+                .find(fragment)
+                .unwrap_or_else(|| panic!("fragment not found: {fragment}"));
+            assert!(
+                position >= last_position,
+                "fragment `{fragment}` appears out of order"
+            );
+            last_position = position;
+        }
+
+        assert!(script.contains("'unknown'::text"));
+        assert!(script.contains("lower(name)"));
+        assert!(script.contains("notify_user"));
     }
 }

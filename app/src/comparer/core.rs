@@ -19,6 +19,7 @@ pub struct Comparer {
     script: String,
     enum_pre_script: String,
     enum_post_script: String,
+    sequence_post_script: String,
     dropped_views: HashSet<String>,
 }
 
@@ -32,6 +33,7 @@ impl Comparer {
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
+            sequence_post_script: String::new(),
             dropped_views: HashSet::new(),
         };
 
@@ -62,13 +64,22 @@ impl Comparer {
             self.enum_pre_script.clear();
         }
         self.compare_types().await?;
+        // The order of operations here is important due to dependency relationships:
+        // - Tables may depend on sequences (e.g., via SERIAL columns).
+        // - Sequences may depend on tables (e.g., via ownership).
+        // Therefore, we compare sequences and drop views before comparing tables,
+        // and defer sequence drops until after tables to avoid dependency errors.
+        self.compare_sequences().await?;
+        self.drop_views().await?;
+        self.compare_tables().await?;
         if !self.enum_post_script.is_empty() {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        self.compare_sequences().await?;
-        self.drop_views().await?;
-        self.compare_tables().await?;
+        if !self.sequence_post_script.is_empty() {
+            self.script.push_str(&self.sequence_post_script);
+            self.sequence_post_script.clear();
+        }
         self.create_views().await?;
         self.compare_routines().await?;
 
@@ -105,7 +116,11 @@ impl Comparer {
 
             let will_be_dropped = matching_table.is_none() && self.use_drop;
             let will_be_altered = matching_table
-                .map(|target| target.hash() != table.hash())
+                .map(|target| match (&target.hash, &table.hash) {
+                    (Some(target_hash), Some(table_hash)) => target_hash != table_hash,
+                    (Some(_), None) | (None, Some(_)) => true,
+                    (None, None) => false,
+                })
                 .unwrap_or(false);
 
             if !will_be_dropped && !will_be_altered {
@@ -242,7 +257,7 @@ impl Comparer {
                 .iter()
                 .find(|t| t.schema == to_type.schema && t.typname == to_type.typname)
             {
-                if from_type.hash() != to_type.hash() {
+                if from_type.hash != to_type.hash {
                     self.script.push_str(
                         format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
                     );
@@ -305,13 +320,33 @@ impl Comparer {
             .filter(|t| (t.typtype as u8 as char) == 'e');
 
         for to_enum in to_enums {
+            if to_enum.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping enum {}.{} due to missing hash. */\n",
+                        to_enum.schema, to_enum.typname
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_enum) = self
                 .from
                 .types
                 .iter()
                 .find(|t| t.schema == to_enum.schema && t.typname == to_enum.typname)
             {
-                if from_enum.hash() != to_enum.hash() {
+                if from_enum.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping enum {}.{} due to missing hash. */\n",
+                            from_enum.schema, from_enum.typname
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_enum.hash != to_enum.hash {
                     create_alter_section.push_str(
                         format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
                     );
@@ -381,17 +416,39 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Sequences: Start section --------------- */\n\n");
 
+        let mut drop_section = String::new();
+
         // We will find all new sequences from "to" dump that are not in "from" dump
         // and we will find all existing sequences in both dumps with different hashes
         // and add them to the script.
         for sequence in &self.to.sequences {
+            if sequence.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping sequence {}.{} due to missing hash. */\n",
+                        sequence.schema, sequence.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_sequence) = self
                 .from
                 .sequences
                 .iter()
                 .find(|s| s.name == sequence.name && s.schema == sequence.schema)
             {
-                if from_sequence.hash() != sequence.hash() {
+                if from_sequence.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping sequence {}.{} due to missing hash. */\n",
+                            from_sequence.schema, from_sequence.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_sequence.hash != sequence.hash {
                     self.script.push_str(
                         format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                     );
@@ -405,28 +462,40 @@ impl Comparer {
             }
         }
 
-        for sequence in &self.from.sequences {
-            if let Some(_to_sequence) = self
-                .to
-                .sequences
-                .iter()
-                .find(|s| s.name == sequence.name && s.schema == sequence.schema)
-            {
-                continue; // Sequence is present in both dumps, we already processed it
-            } else if self.use_drop {
-                // Just if we're using DROP statements
-                self.script.push_str(
+        if self.use_drop {
+            for sequence in &self.from.sequences {
+                if let Some(_to_sequence) = self
+                    .to
+                    .sequences
+                    .iter()
+                    .find(|s| s.name == sequence.name && s.schema == sequence.schema)
+                {
+                    continue; // Sequence is present in both dumps, we already processed it
+                }
+
+                if drop_section.is_empty() {
+                    drop_section.push_str(
+                        "\n/* ---> Sequences: Drop section (execute after dependent tables) --------------- */\n\n",
+                    );
+                }
+
+                drop_section.push_str(
                     format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                 );
-                self.script.push_str(
+                drop_section.push_str(
                     "/* Sequence is not present in 'to' dump and should be dropped. */\n",
                 );
-                self.script.push_str(sequence.get_drop_script().as_str());
+                drop_section.push_str(sequence.get_drop_script().as_str());
             }
         }
 
         self.script
             .push_str("\n/* ---> Sequences: End section --------------- */\n\n");
+
+        if self.use_drop && !drop_section.is_empty() {
+            drop_section.push_str("\n/* ---> Sequences: Drop section end --------------- */\n\n");
+            self.sequence_post_script.push_str(&drop_section);
+        }
         Ok(())
     }
 
@@ -439,13 +508,33 @@ impl Comparer {
         // and we will find all existing routines in both dumps with different hashes
         // and add them to the script.
         for routine in &self.to.routines {
+            if routine.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping routine {}.{} due to missing hash. */\n",
+                        routine.schema, routine.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_routine) = self
                 .from
                 .routines
                 .iter()
                 .find(|r| r.name == routine.name && r.schema == routine.schema)
             {
-                if from_routine.hash() != routine.hash() {
+                if from_routine.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping routine {}.{} due to missing hash. */\n",
+                            from_routine.schema, from_routine.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_routine.hash != routine.hash {
                     self.script.push_str(
                         format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                     );
@@ -508,13 +597,33 @@ impl Comparer {
         // We will find all new tables from "to" dump that are not in "from" dump
         // and add them to the script.
         for table in &self.to.tables {
+            if table.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping table {}.{} due to missing hash. */\n",
+                        table.schema, table.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(from_table) = self
                 .from
                 .tables
                 .iter()
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
-                if from_table.hash() != table.hash() {
+                if from_table.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping table {}.{} due to missing hash. */\n",
+                            from_table.schema, from_table.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if from_table.hash != table.hash {
                     // Just create an alter script for the table
                     // Will be added in next comparision (below)
                 }
@@ -526,13 +635,33 @@ impl Comparer {
         }
         // We will find all existing tables in both dumps with different hashes
         for table in &self.from.tables {
+            if table.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping table {}.{} due to missing hash. */\n",
+                        table.schema, table.name
+                    )
+                    .as_str(),
+                );
+                continue;
+            }
             if let Some(to_table) = self
                 .to
                 .tables
                 .iter()
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
-                if to_table.hash() != table.hash() {
+                if to_table.hash.is_none() {
+                    self.script.push_str(
+                        format!(
+                            "/* Skipping table {}.{} due to missing hash. */\n",
+                            to_table.schema, to_table.name
+                        )
+                        .as_str(),
+                    );
+                    continue;
+                }
+                if to_table.hash != table.hash {
                     self.script.push_str(
                         format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
                     );
