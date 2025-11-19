@@ -131,7 +131,7 @@ fn pgc_version() {
     println!("pgc v{version}");
     let year = chrono::Utc::now().year();
     println!("(c) 2025-{year} nettrash. All rights reserved.");
-    println!("This program is licensed under the GPL v3 License.");
+    println!("This program is licensed under the MIT License.");
     println!();
 }
 
