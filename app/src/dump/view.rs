@@ -12,6 +12,7 @@ pub struct View {
     /// Table relation (list of tables that used by this view)
     pub table_relation: Vec<String>,
     /// Hash of the view
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
 }
 
