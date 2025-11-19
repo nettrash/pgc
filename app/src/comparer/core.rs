@@ -62,13 +62,13 @@ impl Comparer {
             self.enum_pre_script.clear();
         }
         self.compare_types().await?;
+        self.compare_sequences().await?;
+        self.drop_views().await?;
+        self.compare_tables().await?;
         if !self.enum_post_script.is_empty() {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        self.compare_sequences().await?;
-        self.drop_views().await?;
-        self.compare_tables().await?;
         self.create_views().await?;
         self.compare_routines().await?;
 
