@@ -64,6 +64,11 @@ impl Comparer {
             self.enum_pre_script.clear();
         }
         self.compare_types().await?;
+        // The order of operations here is important due to dependency relationships:
+        // - Tables may depend on sequences (e.g., via SERIAL columns).
+        // - Sequences may depend on tables (e.g., via ownership).
+        // Therefore, we compare sequences and drop views before comparing tables,
+        // and defer sequence drops until after tables to avoid dependency errors.
         self.compare_sequences().await?;
         self.drop_views().await?;
         self.compare_tables().await?;
