@@ -165,7 +165,7 @@ impl Sequence {
     }
 
     pub fn get_drop_script(&self) -> String {
-        format!("drop sequence {}.{};\n", self.schema, self.name)
+        format!("drop sequence if exists {}.{};\n", self.schema, self.name)
     }
 
     pub fn get_alter_script(&self) -> String {
@@ -296,7 +296,7 @@ mod tests {
         let sequence = build_sequence();
         assert_eq!(
             sequence.get_drop_script(),
-            "drop sequence public.order_id_seq;\n"
+            "drop sequence if exists public.order_id_seq;\n"
         );
     }
 

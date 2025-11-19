@@ -19,6 +19,7 @@ pub struct Comparer {
     script: String,
     enum_pre_script: String,
     enum_post_script: String,
+    sequence_post_script: String,
     dropped_views: HashSet<String>,
 }
 
@@ -32,6 +33,7 @@ impl Comparer {
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
+            sequence_post_script: String::new(),
             dropped_views: HashSet::new(),
         };
 
@@ -62,13 +64,17 @@ impl Comparer {
             self.enum_pre_script.clear();
         }
         self.compare_types().await?;
+        self.compare_sequences().await?;
+        self.drop_views().await?;
+        self.compare_tables().await?;
         if !self.enum_post_script.is_empty() {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        self.compare_sequences().await?;
-        self.drop_views().await?;
-        self.compare_tables().await?;
+        if !self.sequence_post_script.is_empty() {
+            self.script.push_str(&self.sequence_post_script);
+            self.sequence_post_script.clear();
+        }
         self.create_views().await?;
         self.compare_routines().await?;
 
@@ -405,6 +411,8 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Sequences: Start section --------------- */\n\n");
 
+        let mut drop_section = String::new();
+
         // We will find all new sequences from "to" dump that are not in "from" dump
         // and we will find all existing sequences in both dumps with different hashes
         // and add them to the script.
@@ -449,28 +457,40 @@ impl Comparer {
             }
         }
 
-        for sequence in &self.from.sequences {
-            if let Some(_to_sequence) = self
-                .to
-                .sequences
-                .iter()
-                .find(|s| s.name == sequence.name && s.schema == sequence.schema)
-            {
-                continue; // Sequence is present in both dumps, we already processed it
-            } else if self.use_drop {
-                // Just if we're using DROP statements
-                self.script.push_str(
+        if self.use_drop {
+            for sequence in &self.from.sequences {
+                if let Some(_to_sequence) = self
+                    .to
+                    .sequences
+                    .iter()
+                    .find(|s| s.name == sequence.name && s.schema == sequence.schema)
+                {
+                    continue; // Sequence is present in both dumps, we already processed it
+                }
+
+                if drop_section.is_empty() {
+                    drop_section.push_str(
+                        "\n/* ---> Sequences: Drop section (execute after dependent tables) --------------- */\n\n",
+                    );
+                }
+
+                drop_section.push_str(
                     format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                 );
-                self.script.push_str(
+                drop_section.push_str(
                     "/* Sequence is not present in 'to' dump and should be dropped. */\n",
                 );
-                self.script.push_str(sequence.get_drop_script().as_str());
+                drop_section.push_str(sequence.get_drop_script().as_str());
             }
         }
 
         self.script
             .push_str("\n/* ---> Sequences: End section --------------- */\n\n");
+
+        if self.use_drop && !drop_section.is_empty() {
+            drop_section.push_str("\n/* ---> Sequences: Drop section end --------------- */\n\n");
+            self.sequence_post_script.push_str(&drop_section);
+        }
         Ok(())
     }
 
