@@ -996,4 +996,29 @@ mod tests {
 
         assert!(fk_script.contains("alter table public.users alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
     }
+
+    #[test]
+    fn test_get_foreign_key_script() {
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            Some("pg_default".to_string()),
+            vec![identity_column("id", 1, "integer")],
+            vec![
+                primary_key_constraint(),
+                check_constraint("users_name_check", "CHECK (name <> '')"),
+                foreign_key_constraint(false, false),
+            ],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let script = table.get_foreign_key_script();
+
+        assert!(script.contains("alter table public.users add constraint users_account_fk foreign key (account_id) references public.accounts(id)"));
+        assert!(!script.contains("users_name_check"));
+        assert!(!script.contains("users_pkey"));
+    }
 }
