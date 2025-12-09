@@ -478,7 +478,7 @@ impl Table {
                     if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
                         script.push_str(&alter_script);
                     } else {
-                        // Drop happened in get_alter_script, so just add.
+                        // Drop is handled in the table's get_alter_script (line 537), so just add the new FK here.
                         script.push_str(&new_constraint.get_script());
                     }
                 }
