@@ -1252,7 +1252,9 @@ mod tests {
         let change_main_script = fk_change_from.get_alter_script(&fk_change_to);
         let change_fk_script = fk_change_from.get_foreign_key_alter_script(&fk_change_to);
 
-        assert!(change_main_script.contains("alter table public.users drop constraint \"fk_change\";"));
+        assert!(
+            change_main_script.contains("alter table public.users drop constraint \"fk_change\";")
+        );
         assert!(change_fk_script.contains("alter table public.users add constraint fk_change foreign key (col) references new_table(id)"));
     }
 }

@@ -684,12 +684,20 @@ impl Comparer {
             .push_str("\n/* ---> Foreign Keys: Start section --------------- */\n\n");
 
         for table in &self.to.tables {
+            if table.hash.is_none() {
+                continue;
+            }
+
             if let Some(from_table) = self
                 .from
                 .tables
                 .iter()
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
+                if from_table.hash.is_none() {
+                    continue;
+                }
+
                 // Table exists in both. Check for FK changes.
                 self.script
                     .push_str(&from_table.get_foreign_key_alter_script(table));
