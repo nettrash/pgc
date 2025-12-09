@@ -1171,4 +1171,88 @@ mod tests {
         let script = from_table.get_foreign_key_alter_script(&to_table);
         assert_eq!(script, "");
     }
+
+    #[test]
+    fn test_foreign_key_full_lifecycle_workflow() {
+        // 1. Drop FK (exists in from, not in to)
+        let fk_drop_from = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![],
+            vec![custom_foreign_key_constraint(
+                "fk_drop",
+                "FOREIGN KEY (col) REFERENCES other(id)",
+            )],
+            vec![],
+            vec![],
+            None,
+        );
+        let fk_drop_to = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let drop_main_script = fk_drop_from.get_alter_script(&fk_drop_to);
+        let drop_fk_script = fk_drop_from.get_foreign_key_alter_script(&fk_drop_to);
+
+        assert!(drop_main_script.contains("alter table public.users drop constraint \"fk_drop\";"));
+        assert_eq!(drop_fk_script, "");
+
+        // 2. Add FK (not in from, exists in to)
+        let fk_add_from = fk_drop_to.clone();
+        let fk_add_to = fk_drop_from.clone(); // reusing table with FK
+
+        let add_main_script = fk_add_from.get_alter_script(&fk_add_to);
+        let add_fk_script = fk_add_from.get_foreign_key_alter_script(&fk_add_to);
+
+        assert!(!add_main_script.contains("fk_drop")); // Main script shouldn't touch new FKs
+        assert!(add_fk_script.contains(
+            "alter table public.users add constraint fk_drop foreign key (col) references other(id)"
+        ));
+
+        // 3. Recreate FK (definition change)
+        let fk_change_from = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![],
+            vec![custom_foreign_key_constraint(
+                "fk_change",
+                "FOREIGN KEY (col) REFERENCES old_table(id)",
+            )],
+            vec![],
+            vec![],
+            None,
+        );
+        let fk_change_to = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![],
+            vec![custom_foreign_key_constraint(
+                "fk_change",
+                "FOREIGN KEY (col) REFERENCES new_table(id)",
+            )],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let change_main_script = fk_change_from.get_alter_script(&fk_change_to);
+        let change_fk_script = fk_change_from.get_foreign_key_alter_script(&fk_change_to);
+
+        assert!(change_main_script.contains("alter table public.users drop constraint \"fk_change\";"));
+        assert!(change_fk_script.contains("alter table public.users add constraint fk_change foreign key (col) references new_table(id)"));
+    }
 }
