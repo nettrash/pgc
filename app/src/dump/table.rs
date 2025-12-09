@@ -422,9 +422,10 @@ impl Table {
         script.push_str(&column_definitions.join(",\n"));
         script.push_str("\n);\n\n");
 
-        // 5. Add other constraints (excluding primary key)
+        // 5. Add other constraints (excluding primary key and foreign key)
         for constraint in &self.constraints {
-            if constraint.constraint_type.to_lowercase() != "primary key" {
+            let c_type = constraint.constraint_type.to_lowercase();
+            if c_type != "primary key" && c_type != "foreign key" {
                 script.push_str(&constraint.get_script());
             }
         }
@@ -447,6 +448,46 @@ impl Table {
     /// Get drop script for the table
     pub fn get_drop_script(&self) -> String {
         format!("drop table if exists {}.{};\n", self.schema, self.name)
+    }
+
+    /// Get script for creating foreign keys
+    pub fn get_foreign_key_script(&self) -> String {
+        let mut script = String::new();
+        for constraint in &self.constraints {
+            if constraint.constraint_type.to_lowercase() == "foreign key" {
+                script.push_str(&constraint.get_script());
+            }
+        }
+        script
+    }
+
+    /// Get script for altering foreign keys
+    pub fn get_foreign_key_alter_script(&self, to_table: &Table) -> String {
+        let mut script = String::new();
+        for new_constraint in &to_table.constraints {
+            if new_constraint.constraint_type.to_lowercase() != "foreign key" {
+                continue;
+            }
+
+            if let Some(old_constraint) = self
+                .constraints
+                .iter()
+                .find(|c| c.name == new_constraint.name)
+            {
+                if old_constraint != new_constraint {
+                    if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
+                        script.push_str(&alter_script);
+                    } else {
+                        // Drop happened in get_alter_script, so just add.
+                        script.push_str(&new_constraint.get_script());
+                    }
+                }
+            } else {
+                // New FK
+                script.push_str(&new_constraint.get_script());
+            }
+        }
+        script
     }
 
     pub fn get_alter_script(&self, to_table: &Table) -> String {
@@ -481,6 +522,7 @@ impl Table {
 
         // Collect constraint changes; drop statements run before column drops
         for new_constraint in &to_table.constraints {
+            let is_fk = new_constraint.constraint_type.to_lowercase() == "foreign key";
             if let Some(old_constraint) = self
                 .constraints
                 .iter()
@@ -488,13 +530,17 @@ impl Table {
             {
                 if old_constraint != new_constraint {
                     if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
-                        constraint_post_script.push_str(&alter_script);
+                        if !is_fk {
+                            constraint_post_script.push_str(&alter_script);
+                        }
                     } else {
                         constraint_pre_script.push_str(&old_constraint.get_drop_script());
-                        constraint_post_script.push_str(&new_constraint.get_script());
+                        if !is_fk {
+                            constraint_post_script.push_str(&new_constraint.get_script());
+                        }
                     }
                 }
-            } else {
+            } else if !is_fk {
                 constraint_post_script.push_str(&new_constraint.get_script());
             }
         }
@@ -912,6 +958,7 @@ mod tests {
         );
 
         let script = from_table.get_alter_script(&to_table);
+        let fk_script = from_table.get_foreign_key_alter_script(&to_table);
 
         let expected_fragments = [
             "alter table public.users drop constraint \"users_name_check\";\n",
@@ -924,7 +971,6 @@ mod tests {
             "drop trigger if exists cleanup_user on public.users;\n",
             "alter table public.users drop column \"legacy\";\n",
             "alter table public.users add constraint users_name_check check (char_length(name) > 0) ;\n",
-            "alter table public.users alter constraint \"users_account_fk\" deferrable initially deferred;\n",
             "alter table public.users add constraint users_email_unique unique (email) ;\n",
             "create index idx_users_name on public.users using btree (lower(name));\n",
             "create index idx_users_email on public.users using btree (email);\n",
@@ -947,5 +993,7 @@ mod tests {
         assert!(script.contains("'unknown'::text"));
         assert!(script.contains("lower(name)"));
         assert!(script.contains("notify_user"));
+
+        assert!(fk_script.contains("alter table public.users alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
     }
 }

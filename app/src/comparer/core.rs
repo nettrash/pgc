@@ -72,6 +72,7 @@ impl Comparer {
         self.compare_sequences().await?;
         self.drop_views().await?;
         self.compare_tables().await?;
+        self.compare_foreign_keys().await?;
         if !self.enum_post_script.is_empty() {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
@@ -674,6 +675,32 @@ impl Comparer {
         }
         self.script
             .push_str("\n/* ---> Tables: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    // Comparing foreign keys
+    async fn compare_foreign_keys(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Foreign Keys: Start section --------------- */\n\n");
+
+        for table in &self.to.tables {
+            if let Some(from_table) = self
+                .from
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+            {
+                // Table exists in both. Check for FK changes.
+                self.script
+                    .push_str(&from_table.get_foreign_key_alter_script(table));
+            } else {
+                // New table. Add its FKs.
+                self.script.push_str(&table.get_foreign_key_script());
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> Foreign Keys: End section --------------- */\n\n");
         Ok(())
     }
 
