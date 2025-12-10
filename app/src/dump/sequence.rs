@@ -112,7 +112,10 @@ impl Sequence {
         let mut script = String::new();
 
         // CREATE SEQUENCE statement
-        script.push_str(&format!("create sequence {}.{}", self.schema, self.name));
+        script.push_str(&format!(
+            "create sequence \"{}\".\"{}\"",
+            self.schema, self.name
+        ));
 
         // Add AS clause for data type if not default
         if !self.data_type.is_empty() && self.data_type != "bigint" {
@@ -165,7 +168,10 @@ impl Sequence {
     }
 
     pub fn get_drop_script(&self) -> String {
-        format!("drop sequence if exists {}.{};\n", self.schema, self.name)
+        format!(
+            "drop sequence if exists \"{}\".\"{}\";\n",
+            self.schema, self.name
+        )
     }
 
     pub fn get_alter_script(&self) -> String {
@@ -200,7 +206,7 @@ impl Sequence {
             clauses.push(owned_by);
         }
 
-        let mut script = format!("alter sequence {}.{}", self.schema, self.name);
+        let mut script = format!("alter sequence \"{}\".\"{}\"", self.schema, self.name);
         if !clauses.is_empty() {
             script.push(' ');
             script.push_str(&clauses.join(" "));
@@ -262,7 +268,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\n",
+            "create sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\n",
         );
     }
 
@@ -287,7 +293,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_script(),
-            "create sequence public.minimal_seq no minvalue no maxvalue no cycle;\n",
+            "create sequence \"public\".\"minimal_seq\" no minvalue no maxvalue no cycle;\n",
         );
     }
 
@@ -296,7 +302,7 @@ mod tests {
         let sequence = build_sequence();
         assert_eq!(
             sequence.get_drop_script(),
-            "drop sequence if exists public.order_id_seq;\n"
+            "drop sequence if exists \"public\".\"order_id_seq\";\n"
         );
     }
 
@@ -306,7 +312,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\n",
+            "alter sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\n",
         );
     }
 
@@ -331,7 +337,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence audit.event_seq start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\n",
+            "alter sequence \"audit\".\"event_seq\" start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\n",
         );
     }
 }

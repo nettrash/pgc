@@ -1,6 +1,9 @@
 v1.0.2
 
                 Features:
+                    - Fixed foreign keys ordering.
+                    - Fixed TLS connection error.
+                    - Fixed naming with special characters.
 
 2025-11-19      v1.0.1
 

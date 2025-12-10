@@ -247,7 +247,7 @@ impl PgType {
                     .join(", ");
 
                 format!(
-                    "create type {}.{} as enum ({});\n",
+                    "create type \"{}\".\"{}\" as enum ({});\n",
                     self.schema, self.typname, variants
                 )
             }
@@ -267,7 +267,7 @@ impl PgType {
                 }
 
                 let mut script = format!(
-                    "create domain {}.{} as {}",
+                    "create domain \"{}\".\"{}\" as {}",
                     self.schema, self.typname, base_type
                 );
 
@@ -280,7 +280,7 @@ impl PgType {
 
                 for constraint in &self.domain_constraints {
                     script.push_str(&format!(
-                        "alter domain {}.{} add constraint {} {};\n",
+                        "alter domain \"{}\".\"{}\" add constraint {} {};\n",
                         self.schema,
                         self.typname,
                         quote_ident(&constraint.name),
@@ -329,7 +329,7 @@ impl PgType {
                     if !known_labels.contains(label) {
                         let escaped_label = escape_single_quotes(label);
                         let mut statement = format!(
-                            "alter type {}.{} add value if not exists '{}'",
+                            "alter type \"{}\".\"{}\" add value if not exists '{}'",
                             self.schema, self.typname, escaped_label
                         );
 
@@ -400,12 +400,12 @@ impl PgType {
                 if self.typdefault != target.typdefault {
                     if let Some(default) = &target.typdefault {
                         statements.push(format!(
-                            "alter domain {}.{} set default {};",
+                            "alter domain \"{}\".\"{}\" set default {};",
                             self.schema, self.typname, default
                         ));
                     } else {
                         statements.push(format!(
-                            "alter domain {}.{} drop default;",
+                            "alter domain \"{}\".\"{}\" drop default;",
                             self.schema, self.typname
                         ));
                     }
@@ -414,12 +414,12 @@ impl PgType {
                 if self.typnotnull != target.typnotnull {
                     if target.typnotnull {
                         statements.push(format!(
-                            "alter domain {}.{} set not null;",
+                            "alter domain \"{}\".\"{}\" set not null;",
                             self.schema, self.typname
                         ));
                     } else {
                         statements.push(format!(
-                            "alter domain {}.{} drop not null;",
+                            "alter domain \"{}\".\"{}\" drop not null;",
                             self.schema, self.typname
                         ));
                     }
@@ -442,13 +442,13 @@ impl PgType {
                         Some(target_constraint) => {
                             if current_constraint.definition != target_constraint.definition {
                                 statements.push(format!(
-                                    "alter domain {}.{} drop constraint {};",
+                                    "alter domain \"{}\".\"{}\" drop constraint {};",
                                     self.schema,
                                     self.typname,
                                     quote_ident(name)
                                 ));
                                 statements.push(format!(
-                                    "alter domain {}.{} add constraint {} {};",
+                                    "alter domain \"{}\".\"{}\" add constraint {} {};",
                                     self.schema,
                                     self.typname,
                                     quote_ident(name),
@@ -459,7 +459,7 @@ impl PgType {
                         }
                         None => {
                             statements.push(format!(
-                                "alter domain {}.{} drop constraint {};",
+                                "alter domain \"{}\".\"{}\" drop constraint {};",
                                 self.schema,
                                 self.typname,
                                 quote_ident(name)
@@ -475,7 +475,7 @@ impl PgType {
 
                     if !current_constraints.contains_key(name) {
                         statements.push(format!(
-                            "alter domain {}.{} add constraint {} {};",
+                            "alter domain \"{}\".\"{}\" add constraint {} {};",
                             self.schema,
                             self.typname,
                             quote_ident(name),
@@ -510,7 +510,10 @@ impl PgType {
 
     /// Returns a string to drop the user-defined type.
     pub fn get_drop_script(&self) -> String {
-        format!("drop type if exists {}.{};\n", self.schema, self.typname)
+        format!(
+            "drop type if exists \"{}\".\"{}\";\n",
+            self.schema, self.typname
+        )
     }
 }
 
@@ -613,7 +616,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create type public.status as enum ('simple', 'O''Reilly');\n"
+            "create type \"public\".\"status\" as enum ('simple', 'O''Reilly');\n"
         );
     }
 
@@ -643,8 +646,8 @@ mod tests {
 
         let script = pg_type.get_script();
 
-        let expected = "create domain public.amount as integer default 42 not null;\n\
-alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
+        let expected = "create domain \"public\".\"amount\" as integer default 42 not null;\n\
+alter domain \"public\".\"amount\" add constraint \"ValueCheck\" check (value > 0);\n";
         assert_eq!(script, expected);
     }
 
@@ -666,7 +669,7 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
 
         assert_eq!(
             script,
-            "alter type public.status add value if not exists 'in_progress' before 'completed';\n"
+            "alter type \"public\".\"status\" add value if not exists 'in_progress' before 'completed';\n"
         );
     }
 
@@ -709,11 +712,11 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
 
         let script = current.get_alter_script(&target);
 
-        let expected = "alter domain public.amount set default 84;\n\
-alter domain public.amount drop not null;\n\
-alter domain public.amount drop constraint \"ValueCheck\";\n\
-alter domain public.amount add constraint \"ValueCheck\" check (value >= 0);\n\
-alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0);\n";
+        let expected = "alter domain \"public\".\"amount\" set default 84;\n\
+alter domain \"public\".\"amount\" drop not null;\n\
+alter domain \"public\".\"amount\" drop constraint \"ValueCheck\";\n\
+alter domain \"public\".\"amount\" add constraint \"ValueCheck\" check (value >= 0);\n\
+alter domain \"public\".\"amount\" add constraint \"FreshConstraint\" check (value <> 0);\n";
 
         assert_eq!(script, expected);
     }
@@ -724,7 +727,7 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
 
         assert_eq!(
             pg_type.get_drop_script(),
-            "drop type if exists public.my_type;\n"
+            "drop type if exists \"public\".\"my_type\";\n"
         );
     }
 }
