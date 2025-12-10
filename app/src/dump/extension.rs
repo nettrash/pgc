@@ -32,7 +32,7 @@ impl Extension {
     /// Returns a string to create the extension.
     pub fn get_script(&self) -> String {
         let script = format!(
-            "create extension if not exists {} with schema {};\n",
+            "create extension if not exists \"{}\" with schema \"{}\";\n",
             self.name, self.schema
         );
 
@@ -41,7 +41,7 @@ impl Extension {
 
     /// Returns a string to drop the extension.
     pub fn get_drop_script(&self) -> String {
-        format!("drop extension if exists {};\n", self.name)
+        format!("drop extension if exists \"{}\";\n", self.name)
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists uuid-ossp with schema public;\n";
+        let expected = "create extension if not exists \"uuid-ossp\" with schema \"public\";\n";
 
         assert_eq!(script, expected);
     }
@@ -166,7 +166,7 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists postgis with schema extensions;\n";
+        let expected = "create extension if not exists \"postgis\" with schema \"extensions\";\n";
 
         assert_eq!(script, expected);
     }
@@ -180,7 +180,8 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists test-ext_name with schema custom_schema;\n";
+        let expected =
+            "create extension if not exists \"test-ext_name\" with schema \"custom_schema\";\n";
 
         assert_eq!(script, expected);
     }
@@ -194,7 +195,7 @@ mod tests {
         );
 
         let drop_script = extension.get_drop_script();
-        let expected = "drop extension if exists uuid-ossp;\n";
+        let expected = "drop extension if exists \"uuid-ossp\";\n";
 
         assert_eq!(drop_script, expected);
     }
@@ -208,7 +209,7 @@ mod tests {
         );
 
         let drop_script = extension.get_drop_script();
-        let expected = "drop extension if exists postgis;\n";
+        let expected = "drop extension if exists \"postgis\";\n";
 
         assert_eq!(drop_script, expected);
     }
@@ -222,7 +223,7 @@ mod tests {
         );
 
         let drop_script = extension.get_drop_script();
-        let expected = "drop extension if exists test-ext_name;\n";
+        let expected = "drop extension if exists \"test-ext_name\";\n";
 
         assert_eq!(drop_script, expected);
     }
@@ -299,10 +300,13 @@ mod tests {
 
         // Scripts should work with empty strings
         let script = extension.get_script();
-        assert_eq!(script, "create extension if not exists  with schema ;\n");
+        assert_eq!(
+            script,
+            "create extension if not exists \"\" with schema \"\";\n"
+        );
 
         let drop_script = extension.get_drop_script();
-        assert_eq!(drop_script, "drop extension if exists ;\n");
+        assert_eq!(drop_script, "drop extension if exists \"\";\n");
     }
 
     #[test]

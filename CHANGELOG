@@ -1,6 +1,10 @@
 v1.0.2
 
                 Features:
+                    - Fixed foreign keys ordering.
+                    - Fixed TLS connection error.
+                    - Fixed naming with special characters.
+                    - Added test cases for special characters and composite foreign keys in schema_a.sql and schema_b.sql.
 
 2025-11-19      v1.0.1
 

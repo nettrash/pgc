@@ -436,3 +436,33 @@ COMMENT ON COLUMN test_schema.users.metadata IS 'Additional user data in JSON fo
 COMMENT ON COLUMN test_schema.products.dimensions IS 'Product dimensions (length, width, height) in JSON';
 COMMENT ON COLUMN test_schema.users.preferred_contact IS 'Preferred method of contact for notifications';
 COMMENT ON COLUMN test_schema.products.barcode IS 'Product barcode for inventory tracking';
+
+-- Special characters test (Modified: added column)
+CREATE TABLE test_schema."special$table" (
+    "id" SERIAL PRIMARY KEY,
+    "user@name" VARCHAR(50),
+    "e-mail" VARCHAR(100),
+    "new#col" INT
+);
+
+-- table with spaces (Modified: changed type)
+CREATE TABLE test_schema."table with spaces" (
+    "id" SERIAL PRIMARY KEY,
+    "column with spaces" VARCHAR(255)
+);
+
+-- Complex Foreign Keys test (Modified: ON DELETE CASCADE)
+CREATE TABLE test_schema.composite_pk (
+    part_one INT,
+    part_two INT,
+    data TEXT,
+    PRIMARY KEY (part_one, part_two)
+);
+
+CREATE TABLE test_schema.composite_fk (
+    id SERIAL PRIMARY KEY,
+    ref_part_one INT,
+    ref_part_two INT,
+    CONSTRAINT fk_composite FOREIGN KEY (ref_part_one, ref_part_two) 
+        REFERENCES test_schema.composite_pk (part_one, part_two) ON DELETE CASCADE
+);

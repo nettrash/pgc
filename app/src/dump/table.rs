@@ -140,7 +140,8 @@ impl Table {
                             AND a.attisdropped = false
                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
-                        self.schema, self.name
+                        self.schema.replace('\'', "''"),
+                        self.name.replace('\'', "''")
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -213,7 +214,8 @@ impl Table {
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique ORDER BY i.schemaname, i.tablename, i.indexname",
-            self.schema, self.name
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''")
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -241,7 +243,8 @@ impl Table {
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, c.contype::text AS constraint_type, c.condeferrable::text AS is_deferrable, c.condeferred::text AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') ORDER BY n.nspname, t.relname, c.conname;",
-            self.schema, self.name
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''")
         );
 
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -269,8 +272,9 @@ impl Table {
     /// Fill information about triggers.
     async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}.{}'::regclass and tgisinternal = false ORDER BY tgname",
-            self.schema, self.name
+            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '\"{}\".\"{}\"'::regclass and tgisinternal = false ORDER BY tgname",
+            self.schema.replace('"', "\"\""),
+            self.name.replace('"', "\"\"")
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -299,8 +303,9 @@ impl Table {
         let func_row = sqlx::query(check_func).fetch_optional(pool).await?;
         if func_row.is_some() {
             let query = format!(
-                "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '{}'::regnamespace;",
-                self.name, self.schema
+                "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '\"{}\"'::regnamespace;",
+                self.name.replace('\'', "''"),
+                self.schema.replace('"', "\"\"")
             );
             let row = sqlx::query(&query).fetch_one(pool).await?;
             if let Some(definition) = row.get::<Option<String>, _>("definition") {
@@ -346,7 +351,7 @@ impl Table {
     /// Get script for the table
     pub fn get_script(&self) -> String {
         // 1. Build CREATE TABLE statement
-        let mut script = format!("create table {}.{} (\n", self.schema, self.name);
+        let mut script = format!("create table \"{}\".\"{}\" (\n", self.schema, self.name);
 
         // 2. Add column definitions
         let mut column_definitions = Vec::new();
@@ -447,7 +452,10 @@ impl Table {
 
     /// Get drop script for the table
     pub fn get_drop_script(&self) -> String {
-        format!("drop table if exists {}.{};\n", self.schema, self.name)
+        format!(
+            "drop table if exists \"{}\".\"{}\";\n",
+            self.schema, self.name
+        )
     }
 
     /// Get script for creating foreign keys
@@ -560,7 +568,7 @@ impl Table {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
                     index_drop_script.push_str(&format!(
-                        "drop index if exists {}.{};\n",
+                        "drop index if exists \"{}\".\"{}\";\n",
                         new_index.schema, new_index.name
                     ));
                     index_script.push_str(&new_index.get_script());
@@ -575,7 +583,7 @@ impl Table {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
                     trigger_drop_script.push_str(&format!(
-                        "drop trigger if exists {} on {}.{};\n",
+                        "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
                         old_trigger.name, self.schema, self.name
                     ));
                     trigger_script.push_str(&new_trigger.get_script());
@@ -588,7 +596,7 @@ impl Table {
         for old_index in &self.indexes {
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
                 index_drop_script.push_str(&format!(
-                    "drop index if exists {}.{};\n",
+                    "drop index if exists \"{}\".\"{}\";\n",
                     old_index.schema, old_index.name
                 ));
             }
@@ -597,7 +605,7 @@ impl Table {
         for old_trigger in &self.triggers {
             if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
                 trigger_drop_script.push_str(&format!(
-                    "drop trigger if exists {} on {}.{};\n",
+                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
                     old_trigger.name, self.schema, self.name
                 ));
             }
@@ -861,12 +869,12 @@ mod tests {
         let script = table.get_script();
 
         let expected = concat!(
-            "create table public.users (\n",
+            "create table \"public\".\"users\" (\n",
             "    \"id\" serial,\n",
             "    \"name\" text not null,\n",
             "    primary key (\"id\")\n",
             ");\n\n",
-            "alter table public.users add constraint users_name_check check (name <> '') ;\n",
+            "alter table \"public\".\"users\" add constraint \"users_name_check\" check (name <> '') ;\n",
             "create index idx_users_name on public.users using btree (name);\n",
             "create trigger audit_user before insert on public.users for each row execute function log_user();\n",
         );
@@ -879,7 +887,7 @@ mod tests {
         let table = basic_table();
         assert_eq!(
             table.get_drop_script(),
-            "drop table if exists public.users;\n"
+            "drop table if exists \"public\".\"users\";\n"
         );
     }
 
@@ -961,17 +969,17 @@ mod tests {
         let fk_script = from_table.get_foreign_key_alter_script(&to_table);
 
         let expected_fragments = [
-            "alter table public.users drop constraint \"users_name_check\";\n",
-            "alter table public.users drop constraint \"users_legacy_check\";\n",
-            "alter table public.users alter column \"name\" set default 'unknown'::text;\n",
-            "alter table public.users add column \"email\" text;\n",
-            "drop index if exists public.idx_users_name;\n",
-            "drop index if exists public.idx_users_old;\n",
-            "drop trigger if exists audit_user on public.users;\n",
-            "drop trigger if exists cleanup_user on public.users;\n",
-            "alter table public.users drop column \"legacy\";\n",
-            "alter table public.users add constraint users_name_check check (char_length(name) > 0) ;\n",
-            "alter table public.users add constraint users_email_unique unique (email) ;\n",
+            "alter table \"public\".\"users\" drop constraint \"users_name_check\";\n",
+            "alter table \"public\".\"users\" drop constraint \"users_legacy_check\";\n",
+            "alter table \"public\".\"users\" alter column \"name\" set default 'unknown'::text;\n",
+            "alter table \"public\".\"users\" add column \"email\" text;\n",
+            "drop index if exists \"public\".\"idx_users_name\";\n",
+            "drop index if exists \"public\".\"idx_users_old\";\n",
+            "drop trigger if exists \"audit_user\" on \"public\".\"users\";\n",
+            "drop trigger if exists \"cleanup_user\" on \"public\".\"users\";\n",
+            "alter table \"public\".\"users\" drop column \"legacy\";\n",
+            "alter table \"public\".\"users\" add constraint \"users_name_check\" check (char_length(name) > 0) ;\n",
+            "alter table \"public\".\"users\" add constraint \"users_email_unique\" unique (email) ;\n",
             "create index idx_users_name on public.users using btree (lower(name));\n",
             "create index idx_users_email on public.users using btree (email);\n",
             "create trigger audit_user after insert on public.users for each row execute function log_user_change();\n",
@@ -994,7 +1002,7 @@ mod tests {
         assert!(script.contains("lower(name)"));
         assert!(script.contains("notify_user"));
 
-        assert!(fk_script.contains("alter table public.users alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
+        assert!(fk_script.contains("alter table \"public\".\"users\" alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
     }
 
     #[test]
@@ -1017,7 +1025,7 @@ mod tests {
 
         let script = table.get_foreign_key_script();
 
-        assert!(script.contains("alter table public.users add constraint users_account_fk foreign key (account_id) references public.accounts(id)"));
+        assert!(script.contains("alter table \"public\".\"users\" add constraint \"users_account_fk\" foreign key (account_id) references public.accounts(id)"));
         assert!(!script.contains("users_name_check"));
         assert!(!script.contains("users_pkey"));
     }
@@ -1066,7 +1074,7 @@ mod tests {
 
         let script = from_table.get_foreign_key_alter_script(&to_table);
         assert!(script.contains(
-            "alter table public.users add constraint fk_new foreign key (col) references other(id)"
+            "alter table \"public\".\"users\" add constraint \"fk_new\" foreign key (col) references other(id)"
         ));
     }
 
@@ -1137,7 +1145,7 @@ mod tests {
 
         let script = from_table.get_foreign_key_alter_script(&to_table);
         // Should contain the add constraint part. Drop is elsewhere.
-        assert!(script.contains("alter table public.users add constraint fk_change foreign key (col) references table_b(id)"));
+        assert!(script.contains("alter table \"public\".\"users\" add constraint \"fk_change\" foreign key (col) references table_b(id)"));
     }
 
     #[test]
@@ -1204,7 +1212,10 @@ mod tests {
         let drop_main_script = fk_drop_from.get_alter_script(&fk_drop_to);
         let drop_fk_script = fk_drop_from.get_foreign_key_alter_script(&fk_drop_to);
 
-        assert!(drop_main_script.contains("alter table public.users drop constraint \"fk_drop\";"));
+        assert!(
+            drop_main_script
+                .contains("alter table \"public\".\"users\" drop constraint \"fk_drop\";")
+        );
         assert_eq!(drop_fk_script, "");
 
         // 2. Add FK (not in from, exists in to)
@@ -1216,7 +1227,7 @@ mod tests {
 
         assert!(!add_main_script.contains("fk_drop")); // Main script shouldn't touch new FKs
         assert!(add_fk_script.contains(
-            "alter table public.users add constraint fk_drop foreign key (col) references other(id)"
+            "alter table \"public\".\"users\" add constraint \"fk_drop\" foreign key (col) references other(id)"
         ));
 
         // 3. Recreate FK (definition change)
@@ -1253,8 +1264,9 @@ mod tests {
         let change_fk_script = fk_change_from.get_foreign_key_alter_script(&fk_change_to);
 
         assert!(
-            change_main_script.contains("alter table public.users drop constraint \"fk_change\";")
+            change_main_script
+                .contains("alter table \"public\".\"users\" drop constraint \"fk_change\";")
         );
-        assert!(change_fk_script.contains("alter table public.users add constraint fk_change foreign key (col) references new_table(id)"));
+        assert!(change_fk_script.contains("alter table \"public\".\"users\" add constraint \"fk_change\" foreign key (col) references new_table(id)"));
     }
 }

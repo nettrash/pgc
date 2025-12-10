@@ -23,7 +23,7 @@ impl TableIndex {
     /// Returns a string representation of the index
     pub fn get_script(&self) -> String {
         let mut script = String::new();
-        script.push_str(&self.indexdef.to_lowercase());
+        script.push_str(&self.indexdef);
         script.push_str(";\n");
         script
     }
@@ -233,7 +233,7 @@ mod tests {
         let index = create_test_index();
         let script = index.get_script();
 
-        let expected = "create unique index idx_users_email on public.users using btree (email);\n";
+        let expected = "CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email);\n";
         assert_eq!(script, expected);
     }
 
@@ -242,7 +242,7 @@ mod tests {
         let index = create_simple_index();
         let script = index.get_script();
 
-        let expected = "create index idx_orders_date on app.orders using btree (created_at);\n";
+        let expected = "CREATE INDEX idx_orders_date ON app.orders USING btree (created_at);\n";
         assert_eq!(script, expected);
     }
 
@@ -251,10 +251,10 @@ mod tests {
         let index = create_complex_index();
         let script = index.get_script();
 
-        // Should convert to lowercase and add semicolon + newline
-        assert!(script.starts_with("create index idx_events_composite"));
-        assert!(script.contains("using gin"));
-        assert!(script.contains("where active = true"));
+        // Should preserve case and add semicolon + newline
+        assert!(script.starts_with("CREATE INDEX idx_events_composite"));
+        assert!(script.contains("USING gin"));
+        assert!(script.contains("WHERE active = true"));
         assert!(script.ends_with(";\n"));
     }
 
@@ -263,7 +263,7 @@ mod tests {
         let index = create_partial_index();
         let script = index.get_script();
 
-        let expected = "create index idx_products_active on public.products (name, price) where active = true;\n";
+        let expected = "CREATE INDEX idx_products_active ON public.products (name, price) WHERE active = true;\n";
         assert_eq!(script, expected);
     }
 
@@ -279,7 +279,7 @@ mod tests {
         };
 
         let script = index.get_script();
-        let expected = "create unique index idx_users_name on public.users using btree (name);\n";
+        let expected = "CREATE UNIQUE INDEX IDX_USERS_NAME ON PUBLIC.USERS USING BTREE (NAME);\n";
         assert_eq!(script, expected);
     }
 
@@ -533,7 +533,7 @@ mod tests {
         for index in indexes {
             // Each should produce a valid script
             let script = index.get_script();
-            assert!(script.contains(&format!("create index {}", index.name)));
+            assert!(script.contains(&format!("CREATE INDEX {}", index.name)));
             assert!(script.ends_with(";\n"));
 
             // Each should produce a valid hash
@@ -608,9 +608,9 @@ mod tests {
         };
 
         let script = index.get_script();
-        assert!(script.contains("create index multiline_idx"));
+        assert!(script.contains("CREATE INDEX multiline_idx"));
         assert!(script.contains("\n"));
-        assert!(script.contains("where active = true"));
+        assert!(script.contains("WHERE active = true"));
         assert!(script.ends_with(";\n"));
 
         // Hash should work with multiline definitions

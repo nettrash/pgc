@@ -18,12 +18,12 @@ impl Schema {
 
     /// Returns a string to create the schema.
     pub fn get_script(&self) -> String {
-        format!("create schema if not exists {};\n", self.name)
+        format!("create schema if not exists \"{}\";\n", self.name)
     }
 
     /// Returns a string to drop the schema.
     pub fn get_drop_script(&self) -> String {
-        format!("drop schema if exists {};\n", self.name)
+        format!("drop schema if exists \"{}\";\n", self.name)
     }
 }
 
@@ -47,7 +47,7 @@ mod tests {
 
         assert_eq!(
             schema.get_script(),
-            "create schema if not exists analytics;\n"
+            "create schema if not exists \"analytics\";\n"
         );
     }
 
@@ -55,6 +55,9 @@ mod tests {
     fn test_get_drop_script_returns_drop_statement() {
         let schema = Schema::new("archive".to_string());
 
-        assert_eq!(schema.get_drop_script(), "drop schema if exists archive;\n");
+        assert_eq!(
+            schema.get_drop_script(),
+            "drop schema if exists \"archive\";\n"
+        );
     }
 }
