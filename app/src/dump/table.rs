@@ -140,7 +140,8 @@ impl Table {
                             AND a.attisdropped = false
                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
-                        self.schema, self.name
+                        self.schema.replace('\'', "''"),
+                        self.name.replace('\'', "''")
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -213,7 +214,8 @@ impl Table {
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique ORDER BY i.schemaname, i.tablename, i.indexname",
-            self.schema, self.name
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''")
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -241,7 +243,8 @@ impl Table {
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, c.contype::text AS constraint_type, c.condeferrable::text AS is_deferrable, c.condeferred::text AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') ORDER BY n.nspname, t.relname, c.conname;",
-            self.schema, self.name
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''")
         );
 
         let rows = sqlx::query(&query).fetch_all(pool).await?;
@@ -269,8 +272,9 @@ impl Table {
     /// Fill information about triggers.
     async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '{}.{}'::regclass and tgisinternal = false ORDER BY tgname",
-            self.schema, self.name
+            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '\"{}\".\"{}\"'::regclass and tgisinternal = false ORDER BY tgname",
+            self.schema.replace('"', "\"\""),
+            self.name.replace('"', "\"\"")
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -299,8 +303,9 @@ impl Table {
         let func_row = sqlx::query(check_func).fetch_optional(pool).await?;
         if func_row.is_some() {
             let query = format!(
-                "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '{}'::regnamespace;",
-                self.name, self.schema
+                "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '\"{}\"'::regnamespace;",
+                self.name.replace('\'', "''"),
+                self.schema.replace('"', "\"\"")
             );
             let row = sqlx::query(&query).fetch_one(pool).await?;
             if let Some(definition) = row.get::<Option<String>, _>("definition") {

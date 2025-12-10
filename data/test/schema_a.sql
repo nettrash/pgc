@@ -324,3 +324,31 @@ COMMENT ON TABLE test_schema.products IS 'Product catalog';
 COMMENT ON TABLE test_schema.orders IS 'Customer orders';
 COMMENT ON COLUMN test_schema.users.metadata IS 'Additional user data in JSON format';
 COMMENT ON COLUMN test_schema.products.dimensions IS 'Product dimensions (length, width, height) in JSON';
+
+-- Special characters test
+CREATE TABLE test_schema."special$table" (
+    "id" SERIAL PRIMARY KEY,
+    "user@name" VARCHAR(50),
+    "e-mail" VARCHAR(100)
+);
+
+CREATE TABLE test_schema."table with spaces" (
+    "id" SERIAL PRIMARY KEY,
+    "column with spaces" TEXT
+);
+
+-- Complex Foreign Keys test
+CREATE TABLE test_schema.composite_pk (
+    part_one INT,
+    part_two INT,
+    data TEXT,
+    PRIMARY KEY (part_one, part_two)
+);
+
+CREATE TABLE test_schema.composite_fk (
+    id SERIAL PRIMARY KEY,
+    ref_part_one INT,
+    ref_part_two INT,
+    CONSTRAINT fk_composite FOREIGN KEY (ref_part_one, ref_part_two) 
+        REFERENCES test_schema.composite_pk (part_one, part_two)
+);
