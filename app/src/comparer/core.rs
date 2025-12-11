@@ -456,6 +456,34 @@ impl Comparer {
                     self.script.push_str(sequence.get_alter_script().as_str());
                 }
             } else {
+                // Check if the sequence is owned by a column that is an identity column or serial type.
+                // In this case, the sequence is created automatically by PostgreSQL when the table/column is created.
+                if let (Some(schema), Some(table), Some(column)) = (
+                    &sequence.owned_by_schema,
+                    &sequence.owned_by_table,
+                    &sequence.owned_by_column,
+                ) && let Some(to_table) = self
+                    .to
+                    .tables
+                    .iter()
+                    .find(|t| t.schema == *schema && t.name == *table)
+                    && let Some(to_column) = to_table.columns.iter().find(|c| c.name == *column)
+                {
+                    let is_identity = to_column.is_identity;
+                    let is_serial = to_column.data_type.to_lowercase().contains("serial");
+
+                    if is_identity || is_serial {
+                        self.script.push_str(
+                                    format!(
+                                        "/* Skipping sequence {}.{} as it will be created by column {}.{}.{} (identity/serial) */\n",
+                                        sequence.schema, sequence.name, schema, table, column
+                                    )
+                                    .as_str(),
+                                );
+                        continue;
+                    }
+                }
+
                 self.script.push_str(
                     format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                 );
@@ -464,7 +492,12 @@ impl Comparer {
         }
 
         if self.use_drop {
+            let mut dropped_sequences = HashSet::new();
             for sequence in &self.from.sequences {
+                if dropped_sequences.contains(&format!("{}.{}", sequence.schema, sequence.name)) {
+                    continue;
+                }
+
                 if let Some(_to_sequence) = self
                     .to
                     .sequences
@@ -472,6 +505,65 @@ impl Comparer {
                     .find(|s| s.name == sequence.name && s.schema == sequence.schema)
                 {
                     continue; // Sequence is present in both dumps, we already processed it
+                }
+
+                // Check if the sequence is owned by a table/column.
+                if let (Some(schema), Some(table)) =
+                    (&sequence.owned_by_schema, &sequence.owned_by_table)
+                {
+                    let to_table = self
+                        .to
+                        .tables
+                        .iter()
+                        .find(|t| t.schema == *schema && t.name == *table);
+
+                    if to_table.is_none() {
+                        self.script.push_str(
+                            format!(
+                                "/* Skipping drop of sequence {}.{} as it is owned by table {}.{} which will be dropped. */\n",
+                                sequence.schema, sequence.name, schema, table
+                            )
+                            .as_str(),
+                        );
+                        continue;
+                    }
+
+                    // Table exists in TO. Check if column exists or if it was an identity column.
+                    if let Some(column_name) = &sequence.owned_by_column {
+                        let to_table = to_table.unwrap();
+                        let to_column = to_table.columns.iter().find(|c| c.name == *column_name);
+
+                        if to_column.is_none() {
+                            self.script.push_str(
+                                format!(
+                                    "/* Skipping drop of sequence {}.{} as it is owned by column {}.{}.{} which will be dropped. */\n",
+                                    sequence.schema, sequence.name, schema, table, column_name
+                                )
+                                .as_str(),
+                            );
+                            continue;
+                        }
+
+                        // Column exists in TO. Check if it was an identity column in FROM.
+                        if let Some(from_table) = self
+                            .from
+                            .tables
+                            .iter()
+                            .find(|t| t.schema == *schema && t.name == *table)
+                            && let Some(from_column) =
+                                from_table.columns.iter().find(|c| c.name == *column_name)
+                            && from_column.is_identity
+                        {
+                            self.script.push_str(
+                                        format!(
+                                            "/* Skipping drop of sequence {}.{} as it is owned by identity column {}.{}.{}. */\n",
+                                            sequence.schema, sequence.name, schema, table, column_name
+                                        )
+                                        .as_str(),
+                                    );
+                            continue;
+                        }
+                    }
                 }
 
                 if drop_section.is_empty() {
@@ -487,6 +579,7 @@ impl Comparer {
                     "/* Sequence is not present in 'to' dump and should be dropped. */\n",
                 );
                 drop_section.push_str(sequence.get_drop_script().as_str());
+                dropped_sequences.insert(format!("{}.{}", sequence.schema, sequence.name));
             }
         }
 
@@ -875,5 +968,483 @@ mod tests {
         assert!(script.contains(
             "create or replace function \"public\".\"test_func\"(a text) returns integer"
         ));
+    }
+
+    use crate::dump::sequence::Sequence;
+    use crate::dump::table::Table;
+    use crate::dump::table_column::TableColumn;
+
+    #[tokio::test]
+    async fn compare_sequences_skips_owned_by_serial_column() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Sequence owned by table column
+        let sequence = Sequence::new(
+            "public".to_string(),
+            "test_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("public".to_string()),
+            Some("test".to_string()),
+            Some("id".to_string()),
+        );
+        to_dump.sequences.push(sequence);
+
+        // Table with serial column
+        let column = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            table: "test".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: Some("nextval('test_id_seq'::regclass)".to_string()),
+            is_nullable: false,
+            data_type: "bigserial".to_string(), // This triggers the skip
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        };
+
+        let table = Table::new(
+            "public".to_string(),
+            "test".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![column],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains(
+            "Skipping sequence public.test_id_seq as it will be created by column public.test.id"
+        ));
+        assert!(!script.contains("create sequence \"public\".\"test_id_seq\""));
+    }
+
+    #[tokio::test]
+    async fn compare_sequences_skips_owned_by_identity_column() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Sequence owned by table column
+        let sequence = Sequence::new(
+            "public".to_string(),
+            "test_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("public".to_string()),
+            Some("test".to_string()),
+            Some("id".to_string()),
+        );
+        to_dump.sequences.push(sequence);
+
+        // Table with identity column
+        let column = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            table: "test".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: None,
+            is_nullable: false,
+            data_type: "bigint".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: true, // This triggers the skip
+            identity_generation: Some("ALWAYS".to_string()),
+            identity_start: Some("1".to_string()),
+            identity_increment: Some("1".to_string()),
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        };
+
+        let table = Table::new(
+            "public".to_string(),
+            "test".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![column],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains(
+            "Skipping sequence public.test_id_seq as it will be created by column public.test.id"
+        ));
+        assert!(!script.contains("create sequence \"public\".\"test_id_seq\""));
+    }
+
+    #[tokio::test]
+    async fn compare_sequences_does_not_skip_normal_sequence() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Normal sequence not owned by any column
+        let sequence = Sequence::new(
+            "public".to_string(),
+            "test_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_dump.sequences.push(sequence);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(!script.contains("Skipping sequence"));
+        assert!(script.contains("create sequence \"public\".\"test_seq\""));
+    }
+
+    #[tokio::test]
+    async fn compare_sequences_skips_drop_if_owned_by_dropped_table() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        // Sequence owned by table column
+        let sequence = Sequence::new(
+            "public".to_string(),
+            "test_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("public".to_string()),
+            Some("test".to_string()),
+            Some("id".to_string()),
+        );
+        from_dump.sequences.push(sequence);
+
+        // Table that owns the sequence
+        let column = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            table: "test".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: None,
+            is_nullable: false,
+            data_type: "bigint".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: true,
+            identity_generation: Some("ALWAYS".to_string()),
+            identity_start: Some("1".to_string()),
+            identity_increment: Some("1".to_string()),
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        };
+
+        let table = Table::new(
+            "public".to_string(),
+            "test".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![column],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_dump.tables.push(table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("Skipping drop of sequence public.test_id_seq as it is owned by table public.test which will be dropped."));
+    }
+
+    #[tokio::test]
+    async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Sequence owned by table column
+        let sequence = Sequence::new(
+            "public".to_string(),
+            "test_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("public".to_string()),
+            Some("test".to_string()),
+            Some("id".to_string()),
+        );
+        from_dump.sequences.push(sequence);
+
+        // Table with identity column in FROM
+        let from_column = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            table: "test".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: None,
+            is_nullable: false,
+            data_type: "bigint".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: true,
+            identity_generation: Some("ALWAYS".to_string()),
+            identity_start: Some("1".to_string()),
+            identity_increment: Some("1".to_string()),
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        };
+
+        let from_table = Table::new(
+            "public".to_string(),
+            "test".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![from_column],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_dump.tables.push(from_table);
+
+        // Table in TO (exists, but maybe column changed or sequence changed)
+        // Even if column is same, if sequence is missing in TO (simulated here by not adding it to to_dump.sequences),
+        // we should skip drop if it's identity.
+        let to_column = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            table: "test".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: None,
+            is_nullable: false,
+            data_type: "bigint".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: true, // Still identity
+            identity_generation: Some("ALWAYS".to_string()),
+            identity_start: Some("1".to_string()),
+            identity_increment: Some("1".to_string()),
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        };
+
+        let to_table = Table::new(
+            "public".to_string(),
+            "test".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![to_column],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("Skipping drop of sequence public.test_id_seq as it is owned by identity column public.test.id."));
     }
 }

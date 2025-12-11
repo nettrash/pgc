@@ -18,6 +18,7 @@ pub struct Sequence {
     pub owned_by_schema: Option<String>, // Schema of the owning table/column
     pub owned_by_table: Option<String>,  // Owning table name
     pub owned_by_column: Option<String>, // Owning column name
+    pub is_identity: bool,               // Whether the sequence is an identity sequence
     pub hash: Option<String>,            // Hash of the sequence
 }
 
@@ -55,10 +56,16 @@ impl Sequence {
             owned_by_schema,
             owned_by_table,
             owned_by_column,
+            is_identity: false,
             hash: None,
         };
         sequence.hash();
         sequence
+    }
+
+    pub fn set_is_identity(&mut self, is_identity: bool) {
+        self.is_identity = is_identity;
+        self.hash();
     }
 
     /// Hash
@@ -84,11 +91,15 @@ impl Sequence {
         if let Some(cache_size) = self.cache_size {
             hasher.update(cache_size.to_string().as_bytes());
         }
+        hasher.update(self.is_identity.to_string().as_bytes());
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
     fn render_owned_by_clause(&self) -> Option<String> {
+        if self.is_identity {
+            return None;
+        }
         match (
             self.owned_by_schema.as_deref(),
             self.owned_by_table.as_deref(),
@@ -254,6 +265,7 @@ mod tests {
         hasher.update("5".as_bytes());
         hasher.update("true".as_bytes());
         hasher.update("20".as_bytes());
+        hasher.update("false".as_bytes());
 
         let expected_hash = format!("{:x}", hasher.finalize());
 

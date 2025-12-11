@@ -419,14 +419,15 @@ impl Dump {
                     seq.last_value,
                     owner_ns.nspname as owned_by_schema,
                     owner_table.relname as owned_by_table,
-                    owner_attr.attname as owned_by_column
+                    owner_attr.attname as owned_by_column,
+                    dep.deptype::text as dependency_type
                 from
                     pg_sequences seq
                     left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
                     left join pg_class seq_class on seq_class.relname = seq.sequencename
                         and seq_class.relnamespace = seq_ns.oid
                     left join pg_depend dep on dep.objid = seq_class.oid
-                        and dep.deptype = 'a'
+                        and dep.deptype in ('a', 'i')
                     left join pg_class owner_table on owner_table.oid = dep.refobjid
                     left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
                     left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
@@ -468,8 +469,14 @@ impl Dump {
                     owned_by_schema: row.get::<Option<String>, _>("owned_by_schema"),
                     owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
                     owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
+                    is_identity: false,
                     hash: None,
                 };
+                if let Some(deptype) = row.get::<Option<String>, _>("dependency_type")
+                    && deptype == "i"
+                {
+                    seq.is_identity = true;
+                }
                 seq.hash();
                 self.sequences.push(seq.clone());
                 println!(
