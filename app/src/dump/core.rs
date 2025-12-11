@@ -533,7 +533,9 @@ impl Dump {
                     name: row.get("proname"),
                     lang: row.get("prolang"),
                     kind: row.get("prokind"),
-                    return_type: row.get::<Option<String>, _>("prorettype").unwrap_or_else(|| "void".to_string()),
+                    return_type: row
+                        .get::<Option<String>, _>("prorettype")
+                        .unwrap_or_else(|| "void".to_string()),
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
                     source_code: row.get("prosrc"),

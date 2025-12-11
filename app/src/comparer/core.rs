@@ -830,6 +830,8 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(script.contains("drop function if exists \"public\".\"test_func\" ();"));
-        assert!(script.contains("create or replace function \"public\".\"test_func\"() returns text"));
+        assert!(
+            script.contains("create or replace function \"public\".\"test_func\"() returns text")
+        );
     }
 }
