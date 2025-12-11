@@ -308,6 +308,15 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION test_schema.get_users_by_status(p_status test_schema.status_type)
+RETURNS TABLE(user_id integer, username varchar, email varchar, created_at timestamp with time zone)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY SELECT id, username, email, created_at FROM test_schema.users WHERE status = p_status;
+END;
+$$;
+
 -- cleanup_old_orders procedure removed (table doesn't exist)
 
 -- NEW PROCEDURE
@@ -458,6 +467,21 @@ CREATE TABLE test_schema.composite_pk (
     data TEXT,
     PRIMARY KEY (part_one, part_two)
 );
+
+-- Function argument change test (Modified: added currency argument)
+CREATE OR REPLACE FUNCTION test_schema.calculate_tax(price numeric, tax_rate numeric, currency varchar)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Just a dummy implementation using the new argument
+    IF currency = 'USD' THEN
+        RETURN price * tax_rate;
+    ELSE
+        RETURN price * tax_rate * 1.1;
+    END IF;
+END;
+$$;
 
 CREATE TABLE test_schema.composite_fk (
     id SERIAL PRIMARY KEY,

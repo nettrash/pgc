@@ -233,6 +233,15 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION test_schema.get_users_by_status(p_status test_schema.status_type)
+RETURNS TABLE(user_id integer, username varchar, email varchar)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY SELECT id, username, email FROM test_schema.users WHERE status = p_status;
+END;
+$$;
+
 -- Procedure (PostgreSQL 11+)
 CREATE OR REPLACE PROCEDURE test_schema.cleanup_old_orders(days_old INTEGER DEFAULT 365)
 LANGUAGE plpgsql AS $$
@@ -344,6 +353,16 @@ CREATE TABLE test_schema.composite_pk (
     data TEXT,
     PRIMARY KEY (part_one, part_two)
 );
+
+-- Function argument change test
+CREATE OR REPLACE FUNCTION test_schema.calculate_tax(price numeric, tax_rate numeric)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN price * tax_rate;
+END;
+$$;
 
 CREATE TABLE test_schema.composite_fk (
     id SERIAL PRIMARY KEY,

@@ -494,7 +494,7 @@ impl Dump {
                     r.proname,
                     l.lanname as prolang,
                     case when r.prokind = 'f' then 'function' else 'procedure' end as prokind,
-                    t.typname as prorettype,
+                    pg_get_function_result(r.oid) as prorettype,
                     pg_get_function_identity_arguments(r.oid) as proarguments,
                     pg_get_expr(r.proargdefaults, 0) as proargdefaults,
                     r.prosrc
@@ -502,7 +502,6 @@ impl Dump {
                     pg_proc r
                     join pg_namespace n on r.pronamespace = n.oid
                     join pg_language l on r.prolang = l.oid
-                    join pg_type t on r.prorettype = t.oid
                 where
                     n.nspname like '{}'
                     and n.nspname not in ('pg_catalog', 'information_schema')
@@ -534,7 +533,9 @@ impl Dump {
                     name: row.get("proname"),
                     lang: row.get("prolang"),
                     kind: row.get("prokind"),
-                    return_type: row.get("prorettype"),
+                    return_type: row
+                        .get::<Option<String>, _>("prorettype")
+                        .unwrap_or_else(|| "void".to_string()),
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
                     source_code: row.get("prosrc"),

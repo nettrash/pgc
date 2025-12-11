@@ -5,6 +5,7 @@ v1.0.2
                     - Fixed TLS connection error.
                     - Fixed naming with special characters.
                     - Added test cases for special characters and composite foreign keys in schema_a.sql and schema_b.sql.
+                    - Fixed incorrect transformation of RETURNS TABLE.
 
 2025-11-19      v1.0.1
 

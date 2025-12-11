@@ -536,6 +536,12 @@ impl Comparer {
                     continue;
                 }
                 if from_routine.hash != routine.hash {
+                    if from_routine.return_type != routine.return_type
+                        || from_routine.arguments != routine.arguments
+                    {
+                        self.script
+                            .push_str(from_routine.get_drop_script().as_str());
+                    }
                     self.script.push_str(
                         format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                     );
@@ -777,5 +783,97 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Views CREATE: End section --------------- */\n\n");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::dump_config::DumpConfig;
+    use crate::dump::routine::Routine;
+    use sqlx::postgres::types::Oid;
+
+    #[tokio::test]
+    async fn compare_routines_drops_and_recreates_on_return_type_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+
+        let to_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "text".to_string(),
+            "".to_string(),
+            None,
+            "BEGIN RETURN '1'; END".to_string(),
+        );
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("drop function if exists \"public\".\"test_func\" ();"));
+        assert!(
+            script.contains("create or replace function \"public\".\"test_func\"() returns text")
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_drops_and_recreates_on_argument_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "a integer".to_string(),
+            None,
+            "BEGIN RETURN a; END".to_string(),
+        );
+
+        let to_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "a text".to_string(),
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("drop function if exists \"public\".\"test_func\" (a integer);"));
+        assert!(script.contains(
+            "create or replace function \"public\".\"test_func\"(a text) returns integer"
+        ));
     }
 }
