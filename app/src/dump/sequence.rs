@@ -265,6 +265,7 @@ mod tests {
         hasher.update("5".as_bytes());
         hasher.update("true".as_bytes());
         hasher.update("20".as_bytes());
+        hasher.update("false".as_bytes());
 
         let expected_hash = format!("{:x}", hasher.finalize());
 

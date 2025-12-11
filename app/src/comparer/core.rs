@@ -550,21 +550,18 @@ impl Comparer {
                             .tables
                             .iter()
                             .find(|t| t.schema == *schema && t.name == *table)
-                        {
-                            if let Some(from_column) =
+                            && let Some(from_column) =
                                 from_table.columns.iter().find(|c| c.name == *column_name)
-                            {
-                                if from_column.is_identity {
-                                    self.script.push_str(
+                            && from_column.is_identity
+                        {
+                            self.script.push_str(
                                         format!(
                                             "/* Skipping drop of sequence {}.{} as it is owned by identity column {}.{}.{}. */\n",
                                             sequence.schema, sequence.name, schema, table, column_name
                                         )
                                         .as_str(),
                                     );
-                                    continue;
-                                }
-                            }
+                            continue;
                         }
                     }
                 }

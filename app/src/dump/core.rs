@@ -472,10 +472,10 @@ impl Dump {
                     is_identity: false,
                     hash: None,
                 };
-                if let Some(deptype) = row.get::<Option<String>, _>("dependency_type") {
-                    if deptype == "i" {
-                        seq.is_identity = true;
-                    }
+                if let Some(deptype) = row.get::<Option<String>, _>("dependency_type")
+                    && deptype == "i"
+                {
+                    seq.is_identity = true;
                 }
                 seq.hash();
                 self.sequences.push(seq.clone());
