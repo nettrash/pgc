@@ -371,3 +371,6 @@ CREATE TABLE test_schema.composite_fk (
     CONSTRAINT fk_composite FOREIGN KEY (ref_part_one, ref_part_two) 
         REFERENCES test_schema.composite_pk (part_one, part_two)
 );
+
+-- Identity column test (Schema exists, table missing)
+CREATE SCHEMA IF NOT EXISTS data;
