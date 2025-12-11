@@ -308,6 +308,15 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION test_schema.get_users_by_status(p_status test_schema.status_type)
+RETURNS TABLE(user_id integer, username varchar, email varchar, created_at timestamp with time zone)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY SELECT id, username, email, created_at FROM test_schema.users WHERE status = p_status;
+END;
+$$;
+
 -- cleanup_old_orders procedure removed (table doesn't exist)
 
 -- NEW PROCEDURE

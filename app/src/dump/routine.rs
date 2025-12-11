@@ -234,4 +234,23 @@ mod tests {
         let expected = "drop function if exists \"public\".\"add\" (a integer);\n";
         assert_eq!(drop_script, expected);
     }
+
+    #[test]
+    fn get_script_handles_returns_table() {
+        let routine = Routine::new(
+            "data".to_string(),
+            Oid(100),
+            "test".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "TABLE(row_to_json json)".to_string(),
+            "fetching_id bigint, fetching_event_id character varying".to_string(),
+            None,
+            "BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END".to_string(),
+        );
+        let script = routine.get_script();
+
+        let expected = "create or replace function \"data\".\"test\"(fetching_id bigint, fetching_event_id character varying) returns TABLE(row_to_json json) language plpgsql as $$BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END$$;\n";
+        assert_eq!(script, expected);
+    }
 }
