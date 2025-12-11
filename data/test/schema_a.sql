@@ -354,6 +354,16 @@ CREATE TABLE test_schema.composite_pk (
     PRIMARY KEY (part_one, part_two)
 );
 
+-- Function argument change test
+CREATE OR REPLACE FUNCTION test_schema.calculate_tax(price numeric, tax_rate numeric)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN price * tax_rate;
+END;
+$$;
+
 CREATE TABLE test_schema.composite_fk (
     id SERIAL PRIMARY KEY,
     ref_part_one INT,

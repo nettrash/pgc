@@ -468,6 +468,21 @@ CREATE TABLE test_schema.composite_pk (
     PRIMARY KEY (part_one, part_two)
 );
 
+-- Function argument change test (Modified: added currency argument)
+CREATE OR REPLACE FUNCTION test_schema.calculate_tax(price numeric, tax_rate numeric, currency varchar)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Just a dummy implementation using the new argument
+    IF currency = 'USD' THEN
+        RETURN price * tax_rate;
+    ELSE
+        RETURN price * tax_rate * 1.1;
+    END IF;
+END;
+$$;
+
 CREATE TABLE test_schema.composite_fk (
     id SERIAL PRIMARY KEY,
     ref_part_one INT,
