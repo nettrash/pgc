@@ -361,7 +361,7 @@ impl Table {
             // Column name
             col_def.push_str(&format!("    \"{}\" ", column.name));
 
-            // Handle identity columns as serial/bigserial
+            // Handle identity columns
             if column.is_identity {
                 // Use standard column definition with identity
                 let col_script = column.get_script();
