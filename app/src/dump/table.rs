@@ -361,21 +361,11 @@ impl Table {
             // Column name
             col_def.push_str(&format!("    \"{}\" ", column.name));
 
-            // Handle identity columns
-            if column.is_identity {
-                // Use standard column definition with identity
-                let col_script = column.get_script();
-                // Extract just the type and constraints part (skip the quoted name)
-                if let Some(type_start) = col_script.find(' ') {
-                    col_def.push_str(&col_script[type_start + 1..]);
-                }
-            } else {
-                // Use standard column definition
-                let col_script = column.get_script();
-                // Extract just the type and constraints part (skip the quoted name)
-                if let Some(type_start) = col_script.find(' ') {
-                    col_def.push_str(&col_script[type_start + 1..]);
-                }
+            // Use standard column definition
+            let col_script = column.get_script();
+            // Extract just the type and constraints part (skip the quoted name)
+            if let Some(type_start) = col_script.find(' ') {
+                col_def.push_str(&col_script[type_start + 1..]);
             }
 
             column_definitions.push(col_def);
