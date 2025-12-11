@@ -205,17 +205,13 @@ impl TableColumn {
             });
         }
 
-        if !options.is_empty() {
+        for option in options {
             statements.push(format!(
-                "alter table \"{}\".\"{}\" alter column \"{}\" set ({});\n",
+                "alter table \"{}\".\"{}\" alter column \"{}\" set {};\n",
                 self.schema,
                 self.table,
                 self.name,
-                options
-                    .iter()
-                    .map(|opt| opt.to_uppercase())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                option.to_uppercase()
             ));
         }
     }
@@ -327,7 +323,6 @@ impl TableColumn {
             if !opts.is_empty() {
                 script.push_str(&format!(" ({})", opts.join(" ")));
             }
-            script.push(' ');
         }
 
         // Generated always as (expression)
@@ -782,6 +777,20 @@ mod tests {
     }
 
     #[test]
+    fn test_get_script_identity_column_generated_always() {
+        let mut column = create_test_column();
+        column.data_type = "integer".to_string();
+        column.character_maximum_length = None;
+        column.is_identity = true;
+        column.identity_generation = Some("ALWAYS".to_string());
+        let script = column.get_script();
+        assert_eq!(
+            script,
+            "\"test_column\" integer generated ALWAYS as identity"
+        );
+    }
+
+    #[test]
     fn test_get_script_identity_column_with_options() {
         let mut column = create_test_column();
         column.data_type = "integer".to_string();
@@ -1210,5 +1219,27 @@ mod tests {
         column.name = "weird name$".to_string();
         let expected = "alter table \"public\".\"test_table\" drop column \"weird name$\";\n";
         assert_eq!(column.get_drop_script(), expected);
+    }
+
+    #[test]
+    fn test_get_alter_script_identity_update() {
+        let mut existing = create_test_column();
+        existing.is_identity = true;
+        existing.identity_generation = Some("BY DEFAULT".to_string());
+        existing.identity_start = Some("1".to_string());
+        existing.identity_increment = Some("1".to_string());
+
+        let mut updated = existing.clone();
+        updated.identity_start = Some("100".to_string());
+        updated.identity_increment = Some("5".to_string());
+
+        let script = updated
+            .get_alter_script(&existing)
+            .expect("expected alter statement for identity update");
+
+        assert_eq!(
+            script,
+            "alter table \"public\".\"test_table\" alter column \"test_column\" set START WITH 100;\nalter table \"public\".\"test_table\" alter column \"test_column\" set INCREMENT BY 5;\n"
+        );
     }
 }
