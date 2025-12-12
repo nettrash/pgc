@@ -643,7 +643,12 @@ impl Table {
                 if use_drop {
                     column_drop_script.push_str(&drop_cmd);
                 } else {
-                    column_drop_script.push_str(&drop_cmd.lines().map(|l| format!("-- {}\n", l)).collect::<String>());
+                    column_drop_script.push_str(
+                        &drop_cmd
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
                 }
             }
         }
@@ -666,9 +671,14 @@ impl Table {
                         if use_drop {
                             constraint_pre_script.push_str(&drop_cmd);
                         } else {
-                            constraint_pre_script.push_str(&drop_cmd.lines().map(|l| format!("-- {}\n", l)).collect::<String>());
+                            constraint_pre_script.push_str(
+                                &drop_cmd
+                                    .lines()
+                                    .map(|l| format!("-- {}\n", l))
+                                    .collect::<String>(),
+                            );
                         }
-                        
+
                         if !is_fk {
                             constraint_post_script.push_str(&new_constraint.get_script());
                         }
@@ -689,7 +699,12 @@ impl Table {
                 if use_drop {
                     constraint_pre_script.push_str(&drop_cmd);
                 } else {
-                    constraint_pre_script.push_str(&drop_cmd.lines().map(|l| format!("-- {}\n", l)).collect::<String>());
+                    constraint_pre_script.push_str(
+                        &drop_cmd
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
                 }
             }
         }

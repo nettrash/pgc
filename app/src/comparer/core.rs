@@ -234,7 +234,7 @@ impl Comparer {
                 self.script.push_str(
                     "/* Extension is not present in 'to' dump and should be dropped. */\n",
                 );
-                
+
                 let drop_script = ext.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
@@ -310,7 +310,7 @@ impl Comparer {
                 );
                 self.script
                     .push_str("/* Type is not present in 'to' dump and should be dropped. */\n");
-                
+
                 let drop_script = from_type.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
@@ -418,7 +418,7 @@ impl Comparer {
                 );
                 drop_section
                     .push_str("/* Enum is not present in 'to' dump and should be dropped. */\n");
-                
+
                 let drop_script = from_enum.get_drop_script();
                 if self.use_drop {
                     drop_section.push_str(drop_script.as_str());
@@ -614,7 +614,7 @@ impl Comparer {
                 drop_section.push_str(
                     "/* Sequence is not present in 'to' dump and should be dropped. */\n",
                 );
-                
+
                 let drop_script = sequence.get_drop_script();
                 if self.use_drop {
                     drop_section.push_str(drop_script.as_str());
@@ -721,7 +721,7 @@ impl Comparer {
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
-                
+
                 let drop_script = routine.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
@@ -761,7 +761,7 @@ impl Comparer {
                     .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
                 self.script
                     .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
-                
+
                 let drop_script = table.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
@@ -909,7 +909,7 @@ impl Comparer {
                 self.script.push_str(
                     format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
                 );
-                
+
                 let drop_script = from_view.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
