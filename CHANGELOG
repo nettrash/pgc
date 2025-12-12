@@ -8,6 +8,7 @@ v1.0.2
                     - Fixed incorrect transformation of RETURNS TABLE.
                     - Fixed identity columns processing.
                     - Fixed sequence duplication for identity and serial columns.
+                    - Fixed creation of partitioned table as a regular table instead of actual partitions.
 
 2025-11-19      v1.0.1
 

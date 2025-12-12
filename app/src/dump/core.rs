@@ -609,6 +609,9 @@ impl Dump {
                     indexes: Vec::new(),
                     triggers: Vec::new(),
                     definition: None,
+                    partition_key: None,
+                    partition_of: None,
+                    partition_bound: None,
                     hash: None,
                 };
                 table.fill(pool).await.map_err(|e| {
