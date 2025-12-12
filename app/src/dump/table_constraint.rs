@@ -33,7 +33,7 @@ impl TableConstraint {
     pub fn get_script(&self) -> String {
         let mut script = String::new();
         script.push_str(&format!(
-            "alter table {}.{} add constraint {} ",
+            "alter table \"{}\".\"{}\" add constraint \"{}\" ",
             self.schema, self.table_name, self.name
         ));
 
@@ -96,18 +96,18 @@ impl TableConstraint {
                 if target.is_deferrable {
                     if target.initially_deferred {
                         script.push_str(&format!(
-                            "alter table {}.{} alter constraint \"{}\" deferrable initially deferred;\n",
+                            "alter table \"{}\".\"{}\" alter constraint \"{}\" deferrable initially deferred;\n",
                             self.schema, self.table_name, target.name
                         ));
                     } else {
                         script.push_str(&format!(
-                            "alter table {}.{} alter constraint \"{}\" deferrable initially immediate;\n",
+                            "alter table \"{}\".\"{}\" alter constraint \"{}\" deferrable initially immediate;\n",
                             self.schema, self.table_name, target.name
                         ));
                     }
                 } else {
                     script.push_str(&format!(
-                        "alter table {}.{} alter constraint \"{}\" not deferrable;\n",
+                        "alter table \"{}\".\"{}\" alter constraint \"{}\" not deferrable;\n",
                         self.schema, self.table_name, target.name
                     ));
                 }
@@ -143,7 +143,7 @@ impl TableConstraint {
     /// Get drop script for this constraint
     pub fn get_drop_script(&self) -> String {
         format!(
-            "alter table {}.{} drop constraint \"{}\";\n",
+            "alter table \"{}\".\"{}\" drop constraint \"{}\";\n",
             self.schema, self.table_name, self.name
         )
     }
@@ -380,7 +380,8 @@ mod tests {
         let constraint = create_primary_key_constraint();
         let script = constraint.get_script();
 
-        let expected = "alter table public.users add constraint pk_users_id primary key ;\n";
+        let expected =
+            "alter table \"public\".\"users\" add constraint \"pk_users_id\" primary key ;\n";
         assert_eq!(script, expected);
     }
 
@@ -389,7 +390,7 @@ mod tests {
         let constraint = create_foreign_key_constraint();
         let script = constraint.get_script();
 
-        let expected = "alter table app.orders add constraint fk_orders_user_id foreign key deferrable initially deferred ;\n";
+        let expected = "alter table \"app\".\"orders\" add constraint \"fk_orders_user_id\" foreign key deferrable initially deferred ;\n";
         assert_eq!(script, expected);
     }
 
@@ -398,7 +399,8 @@ mod tests {
         let constraint = create_unique_constraint();
         let script = constraint.get_script();
         // With reduced fields/behavior we no longer append null handling
-        let expected = "alter table analytics.products add constraint uk_products_sku unique ;\n";
+        let expected =
+            "alter table \"analytics\".\"products\" add constraint \"uk_products_sku\" unique ;\n";
         assert_eq!(script, expected);
     }
 
@@ -407,7 +409,8 @@ mod tests {
         let constraint = create_check_constraint();
         let script = constraint.get_script();
         // Simplified behavior: just the base type
-        let expected = "alter table test.persons add constraint chk_age_positive check ;\n";
+        let expected =
+            "alter table \"test\".\"persons\" add constraint \"chk_age_positive\" check ;\n";
         assert_eq!(script, expected);
     }
 
@@ -425,7 +428,7 @@ mod tests {
         };
 
         let script = constraint.get_script();
-        let expected = "alter table test.test_table add constraint test_constraint unique (id) deferrable initially deferred ;\n";
+        let expected = "alter table \"test\".\"test_table\" add constraint \"test_constraint\" unique (id) deferrable initially deferred ;\n";
         assert_eq!(script, expected);
     }
 
@@ -443,8 +446,7 @@ mod tests {
         };
 
         let script = constraint.get_script();
-        let expected =
-            "alter table PUBLIC.USERS add constraint CONSTRAINT_NAME primary key (id) ;\n";
+        let expected = "alter table \"PUBLIC\".\"USERS\" add constraint \"CONSTRAINT_NAME\" primary key (id) ;\n";
         assert_eq!(script, expected);
     }
 
@@ -463,7 +465,7 @@ mod tests {
 
         let script = constraint.get_script();
         // Note: constraint_type.to_lowercase() produces empty string, but format!("{} ", "") produces " "
-        let expected = "alter table . add constraint   ;\n";
+        let expected = "alter table \"\".\"\" add constraint \"\"  ;\n";
         assert_eq!(script, expected);
     }
 
@@ -605,8 +607,8 @@ mod tests {
         assert_eq!(hash.len(), 64);
 
         let script = constraint.get_script();
-        assert!(script.contains("app$schema.table#name"));
-        assert!(script.contains("constraint@name"));
+        assert!(script.contains("\"app$schema\".\"table#name\""));
+        assert!(script.contains("\"constraint@name\""));
         assert!(script.contains("unique"));
         assert!(script.ends_with(";\n"));
     }
@@ -659,7 +661,7 @@ mod tests {
         for constraint in constraints {
             // Each should produce a valid script
             let script = constraint.get_script();
-            assert!(script.contains(&format!("add constraint {}", constraint.name)));
+            assert!(script.contains(&format!("add constraint \"{}\"", constraint.name)));
             assert!(script.contains(&constraint.constraint_type.to_lowercase()));
             assert!(script.ends_with(";\n"));
 
@@ -782,7 +784,7 @@ mod tests {
         assert!(alter_script.is_some());
 
         let script = alter_script.unwrap();
-        assert!(script.contains("alter table app.orders alter constraint \"fk_orders_user_id\" deferrable initially deferred"));
+        assert!(script.contains("alter table \"app\".\"orders\" alter constraint \"fk_orders_user_id\" deferrable initially deferred"));
     }
 
     #[test]
@@ -798,7 +800,7 @@ mod tests {
 
         let script = alter_script.unwrap();
         assert!(script.contains(
-            "alter table app.orders alter constraint \"fk_orders_user_id\" not deferrable"
+            "alter table \"app\".\"orders\" alter constraint \"fk_orders_user_id\" not deferrable"
         ));
     }
 
@@ -831,7 +833,7 @@ mod tests {
 
         assert_eq!(
             drop_script,
-            "alter table app.orders drop constraint \"fk_orders_user_id\";\n"
+            "alter table \"app\".\"orders\" drop constraint \"fk_orders_user_id\";\n"
         );
     }
 }

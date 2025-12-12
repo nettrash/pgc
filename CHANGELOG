@@ -1,3 +1,16 @@
+2025-12-12      v1.0.2
+
+                Features:
+                    - Fixed foreign keys ordering.
+                    - Fixed TLS connection error.
+                    - Fixed naming with special characters.
+                    - Added test cases for special characters and composite foreign keys in schema_a.sql and schema_b.sql.
+                    - Fixed incorrect transformation of RETURNS TABLE.
+                    - Fixed identity columns processing.
+                    - Fixed sequence duplication for identity and serial columns.
+                    - Fixed creation of partitioned table as a regular table instead of actual partitions.
+                    - Fixed DROP scripts for table and table's parts.
+
 2025-11-19      v1.0.1
 
                 Features:

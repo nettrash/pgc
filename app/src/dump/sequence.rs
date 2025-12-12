@@ -18,6 +18,7 @@ pub struct Sequence {
     pub owned_by_schema: Option<String>, // Schema of the owning table/column
     pub owned_by_table: Option<String>,  // Owning table name
     pub owned_by_column: Option<String>, // Owning column name
+    pub is_identity: bool,               // Whether the sequence is an identity sequence
     pub hash: Option<String>,            // Hash of the sequence
 }
 
@@ -55,10 +56,16 @@ impl Sequence {
             owned_by_schema,
             owned_by_table,
             owned_by_column,
+            is_identity: false,
             hash: None,
         };
         sequence.hash();
         sequence
+    }
+
+    pub fn set_is_identity(&mut self, is_identity: bool) {
+        self.is_identity = is_identity;
+        self.hash();
     }
 
     /// Hash
@@ -84,11 +91,15 @@ impl Sequence {
         if let Some(cache_size) = self.cache_size {
             hasher.update(cache_size.to_string().as_bytes());
         }
+        hasher.update(self.is_identity.to_string().as_bytes());
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
     fn render_owned_by_clause(&self) -> Option<String> {
+        if self.is_identity {
+            return None;
+        }
         match (
             self.owned_by_schema.as_deref(),
             self.owned_by_table.as_deref(),
@@ -112,7 +123,10 @@ impl Sequence {
         let mut script = String::new();
 
         // CREATE SEQUENCE statement
-        script.push_str(&format!("create sequence {}.{}", self.schema, self.name));
+        script.push_str(&format!(
+            "create sequence \"{}\".\"{}\"",
+            self.schema, self.name
+        ));
 
         // Add AS clause for data type if not default
         if !self.data_type.is_empty() && self.data_type != "bigint" {
@@ -165,7 +179,10 @@ impl Sequence {
     }
 
     pub fn get_drop_script(&self) -> String {
-        format!("drop sequence if exists {}.{};\n", self.schema, self.name)
+        format!(
+            "drop sequence if exists \"{}\".\"{}\";\n",
+            self.schema, self.name
+        )
     }
 
     pub fn get_alter_script(&self) -> String {
@@ -200,7 +217,7 @@ impl Sequence {
             clauses.push(owned_by);
         }
 
-        let mut script = format!("alter sequence {}.{}", self.schema, self.name);
+        let mut script = format!("alter sequence \"{}\".\"{}\"", self.schema, self.name);
         if !clauses.is_empty() {
             script.push(' ');
             script.push_str(&clauses.join(" "));
@@ -248,6 +265,7 @@ mod tests {
         hasher.update("5".as_bytes());
         hasher.update("true".as_bytes());
         hasher.update("20".as_bytes());
+        hasher.update("false".as_bytes());
 
         let expected_hash = format!("{:x}", hasher.finalize());
 
@@ -262,7 +280,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\n",
+            "create sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\n",
         );
     }
 
@@ -287,7 +305,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_script(),
-            "create sequence public.minimal_seq no minvalue no maxvalue no cycle;\n",
+            "create sequence \"public\".\"minimal_seq\" no minvalue no maxvalue no cycle;\n",
         );
     }
 
@@ -296,7 +314,7 @@ mod tests {
         let sequence = build_sequence();
         assert_eq!(
             sequence.get_drop_script(),
-            "drop sequence if exists public.order_id_seq;\n"
+            "drop sequence if exists \"public\".\"order_id_seq\";\n"
         );
     }
 
@@ -306,7 +324,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\n",
+            "alter sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\n",
         );
     }
 
@@ -331,7 +349,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence audit.event_seq start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\n",
+            "alter sequence \"audit\".\"event_seq\" start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\n",
         );
     }
 }

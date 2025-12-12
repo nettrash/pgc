@@ -419,14 +419,15 @@ impl Dump {
                     seq.last_value,
                     owner_ns.nspname as owned_by_schema,
                     owner_table.relname as owned_by_table,
-                    owner_attr.attname as owned_by_column
+                    owner_attr.attname as owned_by_column,
+                    dep.deptype::text as dependency_type
                 from
                     pg_sequences seq
                     left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
                     left join pg_class seq_class on seq_class.relname = seq.sequencename
                         and seq_class.relnamespace = seq_ns.oid
                     left join pg_depend dep on dep.objid = seq_class.oid
-                        and dep.deptype = 'a'
+                        and dep.deptype in ('a', 'i')
                     left join pg_class owner_table on owner_table.oid = dep.refobjid
                     left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
                     left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
@@ -468,8 +469,14 @@ impl Dump {
                     owned_by_schema: row.get::<Option<String>, _>("owned_by_schema"),
                     owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
                     owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
+                    is_identity: false,
                     hash: None,
                 };
+                if let Some(deptype) = row.get::<Option<String>, _>("dependency_type")
+                    && deptype == "i"
+                {
+                    seq.is_identity = true;
+                }
                 seq.hash();
                 self.sequences.push(seq.clone());
                 println!(
@@ -494,7 +501,7 @@ impl Dump {
                     r.proname,
                     l.lanname as prolang,
                     case when r.prokind = 'f' then 'function' else 'procedure' end as prokind,
-                    t.typname as prorettype,
+                    pg_get_function_result(r.oid) as prorettype,
                     pg_get_function_identity_arguments(r.oid) as proarguments,
                     pg_get_expr(r.proargdefaults, 0) as proargdefaults,
                     r.prosrc
@@ -502,7 +509,6 @@ impl Dump {
                     pg_proc r
                     join pg_namespace n on r.pronamespace = n.oid
                     join pg_language l on r.prolang = l.oid
-                    join pg_type t on r.prorettype = t.oid
                 where
                     n.nspname like '{}'
                     and n.nspname not in ('pg_catalog', 'information_schema')
@@ -534,7 +540,9 @@ impl Dump {
                     name: row.get("proname"),
                     lang: row.get("prolang"),
                     kind: row.get("prokind"),
-                    return_type: row.get("prorettype"),
+                    return_type: row
+                        .get::<Option<String>, _>("prorettype")
+                        .unwrap_or_else(|| "void".to_string()),
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
                     source_code: row.get("prosrc"),
@@ -601,6 +609,9 @@ impl Dump {
                     indexes: Vec::new(),
                     triggers: Vec::new(),
                     definition: None,
+                    partition_key: None,
+                    partition_of: None,
+                    partition_bound: None,
                     hash: None,
                 };
                 table.fill(pool).await.map_err(|e| {

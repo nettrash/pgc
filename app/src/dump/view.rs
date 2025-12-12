@@ -46,7 +46,7 @@ impl View {
     /// Returns a string to create the view.
     pub fn get_script(&self) -> String {
         let script = format!(
-            "create view {}.{} as\n{}\n",
+            "create view \"{}\".\"{}\" as\n{}\n",
             self.schema, self.name, self.definition
         );
 
@@ -55,7 +55,10 @@ impl View {
 
     /// Returns a string to drop the view.
     pub fn get_drop_script(&self) -> String {
-        format!("drop view if exists {}.{};\n", self.schema, self.name)
+        format!(
+            "drop view if exists \"{}\".\"{}\";\n",
+            self.schema, self.name
+        )
     }
 
     /// Returns a script that alters the current view to match the target definition.
@@ -83,7 +86,7 @@ impl View {
         }
 
         format!(
-            "CREATE OR REPLACE VIEW {}.{} AS\n{}\n",
+            "CREATE OR REPLACE VIEW \"{}\".\"{}\" AS\n{}\n",
             target.schema,
             target.name,
             target.definition.trim_end()
@@ -136,7 +139,7 @@ mod tests {
         let view = create_view("select id from public.users");
         assert_eq!(
             view.get_script(),
-            "create view analytics.active_users as\nselect id from public.users\n"
+            "create view \"analytics\".\"active_users\" as\nselect id from public.users\n"
         );
     }
 
@@ -145,7 +148,7 @@ mod tests {
         let view = create_view("select id from public.users");
         assert_eq!(
             view.get_drop_script(),
-            "drop view if exists analytics.active_users;\n"
+            "drop view if exists \"analytics\".\"active_users\";\n"
         );
     }
 
@@ -184,7 +187,7 @@ mod tests {
 
         assert_eq!(
             current.get_alter_script(&replacement),
-            "create view analytics.active_users as\ncreate or replace view analytics.active_users as select 2\n"
+            "create view \"analytics\".\"active_users\" as\ncreate or replace view analytics.active_users as select 2\n"
         );
     }
 
@@ -195,7 +198,7 @@ mod tests {
 
         assert_eq!(
             current.get_alter_script(&target),
-            "CREATE OR REPLACE VIEW analytics.active_users AS\nselect id, active from public.users where active\n"
+            "CREATE OR REPLACE VIEW \"analytics\".\"active_users\" AS\nselect id, active from public.users where active\n"
         );
     }
 }

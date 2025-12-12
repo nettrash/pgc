@@ -76,11 +76,11 @@ impl Routine {
         let kind = self.kind.to_lowercase();
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure {}.{}({}) language {} as $${}$$;\n",
+                "create or replace procedure \"{}\".\"{}\"({}) language {} as $${}$$;\n",
                 self.schema, self.name, self.arguments, self.lang, self.source_code
             ),
             _ => format!(
-                "create or replace {} {}.{}({}) returns {} language {} as $${}$$;\n",
+                "create or replace {} \"{}\".\"{}\"({}) returns {} language {} as $${}$$;\n",
                 kind,
                 self.schema,
                 self.name,
@@ -103,7 +103,7 @@ impl Routine {
     /// Returns a string to drop the routine.
     pub fn get_drop_script(&self) -> String {
         format!(
-            "drop {} if exists {}.{} ({});\n",
+            "drop {} if exists \"{}\".\"{}\" ({});\n",
             self.kind.to_lowercase(),
             self.schema,
             self.name,
@@ -213,7 +213,7 @@ mod tests {
         let routine = build_function_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace function public.add(a integer) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n-- Defaults: DEFAULT 1\n";
+        let expected = "create or replace function \"public\".\"add\"(a integer) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n-- Defaults: DEFAULT 1\n";
         assert_eq!(script, expected);
     }
 
@@ -222,7 +222,7 @@ mod tests {
         let routine = build_procedure_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace procedure public.do_something(a integer) language sql as $$SELECT a;$$;\n";
+        let expected = "create or replace procedure \"public\".\"do_something\"(a integer) language sql as $$SELECT a;$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -231,7 +231,26 @@ mod tests {
         let routine = build_function_routine();
         let drop_script = routine.get_drop_script();
 
-        let expected = "drop function if exists public.add (a integer);\n";
+        let expected = "drop function if exists \"public\".\"add\" (a integer);\n";
         assert_eq!(drop_script, expected);
+    }
+
+    #[test]
+    fn get_script_handles_returns_table() {
+        let routine = Routine::new(
+            "data".to_string(),
+            Oid(100),
+            "test".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "TABLE(row_to_json json)".to_string(),
+            "fetching_id bigint, fetching_event_id character varying".to_string(),
+            None,
+            "BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END".to_string(),
+        );
+        let script = routine.get_script();
+
+        let expected = "create or replace function \"data\".\"test\"(fetching_id bigint, fetching_event_id character varying) returns TABLE(row_to_json json) language plpgsql as $$BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END$$;\n";
+        assert_eq!(script, expected);
     }
 }

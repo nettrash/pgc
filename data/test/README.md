@@ -47,6 +47,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **categories**: Added columns (`category_code`, `icon_url`)
 - **products**: Added columns (`barcode`, `manufacturer`, `warranty_months`, `is_featured`), removed columns (`weight`, `priority`), modified precision (`price`)
 - **audit_logs**: Added columns (`session_id`, `request_id`)
+- **identity_update_test**: Modified identity column options (`START WITH`, `INCREMENT BY`)
 
 #### Removed Tables
 - **orders**: Completely removed in Schema B
