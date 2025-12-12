@@ -567,6 +567,16 @@ impl Table {
     }
 
     pub fn get_alter_script(&self, to_table: &Table) -> String {
+        // If partition key changes (e.g. from LIST to RANGE, or different column), we must recreate the table.
+        // Also if table changes from partitioned to non-partitioned or vice versa.
+        if self.partition_key != to_table.partition_key {
+            return format!(
+                "/* Partition key changed. Table must be recreated. Data loss will occur! */\n{}{}",
+                self.get_drop_script(),
+                to_table.get_script()
+            );
+        }
+
         let mut constraint_pre_script = String::new();
         let mut column_alter_script = String::new();
         let mut column_drop_script = String::new();
@@ -575,6 +585,32 @@ impl Table {
         let mut trigger_script = String::new();
         let mut index_drop_script = String::new();
         let mut trigger_drop_script = String::new();
+        let mut partition_script = String::new();
+
+        // Handle partition changes
+        if self.partition_of != to_table.partition_of
+            || (self.partition_of.is_some()
+                && self.partition_of == to_table.partition_of
+                && self.partition_bound != to_table.partition_bound)
+        {
+            // If it was a partition, detach it
+            if let Some(old_parent) = &self.partition_of {
+                partition_script.push_str(&format!(
+                    "alter table {} detach partition \"{}\".\"{}\";\n",
+                    old_parent, self.schema, self.name
+                ));
+            }
+
+            // If it is now a partition, attach it
+            if let Some(new_parent) = &to_table.partition_of {
+                if let Some(bound) = &to_table.partition_bound {
+                    partition_script.push_str(&format!(
+                        "alter table {} attach partition \"{}\".\"{}\" {};\n",
+                        new_parent, self.schema, self.name, bound
+                    ));
+                }
+            }
+        }
 
         // Collect column additions or alterations
         for new_col in &to_table.columns {
@@ -680,6 +716,7 @@ impl Table {
         }
 
         let mut script = String::new();
+        script.push_str(&partition_script);
         script.push_str(&constraint_pre_script);
         script.push_str(&column_alter_script);
         script.push_str(&index_drop_script);
@@ -1452,5 +1489,146 @@ mod tests {
                 .contains("create table \"data\".\"test_default\" partition of \"data\".\"test\"")
         );
         assert!(script.contains("DEFAULT"));
+    }
+
+    #[test]
+    fn test_get_alter_script_partition_bound_change() {
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_of = Some("\"data\".\"test\"".to_string());
+        from_table.partition_bound = Some("FOR VALUES IN (1)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_of = Some("\"data\".\"test\"".to_string());
+        to_table.partition_bound = Some("FOR VALUES IN (2)".to_string());
+
+        let script = from_table.get_alter_script(&to_table);
+        
+        assert!(script.contains("detach partition")); 
+        assert!(script.contains("attach partition"));
+    }
+
+    #[test]
+    fn test_get_alter_script_partition_key_change() {
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (flow_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table);
+        
+        assert!(script.contains("Partition key changed"));
+        assert!(script.contains("drop table"));
+        assert!(script.contains("create table"));
+    }
+
+    #[test]
+    fn test_get_alter_script_detach_partition() {
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_of = Some("\"data\".\"test\"".to_string());
+        from_table.partition_bound = Some("DEFAULT".to_string());
+
+        let to_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        // to_table has no partition info, so it's a standalone table
+
+        let script = from_table.get_alter_script(&to_table);
+        
+        assert!(script.contains("alter table \"data\".\"test\" detach partition \"data\".\"test_default\";"));
+        assert!(!script.contains("attach partition"));
+    }
+
+    #[test]
+    fn test_get_alter_script_attach_partition() {
+        let from_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        // from_table is standalone
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_of = Some("\"data\".\"test\"".to_string());
+        to_table.partition_bound = Some("DEFAULT".to_string());
+
+        let script = from_table.get_alter_script(&to_table);
+        
+        assert!(!script.contains("detach partition"));
+        assert!(script.contains("alter table \"data\".\"test\" attach partition \"data\".\"test_default\" DEFAULT;"));
     }
 }

@@ -539,3 +539,12 @@ PARTITION BY LIST (flow_id);
 CREATE TABLE data.partition_test_default
     PARTITION OF data.partition_test
     DEFAULT;
+
+-- Partition bound change test (TO: value 'inactive')
+CREATE TABLE data.partition_bound_test (
+    id int,
+    status text,
+    CONSTRAINT partition_bound_test_pkey PRIMARY KEY (id, status)
+) PARTITION BY LIST (status);
+
+CREATE TABLE data.partition_bound_test_active PARTITION OF data.partition_bound_test FOR VALUES IN ('inactive');
