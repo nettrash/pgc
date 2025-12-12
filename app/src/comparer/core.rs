@@ -227,14 +227,26 @@ impl Comparer {
                 .find(|r| r.name == ext.name && r.schema == ext.schema)
             {
                 continue; // Routine is present in both dumps, we already processed it
-            } else if self.use_drop {
-                // Just if we're using DROP statements
+            } else {
+                // Extension is not present in 'to' dump and should be dropped.
                 self.script
                     .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
                 self.script.push_str(
                     "/* Extension is not present in 'to' dump and should be dropped. */\n",
                 );
-                self.script.push_str(ext.get_drop_script().as_str());
+                
+                let drop_script = ext.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
             }
         }
 
@@ -279,7 +291,7 @@ impl Comparer {
             }
         }
 
-        if self.use_drop {
+        {
             for from_type in &self.from.types {
                 if (from_type.typtype as u8 as char) == 'e' {
                     continue;
@@ -298,7 +310,19 @@ impl Comparer {
                 );
                 self.script
                     .push_str("/* Type is not present in 'to' dump and should be dropped. */\n");
-                self.script.push_str(from_type.get_drop_script().as_str());
+                
+                let drop_script = from_type.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
             }
         }
 
@@ -368,7 +392,7 @@ impl Comparer {
             }
         }
 
-        if self.use_drop {
+        {
             for from_enum in self
                 .from
                 .types
@@ -394,19 +418,31 @@ impl Comparer {
                 );
                 drop_section
                     .push_str("/* Enum is not present in 'to' dump and should be dropped. */\n");
-                drop_section.push_str(from_enum.get_drop_script().as_str());
+                
+                let drop_script = from_enum.get_drop_script();
+                if self.use_drop {
+                    drop_section.push_str(drop_script.as_str());
+                } else {
+                    drop_section.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
             }
         }
 
         create_alter_section.push_str("\n/* ---> Enums: End --------------- */\n\n");
-        if self.use_drop && !drop_section.is_empty() {
+        if !drop_section.is_empty() {
             drop_section.push_str("\n/* ---> Enums: Drop section end --------------- */\n\n");
         }
 
         if !create_alter_section.trim().is_empty() {
             self.enum_pre_script.push_str(&create_alter_section);
         }
-        if self.use_drop && !drop_section.is_empty() {
+        if !drop_section.is_empty() {
             self.enum_post_script.push_str(&drop_section);
         }
         Ok(())
@@ -491,7 +527,7 @@ impl Comparer {
             }
         }
 
-        if self.use_drop {
+        {
             let mut dropped_sequences = HashSet::new();
             for sequence in &self.from.sequences {
                 if dropped_sequences.contains(&format!("{}.{}", sequence.schema, sequence.name)) {
@@ -578,7 +614,19 @@ impl Comparer {
                 drop_section.push_str(
                     "/* Sequence is not present in 'to' dump and should be dropped. */\n",
                 );
-                drop_section.push_str(sequence.get_drop_script().as_str());
+                
+                let drop_script = sequence.get_drop_script();
+                if self.use_drop {
+                    drop_section.push_str(drop_script.as_str());
+                } else {
+                    drop_section.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
                 dropped_sequences.insert(format!("{}.{}", sequence.schema, sequence.name));
             }
         }
@@ -586,7 +634,7 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Sequences: End section --------------- */\n\n");
 
-        if self.use_drop && !drop_section.is_empty() {
+        if !drop_section.is_empty() {
             drop_section.push_str("\n/* ---> Sequences: Drop section end --------------- */\n\n");
             self.sequence_post_script.push_str(&drop_section);
         }
@@ -632,8 +680,18 @@ impl Comparer {
                     if from_routine.return_type != routine.return_type
                         || from_routine.arguments != routine.arguments
                     {
-                        self.script
-                            .push_str(from_routine.get_drop_script().as_str());
+                        let drop_script = from_routine.get_drop_script();
+                        if self.use_drop {
+                            self.script.push_str(drop_script.as_str());
+                        } else {
+                            self.script.push_str(
+                                drop_script
+                                    .lines()
+                                    .map(|l| format!("-- {}\n", l))
+                                    .collect::<String>()
+                                    .as_str(),
+                            );
+                        }
                     }
                     self.script.push_str(
                         format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
@@ -656,14 +714,26 @@ impl Comparer {
                 .find(|r| r.name == routine.name && r.schema == routine.schema)
             {
                 continue; // Routine is present in both dumps, we already processed it
-            } else if self.use_drop {
-                // Just if we're using DROP statements
+            } else {
+                // Routine is not present in 'to' dump and should be dropped.
                 self.script.push_str(
                     format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
-                self.script.push_str(routine.get_drop_script().as_str());
+                
+                let drop_script = routine.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
             }
         }
 
@@ -685,13 +755,25 @@ impl Comparer {
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
                 continue; // Table is present in both dumps, we already processed it
-            } else if self.use_drop {
-                // Just if we're using DROP statements
+            } else {
+                // Table is not present in 'to' dump and should be dropped.
                 self.script
                     .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
                 self.script
                     .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
-                self.script.push_str(table.get_drop_script().as_str());
+                
+                let drop_script = table.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
             }
         }
         // We will find all new tables from "to" dump that are not in "from" dump
@@ -766,7 +848,7 @@ impl Comparer {
                         format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
                     );
                     self.script
-                        .push_str(table.get_alter_script(to_table).as_str());
+                        .push_str(table.get_alter_script(to_table, self.use_drop).as_str());
                 }
             } else {
                 continue; // Table is present in both dumps, we already processed it
@@ -827,7 +909,19 @@ impl Comparer {
                 self.script.push_str(
                     format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
                 );
-                self.script.push_str(from_view.get_drop_script().as_str());
+                
+                let drop_script = from_view.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
                 self.dropped_views.insert(normalized_view);
             }
         }

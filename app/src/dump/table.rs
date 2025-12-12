@@ -566,13 +566,21 @@ impl Table {
         script
     }
 
-    pub fn get_alter_script(&self, to_table: &Table) -> String {
+    pub fn get_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
         // If partition key changes (e.g. from LIST to RANGE, or different column), we must recreate the table.
         // Also if table changes from partitioned to non-partitioned or vice versa.
         if self.partition_key != to_table.partition_key {
+            let drop_script = if use_drop {
+                self.get_drop_script()
+            } else {
+                self.get_drop_script()
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect()
+            };
             return format!(
                 "/* Partition key changed. Table must be recreated. Data loss will occur! */\n{}{}",
-                self.get_drop_script(),
+                drop_script,
                 to_table.get_script()
             );
         }
@@ -593,10 +601,15 @@ impl Table {
         {
             // If it was a partition, detach it
             if let Some(old_parent) = &self.partition_of {
-                partition_script.push_str(&format!(
+                let detach_cmd = format!(
                     "alter table {} detach partition \"{}\".\"{}\";\n",
                     old_parent, self.schema, self.name
-                ));
+                );
+                if use_drop {
+                    partition_script.push_str(&detach_cmd);
+                } else {
+                    partition_script.push_str(&format!("-- {}", detach_cmd));
+                }
             }
 
             // If it is now a partition, attach it
@@ -626,7 +639,12 @@ impl Table {
         // Collect column drops separately so they happen after constraint drops
         for old_col in &self.columns {
             if !to_table.columns.iter().any(|c| c.name == old_col.name) {
-                column_drop_script.push_str(&old_col.get_drop_script());
+                let drop_cmd = old_col.get_drop_script();
+                if use_drop {
+                    column_drop_script.push_str(&drop_cmd);
+                } else {
+                    column_drop_script.push_str(&drop_cmd.lines().map(|l| format!("-- {}\n", l)).collect::<String>());
+                }
             }
         }
 
@@ -644,7 +662,13 @@ impl Table {
                             constraint_post_script.push_str(&alter_script);
                         }
                     } else {
-                        constraint_pre_script.push_str(&old_constraint.get_drop_script());
+                        let drop_cmd = old_constraint.get_drop_script();
+                        if use_drop {
+                            constraint_pre_script.push_str(&drop_cmd);
+                        } else {
+                            constraint_pre_script.push_str(&drop_cmd.lines().map(|l| format!("-- {}\n", l)).collect::<String>());
+                        }
+                        
                         if !is_fk {
                             constraint_post_script.push_str(&new_constraint.get_script());
                         }
@@ -661,7 +685,12 @@ impl Table {
                 .iter()
                 .any(|c| c.name == old_constraint.name)
             {
-                constraint_pre_script.push_str(&old_constraint.get_drop_script());
+                let drop_cmd = old_constraint.get_drop_script();
+                if use_drop {
+                    constraint_pre_script.push_str(&drop_cmd);
+                } else {
+                    constraint_pre_script.push_str(&drop_cmd.lines().map(|l| format!("-- {}\n", l)).collect::<String>());
+                }
             }
         }
 
@@ -669,10 +698,15 @@ impl Table {
         for new_index in &to_table.indexes {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
-                    index_drop_script.push_str(&format!(
+                    let drop_cmd = format!(
                         "drop index if exists \"{}\".\"{}\";\n",
                         new_index.schema, new_index.name
-                    ));
+                    );
+                    if use_drop {
+                        index_drop_script.push_str(&drop_cmd);
+                    } else {
+                        index_drop_script.push_str(&format!("-- {}", drop_cmd));
+                    }
                     index_script.push_str(&new_index.get_script());
                 }
             } else {
@@ -684,10 +718,15 @@ impl Table {
         for new_trigger in &to_table.triggers {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
-                    trigger_drop_script.push_str(&format!(
+                    let drop_cmd = format!(
                         "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
                         old_trigger.name, self.schema, self.name
-                    ));
+                    );
+                    if use_drop {
+                        trigger_drop_script.push_str(&drop_cmd);
+                    } else {
+                        trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
+                    }
                     trigger_script.push_str(&new_trigger.get_script());
                 }
             } else {
@@ -697,19 +736,29 @@ impl Table {
 
         for old_index in &self.indexes {
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
-                index_drop_script.push_str(&format!(
+                let drop_cmd = format!(
                     "drop index if exists \"{}\".\"{}\";\n",
                     old_index.schema, old_index.name
-                ));
+                );
+                if use_drop {
+                    index_drop_script.push_str(&drop_cmd);
+                } else {
+                    index_drop_script.push_str(&format!("-- {}", drop_cmd));
+                }
             }
         }
 
         for old_trigger in &self.triggers {
             if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
-                trigger_drop_script.push_str(&format!(
+                let drop_cmd = format!(
                     "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
                     old_trigger.name, self.schema, self.name
-                ));
+                );
+                if use_drop {
+                    trigger_drop_script.push_str(&drop_cmd);
+                } else {
+                    trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
+                }
             }
         }
 
@@ -1087,7 +1136,7 @@ mod tests {
             Some("create table public.users (...);".to_string()),
         );
 
-        let script = from_table.get_alter_script(&to_table);
+        let script = from_table.get_alter_script(&to_table, true);
         let fk_script = from_table.get_foreign_key_alter_script(&to_table);
 
         let expected_fragments = [
@@ -1331,7 +1380,7 @@ mod tests {
             None,
         );
 
-        let drop_main_script = fk_drop_from.get_alter_script(&fk_drop_to);
+        let drop_main_script = fk_drop_from.get_alter_script(&fk_drop_to, true);
         let drop_fk_script = fk_drop_from.get_foreign_key_alter_script(&fk_drop_to);
 
         assert!(
@@ -1344,7 +1393,7 @@ mod tests {
         let fk_add_from = fk_drop_to.clone();
         let fk_add_to = fk_drop_from.clone(); // reusing table with FK
 
-        let add_main_script = fk_add_from.get_alter_script(&fk_add_to);
+        let add_main_script = fk_add_from.get_alter_script(&fk_add_to, true);
         let add_fk_script = fk_add_from.get_foreign_key_alter_script(&fk_add_to);
 
         assert!(!add_main_script.contains("fk_drop")); // Main script shouldn't touch new FKs
@@ -1382,7 +1431,7 @@ mod tests {
             None,
         );
 
-        let change_main_script = fk_change_from.get_alter_script(&fk_change_to);
+        let change_main_script = fk_change_from.get_alter_script(&fk_change_to, true);
         let change_fk_script = fk_change_from.get_foreign_key_alter_script(&fk_change_to);
 
         assert!(
@@ -1519,7 +1568,7 @@ mod tests {
         to_table.partition_of = Some("\"data\".\"test\"".to_string());
         to_table.partition_bound = Some("FOR VALUES IN (2)".to_string());
 
-        let script = from_table.get_alter_script(&to_table);
+        let script = from_table.get_alter_script(&to_table, true);
 
         assert!(script.contains("detach partition"));
         assert!(script.contains("attach partition"));
@@ -1553,10 +1602,45 @@ mod tests {
         );
         to_table.partition_key = Some("LIST (flow_id)".to_string());
 
-        let script = from_table.get_alter_script(&to_table);
+        let script = from_table.get_alter_script(&to_table, true);
 
         assert!(script.contains("Partition key changed"));
         assert!(script.contains("drop table"));
+        assert!(script.contains("create table"));
+    }
+
+    #[test]
+    fn test_get_alter_script_partition_key_change_no_drop() {
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (flow_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, false);
+
+        assert!(script.contains("Partition key changed"));
+        assert!(script.contains("-- drop table"));
         assert!(script.contains("create table"));
     }
 
@@ -1589,7 +1673,7 @@ mod tests {
         );
         // to_table has no partition info, so it's a standalone table
 
-        let script = from_table.get_alter_script(&to_table);
+        let script = from_table.get_alter_script(&to_table, true);
 
         assert!(
             script.contains(
@@ -1628,7 +1712,7 @@ mod tests {
         to_table.partition_of = Some("\"data\".\"test\"".to_string());
         to_table.partition_bound = Some("DEFAULT".to_string());
 
-        let script = from_table.get_alter_script(&to_table);
+        let script = from_table.get_alter_script(&to_table, true);
 
         assert!(!script.contains("detach partition"));
         assert!(script.contains(
