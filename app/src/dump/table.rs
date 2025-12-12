@@ -589,9 +589,7 @@ impl Table {
 
         // Handle partition changes
         if self.partition_of != to_table.partition_of
-            || (self.partition_of.is_some()
-                && self.partition_of == to_table.partition_of
-                && self.partition_bound != to_table.partition_bound)
+            || (self.partition_of.is_some() && self.partition_bound != to_table.partition_bound)
         {
             // If it was a partition, detach it
             if let Some(old_parent) = &self.partition_of {
@@ -602,13 +600,13 @@ impl Table {
             }
 
             // If it is now a partition, attach it
-            if let Some(new_parent) = &to_table.partition_of {
-                if let Some(bound) = &to_table.partition_bound {
-                    partition_script.push_str(&format!(
-                        "alter table {} attach partition \"{}\".\"{}\" {};\n",
-                        new_parent, self.schema, self.name, bound
-                    ));
-                }
+            if let Some(new_parent) = &to_table.partition_of
+                && let Some(bound) = &to_table.partition_bound
+            {
+                partition_script.push_str(&format!(
+                    "alter table {} attach partition \"{}\".\"{}\" {};\n",
+                    new_parent, self.schema, self.name, bound
+                ));
             }
         }
 
@@ -1522,8 +1520,8 @@ mod tests {
         to_table.partition_bound = Some("FOR VALUES IN (2)".to_string());
 
         let script = from_table.get_alter_script(&to_table);
-        
-        assert!(script.contains("detach partition")); 
+
+        assert!(script.contains("detach partition"));
         assert!(script.contains("attach partition"));
     }
 
@@ -1556,7 +1554,7 @@ mod tests {
         to_table.partition_key = Some("LIST (flow_id)".to_string());
 
         let script = from_table.get_alter_script(&to_table);
-        
+
         assert!(script.contains("Partition key changed"));
         assert!(script.contains("drop table"));
         assert!(script.contains("create table"));
@@ -1592,8 +1590,12 @@ mod tests {
         // to_table has no partition info, so it's a standalone table
 
         let script = from_table.get_alter_script(&to_table);
-        
-        assert!(script.contains("alter table \"data\".\"test\" detach partition \"data\".\"test_default\";"));
+
+        assert!(
+            script.contains(
+                "alter table \"data\".\"test\" detach partition \"data\".\"test_default\";"
+            )
+        );
         assert!(!script.contains("attach partition"));
     }
 
@@ -1627,8 +1629,10 @@ mod tests {
         to_table.partition_bound = Some("DEFAULT".to_string());
 
         let script = from_table.get_alter_script(&to_table);
-        
+
         assert!(!script.contains("detach partition"));
-        assert!(script.contains("alter table \"data\".\"test\" attach partition \"data\".\"test_default\" DEFAULT;"));
+        assert!(script.contains(
+            "alter table \"data\".\"test\" attach partition \"data\".\"test_default\" DEFAULT;"
+        ));
     }
 }
