@@ -22,6 +22,9 @@ pub struct Table {
     pub indexes: Vec<TableIndex>,          // Index names
     pub triggers: Vec<TableTrigger>,       // Trigger names
     pub definition: Option<String>,        // Table definition (optional)
+    pub partition_key: Option<String>,     // Partition key (PARTITION BY ...)
+    pub partition_of: Option<String>,      // Parent table (PARTITION OF ...)
+    pub partition_bound: Option<String>,   // Partition bound (FOR VALUES ... or DEFAULT)
     pub hash: Option<String>,              // Hash of the table
 }
 
@@ -53,6 +56,9 @@ impl Table {
             indexes,
             triggers,
             definition,
+            partition_key: None,
+            partition_of: None,
+            partition_bound: None,
             hash: None,
         };
         table.hash();
@@ -64,6 +70,7 @@ impl Table {
         self.fill_indexes(pool).await?;
         self.fill_constraints(pool).await?;
         self.fill_triggers(pool).await?;
+        self.fill_partition_info(pool).await?;
         self.fill_definition(pool).await?;
         Ok(())
     }
@@ -296,6 +303,46 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about partition.
+    async fn fill_partition_info(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let query = format!(
+            "SELECT
+                c.relkind::text,
+                pg_get_partkeydef(c.oid) AS partition_key,
+                pg_get_expr(c.relpartbound, c.oid) AS partition_bound,
+                p.relname AS parent_table,
+                pn.nspname AS parent_schema
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_inherits i ON i.inhrelid = c.oid
+            LEFT JOIN pg_class p ON p.oid = i.inhparent
+            LEFT JOIN pg_namespace pn ON pn.oid = p.relnamespace
+            WHERE n.nspname = '{}' AND c.relname = '{}'",
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''")
+        );
+
+        let row = sqlx::query(&query).fetch_optional(pool).await?;
+
+        if let Some(row) = row {
+            let relkind: String = row.get("relkind");
+
+            // If it is a partitioned table (parent)
+            if relkind == "p" {
+                self.partition_key = row.get("partition_key");
+            }
+
+            // If it is a partition (child)
+            if let Some(parent_table) = row.get::<Option<String>, _>("parent_table")
+                && let Some(parent_schema) = row.get::<Option<String>, _>("parent_schema")
+            {
+                self.partition_of = Some(format!("\"{}\".\"{}\"", parent_schema, parent_table));
+                self.partition_bound = row.get("partition_bound");
+            }
+        }
+        Ok(())
+    }
+
     /// Fill table definition.
     async fn fill_definition(&mut self, pool: &PgPool) -> Result<(), Error> {
         // Check if pg_get_tabledef exists
@@ -345,71 +392,108 @@ impl Table {
             trigger.add_to_hasher(&mut hasher);
         }
 
+        if let Some(pk) = &self.partition_key {
+            hasher.update(pk.as_bytes());
+        }
+        if let Some(po) = &self.partition_of {
+            hasher.update(po.as_bytes());
+        }
+        if let Some(pb) = &self.partition_bound {
+            hasher.update(pb.as_bytes());
+        }
+
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
     /// Get script for the table
     pub fn get_script(&self) -> String {
-        // 1. Build CREATE TABLE statement
-        let mut script = format!("create table \"{}\".\"{}\" (\n", self.schema, self.name);
+        let mut script = String::new();
 
-        // 2. Add column definitions
-        let mut column_definitions = Vec::new();
-        for column in &self.columns {
-            let mut col_def = String::new();
-
-            // Column name
-            col_def.push_str(&format!("    \"{}\" ", column.name));
-
-            // Use standard column definition
-            let col_script = column.get_script();
-            // Extract just the type and constraints part (skip the quoted name)
-            if let Some(type_start) = col_script.find(' ') {
-                col_def.push_str(&col_script[type_start + 1..]);
+        if let Some(parent) = &self.partition_of {
+            script.push_str(&format!(
+                "create table \"{}\".\"{}\" partition of {}",
+                self.schema, self.name, parent
+            ));
+            if let Some(bound) = &self.partition_bound {
+                script.push_str(&format!("\n    {}", bound));
             }
 
-            column_definitions.push(col_def);
-        }
+            if let Some(partition_key) = &self.partition_key {
+                script.push_str(&format!("\npartition by {}", partition_key));
+            }
 
-        // 4. Add primary key constraint if exists
-        let has_pk_constraint = self
-            .constraints
-            .iter()
-            .any(|c| c.constraint_type.to_lowercase() == "primary key");
+            script.push_str(";\n\n");
+        } else {
+            // 1. Build CREATE TABLE statement
+            script.push_str(&format!(
+                "create table \"{}\".\"{}\" (\n",
+                self.schema, self.name
+            ));
 
-        if has_pk_constraint {
-            // Find PK columns from indexes if available
-            for index in &self.indexes {
-                if index.indexdef.to_lowercase().contains("primary key") {
-                    if let Some(start) = index.indexdef.to_lowercase().find("primary key (") {
-                        let after = &index.indexdef[start + "primary key (".len()..];
-                        if let Some(end) = after.find(')') {
-                            let cols_part = &after[..end];
-                            let pk_cols: Vec<&str> = cols_part
-                                .split(',')
-                                .map(|c| c.trim().trim_matches('"'))
-                                .collect();
-                            if !pk_cols.is_empty() {
-                                let pk_def = format!(
-                                    "    primary key ({})",
-                                    pk_cols
-                                        .iter()
-                                        .map(|c| format!("\"{c}\""))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                );
-                                column_definitions.push(pk_def);
+            // 2. Add column definitions
+            let mut column_definitions = Vec::new();
+            for column in &self.columns {
+                let mut col_def = String::new();
+
+                // Column name
+                col_def.push_str(&format!("    \"{}\" ", column.name));
+
+                // Use standard column definition
+                let col_script = column.get_script();
+                // Extract just the type and constraints part (skip the quoted name)
+                if let Some(type_start) = col_script.find(' ') {
+                    col_def.push_str(&col_script[type_start + 1..]);
+                }
+
+                column_definitions.push(col_def);
+            }
+
+            // 4. Add primary key constraint if exists
+            let has_pk_constraint = self
+                .constraints
+                .iter()
+                .any(|c| c.constraint_type.to_lowercase() == "primary key");
+
+            if has_pk_constraint {
+                // Find PK columns from indexes if available
+                for index in &self.indexes {
+                    if index.indexdef.to_lowercase().contains("primary key") {
+                        if let Some(start) = index.indexdef.to_lowercase().find("primary key (") {
+                            let after = &index.indexdef[start + "primary key (".len()..];
+                            if let Some(end) = after.find(')') {
+                                let cols_part = &after[..end];
+                                let pk_cols: Vec<&str> = cols_part
+                                    .split(',')
+                                    .map(|c| c.trim().trim_matches('"'))
+                                    .collect();
+                                if !pk_cols.is_empty() {
+                                    let pk_def = format!(
+                                        "    primary key ({})",
+                                        pk_cols
+                                            .iter()
+                                            .map(|c| format!("\"{c}\""))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    );
+                                    column_definitions.push(pk_def);
+                                }
                             }
                         }
+                        break;
                     }
-                    break;
                 }
             }
-        }
 
-        // Join all column definitions
-        script.push_str(&column_definitions.join(",\n"));
-        script.push_str("\n);\n\n");
+            // Join all column definitions
+            script.push_str(&column_definitions.join(",\n"));
+            script.push_str("\n)");
+
+            if let Some(partition_key) = &self.partition_key {
+                script.push_str(&format!("\npartition by {}", partition_key));
+            }
+
+            script.push_str(";\n\n");
+        }
 
         // 5. Add other constraints (excluding primary key and foreign key)
         for constraint in &self.constraints {
@@ -1271,5 +1355,102 @@ mod tests {
                 .contains("alter table \"public\".\"users\" drop constraint \"fk_change\";")
         );
         assert!(change_fk_script.contains("alter table \"public\".\"users\" add constraint \"fk_change\" foreign key (col) references new_table(id)"));
+    }
+
+    fn create_dummy_column(name: &str, data_type: &str) -> TableColumn {
+        TableColumn {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_nullable: true,
+            ordinal_position: 1,
+            catalog: "".to_string(),
+            schema: "".to_string(),
+            table: "".to_string(),
+            column_default: None,
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: None,
+            numeric_precision_radix: None,
+            numeric_scale: None,
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+        }
+    }
+
+    #[test]
+    fn test_partitioned_table_script() {
+        let mut table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "bigint"),
+                create_dummy_column("flow_id", "varchar"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        table.partition_key = Some("LIST (flow_id)".to_string());
+
+        let script = table.get_script();
+        assert!(script.contains("create table \"data\".\"test\""));
+        assert!(script.contains("partition by LIST (flow_id)"));
+    }
+
+    #[test]
+    fn test_partition_child_script() {
+        let mut table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
+            "owner".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        table.partition_of = Some("\"data\".\"test\"".to_string());
+        table.partition_bound = Some("DEFAULT".to_string());
+
+        let script = table.get_script();
+        assert!(
+            script
+                .contains("create table \"data\".\"test_default\" partition of \"data\".\"test\"")
+        );
+        assert!(script.contains("DEFAULT"));
     }
 }
