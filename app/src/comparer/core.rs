@@ -1,4 +1,4 @@
-use crate::dump::core::Dump;
+use crate::dump::{core::Dump, routine::Routine};
 use std::{
     collections::HashSet,
     fs::File,
@@ -93,6 +93,64 @@ impl Comparer {
             (Some(lhs), Some(rhs)) => lhs != rhs,
             (Some(_), None) | (None, Some(_)) => true,
             (None, None) => false,
+        }
+    }
+
+    fn process_target_routine(&mut self, routine: &Routine) {
+        if routine.hash.is_none() {
+            self.script.push_str(
+                format!(
+                    "/* Skipping routine {}.{} due to missing hash. */\n",
+                    routine.schema, routine.name
+                )
+                .as_str(),
+            );
+            return;
+        }
+
+        if let Some(from_routine) = self
+            .from
+            .routines
+            .iter()
+            .find(|r| r.name == routine.name && r.schema == routine.schema)
+        {
+            if from_routine.hash.is_none() {
+                self.script.push_str(
+                    format!(
+                        "/* Skipping routine {}.{} due to missing hash. */\n",
+                        from_routine.schema, from_routine.name
+                    )
+                    .as_str(),
+                );
+                return;
+            }
+
+            if Self::hashes_differ(&from_routine.hash, &routine.hash) {
+                if from_routine.return_type != routine.return_type
+                    || from_routine.arguments != routine.arguments
+                {
+                    let drop_script = from_routine.get_drop_script();
+                    if self.use_drop {
+                        self.script.push_str(drop_script.as_str());
+                    } else {
+                        self.script.push_str(
+                            drop_script
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect::<String>()
+                                .as_str(),
+                        );
+                    }
+                }
+                self.script.push_str(
+                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                );
+                self.script.push_str(routine.get_script().as_str());
+            }
+        } else {
+            self.script
+                .push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+            self.script.push_str(routine.get_script().as_str());
         }
     }
 
@@ -651,64 +709,20 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Routines: Start section --------------- */\n\n");
 
-        // We will find all new routines from "to" dump that are not in "from" dump
-        // and we will find all existing routines in both dumps with different hashes
-        // and add them to the script.
-        for routine in &self.to.routines {
-            if routine.hash.is_none() {
-                self.script.push_str(
-                    format!(
-                        "/* Skipping routine {}.{} due to missing hash. */\n",
-                        routine.schema, routine.name
-                    )
-                    .as_str(),
-                );
-                continue;
-            }
-            if let Some(from_routine) = self
-                .from
-                .routines
-                .iter()
-                .find(|r| r.name == routine.name && r.schema == routine.schema)
-            {
-                if from_routine.hash.is_none() {
-                    self.script.push_str(
-                        format!(
-                            "/* Skipping routine {}.{} due to missing hash. */\n",
-                            from_routine.schema, from_routine.name
-                        )
-                        .as_str(),
-                    );
-                    continue;
-                }
-                if Self::hashes_differ(&from_routine.hash, &routine.hash) {
-                    if from_routine.return_type != routine.return_type
-                        || from_routine.arguments != routine.arguments
-                    {
-                        let drop_script = from_routine.get_drop_script();
-                        if self.use_drop {
-                            self.script.push_str(drop_script.as_str());
-                        } else {
-                            self.script.push_str(
-                                drop_script
-                                    .lines()
-                                    .map(|l| format!("-- {}\n", l))
-                                    .collect::<String>()
-                                    .as_str(),
-                            );
-                        }
-                    }
-                    self.script.push_str(
-                        format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
-                    );
-                    self.script.push_str(routine.get_script().as_str());
-                }
-            } else {
-                self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
-                );
-                self.script.push_str(routine.get_script().as_str());
-            }
+        // Apply non-SQL routines first, then SQL routines last.
+        let (sql_routines, other_routines): (Vec<_>, Vec<_>) = self
+            .to
+            .routines
+            .iter()
+            .cloned()
+            .partition(|r| r.lang.eq_ignore_ascii_case("sql"));
+
+        for routine in &other_routines {
+            self.process_target_routine(routine);
+        }
+
+        for routine in &sql_routines {
+            self.process_target_routine(routine);
         }
 
         for routine in &self.from.routines {
@@ -1067,6 +1081,53 @@ mod tests {
         assert!(script.contains(
             "create or replace function \"public\".\"test_func\"(a text) returns integer"
         ));
+    }
+
+    #[tokio::test]
+    async fn compare_routines_applies_sql_routines_last() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let plpgsql_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "fn_plpgsql".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+
+        let sql_routine = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "fn_sql".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            "SELECT 1;".to_string(),
+        );
+
+        // Intentionally add SQL first to ensure reordering happens.
+        to_dump.routines.push(sql_routine);
+        to_dump.routines.push(plpgsql_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_plpgsql = script
+            .find("create or replace function \"public\".\"fn_plpgsql\"")
+            .expect("plpgsql routine script not found");
+        let pos_sql = script
+            .find("create or replace function \"public\".\"fn_sql\"")
+            .expect("sql routine script not found");
+
+        assert!(pos_plpgsql < pos_sql, "SQL routines should be applied last");
     }
 
     use crate::dump::sequence::Sequence;
