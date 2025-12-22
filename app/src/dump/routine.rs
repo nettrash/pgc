@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_ignores_argument_defaults() {
+    fn hash_does_not_include_argument_defaults() {
         let mut routine = build_function_routine();
         let original_hash = routine.hash.clone();
 
