@@ -75,6 +75,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **calculate_average_rating**: New function in Schema B
 - **get_user_review_count**: New function in Schema B
 - **update_daily_stats**: New function in Schema B
+- **SQL routines**: Added `get_active_usernames_sql` and `product_price_with_tax_sql` to cover SQL-language routines with and without dependencies on plpgsql functions (signature differs in Schema B)
 
 ### 8. Procedures
 

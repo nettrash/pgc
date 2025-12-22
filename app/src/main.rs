@@ -4,7 +4,7 @@ use crate::{
     dump::core::Dump,
 };
 use chrono::Datelike;
-use clap::{CommandFactory, Parser, command};
+use clap::{CommandFactory, Parser};
 use std::{io::Error, path::Path};
 
 pub mod comparer;
