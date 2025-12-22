@@ -548,3 +548,20 @@ CREATE TABLE data.partition_bound_test (
 ) PARTITION BY LIST (status);
 
 CREATE TABLE data.partition_bound_test_active PARTITION OF data.partition_bound_test FOR VALUES IN ('inactive');
+
+-- SQL routines to test dependency handling
+CREATE OR REPLACE FUNCTION test_schema.get_active_usernames_sql()
+RETURNS TABLE(username varchar, preferred_contact test_schema.contact_type)
+LANGUAGE sql
+AS $$
+    SELECT username, preferred_contact FROM test_schema.users WHERE status = 'active';
+$$;
+
+CREATE OR REPLACE FUNCTION test_schema.product_price_with_tax_sql(p_product_id uuid, p_tax_rate numeric, p_currency varchar DEFAULT 'USD')
+RETURNS numeric
+LANGUAGE sql
+AS $$
+    SELECT p.price + test_schema.calculate_tax(p.price, p_tax_rate, p_currency)
+    FROM test_schema.products p
+    WHERE p.id = p_product_id;
+$$;
