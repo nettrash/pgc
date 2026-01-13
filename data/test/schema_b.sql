@@ -317,7 +317,7 @@ BEGIN
 END;
 $$;
 
--- Function containing nested $$ to exercise custom dollar quoting (TO variant)
+-- Function containing nested $$ to exercise custom dollar quoting (TO database variant of fn_dollar_from)
 CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
 RETURNS text
 LANGUAGE plpgsql
