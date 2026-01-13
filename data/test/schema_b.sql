@@ -445,6 +445,11 @@ COMMENT ON COLUMN test_schema.users.metadata IS 'Additional user data in JSON fo
 COMMENT ON COLUMN test_schema.products.dimensions IS 'Product dimensions (length, width, height) in JSON';
 COMMENT ON COLUMN test_schema.users.preferred_contact IS 'Preferred method of contact for notifications';
 COMMENT ON COLUMN test_schema.products.barcode IS 'Product barcode for inventory tracking';
+COMMENT ON TYPE test_schema.status_type IS 'User status values including suspended (TO)';
+COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer capped at 1,000,000 (TO)';
+COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 2000 (TO)';
+COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with featured flag (TO)';
+COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users with created_at for status filter (TO)';
 
 -- Special characters test (Modified: added column)
 CREATE TABLE test_schema."special$table" (

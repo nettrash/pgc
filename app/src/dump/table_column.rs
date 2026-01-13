@@ -49,6 +49,8 @@ pub struct TableColumn {
     pub generation_expression: Option<String>, // Generation expression for the column
     pub is_updatable: bool,                    // Whether the column is updatable
     pub related_views: Option<Vec<String>>,    // Related views (optional)
+    #[serde(default)]
+    pub comment: Option<String>,               // Column comment
 }
 
 impl TableColumn {
@@ -241,7 +243,22 @@ impl TableColumn {
         if let Some(expr) = &self.generation_expression {
             hasher.update(expr.as_bytes());
         }
+        if let Some(comment) = &self.comment {
+            hasher.update(comment.as_bytes());
+        }
         // skip catalog/charset/related_views and other descriptive-only fields
+    }
+
+    pub fn get_comment_script(&self) -> Option<String> {
+        self.comment.as_ref().map(|comment| {
+            format!(
+                "comment on column \"{}\".\"{}\".\"{}\" is '{}';\n",
+                self.schema,
+                self.table,
+                self.name,
+                comment.replace('\'', "''")
+            )
+        })
     }
 
     /// Returns a string representation of the column
@@ -401,7 +418,25 @@ impl TableColumn {
         if statements.is_empty() {
             None
         } else {
-            Some(statements.join(""))
+            let mut joined = statements.join("");
+            if self.comment != existing.comment {
+                let comment_stmt = if let Some(cmt) = &self.comment {
+                    format!(
+                        "comment on column \"{}\".\"{}\".\"{}\" is '{}';\n",
+                        self.schema,
+                        self.table,
+                        self.name,
+                        cmt.replace('\'', "''")
+                    )
+                } else {
+                    format!(
+                        "comment on column \"{}\".\"{}\".\"{}\" is null;\n",
+                        self.schema, self.table, self.name
+                    )
+                };
+                joined.push_str(&comment_stmt);
+            }
+            Some(joined)
         }
     }
 
@@ -466,6 +501,15 @@ impl TableColumn {
         }
 
         statement.push_str(";\n");
+        if let Some(comment) = &self.comment {
+            statement.push_str(&format!(
+                "comment on column \"{}\".\"{}\".\"{}\" is '{}';\n",
+                self.schema,
+                self.table,
+                self.name,
+                comment.replace('\'', "''")
+            ));
+        }
         statement
     }
 
@@ -528,6 +572,7 @@ impl PartialEq for TableColumn {
                 || self.is_generated.to_uppercase().contains("BY DEFAULT"))
             && self.generation_expression == other.generation_expression
             && self.is_updatable == other.is_updatable
+            && self.comment == other.comment
     }
 }
 
@@ -584,6 +629,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         }
     }
 

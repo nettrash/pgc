@@ -1013,6 +1013,7 @@ mod tests {
             "integer".to_string(),
             "".to_string(),
             None,
+            None,
             "BEGIN RETURN 1; END".to_string(),
         );
 
@@ -1024,6 +1025,7 @@ mod tests {
             "FUNCTION".to_string(),
             "text".to_string(),
             "".to_string(),
+            None,
             None,
             "BEGIN RETURN '1'; END".to_string(),
         );
@@ -1055,6 +1057,7 @@ mod tests {
             "integer".to_string(),
             "a integer".to_string(),
             None,
+            None,
             "BEGIN RETURN a; END".to_string(),
         );
 
@@ -1066,6 +1069,7 @@ mod tests {
             "FUNCTION".to_string(),
             "integer".to_string(),
             "a text".to_string(),
+            None,
             None,
             "BEGIN RETURN 1; END".to_string(),
         );
@@ -1097,6 +1101,7 @@ mod tests {
             "integer".to_string(),
             "".to_string(),
             None,
+            None,
             "BEGIN RETURN 1; END".to_string(),
         );
 
@@ -1108,6 +1113,7 @@ mod tests {
             "FUNCTION".to_string(),
             "integer".to_string(),
             "".to_string(),
+            None,
             None,
             "SELECT 1;".to_string(),
         );
@@ -1205,6 +1211,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         };
 
         let table = Table::new(
@@ -1301,6 +1308,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         };
 
         let table = Table::new(
@@ -1429,6 +1437,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         };
 
         let table = Table::new(
@@ -1522,6 +1531,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         };
 
         let from_table = Table::new(
@@ -1586,6 +1596,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         };
 
         let to_table = Table::new(
