@@ -141,6 +141,14 @@ CREATE TABLE test_schema.reviews (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Generated column change test (TO: generated stored)
+CREATE TABLE test_schema.generated_pricing (
+    id SERIAL PRIMARY KEY,
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    total DECIMAL(12,2) GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+
 CREATE TABLE shared_schema.audit_logs (
     id BIGSERIAL PRIMARY KEY,
     table_name VARCHAR(100) NOT NULL,

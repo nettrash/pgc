@@ -658,7 +658,7 @@ impl Table {
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
                 if old_col != new_col
-                    && let Some(alter_col_script) = new_col.get_alter_script(old_col)
+                    && let Some(alter_col_script) = new_col.get_alter_script(old_col, use_drop)
                 {
                     column_alter_script.push_str(&alter_col_script);
                 }

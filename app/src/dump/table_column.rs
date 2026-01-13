@@ -107,6 +107,35 @@ impl TableColumn {
             .unwrap_or_else(|| "BY DEFAULT".to_string())
     }
 
+    fn normalized_generated(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            "NEVER".to_string()
+        } else {
+            let upper = trimmed.to_uppercase();
+            if upper.contains("ALWAYS") {
+                "ALWAYS".to_string()
+            } else if upper.contains("BY DEFAULT") {
+                "BY DEFAULT".to_string()
+            } else {
+                upper
+            }
+        }
+    }
+
+    fn normalized_generation_expression(expr: &str) -> String {
+        let mut trimmed = expr.trim();
+        // Strip redundant outer parentheses to avoid emitted ((expr)) which some servers reject
+        while trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() > 2 {
+            let candidate = trimmed[1..trimmed.len() - 1].trim();
+            if candidate.len() == trimmed.len() {
+                break;
+            }
+            trimmed = candidate;
+        }
+        trimmed.to_string()
+    }
+
     fn build_identity_add_statement(&self, existing: &TableColumn) -> String {
         let generation = Self::normalized_identity_generation(self.identity_generation.as_ref());
         let mut statement = format!(
@@ -223,6 +252,8 @@ impl TableColumn {
         hasher.update(self.name.as_bytes());
         hasher.update(self.data_type.as_bytes());
         hasher.update(self.is_nullable.to_string().as_bytes());
+
+        hasher.update(Self::normalized_generated(&self.is_generated).as_bytes());
 
         if let Some(default) = &self.column_default {
             hasher.update(default.as_bytes());
@@ -346,7 +377,9 @@ impl TableColumn {
         if self.is_generated.to_lowercase() == "always"
             && let Some(expr) = &self.generation_expression
         {
-            script.push_str(&format!(" generated always as ({expr}) stored "));
+            let norm_expr = Self::normalized_generation_expression(expr);
+            let wrapped = format!("({norm_expr})");
+            script.push_str(&format!(" generated always as {wrapped} stored"));
         }
 
         // Default
@@ -362,8 +395,11 @@ impl TableColumn {
         script.trim_end().to_string()
     }
 
-    pub fn get_alter_script(&self, existing: &TableColumn) -> Option<String> {
+    pub fn get_alter_script(&self, existing: &TableColumn, use_drop: bool) -> Option<String> {
         let mut statements = Vec::new();
+
+        let new_generated = Self::normalized_generated(&self.is_generated);
+        let old_generated = Self::normalized_generated(&existing.is_generated);
 
         if self.type_clause_differs(existing) {
             statements.push(format!(
@@ -390,10 +426,18 @@ impl TableColumn {
 
         if self.is_nullable != existing.is_nullable {
             if self.is_nullable {
-                statements.push(format!(
-                    "alter table \"{}\".\"{}\" alter column \"{}\" drop not null;\n",
-                    self.schema, self.table, self.name
-                ));
+                if use_drop {
+                    statements.push(format!(
+                        "alter table \"{}\".\"{}\" alter column \"{}\" drop not null;\n",
+                        self.schema, self.table, self.name
+                    ));
+                } else {
+                    let commented = format!(
+                        "-- use_drop=false: would drop NOT NULL\n-- alter table \"{}\".\"{}\" alter column \"{}\" drop not null;\n",
+                        self.schema, self.table, self.name
+                    );
+                    statements.push(commented);
+                }
             } else {
                 statements.push(format!(
                     "alter table \"{}\".\"{}\" alter column \"{}\" set not null;\n",
@@ -413,6 +457,52 @@ impl TableColumn {
             }
         } else if self.is_identity {
             self.build_identity_update_statements(existing, &mut statements);
+        }
+
+        let generated_changed = new_generated != old_generated
+            || (new_generated == "ALWAYS"
+                && self.generation_expression != existing.generation_expression);
+
+        if generated_changed {
+            let new_is_generated = new_generated == "ALWAYS";
+            let old_is_generated = old_generated != "NEVER";
+
+            if !old_is_generated && new_is_generated {
+                // PostgreSQL cannot ALTER COLUMN ... ADD GENERATED; drop and re-add instead.
+                if use_drop {
+                    statements.push(self.get_drop_script());
+                    statements.push(self.get_add_script());
+                } else {
+                    let mut commented = String::from(
+                        "-- use_drop=false: converting column to generated requires drop/add; statements commented out\n",
+                    );
+
+                    for line in self.get_drop_script().lines() {
+                        commented.push_str(&format!("-- {line}\n"));
+                    }
+                    for line in self.get_add_script().lines() {
+                        commented.push_str(&format!("-- {line}\n"));
+                    }
+
+                    statements.push(commented);
+                }
+            } else {
+                if old_is_generated {
+                    statements.push(format!(
+                        "alter table \"{}\".\"{}\" alter column \"{}\" drop expression;\n",
+                        self.schema, self.table, self.name
+                    ));
+                }
+
+                if new_is_generated && let Some(expr) = &self.generation_expression {
+                    let norm_expr = Self::normalized_generation_expression(expr);
+                    let wrapped = format!("({norm_expr})");
+                    statements.push(format!(
+                        "alter table \"{}\".\"{}\" alter column \"{}\" add generated always as {wrapped} stored;\n",
+                        self.schema, self.table, self.name
+                    ));
+                }
+            }
         }
 
         if statements.is_empty() {
@@ -489,7 +579,9 @@ impl TableColumn {
         if self.is_generated.to_lowercase() == "always"
             && let Some(expr) = &self.generation_expression
         {
-            statement.push_str(&format!(" generated always as ({expr}) stored"));
+            let norm_expr = Self::normalized_generation_expression(expr);
+            let wrapped = format!("({norm_expr})");
+            statement.push_str(&format!(" generated always as {wrapped} stored"));
         }
 
         if let Some(default) = &self.column_default {
@@ -523,6 +615,9 @@ impl TableColumn {
 
 impl PartialEq for TableColumn {
     fn eq(&self, other: &Self) -> bool {
+        let self_generated = Self::normalized_generated(&self.is_generated);
+        let other_generated = Self::normalized_generated(&other.is_generated);
+
         self.schema == other.schema
             && self.table == other.table
             && self.name == other.name
@@ -563,19 +658,13 @@ impl PartialEq for TableColumn {
             && self.identity_maximum == other.identity_maximum
             && self.identity_minimum == other.identity_minimum
             && self.identity_cycle == other.identity_cycle
-            // is_generated is a string, so we compare it directly.
-            // If it contains "ALWAYS" or "BY DEFAULT", we consider them equal.
-            // This is a workaround for the fact that
-            // PostgreSQL uses different strings for generated columns.
-            && (self.is_generated.to_uppercase() == other.is_generated.to_uppercase()
-                || self.is_generated.to_uppercase().contains("ALWAYS")
-                || self.is_generated.to_uppercase().contains("BY DEFAULT"))
-            && self.generation_expression == other.generation_expression
+            && self_generated == other_generated
+            && (self_generated != "ALWAYS"
+                || self.generation_expression == other.generation_expression)
             && self.is_updatable == other.is_updatable
             && self.comment == other.comment
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,7 +954,7 @@ mod tests {
         let script = column.get_script();
         assert_eq!(
             script,
-            "\"test_column\" integer generated always as ((id * 2)) stored"
+            "\"test_column\" integer generated always as (id * 2) stored"
         );
     }
 
@@ -1025,10 +1114,23 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_eq_generated_differs_from_plain_column() {
+        let mut column1 = create_test_column();
+        column1.is_generated = "ALWAYS".to_string();
+        column1.generation_expression = Some("(id * 2)".to_string());
+
+        let column2 = create_test_column();
+
+        assert_ne!(column1, column2);
+    }
+
+    #[test]
     fn test_partial_eq_different_generation_expression() {
         let mut column1 = create_test_column();
         let mut column2 = create_test_column();
+        column1.is_generated = "ALWAYS".to_string();
         column1.generation_expression = Some("(id * 2)".to_string());
+        column2.is_generated = "ALWAYS".to_string();
         column2.generation_expression = Some("(id * 3)".to_string());
         assert_ne!(column1, column2);
     }
@@ -1127,7 +1229,7 @@ mod tests {
         // This is a known hash for the test data - if the hashing logic changes, this will fail
         assert_eq!(
             hash_hex,
-            "db78cc9acba9b94dc4dfd0bfebf0ba1a2bbf63fe7d1ef6d2b1a8291e222d6484"
+            "e8f4ac1ac6ef0cb7edf47a8fe070ccf7b80c70e4ba37937f80e06cb663ee65e2"
         );
     }
 
@@ -1157,7 +1259,7 @@ mod tests {
         updated.data_type = "integer".to_string();
         updated.character_maximum_length = None;
         let script = updated
-            .get_alter_script(&existing)
+            .get_alter_script(&existing, true)
             .expect("expected alter statement for type change");
         assert_eq!(
             script,
@@ -1174,7 +1276,7 @@ mod tests {
         updated.data_type = "integer".to_string();
         updated.character_maximum_length = None;
         let script = updated
-            .get_alter_script(&existing)
+            .get_alter_script(&existing, true)
             .expect("expected alter statement for type change");
         assert_eq!(
             script,
@@ -1190,7 +1292,7 @@ mod tests {
         updated.column_default = Some("'default_value'".to_string());
 
         let script = updated
-            .get_alter_script(&existing)
+            .get_alter_script(&existing, true)
             .expect("expected alter statement for default change");
         assert_eq!(
             script,
@@ -1206,7 +1308,7 @@ mod tests {
         updated.is_nullable = false;
 
         let script = updated
-            .get_alter_script(&existing)
+            .get_alter_script(&existing, true)
             .expect("expected alter statement for nullability change");
         assert_eq!(
             script,
@@ -1215,9 +1317,25 @@ mod tests {
     }
 
     #[test]
+    fn test_get_alter_script_drop_not_null_use_drop_false() {
+        let mut existing = create_test_column();
+        existing.is_nullable = false;
+        let mut updated = existing.clone();
+        updated.is_nullable = true;
+
+        let script = updated
+            .get_alter_script(&existing, false)
+            .expect("expected commented drop not null when use_drop is false");
+
+        assert!(script.contains("use_drop=false"));
+        assert!(script.contains("alter column \"test_column\" drop not null"));
+        assert!(script.lines().all(|l| l.starts_with("--")));
+    }
+
+    #[test]
     fn test_get_alter_script_returns_none_when_no_change() {
         let column = create_test_column();
-        assert!(column.get_alter_script(&column).is_none());
+        assert!(column.get_alter_script(&column, true).is_none());
     }
 
     #[test]
@@ -1280,12 +1398,86 @@ mod tests {
         updated.identity_increment = Some("5".to_string());
 
         let script = updated
-            .get_alter_script(&existing)
+            .get_alter_script(&existing, true)
             .expect("expected alter statement for identity update");
 
         assert_eq!(
             script,
             "alter table \"public\".\"test_table\" alter column \"test_column\" set START WITH 100;\nalter table \"public\".\"test_table\" alter column \"test_column\" set INCREMENT BY 5;\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_add_generated_always() {
+        let existing = create_test_column();
+        let mut updated = existing.clone();
+        updated.is_generated = "ALWAYS".to_string();
+        updated.generation_expression = Some("(id * 2)".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected alter statement for generated column");
+
+        assert_eq!(
+            script,
+            "alter table \"public\".\"test_table\" drop column \"test_column\";\n".to_owned()
+                + "alter table \"public\".\"test_table\" add column \"test_column\" varchar(255) generated always as (id * 2) stored;\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_add_generated_always_use_drop_false() {
+        let existing = create_test_column();
+        let mut updated = existing.clone();
+        updated.is_generated = "ALWAYS".to_string();
+        updated.generation_expression = Some("(id * 2)".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, false)
+            .expect("expected statement, even if commented when use_drop is false");
+
+        assert!(script.contains("use_drop=false"));
+        assert!(script.contains("drop column \"test_column\""));
+        assert!(script.contains(
+            "add column \"test_column\" varchar(255) generated always as (id * 2) stored"
+        ));
+        assert!(script.lines().all(|l| l.starts_with("--") || l.is_empty()));
+    }
+
+    #[test]
+    fn test_get_alter_script_update_generated_expression() {
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+
+        let mut updated = existing.clone();
+        updated.generation_expression = Some("(id * 3)".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected alter statement for generated expression change");
+
+        assert_eq!(
+            script,
+            "alter table \"public\".\"test_table\" alter column \"test_column\" drop expression;\nalter table \"public\".\"test_table\" alter column \"test_column\" add generated always as (id * 3) stored;\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_drop_generated_column() {
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+
+        let updated = create_test_column();
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected alter statement for dropping generated expression");
+
+        assert_eq!(
+            script,
+            "alter table \"public\".\"test_table\" alter column \"test_column\" drop expression;\n"
         );
     }
 }
