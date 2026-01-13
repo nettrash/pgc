@@ -115,10 +115,8 @@ impl TableColumn {
             let upper = trimmed.to_uppercase();
             if upper.contains("ALWAYS") {
                 "ALWAYS".to_string()
-            } else if upper.contains("BY DEFAULT") {
-                "BY DEFAULT".to_string()
             } else {
-                upper
+                "NEVER".to_string()
             }
         }
     }
