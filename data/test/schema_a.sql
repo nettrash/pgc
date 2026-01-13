@@ -333,6 +333,11 @@ COMMENT ON TABLE test_schema.products IS 'Product catalog';
 COMMENT ON TABLE test_schema.orders IS 'Customer orders';
 COMMENT ON COLUMN test_schema.users.metadata IS 'Additional user data in JSON format';
 COMMENT ON COLUMN test_schema.products.dimensions IS 'Product dimensions (length, width, height) in JSON';
+COMMENT ON TYPE test_schema.status_type IS 'User status values (active/inactive/pending)';
+COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer with no upper bound in FROM';
+COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 1000 (FROM)';
+COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with basic stock buckets (FROM)';
+COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users filtered by status (FROM)';
 
 -- Special characters test
 CREATE TABLE test_schema."special$table" (

@@ -57,6 +57,8 @@ pub struct PgType {
     pub enum_labels: Vec<String>, // Enum labels ordered by sort order
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_constraints: Vec<DomainConstraint>, // Domain constraints (check, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>, // Optional comment on the type
     pub hash: Option<String>,         // SHA256 hash of the type definition
 }
 
@@ -98,6 +100,7 @@ impl PgType {
         formatted_basetype: Option<String>,
         enum_labels: Vec<String>,
         domain_constraints: Vec<DomainConstraint>,
+        comment: Option<String>,
     ) -> Self {
         let mut pg_type = PgType {
             oid,
@@ -134,6 +137,7 @@ impl PgType {
             formatted_basetype,
             enum_labels,
             domain_constraints,
+            comment,
             hash: None,
         };
         pg_type.hash();
@@ -225,6 +229,11 @@ impl PgType {
             hasher.update(constraint.definition.as_bytes());
         }
 
+        if let Some(comment) = &self.comment {
+            hasher.update((comment.len() as u32).to_be_bytes());
+            hasher.update(comment.as_bytes());
+        }
+
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
@@ -246,10 +255,21 @@ impl PgType {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                format!(
+                let mut script = format!(
                     "create type \"{}\".\"{}\" as enum ({});\n",
                     self.schema, self.typname, variants
-                )
+                );
+
+                if let Some(comment) = &self.comment {
+                    script.push_str(&format!(
+                        "comment on type \"{}\".\"{}\" is '{}';\n",
+                        self.schema,
+                        self.typname,
+                        escape_single_quotes(comment)
+                    ));
+                }
+
+                script
             }
             'd' => {
                 let base_type = self.formatted_basetype.as_deref().unwrap_or("text");
@@ -287,6 +307,15 @@ impl PgType {
                         constraint.definition
                     ));
                 }
+                if let Some(comment) = &self.comment {
+                    script.push_str(&format!(
+                        "comment on domain \"{}\".\"{}\" is '{}';\n",
+                        self.schema,
+                        self.typname,
+                        escape_single_quotes(comment)
+                    ));
+                }
+
                 script
             }
             'r' => format!(
@@ -302,6 +331,14 @@ impl PgType {
                 self.schema, self.typname, other
             ),
         }
+    }
+
+    /// Returns a statement to drop the user-defined type if it exists.
+    pub fn get_drop_script(&self) -> String {
+        format!(
+            "drop type if exists \"{}\".\"{}\";\n",
+            self.schema, self.typname
+        )
     }
 
     /// Returns a string to alter the existing user-defined type to match the target definition.
@@ -320,7 +357,7 @@ impl PgType {
             );
         }
 
-        match (self.typtype as u8 as char, target.typtype as u8 as char) {
+        let mut script = match (self.typtype as u8 as char, target.typtype as u8 as char) {
             ('e', 'e') => {
                 let mut script = String::new();
                 let mut known_labels = self.enum_labels.clone();
@@ -501,19 +538,30 @@ impl PgType {
                 "-- Altering multirange type {}.{} is not supported yet.\n",
                 self.schema, self.typname
             ),
-            _ => format!(
-                "-- Altering type {}.{} (typtype = {}) is not supported yet.\n",
-                self.schema, self.typname, target.typtype as u8 as char
+            (kind, other) => format!(
+                "-- Alter script not implemented for type {}.{} ({} -> {})\n",
+                self.schema, self.typname, kind, other
             ),
-        }
-    }
+        };
 
-    /// Returns a string to drop the user-defined type.
-    pub fn get_drop_script(&self) -> String {
-        format!(
-            "drop type if exists \"{}\".\"{}\";\n",
-            self.schema, self.typname
-        )
+        if self.comment != target.comment {
+            let comment_stmt = if let Some(cmt) = &target.comment {
+                format!(
+                    "comment on type \"{}\".\"{}\" is '{}';\n",
+                    target.schema,
+                    target.typname,
+                    escape_single_quotes(cmt)
+                )
+            } else {
+                format!(
+                    "comment on type \"{}\".\"{}\" is null;\n",
+                    target.schema, target.typname
+                )
+            };
+            script.push_str(&comment_stmt);
+        }
+
+        script
     }
 }
 
@@ -570,6 +618,7 @@ mod tests {
             formatted_basetype: None,
             enum_labels: Vec::new(),
             domain_constraints: Vec::new(),
+            comment: None,
             hash: None,
         }
     }

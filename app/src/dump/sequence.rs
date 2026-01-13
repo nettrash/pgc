@@ -19,6 +19,8 @@ pub struct Sequence {
     pub owned_by_table: Option<String>,  // Owning table name
     pub owned_by_column: Option<String>, // Owning column name
     pub is_identity: bool,               // Whether the sequence is an identity sequence
+    #[serde(default)]
+    pub comment: Option<String>, // Optional sequence comment
     pub hash: Option<String>,            // Hash of the sequence
 }
 
@@ -57,6 +59,7 @@ impl Sequence {
             owned_by_table,
             owned_by_column,
             is_identity: false,
+            comment: None,
             hash: None,
         };
         sequence.hash();
@@ -92,6 +95,9 @@ impl Sequence {
             hasher.update(cache_size.to_string().as_bytes());
         }
         hasher.update(self.is_identity.to_string().as_bytes());
+        if let Some(comment) = &self.comment {
+            hasher.update(comment.as_bytes());
+        }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
@@ -175,6 +181,15 @@ impl Sequence {
 
         script.push_str(";\n");
 
+        if let Some(comment) = &self.comment {
+            script.push_str(&format!(
+                "comment on sequence \"{}\".\"{}\" is '{}';\n",
+                self.schema,
+                self.name,
+                comment.replace('\'', "''")
+            ));
+        }
+
         script
     }
 
@@ -223,6 +238,15 @@ impl Sequence {
             script.push_str(&clauses.join(" "));
         }
         script.push_str(";\n");
+
+        if let Some(comment) = &self.comment {
+            script.push_str(&format!(
+                "comment on sequence \"{}\".\"{}\" is '{}';\n",
+                self.schema,
+                self.name,
+                comment.replace('\'', "''")
+            ));
+        }
 
         script
     }

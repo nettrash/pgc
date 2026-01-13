@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Error, PgPool, Row};
 
+fn escape_single_quotes(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
@@ -25,6 +29,8 @@ pub struct Table {
     pub partition_key: Option<String>,     // Partition key (PARTITION BY ...)
     pub partition_of: Option<String>,      // Parent table (PARTITION OF ...)
     pub partition_bound: Option<String>,   // Partition bound (FOR VALUES ... or DEFAULT)
+    #[serde(default)]
+    pub comment: Option<String>, // Table comment
     pub hash: Option<String>,              // Hash of the table
 }
 
@@ -59,6 +65,7 @@ impl Table {
             partition_key: None,
             partition_of: None,
             partition_bound: None,
+            comment: None,
             hash: None,
         };
         table.hash();
@@ -127,6 +134,7 @@ impl Table {
                                 c.is_generated,
                                 c.generation_expression,
                                 c.is_updatable,
+                                pd.description as column_comment,
                                 (
                                         SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
                                         FROM information_schema.view_column_usage v
@@ -145,6 +153,9 @@ impl Table {
                             AND a.attname = c.column_name
                             AND a.attnum > 0
                             AND a.attisdropped = false
+                         LEFT JOIN pg_description pd
+                             ON pd.objoid = cls.oid
+                            AND pd.objsubid = a.attnum
                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
                         self.schema.replace('\'', "''"),
@@ -205,6 +216,7 @@ impl Table {
                         views.sort_unstable();
                         views
                     }),
+                    comment: row.get("column_comment"),
                 };
 
                 self.columns.push(table_column.clone());
@@ -401,6 +413,9 @@ impl Table {
         if let Some(pb) = &self.partition_bound {
             hasher.update(pb.as_bytes());
         }
+        if let Some(cmt) = &self.comment {
+            hasher.update(cmt.as_bytes());
+        }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
@@ -513,6 +528,22 @@ impl Table {
         // 7. Add triggers
         for trigger in &self.triggers {
             script.push_str(&trigger.get_script());
+        }
+
+        // 8. Add table comment (if any) and column comments
+        if let Some(comment) = &self.comment {
+            script.push_str(&format!(
+                "comment on table \"{}\".\"{}\" is '{}';\n",
+                self.schema,
+                self.name,
+                escape_single_quotes(comment)
+            ));
+        }
+
+        for column in &self.columns {
+            if let Some(comment_script) = column.get_comment_script() {
+                script.push_str(&comment_script);
+            }
         }
 
         script
@@ -709,6 +740,24 @@ impl Table {
             }
         }
 
+        // Table comment changes
+        if self.comment != to_table.comment {
+            let comment_stmt = if let Some(cmt) = &to_table.comment {
+                format!(
+                    "comment on table \"{}\".\"{}\" is '{}';\n",
+                    to_table.schema,
+                    to_table.name,
+                    escape_single_quotes(cmt)
+                )
+            } else {
+                format!(
+                    "comment on table \"{}\".\"{}\" is null;\n",
+                    to_table.schema, to_table.name
+                )
+            };
+            constraint_post_script.push_str(&comment_stmt);
+        }
+
         // Collect index updates
         for new_index in &to_table.indexes {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
@@ -844,6 +893,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         }
     }
 
@@ -1503,6 +1553,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         }
     }
 

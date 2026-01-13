@@ -20,6 +20,9 @@ pub struct Routine {
     pub arguments: String,
     /// The default values for the arguments, formatted as a string.
     pub arguments_defaults: Option<String>,
+    /// Optional comment on the routine.
+    #[serde(default)]
+    pub comment: Option<String>,
     /// The description of the routine.
     pub source_code: String,
     /// The hash of the routine.
@@ -38,6 +41,7 @@ impl Routine {
         return_type: String,
         arguments: String,
         arguments_defaults: Option<String>,
+        comment: Option<String>,
         source_code: String,
     ) -> Self {
         let mut routine = Routine {
@@ -49,6 +53,7 @@ impl Routine {
             return_type,
             arguments,
             arguments_defaults,
+            comment,
             source_code,
             hash: None,
         };
@@ -59,13 +64,14 @@ impl Routine {
     /// Hash
     pub fn hash(&mut self) {
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
             self.kind,
             self.return_type,
             self.arguments,
+            self.comment.clone().unwrap_or_default(),
             self.source_code
         );
         self.hash = Some(format!("{:x}", md5::compute(src)));
@@ -97,6 +103,20 @@ impl Routine {
             script.push_str(&format!("-- Defaults: {defaults}\n"));
         }
 
+        if let Some(comment) = &self.comment {
+            let object_kind = match kind.as_str() {
+                "procedure" => "procedure",
+                _ => "function",
+            };
+            script.push_str(&format!(
+                "comment on {object_kind} \"{}\".\"{}\"({}) is '{}';\n",
+                self.schema,
+                self.name,
+                self.arguments,
+                comment.replace('\'', "''")
+            ));
+        }
+
         script
     }
 
@@ -126,6 +146,7 @@ mod tests {
             "integer".to_string(),
             "a integer".to_string(),
             Some("DEFAULT 1".to_string()),
+            None,
             "BEGIN RETURN a + 1; END".to_string(),
         )
     }
@@ -139,6 +160,7 @@ mod tests {
             "Procedure".to_string(),
             "void".to_string(),
             "a integer".to_string(),
+            None,
             None,
             "SELECT a;".to_string(),
         )
@@ -164,6 +186,7 @@ mod tests {
             return_type.to_string(),
             arguments.to_string(),
             defaults.clone(),
+            None,
             source_code.to_string(),
         );
 
@@ -178,8 +201,8 @@ mod tests {
         assert_eq!(routine.source_code, source_code);
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}",
-            schema, name, lang, kind, return_type, arguments, source_code
+            "{}.{}.{}.{}.{}.{}.{}.{}",
+            schema, name, lang, kind, return_type, arguments, "", source_code
         );
         let expected_hash = format!("{:x}", md5::compute(expected_src));
         assert_eq!(routine.hash.as_ref(), Some(&expected_hash));
@@ -245,6 +268,7 @@ mod tests {
             "FUNCTION".to_string(),
             "TABLE(row_to_json json)".to_string(),
             "fetching_id bigint, fetching_event_id character varying".to_string(),
+            None,
             None,
             "BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END".to_string(),
         );

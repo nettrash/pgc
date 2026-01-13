@@ -11,6 +11,9 @@ pub struct View {
     pub definition: String,
     /// Table relation (list of tables that used by this view)
     pub table_relation: Vec<String>,
+    /// Optional comment on the view
+    #[serde(default)]
+    pub comment: Option<String>,
     /// Hash of the view
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -29,6 +32,7 @@ impl View {
             name,
             definition,
             table_relation,
+            comment: None,
             hash: None,
         };
         view.hash();
@@ -39,7 +43,13 @@ impl View {
     pub fn hash(&mut self) {
         self.hash = Some(format!(
             "{:x}",
-            md5::compute(format!("{}.{}.{}", self.schema, self.name, self.definition))
+            md5::compute(format!(
+                "{}.{}.{}.{}",
+                self.schema,
+                self.name,
+                self.definition,
+                self.comment.clone().unwrap_or_default()
+            ))
         ));
     }
 
@@ -50,7 +60,17 @@ impl View {
             self.schema, self.name, self.definition
         );
 
-        script
+        if let Some(comment) = &self.comment {
+            format!(
+                "{}comment on view \"{}\".\"{}\" is '{}';\n",
+                script,
+                self.schema,
+                self.name,
+                comment.replace('\'', "''")
+            )
+        } else {
+            script
+        }
     }
 
     /// Returns a string to drop the view.
@@ -114,7 +134,7 @@ mod tests {
 
         let expected_hash = format!(
             "{:x}",
-            md5::compute(format!("analytics.active_users.{definition}"))
+            md5::compute(format!("analytics.active_users.{definition}."))
         );
 
         assert_eq!(view.hash.as_deref(), Some(expected_hash.as_str()));
