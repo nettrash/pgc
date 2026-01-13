@@ -242,6 +242,18 @@ BEGIN
 END;
 $$;
 
+-- Function containing nested $$ to exercise custom dollar quoting
+CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
+RETURNS text
+LANGUAGE plpgsql
+AS $b$
+DECLARE
+    inner_text text := $$inner-from$$;
+BEGIN
+    RETURN inner_text;
+END;
+$b$;
+
 -- Procedure (PostgreSQL 11+)
 CREATE OR REPLACE PROCEDURE test_schema.cleanup_old_orders(days_old INTEGER DEFAULT 365)
 LANGUAGE plpgsql AS $$
