@@ -159,7 +159,7 @@ impl Routine {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect::<String>();
-        let mut base = if sanitized.is_empty() {
+        let base = if sanitized.is_empty() {
             "pgc_body".to_string()
         } else {
             format!("pgc_{}_body", sanitized)
