@@ -463,7 +463,7 @@ impl TableColumn {
             let old_is_generated = old_generated != "NEVER";
 
             if !old_is_generated && new_is_generated {
-                // PostgreSQL cannot ALTER COLUMN ... ADD GENERATED; drop and re-add instead.
+                // Converting an existing column (especially with data) to GENERATED is not safely handled by a simple ALTER; drop and re-add instead.
                 if use_drop {
                     statements.push(self.get_drop_script());
                     statements.push(self.get_add_script());
