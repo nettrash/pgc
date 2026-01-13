@@ -143,6 +143,16 @@ impl Routine {
         )
     }
 
+    /// Generates a unique dollar-quoted delimiter tag for the routine body.
+    ///
+    /// The base tag is derived from the routine name by keeping only ASCII
+    /// alphanumeric characters and replacing all others with underscores,
+    /// prefixed with `pgc_` and suffixed with `_body`. If the derived base
+    /// is empty, a default `pgc_body` base is used instead. A numeric suffix
+    /// is then appended (starting with no suffix) until a `$tag$` delimiter
+    /// is found that does not occur anywhere in `self.source_code`, ensuring
+    /// the chosen delimiter does not conflict with existing dollar quotes in
+    /// the source.
     fn generate_dollar_delimiter(&self) -> String {
         let mut base = format!(
             "pgc_{}_body",
