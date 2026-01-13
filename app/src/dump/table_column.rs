@@ -50,7 +50,7 @@ pub struct TableColumn {
     pub is_updatable: bool,                    // Whether the column is updatable
     pub related_views: Option<Vec<String>>,    // Related views (optional)
     #[serde(default)]
-    pub comment: Option<String>,               // Column comment
+    pub comment: Option<String>, // Column comment
 }
 
 impl TableColumn {

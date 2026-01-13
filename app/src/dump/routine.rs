@@ -202,14 +202,7 @@ mod tests {
 
         let expected_src = format!(
             "{}.{}.{}.{}.{}.{}.{}.{}",
-            schema,
-            name,
-            lang,
-            kind,
-            return_type,
-            arguments,
-            "",
-            source_code
+            schema, name, lang, kind, return_type, arguments, "", source_code
         );
         let expected_hash = format!("{:x}", md5::compute(expected_src));
         assert_eq!(routine.hash.as_ref(), Some(&expected_hash));

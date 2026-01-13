@@ -30,7 +30,7 @@ pub struct Table {
     pub partition_of: Option<String>,      // Parent table (PARTITION OF ...)
     pub partition_bound: Option<String>,   // Partition bound (FOR VALUES ... or DEFAULT)
     #[serde(default)]
-    pub comment: Option<String>,           // Table comment
+    pub comment: Option<String>, // Table comment
     pub hash: Option<String>,              // Hash of the table
 }
 

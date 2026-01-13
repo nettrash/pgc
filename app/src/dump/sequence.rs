@@ -20,7 +20,7 @@ pub struct Sequence {
     pub owned_by_column: Option<String>, // Owning column name
     pub is_identity: bool,               // Whether the sequence is an identity sequence
     #[serde(default)]
-    pub comment: Option<String>,         // Optional sequence comment
+    pub comment: Option<String>, // Optional sequence comment
     pub hash: Option<String>,            // Hash of the sequence
 }
 
