@@ -126,9 +126,6 @@ impl TableColumn {
         // Strip redundant outer parentheses to avoid emitted ((expr)) which some servers reject
         while trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() > 2 {
             let candidate = trimmed[1..trimmed.len() - 1].trim();
-            if candidate.len() == trimmed.len() {
-                break;
-            }
             trimmed = candidate;
         }
         trimmed.to_string()
