@@ -154,16 +154,16 @@ impl Routine {
     /// the chosen delimiter does not conflict with existing dollar quotes in
     /// the source.
     fn generate_dollar_delimiter(&self) -> String {
-        let mut base = format!(
-            "pgc_{}_body",
-            self.name
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>()
-        );
-        if base.is_empty() {
-            base = "pgc_body".to_string();
-        }
+        let sanitized = self
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let mut base = if sanitized.is_empty() {
+            "pgc_body".to_string()
+        } else {
+            format!("pgc_{}_body", sanitized)
+        };
 
         let mut idx = 0;
         loop {
