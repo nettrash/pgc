@@ -80,20 +80,32 @@ impl Routine {
     /// Returns a string to create the routine.
     pub fn get_script(&self) -> String {
         let kind = self.kind.to_lowercase();
+        let delimiter = if self.source_code.contains("$$") {
+            self.generate_dollar_delimiter()
+        } else {
+            "$$".to_string()
+        };
+
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure \"{}\".\"{}\"({}) language {} as $${}$$;\n",
-                self.schema, self.name, self.arguments, self.lang, self.source_code
+                "create or replace procedure \"{}\".\"{}\"({}) language {} as {d}{body}{d};\n",
+                self.schema,
+                self.name,
+                self.arguments,
+                self.lang,
+                d = delimiter,
+                body = self.source_code
             ),
             _ => format!(
-                "create or replace {} \"{}\".\"{}\"({}) returns {} language {} as $${}$$;\n",
+                "create or replace {} \"{}\".\"{}\"({}) returns {} language {} as {d}{body}{d};\n",
                 kind,
                 self.schema,
                 self.name,
                 self.arguments,
                 self.return_type,
                 self.lang,
-                self.source_code
+                d = delimiter,
+                body = self.source_code
             ),
         };
 
@@ -129,6 +141,33 @@ impl Routine {
             self.name,
             self.arguments
         )
+    }
+
+    fn generate_dollar_delimiter(&self) -> String {
+        let mut base = format!(
+            "pgc_{}_body",
+            self.name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        );
+        if base.is_empty() {
+            base = "pgc_body".to_string();
+        }
+
+        let mut idx = 0;
+        loop {
+            let candidate = if idx == 0 {
+                base.clone()
+            } else {
+                format!("{}_{}", base, idx)
+            };
+            let delimiter = format!("${}$", candidate);
+            if !self.source_code.contains(&delimiter) {
+                return delimiter;
+            }
+            idx += 1;
+        }
     }
 }
 
@@ -218,6 +257,29 @@ mod tests {
 
         let updated_hash = routine.hash.clone().expect("hash should be recomputed");
         assert_ne!(updated_hash, original_hash);
+    }
+
+    #[test]
+    fn get_script_uses_custom_delimiter_when_body_contains_dollar_dollar() {
+        let routine = Routine::new(
+            "public".to_string(),
+            Oid(99),
+            "echo".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN PERFORM $$nested$$; END".to_string(),
+        );
+
+        let script = routine.get_script();
+
+        assert!(script.contains("create or replace function"));
+        assert!(!script.contains("$$BEGIN PERFORM $$nested$$; END$$"));
+        assert!(script.contains("$pgc_echo_body$BEGIN PERFORM $$nested$$; END$pgc_echo_body$"));
+        assert!(!routine.source_code.contains("$pgc_echo_body$"));
     }
 
     #[test]
