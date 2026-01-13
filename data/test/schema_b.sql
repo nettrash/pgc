@@ -317,6 +317,18 @@ BEGIN
 END;
 $$;
 
+-- Function containing nested $$ to exercise custom dollar quoting (TO variant)
+CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
+RETURNS text
+LANGUAGE plpgsql
+AS $c$
+DECLARE
+    inner_text text := $$inner-to$$;
+BEGIN
+    RETURN inner_text || '-v2';
+END;
+$c$;
+
 -- cleanup_old_orders procedure removed (table doesn't exist)
 
 -- NEW PROCEDURE
