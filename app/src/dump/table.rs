@@ -589,10 +589,7 @@ impl Table {
             script.push_str(&trigger.get_script());
         }
 
-        // 8. Add row-level security policies and flag
-        for policy in &self.policies {
-            script.push_str(&policy.get_script());
-        }
+        // 8. Enable row-level security before creating policies
         if self.has_rowsecurity {
             script.push_str(&format!(
                 "alter table \"{}\".\"{}\" enable row level security;\n",
@@ -600,7 +597,12 @@ impl Table {
             ));
         }
 
-        // 9. Add table comment (if any) and column comments
+        // 9. Add row-level security policies
+        for policy in &self.policies {
+            script.push_str(&policy.get_script());
+        }
+
+        // 10. Add table comment (if any) and column comments
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
                 "comment on table \"{}\".\"{}\" is '{}';\n",
