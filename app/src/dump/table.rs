@@ -236,10 +236,23 @@ impl Table {
     /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique ORDER BY i.schemaname, i.tablename, i.indexname",
-            self.schema.replace('\'', "''"),
-            self.name.replace('\'', "''")
-        );
+                        "SELECT i.schemaname,
+                                        i.tablename,
+                                        i.indexname,
+                                        i.tablespace,
+                                        i.indexdef
+                         FROM pg_indexes i
+                         JOIN pg_class ic ON ic.relname = i.indexname
+                         JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
+                         JOIN pg_index idx ON idx.indexrelid = ic.oid
+                         LEFT JOIN pg_constraint con ON con.conindid = ic.oid AND con.contype IN ('p', 'u')
+                         WHERE idx.indisprimary = false
+                             AND (idx.indisunique = false OR con.oid IS NULL)
+                             AND i.schemaname = '{}' AND i.tablename = '{}'
+                         ORDER BY i.schemaname, i.tablename, i.indexname",
+                        self.schema.replace('\'', "''"),
+                        self.name.replace('\'', "''")
+                );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         if !rows.is_empty() {
@@ -1161,6 +1174,17 @@ mod tests {
         }
     }
 
+    fn unique_email_index() -> TableIndex {
+        TableIndex {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: "idx_users_email".to_string(),
+            catalog: None,
+            indexdef: "create unique index idx_users_email on public.users using btree (email)"
+                .to_string(),
+        }
+    }
+
     fn trigger(name: &str, definition: &str, oid: u32) -> TableTrigger {
         TableTrigger {
             oid: Oid(oid),
@@ -1294,6 +1318,29 @@ mod tests {
         assert!(script.contains("create policy \"users_tenant_select\""));
         assert!(script.contains("for select"));
         assert!(script.contains("enable row level security"));
+    }
+
+    #[test]
+    fn test_get_script_includes_unique_indexes() {
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            Some("pg_default".to_string()),
+            vec![identity_column("id", 1, "integer")],
+            vec![],
+            vec![unique_email_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+
+        assert!(
+            script.contains(
+                "create unique index idx_users_email on public.users using btree (email);"
+            )
+        );
     }
 
     #[test]

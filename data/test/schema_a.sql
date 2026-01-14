@@ -171,6 +171,9 @@ CREATE INDEX idx_audit_logs_table_name ON shared_schema.audit_logs(table_name);
 CREATE INDEX idx_audit_logs_operation ON shared_schema.audit_logs(operation);
 CREATE INDEX idx_audit_logs_changed_at ON shared_schema.audit_logs(changed_at);
 CREATE INDEX idx_audit_logs_changed_by ON shared_schema.audit_logs(changed_by);
+-- Standalone unique index (FROM) to validate detection of unique indexes not backed by constraints
+CREATE UNIQUE INDEX idx_audit_logs_table_op_changed_at
+    ON shared_schema.audit_logs(table_name, operation, changed_at);
 
 -- Functions and procedures
 CREATE OR REPLACE FUNCTION test_schema.update_timestamp()
