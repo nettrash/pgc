@@ -323,17 +323,18 @@ impl Table {
     async fn fill_policies(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
             "SELECT p.polname,
-                    p.schemaname,
-                    p.tablename,
-                    p.polcmd,
+                    n.nspname AS schemaname,
+                    c.relname AS tablename,
+                    p.polcmd::text AS polcmd,
                     p.polpermissive,
                     array(SELECT rolname::text FROM pg_roles r WHERE r.oid = ANY(p.polroles) ORDER BY rolname) AS roles,
-                    pg_get_expr(p.qual, p.polrelid) AS using_clause,
-                    pg_get_expr(p.with_check, p.polrelid) AS check_clause,
+                    pg_get_expr(p.polqual, p.polrelid) AS using_clause,
+                    pg_get_expr(p.polwithcheck, p.polrelid) AS check_clause,
                     c.relrowsecurity
-             FROM pg_policies p
+             FROM pg_policy p
              JOIN pg_class c ON c.oid = p.polrelid
-             WHERE p.schemaname = '{}' AND p.tablename = '{}'
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = '{}' AND c.relname = '{}'
              ORDER BY p.polname",
             self.schema.replace('\'', "''"),
             self.name.replace('\'', "''"),
