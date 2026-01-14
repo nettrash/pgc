@@ -798,10 +798,43 @@ impl Table {
         // Collect column additions or alterations
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
-                if old_col != new_col
-                    && let Some(alter_col_script) = new_col.get_alter_script(old_col, use_drop)
-                {
-                    column_alter_script.push_str(&alter_col_script);
+                if old_col != new_col {
+                    let type_changed = old_col.data_type != new_col.data_type
+                        || old_col.udt_name != new_col.udt_name
+                        || old_col.numeric_precision != new_col.numeric_precision
+                        || old_col.numeric_scale != new_col.numeric_scale
+                        || old_col.character_maximum_length != new_col.character_maximum_length;
+
+                    let is_partition_child = self.partition_of.is_some();
+                    let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
+                        let pk_norm: String = pk
+                            .chars()
+                            .filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '`'))
+                            .collect::<String>()
+                            .to_lowercase();
+                        pk_norm.contains(&new_col.name.to_lowercase())
+                    });
+
+                    if type_changed && (is_partition_child || in_partition_key) {
+                        let drop_script = if use_drop {
+                            self.get_drop_script()
+                        } else {
+                            self.get_drop_script()
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect()
+                        };
+                        return format!(
+                            "/* Column {} participates in partitioning; type change requires table recreation. Data loss will occur! */\n{}{}",
+                            new_col.name,
+                            drop_script,
+                            to_table.get_script()
+                        );
+                    }
+
+                    if let Some(alter_col_script) = new_col.get_alter_script(old_col, use_drop) {
+                        column_alter_script.push_str(&alter_col_script);
+                    }
                 }
             } else {
                 column_alter_script.push_str(&new_col.get_add_script());

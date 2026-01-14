@@ -299,6 +299,17 @@ FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
 -- Drop-order dependency scenario intentionally removed in TO to test drop ordering
 -- (drop_status type, drop_parent partitioned table, drop_child partition, drop_orders FK, trg_drop_orders trigger)
 
+-- Partition type-change scenario (TO): partition key switches to UUID to force recreate
+CREATE TABLE test_schema.part_type_change_parent (
+    tenant UUID NOT NULL,
+    id INTEGER NOT NULL,
+    note TEXT,
+    PRIMARY KEY (tenant, id)
+) PARTITION BY LIST (tenant);
+
+CREATE TABLE test_schema.part_type_change_child PARTITION OF test_schema.part_type_change_parent
+FOR VALUES IN ('00000000-0000-0000-0000-000000000000');
+
 -- NEW FUNCTION
 CREATE OR REPLACE FUNCTION test_schema.get_user_review_count(user_id_param INTEGER)
 RETURNS INTEGER AS $$
