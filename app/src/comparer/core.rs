@@ -20,6 +20,7 @@ pub struct Comparer {
     script: String,
     enum_pre_script: String,
     enum_post_script: String,
+    type_post_script: String,
     sequence_post_script: String,
     trigger_post_script: String,
     dropped_views: HashSet<String>,
@@ -35,6 +36,7 @@ impl Comparer {
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
+            type_post_script: String::new(),
             sequence_post_script: String::new(),
             trigger_post_script: String::new(),
             dropped_views: HashSet::new(),
@@ -76,6 +78,10 @@ impl Comparer {
         self.drop_views().await?;
         self.compare_tables().await?;
         self.compare_foreign_keys().await?;
+        if !self.type_post_script.is_empty() {
+            self.script.push_str(&self.type_post_script);
+            self.type_post_script.clear();
+        }
         if !self.enum_post_script.is_empty() {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
@@ -84,8 +90,8 @@ impl Comparer {
             self.script.push_str(&self.sequence_post_script);
             self.sequence_post_script.clear();
         }
-        self.create_views().await?;
         self.compare_routines().await?;
+        self.create_views().await?;
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
             self.trigger_post_script.clear();
@@ -184,6 +190,17 @@ impl Comparer {
         ordered.sort_by(|a, b| match (&a.partition_of, &b.partition_of) {
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
+            _ => a.schema.cmp(&b.schema).then_with(|| a.name.cmp(&b.name)),
+        });
+        ordered
+    }
+
+    fn ordered_tables_for_drop(tables: &[Table]) -> Vec<&Table> {
+        let mut ordered: Vec<&Table> = tables.iter().collect();
+        ordered.sort_by(|a, b| match (&a.partition_of, &b.partition_of) {
+            // Drop partitions before parents
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
             _ => a.schema.cmp(&b.schema).then_with(|| a.name.cmp(&b.name)),
         });
         ordered
@@ -371,6 +388,7 @@ impl Comparer {
             }
         }
 
+        let mut drop_section = String::new();
         {
             for from_type in &self.from.types {
                 if (from_type.typtype as u8 as char) == 'e' {
@@ -385,17 +403,23 @@ impl Comparer {
                     continue;
                 }
 
-                self.script.push_str(
+                if drop_section.is_empty() {
+                    drop_section.push_str(
+                        "\n/* ---> Types: Drop section (execute after dependent tables) --------------- */\n\n",
+                    );
+                }
+
+                drop_section.push_str(
                     format!("/* Type: {}.{} */\n", from_type.schema, from_type.typname).as_str(),
                 );
-                self.script
+                drop_section
                     .push_str("/* Type is not present in 'to' dump and should be dropped. */\n");
 
                 let drop_script = from_type.get_drop_script();
                 if self.use_drop {
-                    self.script.push_str(drop_script.as_str());
+                    drop_section.push_str(drop_script.as_str());
                 } else {
-                    self.script.push_str(
+                    drop_section.push_str(
                         drop_script
                             .lines()
                             .map(|l| format!("-- {}\n", l))
@@ -404,6 +428,11 @@ impl Comparer {
                     );
                 }
             }
+        }
+
+        if !drop_section.is_empty() {
+            drop_section.push_str("\n/* ---> Types: Drop section end --------------- */\n\n");
+            self.type_post_script.push_str(&drop_section);
         }
 
         self.script
@@ -785,8 +814,89 @@ impl Comparer {
         let ordered_from = Self::ordered_tables(&self.from.tables);
         let ordered_to = Self::ordered_tables(&self.to.tables);
 
-        // We will drop all tables that exists just in "from" dump.
-        for table in ordered_from.iter() {
+        // We will drop all tables that exists just in "from" dump (partitions first).
+        let ordered_from_drop = Self::ordered_tables_for_drop(&self.from.tables);
+
+        // Pass 1: collect FK drops for all tables that will be removed.
+        let mut fk_pre_drop = String::new();
+        let mut dropped_fk_keys: HashSet<String> = HashSet::new();
+        for table in ordered_from_drop.iter() {
+            if self
+                .to
+                .tables
+                .iter()
+                .any(|t| t.name == table.name && t.schema == table.schema)
+            {
+                continue;
+            }
+
+            let mut target_refs = vec![format!(
+                "references {}.{}",
+                table.schema.to_lowercase(),
+                table.name.to_lowercase()
+            )];
+            if let Some(parent) = &table.partition_of {
+                let parent_lc = parent.to_lowercase();
+                target_refs.push(parent_lc.clone());
+                let parent_unquoted: String = parent
+                    .chars()
+                    .filter(|c| !matches!(c, '"' | '\'' | '`'))
+                    .collect::<String>()
+                    .to_lowercase();
+                target_refs.push(parent_unquoted);
+                if let Some(parent_name) = parent.split('.').next_back() {
+                    target_refs.push(parent_name.to_lowercase());
+                    let parent_name_unquoted: String = parent_name
+                        .chars()
+                        .filter(|c| !matches!(c, '"' | '\'' | '`'))
+                        .collect::<String>()
+                        .to_lowercase();
+                    target_refs.push(parent_name_unquoted);
+                }
+            } else {
+                target_refs.push(table.name.to_lowercase());
+            }
+
+            for other in &self.from.tables {
+                if other.schema == table.schema && other.name == table.name {
+                    continue;
+                }
+                for constraint in &other.constraints {
+                    if constraint
+                        .constraint_type
+                        .eq_ignore_ascii_case("foreign key")
+                    {
+                        let matches_target = constraint.definition.as_deref().is_some_and(|d| {
+                            let def = d.to_lowercase();
+                            let def_normalized: String = def
+                                .chars()
+                                .filter(|c| !matches!(c, '"' | '\'' | '`'))
+                                .collect();
+                            target_refs
+                                .iter()
+                                .any(|r| def.contains(r) || def_normalized.contains(r))
+                        });
+
+                        if matches_target {
+                            let key = format!(
+                                "{}.{}.{}",
+                                constraint.schema, constraint.table_name, constraint.name
+                            );
+                            if dropped_fk_keys.insert(key) {
+                                fk_pre_drop.push_str(&constraint.get_drop_script());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !fk_pre_drop.is_empty() {
+            self.script.push_str(&fk_pre_drop);
+        }
+
+        // Pass 2: drop tables (and their triggers) now that FK dependencies are removed.
+        for table in ordered_from_drop.iter() {
             if let Some(_to_table) = self
                 .to
                 .tables
@@ -794,25 +904,38 @@ impl Comparer {
                 .find(|t| t.name == table.name && t.schema == table.schema)
             {
                 continue; // Table is present in both dumps, we already processed it
-            } else {
-                // Table is not present in 'to' dump and should be dropped.
-                self.script
-                    .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
-                self.script
-                    .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
+            }
 
-                let drop_script = table.get_drop_script();
-                if self.use_drop {
-                    self.script.push_str(drop_script.as_str());
-                } else {
-                    self.script.push_str(
-                        drop_script
-                            .lines()
-                            .map(|l| format!("-- {}\n", l))
-                            .collect::<String>()
-                            .as_str(),
-                    );
-                }
+            let mut pre_drop = String::new();
+
+            // Drop triggers on the table
+            for trigger in &table.triggers {
+                pre_drop.push_str(&format!(
+                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                    trigger.name, table.schema, table.name
+                ));
+            }
+
+            self.script
+                .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
+            self.script
+                .push_str("/* Table is not present in 'to' dump and should be dropped. */\n");
+
+            if !pre_drop.is_empty() {
+                self.script.push_str(&pre_drop);
+            }
+
+            let drop_script = table.get_drop_script();
+            if self.use_drop {
+                self.script.push_str(drop_script.as_str());
+            } else {
+                self.script.push_str(
+                    drop_script
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>()
+                        .as_str(),
+                );
             }
         }
         // We will find all new tables from "to" dump that are not in "from" dump

@@ -6,7 +6,8 @@ v1.0.4
                     - Fixed handling of GENERATED STORED column changes.
                     - Added support for TABLE POLICIES.
                     - Added support for UNIQUE INDEXes.
-                    - Fixed order of object for creation.
+                    - Fixed order of creation for objects.
+                    - Fixed order of object deletion.
 
 2025-12-22      v1.0.3
 

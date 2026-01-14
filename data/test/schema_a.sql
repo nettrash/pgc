@@ -262,6 +262,41 @@ CREATE TRIGGER trg_order_from
 BEFORE INSERT ON test_schema.trigger_order_test
 FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
 
+-- Drop-order dependency scenario (exists only in FROM)
+-- Custom type used by a table that is referenced by another table and has a trigger/function
+CREATE TYPE test_schema.drop_status AS ENUM ('draft', 'published');
+
+CREATE TABLE test_schema.drop_parent (
+    id SERIAL,
+    status test_schema.drop_status NOT NULL,
+    PRIMARY KEY (id, status)
+)
+PARTITION BY LIST (status);
+
+CREATE TABLE test_schema.drop_child PARTITION OF test_schema.drop_parent
+FOR VALUES IN ('draft');
+
+CREATE OR REPLACE FUNCTION test_schema.drop_fn()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.status := 'draft';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE test_schema.drop_orders (
+    id SERIAL PRIMARY KEY,
+    parent_id INTEGER NOT NULL,
+    parent_status test_schema.drop_status NOT NULL DEFAULT 'draft',
+    note TEXT,
+    CONSTRAINT drop_orders_parent_fk FOREIGN KEY (parent_id, parent_status)
+        REFERENCES test_schema.drop_parent(id, status)
+);
+
+CREATE TRIGGER trg_drop_orders
+BEFORE INSERT ON test_schema.drop_orders
+FOR EACH ROW EXECUTE FUNCTION test_schema.drop_fn();
+
 CREATE OR REPLACE FUNCTION test_schema.get_users_by_status(p_status test_schema.status_type)
 RETURNS TABLE(user_id integer, username varchar, email varchar)
 LANGUAGE plpgsql
