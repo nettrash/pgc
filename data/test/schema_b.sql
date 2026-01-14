@@ -296,6 +296,9 @@ CREATE TRIGGER trg_order_from
 BEFORE INSERT ON test_schema.trigger_order_test
 FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
 
+-- Drop-order dependency scenario intentionally removed in TO to test drop ordering
+-- (drop_status type, drop_parent partitioned table, drop_child partition, drop_orders FK, trg_drop_orders trigger)
+
 -- NEW FUNCTION
 CREATE OR REPLACE FUNCTION test_schema.get_user_review_count(user_id_param INTEGER)
 RETURNS INTEGER AS $$

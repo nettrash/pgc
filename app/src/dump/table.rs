@@ -278,7 +278,7 @@ impl Table {
     /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, c.contype::text AS constraint_type, c.condeferrable::text AS is_deferrable, c.condeferred::text AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') ORDER BY n.nspname, t.relname, c.conname;",
+            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' ELSE c.contype::text END AS constraint_type, c.condeferrable AS is_deferrable, c.condeferred AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') AND c.conislocal ORDER BY n.nspname, t.relname, c.conname;",
             self.schema.replace('\'', "''"),
             self.name.replace('\'', "''")
         );
@@ -293,8 +293,8 @@ impl Table {
                     name: row.get("constraint_name"),
                     table_name: row.get("table_name"),
                     constraint_type: row.get("constraint_type"),
-                    is_deferrable: row.get::<&str, _>("is_deferrable") == "YES", // Convert to boolean
-                    initially_deferred: row.get::<&str, _>("initially_deferred") == "YES", // Convert to boolean
+                    is_deferrable: row.get("is_deferrable"),
+                    initially_deferred: row.get("initially_deferred"),
                     definition: row.get("definition"),
                 };
 
@@ -541,7 +541,8 @@ impl Table {
                 .any(|c| c.constraint_type.to_lowercase() == "primary key");
 
             if has_pk_constraint {
-                // Find PK columns from indexes if available
+                let mut pk_added = false;
+                // Prefer PK columns from indexes if available (preserves order expressions)
                 for index in &self.indexes {
                     if index.indexdef.to_lowercase().contains("primary key") {
                         if let Some(start) = index.indexdef.to_lowercase().find("primary key (") {
@@ -562,10 +563,42 @@ impl Table {
                                             .join(", ")
                                     );
                                     column_definitions.push(pk_def);
+                                    pk_added = true;
                                 }
                             }
                         }
                         break;
+                    }
+                }
+
+                // Fallback: parse PK constraint definition if no index info was found
+                if !pk_added {
+                    if let Some(pk_constraint) = self
+                        .constraints
+                        .iter()
+                        .find(|c| c.constraint_type.eq_ignore_ascii_case("primary key"))
+                        .and_then(|c| c.definition.as_deref())
+                    {
+                        if let Some(start) = pk_constraint.find('(')
+                            && let Some(end) = pk_constraint[start + 1..].find(')')
+                        {
+                            let cols_part = &pk_constraint[start + 1..start + 1 + end];
+                            let pk_cols: Vec<&str> = cols_part
+                                .split(',')
+                                .map(|c| c.trim().trim_matches('"'))
+                                .collect();
+                            if !pk_cols.is_empty() {
+                                let pk_def = format!(
+                                    "    primary key ({})",
+                                    pk_cols
+                                        .iter()
+                                        .map(|c| format!("\"{c}\""))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                                column_definitions.push(pk_def);
+                            }
+                        }
                     }
                 }
             }
