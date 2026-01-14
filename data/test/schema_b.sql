@@ -485,6 +485,20 @@ CREATE TABLE test_schema."table with spaces" (
     "column with spaces" VARCHAR(255)
 );
 
+-- Row-level security (TO: restrictive policy with different predicate and an extra update policy)
+ALTER TABLE test_schema.users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_rls_select ON test_schema.users
+    AS RESTRICTIVE
+    FOR SELECT
+    TO "tenant_reader"
+    USING ((metadata ->> 'tenant_id') = current_setting('app.current_tenant') AND two_factor_enabled = TRUE);
+
+CREATE POLICY users_rls_update ON test_schema.users
+    FOR UPDATE
+    TO "tenant_editor"
+    USING ((metadata ->> 'tenant_id') = current_setting('app.current_tenant'))
+    WITH CHECK ((metadata ->> 'tenant_id') = current_setting('app.current_tenant') AND preferred_contact <> 'sms');
+
 -- Complex Foreign Keys test (Modified: ON DELETE CASCADE)
 CREATE TABLE test_schema.composite_pk (
     part_one INT,

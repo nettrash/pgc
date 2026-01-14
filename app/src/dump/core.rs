@@ -622,6 +622,7 @@ impl Dump {
                     constraints: Vec::new(),
                     indexes: Vec::new(),
                     triggers: Vec::new(),
+                    policies: Vec::new(),
                     definition: None,
                     partition_key: None,
                     partition_of: None,
