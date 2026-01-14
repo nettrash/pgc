@@ -959,9 +959,16 @@ impl Table {
         script.push_str(&constraint_post_script);
         script.push_str(&index_script);
         script.push_str(&trigger_script);
-        script.push_str(&policy_script);
-        script.push_str(&row_security_script);
 
+        // When enabling row security, PostgreSQL requires row security to be
+        // enabled before policies are created. Adjust the order accordingly.
+        if !self.has_rowsecurity && to_table.has_rowsecurity {
+            script.push_str(&row_security_script);
+            script.push_str(&policy_script);
+        } else {
+            script.push_str(&policy_script);
+            script.push_str(&row_security_script);
+        }
         script
     }
 }
