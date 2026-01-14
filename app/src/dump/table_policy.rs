@@ -83,9 +83,12 @@ impl TablePolicy {
 
     pub fn get_script(&self) -> String {
         let mut script = String::new();
+        let escaped_name = self.name.replace('"', "\"\"");
+        let escaped_schema = self.schema.replace('"', "\"\"");
+        let escaped_table = self.table.replace('"', "\"\"");
         script.push_str(&format!(
             "create policy \"{}\" on \"{}\".\"{}\"",
-            self.name, self.schema, self.table
+            escaped_name, escaped_schema, escaped_table
         ));
 
         if !self.permissive {
