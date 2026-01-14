@@ -212,6 +212,9 @@ CREATE INDEX idx_audit_logs_changed_by ON shared_schema.audit_logs(changed_by);
 -- NEW INDEXES
 CREATE INDEX idx_audit_logs_session_id ON shared_schema.audit_logs(session_id);
 CREATE INDEX idx_audit_logs_request_id ON shared_schema.audit_logs(request_id);
+-- Standalone unique index (TO) with different definition to ensure diff detection
+CREATE UNIQUE INDEX idx_audit_logs_table_op_changed_at
+    ON shared_schema.audit_logs(table_name, operation, changed_at, record_id);
 
 -- Functions and procedures (some modified, some removed, some added)
 CREATE OR REPLACE FUNCTION test_schema.update_timestamp()

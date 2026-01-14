@@ -5,6 +5,7 @@ v1.0.4
                     - Fixed handling of $$ delimiters in SQL routine bodies.
                     - Fixed handling of GENERATED STORED column changes.
                     - Added support for TABLE POLICIES.
+                    - Added support of UNIQUE INDEXes.
 
 2025-12-22      v1.0.3
 
