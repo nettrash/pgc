@@ -862,8 +862,11 @@ impl Comparer {
                     continue;
                 }
                 for constraint in &other.constraints {
-                    if constraint.constraint_type.eq_ignore_ascii_case("foreign key") {
-                        let matches_target = constraint.definition.as_deref().map_or(false, |d| {
+                    if constraint
+                        .constraint_type
+                        .eq_ignore_ascii_case("foreign key")
+                    {
+                        let matches_target = constraint.definition.as_deref().is_some_and(|d| {
                             let def = d.to_lowercase();
                             let def_normalized: String = def
                                 .chars()

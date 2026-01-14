@@ -572,33 +572,30 @@ impl Table {
                 }
 
                 // Fallback: parse PK constraint definition if no index info was found
-                if !pk_added {
-                    if let Some(pk_constraint) = self
+                if !pk_added
+                    && let Some(pk_constraint) = self
                         .constraints
                         .iter()
                         .find(|c| c.constraint_type.eq_ignore_ascii_case("primary key"))
                         .and_then(|c| c.definition.as_deref())
-                    {
-                        if let Some(start) = pk_constraint.find('(')
-                            && let Some(end) = pk_constraint[start + 1..].find(')')
-                        {
-                            let cols_part = &pk_constraint[start + 1..start + 1 + end];
-                            let pk_cols: Vec<&str> = cols_part
-                                .split(',')
-                                .map(|c| c.trim().trim_matches('"'))
-                                .collect();
-                            if !pk_cols.is_empty() {
-                                let pk_def = format!(
-                                    "    primary key ({})",
-                                    pk_cols
-                                        .iter()
-                                        .map(|c| format!("\"{c}\""))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                );
-                                column_definitions.push(pk_def);
-                            }
-                        }
+                    && let Some(start) = pk_constraint.find('(')
+                    && let Some(end) = pk_constraint[start + 1..].find(')')
+                {
+                    let cols_part = &pk_constraint[start + 1..start + 1 + end];
+                    let pk_cols: Vec<&str> = cols_part
+                        .split(',')
+                        .map(|c| c.trim().trim_matches('"'))
+                        .collect();
+                    if !pk_cols.is_empty() {
+                        let pk_def = format!(
+                            "    primary key ({})",
+                            pk_cols
+                                .iter()
+                                .map(|c| format!("\"{c}\""))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        column_definitions.push(pk_def);
                     }
                 }
             }
