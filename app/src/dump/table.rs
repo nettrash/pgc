@@ -1,10 +1,14 @@
 use crate::dump::{
     table_column::TableColumn, table_constraint::TableConstraint, table_index::TableIndex,
-    table_trigger::TableTrigger,
+    table_policy::TablePolicy, table_trigger::TableTrigger,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Error, PgPool, Row};
+
+fn escape_single_quotes(value: &str) -> String {
+    value.replace('\'', "''")
+}
 
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,10 +25,14 @@ pub struct Table {
     pub constraints: Vec<TableConstraint>, // Constraint names
     pub indexes: Vec<TableIndex>,          // Index names
     pub triggers: Vec<TableTrigger>,       // Trigger names
+    #[serde(default)]
+    pub policies: Vec<TablePolicy>, // Row-level security policies
     pub definition: Option<String>,        // Table definition (optional)
     pub partition_key: Option<String>,     // Partition key (PARTITION BY ...)
     pub partition_of: Option<String>,      // Parent table (PARTITION OF ...)
     pub partition_bound: Option<String>,   // Partition bound (FOR VALUES ... or DEFAULT)
+    #[serde(default)]
+    pub comment: Option<String>, // Table comment
     pub hash: Option<String>,              // Hash of the table
 }
 
@@ -55,10 +63,12 @@ impl Table {
             constraints,
             indexes,
             triggers,
+            policies: Vec::new(),
             definition,
             partition_key: None,
             partition_of: None,
             partition_bound: None,
+            comment: None,
             hash: None,
         };
         table.hash();
@@ -70,6 +80,7 @@ impl Table {
         self.fill_indexes(pool).await?;
         self.fill_constraints(pool).await?;
         self.fill_triggers(pool).await?;
+        self.fill_policies(pool).await?;
         self.fill_partition_info(pool).await?;
         self.fill_definition(pool).await?;
         Ok(())
@@ -127,6 +138,7 @@ impl Table {
                                 c.is_generated,
                                 c.generation_expression,
                                 c.is_updatable,
+                                pd.description as column_comment,
                                 (
                                         SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
                                         FROM information_schema.view_column_usage v
@@ -145,6 +157,9 @@ impl Table {
                             AND a.attname = c.column_name
                             AND a.attnum > 0
                             AND a.attisdropped = false
+                         LEFT JOIN pg_description pd
+                             ON pd.objoid = cls.oid
+                            AND pd.objsubid = a.attnum
                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
                         self.schema.replace('\'', "''"),
@@ -205,6 +220,7 @@ impl Table {
                         views.sort_unstable();
                         views
                     }),
+                    comment: row.get("column_comment"),
                 };
 
                 self.columns.push(table_column.clone());
@@ -220,10 +236,23 @@ impl Table {
     /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT i.schemaname, i.tablename, i.indexname, i.tablespace, i.indexdef FROM pg_indexes i JOIN pg_class ic ON ic.relname = i.indexname JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname JOIN pg_index idx ON idx.indexrelid = ic.oid WHERE NOT idx.indisprimary AND NOT idx.indisunique AND i.schemaname = '{}' AND i.tablename = '{}' AND NOT idx.indisprimary AND NOT idx.indisunique ORDER BY i.schemaname, i.tablename, i.indexname",
-            self.schema.replace('\'', "''"),
-            self.name.replace('\'', "''")
-        );
+                        "SELECT i.schemaname,
+                                        i.tablename,
+                                        i.indexname,
+                                        i.tablespace,
+                                        i.indexdef
+                         FROM pg_indexes i
+                         JOIN pg_class ic ON ic.relname = i.indexname
+                         JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
+                         JOIN pg_index idx ON idx.indexrelid = ic.oid
+                         LEFT JOIN pg_constraint con ON con.conindid = ic.oid AND con.contype IN ('p', 'u')
+                         WHERE idx.indisprimary = false
+                             AND (idx.indisunique = false OR con.oid IS NULL)
+                             AND i.schemaname = '{}' AND i.tablename = '{}'
+                         ORDER BY i.schemaname, i.tablename, i.indexname",
+                        self.schema.replace('\'', "''"),
+                        self.name.replace('\'', "''")
+                );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         if !rows.is_empty() {
@@ -249,7 +278,7 @@ impl Table {
     /// Fill information about constraints.
     async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, c.contype::text AS constraint_type, c.condeferrable::text AS is_deferrable, c.condeferred::text AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') ORDER BY n.nspname, t.relname, c.conname;",
+            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' ELSE c.contype::text END AS constraint_type, c.condeferrable AS is_deferrable, c.condeferred AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') AND c.conislocal ORDER BY n.nspname, t.relname, c.conname;",
             self.schema.replace('\'', "''"),
             self.name.replace('\'', "''")
         );
@@ -264,8 +293,8 @@ impl Table {
                     name: row.get("constraint_name"),
                     table_name: row.get("table_name"),
                     constraint_type: row.get("constraint_type"),
-                    is_deferrable: row.get::<&str, _>("is_deferrable") == "YES", // Convert to boolean
-                    initially_deferred: row.get::<&str, _>("initially_deferred") == "YES", // Convert to boolean
+                    is_deferrable: row.get("is_deferrable"),
+                    initially_deferred: row.get("initially_deferred"),
                     definition: row.get("definition"),
                 };
 
@@ -298,6 +327,57 @@ impl Table {
 
             self.triggers
                 .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+
+        Ok(())
+    }
+
+    /// Fill information about row-level security policies and row security flag.
+    async fn fill_policies(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let query = format!(
+            "SELECT p.polname,
+                    n.nspname AS schemaname,
+                    c.relname AS tablename,
+                    p.polcmd::text AS polcmd,
+                    p.polpermissive,
+                    array(SELECT rolname::text FROM pg_roles r WHERE r.oid = ANY(p.polroles) ORDER BY rolname) AS roles,
+                    pg_get_expr(p.polqual, p.polrelid) AS using_clause,
+                    pg_get_expr(p.polwithcheck, p.polrelid) AS check_clause,
+                    c.relrowsecurity
+             FROM pg_policy p
+             JOIN pg_class c ON c.oid = p.polrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = '{}' AND c.relname = '{}'
+             ORDER BY p.polname",
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''"),
+        );
+
+        let rows = sqlx::query(&query).fetch_all(pool).await?;
+        self.policies.clear();
+        self.has_rowsecurity = false;
+
+        if !rows.is_empty() {
+            for row in &rows {
+                let policy = TablePolicy::from_row(row)?;
+                self.policies.push(policy);
+            }
+
+            // Rows come from the same table; row security flag is identical across them.
+            self.has_rowsecurity = rows[0].get("relrowsecurity");
+        } else {
+            // No policies; still record whether row security is enabled on the table.
+            let flag_query = format!(
+                "SELECT relrowsecurity FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = '{}' AND c.relname = '{}';",
+                self.schema.replace('\'', "''"),
+                self.name.replace('\'', "''"),
+            );
+
+            if let Some(row) = sqlx::query(&flag_query).fetch_optional(pool).await? {
+                self.has_rowsecurity = row.get("relrowsecurity");
+            }
         }
 
         Ok(())
@@ -392,6 +472,10 @@ impl Table {
             trigger.add_to_hasher(&mut hasher);
         }
 
+        for policy in &self.policies {
+            policy.add_to_hasher(&mut hasher);
+        }
+
         if let Some(pk) = &self.partition_key {
             hasher.update(pk.as_bytes());
         }
@@ -401,12 +485,14 @@ impl Table {
         if let Some(pb) = &self.partition_bound {
             hasher.update(pb.as_bytes());
         }
+        if let Some(cmt) = &self.comment {
+            hasher.update(cmt.as_bytes());
+        }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
-    /// Get script for the table
-    pub fn get_script(&self) -> String {
+    fn build_script(&self, include_triggers: bool) -> String {
         let mut script = String::new();
 
         if let Some(parent) = &self.partition_of {
@@ -455,7 +541,8 @@ impl Table {
                 .any(|c| c.constraint_type.to_lowercase() == "primary key");
 
             if has_pk_constraint {
-                // Find PK columns from indexes if available
+                let mut pk_added = false;
+                // Prefer PK columns from indexes if available (preserves order expressions)
                 for index in &self.indexes {
                     if index.indexdef.to_lowercase().contains("primary key") {
                         if let Some(start) = index.indexdef.to_lowercase().find("primary key (") {
@@ -476,10 +563,39 @@ impl Table {
                                             .join(", ")
                                     );
                                     column_definitions.push(pk_def);
+                                    pk_added = true;
                                 }
                             }
                         }
                         break;
+                    }
+                }
+
+                // Fallback: parse PK constraint definition if no index info was found
+                if !pk_added
+                    && let Some(pk_constraint) = self
+                        .constraints
+                        .iter()
+                        .find(|c| c.constraint_type.eq_ignore_ascii_case("primary key"))
+                        .and_then(|c| c.definition.as_deref())
+                    && let Some(start) = pk_constraint.find('(')
+                    && let Some(end) = pk_constraint[start + 1..].find(')')
+                {
+                    let cols_part = &pk_constraint[start + 1..start + 1 + end];
+                    let pk_cols: Vec<&str> = cols_part
+                        .split(',')
+                        .map(|c| c.trim().trim_matches('"'))
+                        .collect();
+                    if !pk_cols.is_empty() {
+                        let pk_def = format!(
+                            "    primary key ({})",
+                            pk_cols
+                                .iter()
+                                .map(|c| format!("\"{c}\""))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        column_definitions.push(pk_def);
                     }
                 }
             }
@@ -511,10 +627,60 @@ impl Table {
         }
 
         // 7. Add triggers
+        if include_triggers {
+            for trigger in &self.triggers {
+                script.push_str(&trigger.get_script());
+            }
+        }
+
+        // 8. Enable row-level security before creating policies
+        if self.has_rowsecurity {
+            script.push_str(&format!(
+                "alter table \"{}\".\"{}\" enable row level security;\n",
+                self.schema, self.name
+            ));
+        }
+
+        // 9. Add row-level security policies
+        for policy in &self.policies {
+            script.push_str(&policy.get_script());
+        }
+
+        // 10. Add table comment (if any) and column comments
+        if let Some(comment) = &self.comment {
+            script.push_str(&format!(
+                "comment on table \"{}\".\"{}\" is '{}';\n",
+                self.schema,
+                self.name,
+                escape_single_quotes(comment)
+            ));
+        }
+
+        for column in &self.columns {
+            if let Some(comment_script) = column.get_comment_script() {
+                script.push_str(&comment_script);
+            }
+        }
+
+        script
+    }
+
+    /// Get script for the table
+    pub fn get_script(&self) -> String {
+        self.build_script(true)
+    }
+
+    /// Get script for the table without triggers (for deferred trigger creation)
+    pub fn get_script_without_triggers(&self) -> String {
+        self.build_script(false)
+    }
+
+    /// Get trigger creation scripts only
+    pub fn get_trigger_script(&self) -> String {
+        let mut script = String::new();
         for trigger in &self.triggers {
             script.push_str(&trigger.get_script());
         }
-
         script
     }
 
@@ -566,7 +732,12 @@ impl Table {
         script
     }
 
-    pub fn get_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
+    fn build_alter_script(
+        &self,
+        to_table: &Table,
+        use_drop: bool,
+        include_triggers: bool,
+    ) -> String {
         // If partition key changes (e.g. from LIST to RANGE, or different column), we must recreate the table.
         // Also if table changes from partitioned to non-partitioned or vice versa.
         if self.partition_key != to_table.partition_key {
@@ -590,10 +761,11 @@ impl Table {
         let mut column_drop_script = String::new();
         let mut constraint_post_script = String::new();
         let mut index_script = String::new();
-        let mut trigger_script = String::new();
         let mut index_drop_script = String::new();
-        let mut trigger_drop_script = String::new();
         let mut partition_script = String::new();
+        let mut policy_script = String::new();
+        let mut policy_drop_script = String::new();
+        let mut row_security_script = String::new();
 
         // Handle partition changes
         if self.partition_of != to_table.partition_of
@@ -626,10 +798,43 @@ impl Table {
         // Collect column additions or alterations
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
-                if old_col != new_col
-                    && let Some(alter_col_script) = new_col.get_alter_script(old_col)
-                {
-                    column_alter_script.push_str(&alter_col_script);
+                if old_col != new_col {
+                    let type_changed = old_col.data_type != new_col.data_type
+                        || old_col.udt_name != new_col.udt_name
+                        || old_col.numeric_precision != new_col.numeric_precision
+                        || old_col.numeric_scale != new_col.numeric_scale
+                        || old_col.character_maximum_length != new_col.character_maximum_length;
+
+                    let is_partition_child = self.partition_of.is_some();
+                    let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
+                        let pk_norm: String = pk
+                            .chars()
+                            .filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '`'))
+                            .collect::<String>()
+                            .to_lowercase();
+                        pk_norm.contains(&new_col.name.to_lowercase())
+                    });
+
+                    if type_changed && (is_partition_child || in_partition_key) {
+                        let drop_script = if use_drop {
+                            self.get_drop_script()
+                        } else {
+                            self.get_drop_script()
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect()
+                        };
+                        return format!(
+                            "/* Column {} participates in partitioning; type change requires table recreation. Data loss will occur! */\n{}{}",
+                            new_col.name,
+                            drop_script,
+                            to_table.get_script()
+                        );
+                    }
+
+                    if let Some(alter_col_script) = new_col.get_alter_script(old_col, use_drop) {
+                        column_alter_script.push_str(&alter_col_script);
+                    }
                 }
             } else {
                 column_alter_script.push_str(&new_col.get_add_script());
@@ -709,6 +914,24 @@ impl Table {
             }
         }
 
+        // Table comment changes
+        if self.comment != to_table.comment {
+            let comment_stmt = if let Some(cmt) = &to_table.comment {
+                format!(
+                    "comment on table \"{}\".\"{}\" is '{}';\n",
+                    to_table.schema,
+                    to_table.name,
+                    escape_single_quotes(cmt)
+                )
+            } else {
+                format!(
+                    "comment on table \"{}\".\"{}\" is null;\n",
+                    to_table.schema, to_table.name
+                )
+            };
+            constraint_post_script.push_str(&comment_stmt);
+        }
+
         // Collect index updates
         for new_index in &to_table.indexes {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
@@ -729,7 +952,119 @@ impl Table {
             }
         }
 
-        // Collect trigger updates
+        // Collect policy updates
+        for new_policy in &to_table.policies {
+            if let Some(old_policy) = self.policies.iter().find(|p| p.name == new_policy.name) {
+                if old_policy != new_policy {
+                    let drop_cmd = format!(
+                        "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
+                        old_policy.name.replace('"', "\"\""),
+                        self.schema,
+                        self.name
+                    );
+                    if use_drop {
+                        policy_drop_script.push_str(&drop_cmd);
+                    } else {
+                        policy_drop_script.push_str(&format!("-- {}", drop_cmd));
+                    }
+                    policy_script.push_str(&new_policy.get_script());
+                }
+            } else {
+                policy_script.push_str(&new_policy.get_script());
+            }
+        }
+
+        for old_index in &self.indexes {
+            if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
+                let drop_cmd = format!(
+                    "drop index if exists \"{}\".\"{}\";\n",
+                    old_index.schema, old_index.name
+                );
+                if use_drop {
+                    index_drop_script.push_str(&drop_cmd);
+                } else {
+                    index_drop_script.push_str(&format!("-- {}", drop_cmd));
+                }
+            }
+        }
+
+        for old_policy in &self.policies {
+            if !to_table.policies.iter().any(|p| p.name == old_policy.name) {
+                let drop_cmd = format!(
+                    "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
+                    old_policy.name, self.schema, self.name
+                );
+                if use_drop {
+                    policy_drop_script.push_str(&drop_cmd);
+                } else {
+                    policy_drop_script.push_str(&format!("-- {}", drop_cmd));
+                }
+            }
+        }
+
+        if self.has_rowsecurity != to_table.has_rowsecurity {
+            let stmt = if to_table.has_rowsecurity {
+                format!(
+                    "alter table \"{}\".\"{}\" enable row level security;\n",
+                    self.schema, self.name
+                )
+            } else {
+                format!(
+                    "alter table \"{}\".\"{}\" disable row level security;\n",
+                    self.schema, self.name
+                )
+            };
+            row_security_script.push_str(&stmt);
+        }
+
+        let (trigger_drop_script, trigger_script) = if include_triggers {
+            self.get_trigger_alter_parts(to_table, use_drop)
+        } else {
+            (String::new(), String::new())
+        };
+
+        let mut script = String::new();
+        script.push_str(&partition_script);
+        script.push_str(&constraint_pre_script);
+        script.push_str(&column_alter_script);
+        script.push_str(&index_drop_script);
+        if include_triggers {
+            script.push_str(&trigger_drop_script);
+        }
+        script.push_str(&policy_drop_script);
+        script.push_str(&column_drop_script);
+        script.push_str(&constraint_post_script);
+        script.push_str(&index_script);
+        if include_triggers {
+            script.push_str(&trigger_script);
+        }
+
+        // When enabling row security, PostgreSQL requires row security to be
+        // enabled before policies are created. Adjust the order accordingly.
+        if !self.has_rowsecurity && to_table.has_rowsecurity {
+            script.push_str(&row_security_script);
+            script.push_str(&policy_script);
+        } else {
+            script.push_str(&policy_script);
+            script.push_str(&row_security_script);
+        }
+        script
+    }
+
+    /// Get script for altering the table (including triggers)
+    pub fn get_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
+        self.build_alter_script(to_table, use_drop, true)
+    }
+
+    /// Get script for altering the table without triggers (for deferred trigger creation)
+    pub fn get_alter_script_without_triggers(&self, to_table: &Table, use_drop: bool) -> String {
+        self.build_alter_script(to_table, use_drop, false)
+    }
+
+    fn get_trigger_alter_parts(&self, to_table: &Table, use_drop: bool) -> (String, String) {
+        let mut trigger_script = String::new();
+        let mut trigger_drop_script = String::new();
+
         for new_trigger in &to_table.triggers {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
@@ -749,20 +1084,6 @@ impl Table {
             }
         }
 
-        for old_index in &self.indexes {
-            if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
-                let drop_cmd = format!(
-                    "drop index if exists \"{}\".\"{}\";\n",
-                    old_index.schema, old_index.name
-                );
-                if use_drop {
-                    index_drop_script.push_str(&drop_cmd);
-                } else {
-                    index_drop_script.push_str(&format!("-- {}", drop_cmd));
-                }
-            }
-        }
-
         for old_trigger in &self.triggers {
             if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
                 let drop_cmd = format!(
@@ -777,18 +1098,13 @@ impl Table {
             }
         }
 
-        let mut script = String::new();
-        script.push_str(&partition_script);
-        script.push_str(&constraint_pre_script);
-        script.push_str(&column_alter_script);
-        script.push_str(&index_drop_script);
-        script.push_str(&trigger_drop_script);
-        script.push_str(&column_drop_script);
-        script.push_str(&constraint_post_script);
-        script.push_str(&index_script);
-        script.push_str(&trigger_script);
+        (trigger_drop_script, trigger_script)
+    }
 
-        script
+    /// Trigger-only alter script
+    pub fn get_trigger_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
+        let (drop_part, create_part) = self.get_trigger_alter_parts(to_table, use_drop);
+        format!("{}{}", drop_part, create_part)
     }
 }
 
@@ -844,6 +1160,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         }
     }
 
@@ -975,12 +1292,48 @@ mod tests {
         }
     }
 
+    fn unique_email_index() -> TableIndex {
+        TableIndex {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: "idx_users_email".to_string(),
+            catalog: None,
+            indexdef: "create unique index idx_users_email on public.users using btree (email)"
+                .to_string(),
+        }
+    }
+
     fn trigger(name: &str, definition: &str, oid: u32) -> TableTrigger {
         TableTrigger {
             oid: Oid(oid),
             name: name.to_string(),
             definition: definition.to_string(),
         }
+    }
+
+    fn policy(
+        name: &str,
+        command: &str,
+        using_clause: Option<&str>,
+        check_clause: Option<&str>,
+    ) -> TablePolicy {
+        TablePolicy {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: name.to_string(),
+            command: command.to_string(),
+            permissive: true,
+            roles: vec!["public".to_string()],
+            using_clause: using_clause.map(|c| c.to_string()),
+            check_clause: check_clause.map(|c| c.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_escape_single_quotes() {
+        let input = "O'Reilly";
+        let escaped = super::escape_single_quotes(input);
+        assert_eq!(escaped, "O''Reilly");
     }
 
     fn basic_table() -> Table {
@@ -1030,6 +1383,24 @@ mod tests {
     }
 
     #[test]
+    fn test_table_hash_changes_with_policy() {
+        let mut table = basic_table();
+        table.hash();
+        let original_hash = table.hash.clone();
+
+        table.policies = vec![policy(
+            "users_rls",
+            "select",
+            Some("tenant_id = current_setting('app.current_tenant')::int"),
+            None,
+        )];
+        table.has_rowsecurity = true;
+        table.hash();
+
+        assert_ne!(original_hash, table.hash);
+    }
+
+    #[test]
     fn test_get_script_generates_full_definition() {
         let table = basic_table();
 
@@ -1047,6 +1418,47 @@ mod tests {
         );
 
         assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_script_includes_policies_and_row_security() {
+        let mut table = basic_table();
+        table.policies = vec![policy(
+            "users_tenant_select",
+            "select",
+            Some("tenant_id = current_setting('app.current_tenant')::int"),
+            None,
+        )];
+        table.has_rowsecurity = true;
+
+        let script = table.get_script();
+
+        assert!(script.contains("create policy \"users_tenant_select\""));
+        assert!(script.contains("for select"));
+        assert!(script.contains("enable row level security"));
+    }
+
+    #[test]
+    fn test_get_script_includes_unique_indexes() {
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            Some("pg_default".to_string()),
+            vec![identity_column("id", 1, "integer")],
+            vec![],
+            vec![unique_email_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+
+        assert!(
+            script.contains(
+                "create unique index idx_users_email on public.users using btree (email);"
+            )
+        );
     }
 
     #[test]
@@ -1189,6 +1601,30 @@ mod tests {
         assert!(script.contains("notify_user"));
 
         assert!(fk_script.contains("alter table \"public\".\"users\" alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
+    }
+
+    #[test]
+    fn test_get_alter_script_handles_policy_changes() {
+        let mut from_table = basic_table();
+        let mut to_table = basic_table();
+
+        to_table.policies = vec![policy(
+            "users_tenant_insert",
+            "insert",
+            None,
+            Some("tenant_id = current_setting('app.current_tenant')::int"),
+        )];
+        to_table.has_rowsecurity = true;
+
+        let add_script = from_table.get_alter_script(&to_table, true);
+        assert!(add_script.contains("create policy \"users_tenant_insert\""));
+        assert!(add_script.contains("enable row level security"));
+
+        from_table = to_table.clone();
+        let to_table_no_policy = basic_table();
+        let drop_script = from_table.get_alter_script(&to_table_no_policy, true);
+        assert!(drop_script.contains("drop policy if exists \"users_tenant_insert\""));
+        assert!(drop_script.contains("disable row level security"));
     }
 
     #[test]
@@ -1503,6 +1939,7 @@ mod tests {
             generation_expression: None,
             is_updatable: true,
             related_views: None,
+            comment: None,
         }
     }
 

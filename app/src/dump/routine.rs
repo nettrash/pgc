@@ -20,6 +20,9 @@ pub struct Routine {
     pub arguments: String,
     /// The default values for the arguments, formatted as a string.
     pub arguments_defaults: Option<String>,
+    /// Optional comment on the routine.
+    #[serde(default)]
+    pub comment: Option<String>,
     /// The description of the routine.
     pub source_code: String,
     /// The hash of the routine.
@@ -38,6 +41,7 @@ impl Routine {
         return_type: String,
         arguments: String,
         arguments_defaults: Option<String>,
+        comment: Option<String>,
         source_code: String,
     ) -> Self {
         let mut routine = Routine {
@@ -49,6 +53,7 @@ impl Routine {
             return_type,
             arguments,
             arguments_defaults,
+            comment,
             source_code,
             hash: None,
         };
@@ -59,13 +64,14 @@ impl Routine {
     /// Hash
     pub fn hash(&mut self) {
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
             self.kind,
             self.return_type,
             self.arguments,
+            self.comment.clone().unwrap_or_default(),
             self.source_code
         );
         self.hash = Some(format!("{:x}", md5::compute(src)));
@@ -74,20 +80,32 @@ impl Routine {
     /// Returns a string to create the routine.
     pub fn get_script(&self) -> String {
         let kind = self.kind.to_lowercase();
+        let delimiter = if self.source_code.contains("$$") {
+            self.generate_dollar_delimiter()
+        } else {
+            "$$".to_string()
+        };
+
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure \"{}\".\"{}\"({}) language {} as $${}$$;\n",
-                self.schema, self.name, self.arguments, self.lang, self.source_code
+                "create or replace procedure \"{}\".\"{}\"({}) language {} as {d}{body}{d};\n",
+                self.schema,
+                self.name,
+                self.arguments,
+                self.lang,
+                d = delimiter,
+                body = self.source_code
             ),
             _ => format!(
-                "create or replace {} \"{}\".\"{}\"({}) returns {} language {} as $${}$$;\n",
+                "create or replace {} \"{}\".\"{}\"({}) returns {} language {} as {d}{body}{d};\n",
                 kind,
                 self.schema,
                 self.name,
                 self.arguments,
                 self.return_type,
                 self.lang,
-                self.source_code
+                d = delimiter,
+                body = self.source_code
             ),
         };
 
@@ -95,6 +113,20 @@ impl Routine {
 
         if let Some(defaults) = &self.arguments_defaults {
             script.push_str(&format!("-- Defaults: {defaults}\n"));
+        }
+
+        if let Some(comment) = &self.comment {
+            let object_kind = match kind.as_str() {
+                "procedure" => "procedure",
+                _ => "function",
+            };
+            script.push_str(&format!(
+                "comment on {object_kind} \"{}\".\"{}\"({}) is '{}';\n",
+                self.schema,
+                self.name,
+                self.arguments,
+                comment.replace('\'', "''")
+            ));
         }
 
         script
@@ -109,6 +141,43 @@ impl Routine {
             self.name,
             self.arguments
         )
+    }
+
+    /// Generates a unique dollar-quoted delimiter tag for the routine body.
+    ///
+    /// The base tag is derived from the routine name by keeping only ASCII
+    /// alphanumeric characters and replacing all others with underscores,
+    /// prefixed with `pgc_` and suffixed with `_body`. If the derived base
+    /// is empty, a default `pgc_body` base is used instead. A numeric suffix
+    /// is then appended (starting with no suffix) until a `$tag$` delimiter
+    /// is found that does not occur anywhere in `self.source_code`, ensuring
+    /// the chosen delimiter does not conflict with existing dollar quotes in
+    /// the source.
+    fn generate_dollar_delimiter(&self) -> String {
+        let sanitized = self
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let base = if sanitized.is_empty() {
+            "pgc_body".to_string()
+        } else {
+            format!("pgc_{}_body", sanitized)
+        };
+
+        let mut idx = 0;
+        loop {
+            let candidate = if idx == 0 {
+                base.clone()
+            } else {
+                format!("{}_{}", base, idx)
+            };
+            let delimiter = format!("${}$", candidate);
+            if !self.source_code.contains(&delimiter) {
+                return delimiter;
+            }
+            idx += 1;
+        }
     }
 }
 
@@ -126,6 +195,7 @@ mod tests {
             "integer".to_string(),
             "a integer".to_string(),
             Some("DEFAULT 1".to_string()),
+            None,
             "BEGIN RETURN a + 1; END".to_string(),
         )
     }
@@ -139,6 +209,7 @@ mod tests {
             "Procedure".to_string(),
             "void".to_string(),
             "a integer".to_string(),
+            None,
             None,
             "SELECT a;".to_string(),
         )
@@ -164,6 +235,7 @@ mod tests {
             return_type.to_string(),
             arguments.to_string(),
             defaults.clone(),
+            None,
             source_code.to_string(),
         );
 
@@ -178,8 +250,8 @@ mod tests {
         assert_eq!(routine.source_code, source_code);
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}",
-            schema, name, lang, kind, return_type, arguments, source_code
+            "{}.{}.{}.{}.{}.{}.{}.{}",
+            schema, name, lang, kind, return_type, arguments, "", source_code
         );
         let expected_hash = format!("{:x}", md5::compute(expected_src));
         assert_eq!(routine.hash.as_ref(), Some(&expected_hash));
@@ -195,6 +267,29 @@ mod tests {
 
         let updated_hash = routine.hash.clone().expect("hash should be recomputed");
         assert_ne!(updated_hash, original_hash);
+    }
+
+    #[test]
+    fn get_script_uses_custom_delimiter_when_body_contains_dollar_dollar() {
+        let routine = Routine::new(
+            "public".to_string(),
+            Oid(99),
+            "echo".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN PERFORM $$nested$$; END".to_string(),
+        );
+
+        let script = routine.get_script();
+
+        assert!(script.contains("create or replace function"));
+        assert!(!script.contains("$$BEGIN PERFORM $$nested$$; END$$"));
+        assert!(script.contains("$pgc_echo_body$BEGIN PERFORM $$nested$$; END$pgc_echo_body$"));
+        assert!(!routine.source_code.contains("$pgc_echo_body$"));
     }
 
     #[test]
@@ -245,6 +340,7 @@ mod tests {
             "FUNCTION".to_string(),
             "TABLE(row_to_json json)".to_string(),
             "fetching_id bigint, fetching_event_id character varying".to_string(),
+            None,
             None,
             "BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END".to_string(),
         );

@@ -102,20 +102,15 @@ impl Dump {
         zip.start_file("dump.io", options)?;
         zip.write_all(serialized_bytes)?;
         zip.finish()?;
-
-        // Successfully created the dump file.
-        println!("Dump created successfully: {}", self.configuration.file);
         Ok(())
     }
 
-    // Fill the Dump with data from the database.
     async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
-        // Fetch extensions from the database.
         self.get_schemas(pool).await?;
         self.get_extensions(pool).await?;
         self.get_types(pool).await?;
-        self.get_enums(pool).await?;
         self.get_domain_constraints(pool).await?;
+        self.get_enums(pool).await?;
         self.get_sequences(pool).await?;
         self.get_routines(pool).await?;
         self.get_tables(pool).await?;
@@ -124,16 +119,20 @@ impl Dump {
     }
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(
-            format!("select schema_name from information_schema.schemata where schema_name like '{}' and schema_name not in ('pg_catalog', 'information_schema')", self.configuration.scheme).as_str(),
-        )
-        .fetch_all(pool)
-        .await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch schemas: {}.",
-                result.err().unwrap()
-            )));
+        let query = format!(
+            "select n.nspname as schema_name, d.description as schema_comment
+             from pg_namespace n
+             left join pg_description d on d.objoid = n.oid
+                 and d.classoid = 'pg_namespace'::regclass
+                 and d.objsubid = 0
+             where n.nspname like '{}'
+               and n.nspname not in ('pg_catalog', 'information_schema')",
+            self.configuration.scheme
+        );
+
+        let result = sqlx::query(query.as_str()).fetch_all(pool).await;
+        if let Err(e) = &result {
+            return Err(Error::other(format!("Failed to fetch schemas: {}.", e)));
         }
         let rows = result.unwrap();
 
@@ -143,7 +142,8 @@ impl Dump {
             println!("Schemas found:");
             for row in rows {
                 let schema = row.get("schema_name");
-                let sch = Schema::new(schema);
+                let comment: Option<String> = row.get("schema_comment");
+                let sch = Schema::new(schema, comment);
                 self.schemas.push(sch.clone());
                 println!(" - {}", sch.name);
             }
@@ -220,10 +220,14 @@ impl Dump {
                 t.typndims,
                 t.typcollation,
                 t.typdefault,
-                pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype
+                pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype,
+                d.description as comment
             from 
                 pg_type t 
                 join pg_namespace n on t.typnamespace = n.oid 
+                left join pg_description d on d.objoid = t.oid
+                    and d.classoid = 'pg_type'::regclass
+                    and d.objsubid = 0
             where 
                 n.nspname like '{}' 
                 and t.typtype in ('d', 'e', 'r', 'm') 
@@ -280,6 +284,7 @@ impl Dump {
                     typcollation: row.get::<Option<Oid>, _>("typcollation"),
                     typdefault: row.get::<Option<String>, _>("typdefault"),
                     formatted_basetype: row.get::<Option<String>, _>("formatted_basetype"),
+                    comment: row.get::<Option<String>, _>("comment"),
                     enum_labels: Vec::new(),
                     domain_constraints: Vec::new(),
                     hash: None,
@@ -420,12 +425,14 @@ impl Dump {
                     owner_ns.nspname as owned_by_schema,
                     owner_table.relname as owned_by_table,
                     owner_attr.attname as owned_by_column,
-                    dep.deptype::text as dependency_type
+                    dep.deptype::text as dependency_type,
+                    seq_desc.description as seq_comment
                 from
                     pg_sequences seq
                     left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
                     left join pg_class seq_class on seq_class.relname = seq.sequencename
                         and seq_class.relnamespace = seq_ns.oid
+                    left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and seq_desc.objsubid = 0
                     left join pg_depend dep on dep.objid = seq_class.oid
                         and dep.deptype in ('a', 'i')
                     left join pg_class owner_table on owner_table.oid = dep.refobjid
@@ -470,6 +477,7 @@ impl Dump {
                     owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
                     owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
                     is_identity: false,
+                    comment: row.get("seq_comment"),
                     hash: None,
                 };
                 if let Some(deptype) = row.get::<Option<String>, _>("dependency_type")
@@ -504,11 +512,13 @@ impl Dump {
                     pg_get_function_result(r.oid) as prorettype,
                     pg_get_function_identity_arguments(r.oid) as proarguments,
                     pg_get_expr(r.proargdefaults, 0) as proargdefaults,
-                    r.prosrc
+                    r.prosrc,
+                    d.description as routine_comment
                 from
                     pg_proc r
                     join pg_namespace n on r.pronamespace = n.oid
                     join pg_language l on r.prolang = l.oid
+                    left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
                 where
                     n.nspname like '{}'
                     and n.nspname not in ('pg_catalog', 'information_schema')
@@ -545,6 +555,7 @@ impl Dump {
                         .unwrap_or_else(|| "void".to_string()),
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
+                    comment: row.get("routine_comment"),
                     source_code: row.get("prosrc"),
                     hash: None,
                 };
@@ -569,13 +580,16 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "
-                    select * 
-                    from 
-                        pg_tables 
+                    select t.*, d.description as table_comment
+                    from pg_tables t
+                    left join pg_class c on c.relname = t.tablename
+                        and c.relkind in ('r','p')
+                        and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
+                    left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                     where 
-                        schemaname not in ('pg_catalog', 'information_schema') 
-                        and schemaname like '{}' 
-                        and tablename not like 'pg_%';",
+                        t.schemaname not in ('pg_catalog', 'information_schema') 
+                        and t.schemaname like '{}' 
+                        and t.tablename not like 'pg_%';",
                 self.configuration.scheme
             )
             .as_str(),
@@ -608,10 +622,12 @@ impl Dump {
                     constraints: Vec::new(),
                     indexes: Vec::new(),
                     triggers: Vec::new(),
+                    policies: Vec::new(),
                     definition: None,
                     partition_key: None,
                     partition_of: None,
                     partition_bound: None,
+                    comment: row.get("table_comment"),
                     hash: None,
                 };
                 table.fill(pool).await.map_err(|e| {
@@ -635,13 +651,15 @@ impl Dump {
     async fn get_views(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
             format!(
-                "select v.table_schema, v.table_name, v.view_definition, array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation
+                "select v.table_schema, v.table_name, v.view_definition, array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation, d.description as view_comment
                 from information_schema.views v
-                join information_schema.view_table_usage vtu on v.table_name = vtu.view_name
+                join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
+                left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
+                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                 where
                     v.table_schema not in ('pg_catalog', 'information_schema')
                     and v.table_schema like '{}'
-                group by v.table_schema, v.table_name, v.view_definition;",
+                group by v.table_schema, v.table_name, v.view_definition, d.description;",
                 self.configuration.scheme
             )
             .as_str(),
@@ -666,6 +684,7 @@ impl Dump {
                     name: row.get("table_name"),
                     definition: row.get("view_definition"),
                     table_relation: row.get("table_relation"),
+                    comment: row.get("view_comment"),
                     hash: None,
                 };
                 view.hash();

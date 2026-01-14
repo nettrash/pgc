@@ -141,6 +141,14 @@ CREATE TABLE test_schema.reviews (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Generated column change test (TO: generated stored)
+CREATE TABLE test_schema.generated_pricing (
+    id SERIAL PRIMARY KEY,
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    total DECIMAL(12,2) GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+
 CREATE TABLE shared_schema.audit_logs (
     id BIGSERIAL PRIMARY KEY,
     table_name VARCHAR(100) NOT NULL,
@@ -204,6 +212,9 @@ CREATE INDEX idx_audit_logs_changed_by ON shared_schema.audit_logs(changed_by);
 -- NEW INDEXES
 CREATE INDEX idx_audit_logs_session_id ON shared_schema.audit_logs(session_id);
 CREATE INDEX idx_audit_logs_request_id ON shared_schema.audit_logs(request_id);
+-- Standalone unique index (TO) with different definition to ensure diff detection
+CREATE UNIQUE INDEX idx_audit_logs_table_op_changed_at
+    ON shared_schema.audit_logs(table_name, operation, changed_at, record_id);
 
 -- Functions and procedures (some modified, some removed, some added)
 CREATE OR REPLACE FUNCTION test_schema.update_timestamp()
@@ -265,6 +276,40 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Trigger ordering scenario (TO): modified function and trigger signature
+CREATE OR REPLACE FUNCTION test_schema.fn_order_from()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.description := COALESCE(NEW.description, 'to');
+    NEW.updated_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE test_schema.trigger_order_test (
+    id SERIAL PRIMARY KEY,
+    description TEXT,
+    updated_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TRIGGER trg_order_from
+BEFORE INSERT ON test_schema.trigger_order_test
+FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
+
+-- Drop-order dependency scenario intentionally removed in TO to test drop ordering
+-- (drop_status type, drop_parent partitioned table, drop_child partition, drop_orders FK, trg_drop_orders trigger)
+
+-- Partition type-change scenario (TO): partition key switches to UUID to force recreate
+CREATE TABLE test_schema.part_type_change_parent (
+    tenant UUID NOT NULL,
+    id INTEGER NOT NULL,
+    note TEXT,
+    PRIMARY KEY (tenant, id)
+) PARTITION BY LIST (tenant);
+
+CREATE TABLE test_schema.part_type_change_child PARTITION OF test_schema.part_type_change_parent
+FOR VALUES IN ('00000000-0000-0000-0000-000000000000');
+
 -- NEW FUNCTION
 CREATE OR REPLACE FUNCTION test_schema.get_user_review_count(user_id_param INTEGER)
 RETURNS INTEGER AS $$
@@ -316,6 +361,18 @@ BEGIN
     RETURN QUERY SELECT id, username, email, created_at FROM test_schema.users WHERE status = p_status;
 END;
 $$;
+
+-- Function containing nested $$ to exercise custom dollar quoting (TO database variant of fn_dollar_from)
+CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
+RETURNS text
+LANGUAGE plpgsql
+AS $c$
+DECLARE
+    inner_text text := $$inner-to$$;
+BEGIN
+    RETURN inner_text || '-v2';
+END;
+$c$;
 
 -- cleanup_old_orders procedure removed (table doesn't exist)
 
@@ -445,6 +502,11 @@ COMMENT ON COLUMN test_schema.users.metadata IS 'Additional user data in JSON fo
 COMMENT ON COLUMN test_schema.products.dimensions IS 'Product dimensions (length, width, height) in JSON';
 COMMENT ON COLUMN test_schema.users.preferred_contact IS 'Preferred method of contact for notifications';
 COMMENT ON COLUMN test_schema.products.barcode IS 'Product barcode for inventory tracking';
+COMMENT ON TYPE test_schema.status_type IS 'User status values including suspended (TO)';
+COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer capped at 1,000,000 (TO)';
+COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 2000 (TO)';
+COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with featured flag (TO)';
+COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users with created_at for status filter (TO)';
 
 -- Special characters test (Modified: added column)
 CREATE TABLE test_schema."special$table" (
@@ -459,6 +521,31 @@ CREATE TABLE test_schema."table with spaces" (
     "id" SERIAL PRIMARY KEY,
     "column with spaces" VARCHAR(255)
 );
+
+-- Ensure roles exist for row-level security policies in TO schema
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tenant_reader') THEN
+        CREATE ROLE tenant_reader;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tenant_editor') THEN
+        CREATE ROLE tenant_editor;
+    END IF;
+END$$;
+
+-- Row-level security (TO: restrictive policy with different predicate and an extra update policy)
+ALTER TABLE test_schema.users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_rls_select ON test_schema.users
+    AS RESTRICTIVE
+    FOR SELECT
+    TO "tenant_reader"
+    USING ((metadata ->> 'tenant_id') = current_setting('app.current_tenant') AND two_factor_enabled = TRUE);
+
+CREATE POLICY users_rls_update ON test_schema.users
+    FOR UPDATE
+    TO "tenant_editor"
+    USING ((metadata ->> 'tenant_id') = current_setting('app.current_tenant'))
+    WITH CHECK ((metadata ->> 'tenant_id') = current_setting('app.current_tenant') AND preferred_contact <> 'sms');
 
 -- Complex Foreign Keys test (Modified: ON DELETE CASCADE)
 CREATE TABLE test_schema.composite_pk (

@@ -123,6 +123,14 @@ CREATE TABLE test_schema.order_items (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Generated column change test (FROM: plain column)
+CREATE TABLE test_schema.generated_pricing (
+    id SERIAL PRIMARY KEY,
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    total DECIMAL(12,2) NOT NULL
+);
+
 CREATE TABLE shared_schema.audit_logs (
     id BIGSERIAL PRIMARY KEY,
     table_name VARCHAR(100) NOT NULL,
@@ -163,6 +171,9 @@ CREATE INDEX idx_audit_logs_table_name ON shared_schema.audit_logs(table_name);
 CREATE INDEX idx_audit_logs_operation ON shared_schema.audit_logs(operation);
 CREATE INDEX idx_audit_logs_changed_at ON shared_schema.audit_logs(changed_at);
 CREATE INDEX idx_audit_logs_changed_by ON shared_schema.audit_logs(changed_by);
+-- Standalone unique index (FROM) to validate detection of unique indexes not backed by constraints
+CREATE UNIQUE INDEX idx_audit_logs_table_op_changed_at
+    ON shared_schema.audit_logs(table_name, operation, changed_at);
 
 -- Functions and procedures
 CREATE OR REPLACE FUNCTION test_schema.update_timestamp()
@@ -233,6 +244,70 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Trigger ordering scenario (FROM): function then trigger on same table
+CREATE OR REPLACE FUNCTION test_schema.fn_order_from()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.description := COALESCE(NEW.description, 'from');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE test_schema.trigger_order_test (
+    id SERIAL PRIMARY KEY,
+    description TEXT
+);
+
+CREATE TRIGGER trg_order_from
+BEFORE INSERT ON test_schema.trigger_order_test
+FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
+
+-- Partition type-change scenario (FROM): partition key uses TEXT
+CREATE TABLE test_schema.part_type_change_parent (
+    tenant TEXT NOT NULL,
+    id INTEGER NOT NULL,
+    note TEXT,
+    PRIMARY KEY (tenant, id)
+) PARTITION BY LIST (tenant);
+
+CREATE TABLE test_schema.part_type_change_child PARTITION OF test_schema.part_type_change_parent
+FOR VALUES IN ('from');
+
+-- Drop-order dependency scenario (exists only in FROM)
+-- Custom type used by a table that is referenced by another table and has a trigger/function
+CREATE TYPE test_schema.drop_status AS ENUM ('draft', 'published');
+
+CREATE TABLE test_schema.drop_parent (
+    id SERIAL,
+    status test_schema.drop_status NOT NULL,
+    PRIMARY KEY (id, status)
+)
+PARTITION BY LIST (status);
+
+CREATE TABLE test_schema.drop_child PARTITION OF test_schema.drop_parent
+FOR VALUES IN ('draft');
+
+CREATE OR REPLACE FUNCTION test_schema.drop_fn()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.status := 'draft';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE test_schema.drop_orders (
+    id SERIAL PRIMARY KEY,
+    parent_id INTEGER NOT NULL,
+    parent_status test_schema.drop_status NOT NULL DEFAULT 'draft',
+    note TEXT,
+    CONSTRAINT drop_orders_parent_fk FOREIGN KEY (parent_id, parent_status)
+        REFERENCES test_schema.drop_parent(id, status)
+);
+
+CREATE TRIGGER trg_drop_orders
+BEFORE INSERT ON test_schema.drop_orders
+FOR EACH ROW EXECUTE FUNCTION test_schema.drop_fn();
+
 CREATE OR REPLACE FUNCTION test_schema.get_users_by_status(p_status test_schema.status_type)
 RETURNS TABLE(user_id integer, username varchar, email varchar)
 LANGUAGE plpgsql
@@ -241,6 +316,18 @@ BEGIN
     RETURN QUERY SELECT id, username, email FROM test_schema.users WHERE status = p_status;
 END;
 $$;
+
+-- Function containing nested $$ to exercise custom dollar quoting
+CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
+RETURNS text
+LANGUAGE plpgsql
+AS $b$
+DECLARE
+    inner_text text := $$inner-from$$;
+BEGIN
+    RETURN inner_text;
+END;
+$b$;
 
 -- Procedure (PostgreSQL 11+)
 CREATE OR REPLACE PROCEDURE test_schema.cleanup_old_orders(days_old INTEGER DEFAULT 365)
@@ -333,6 +420,11 @@ COMMENT ON TABLE test_schema.products IS 'Product catalog';
 COMMENT ON TABLE test_schema.orders IS 'Customer orders';
 COMMENT ON COLUMN test_schema.users.metadata IS 'Additional user data in JSON format';
 COMMENT ON COLUMN test_schema.products.dimensions IS 'Product dimensions (length, width, height) in JSON';
+COMMENT ON TYPE test_schema.status_type IS 'User status values (active/inactive/pending)';
+COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer with no upper bound in FROM';
+COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 1000 (FROM)';
+COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with basic stock buckets (FROM)';
+COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users filtered by status (FROM)';
 
 -- Special characters test
 CREATE TABLE test_schema."special$table" (
@@ -345,6 +437,13 @@ CREATE TABLE test_schema."table with spaces" (
     "id" SERIAL PRIMARY KEY,
     "column with spaces" TEXT
 );
+
+-- Row-level security (FROM: one policy, simple predicate)
+ALTER TABLE test_schema.users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_rls_select ON test_schema.users
+    FOR SELECT
+    TO public
+    USING ((metadata ->> 'tenant_id') = current_setting('app.current_tenant'));
 
 -- Complex Foreign Keys test
 CREATE TABLE test_schema.composite_pk (
