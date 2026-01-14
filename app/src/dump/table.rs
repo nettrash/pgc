@@ -877,7 +877,7 @@ impl Table {
                 if old_policy != new_policy {
                     let drop_cmd = format!(
                         "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
-                        old_policy.name, self.schema, self.name
+                        old_policy.name.replace('"', "\"\""), self.schema, self.name
                     );
                     if use_drop {
                         policy_drop_script.push_str(&drop_cmd);
