@@ -276,6 +276,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Trigger ordering scenario (TO): modified function and trigger signature
+CREATE OR REPLACE FUNCTION test_schema.fn_order_from()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.description := COALESCE(NEW.description, 'to');
+    NEW.updated_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE test_schema.trigger_order_test (
+    id SERIAL PRIMARY KEY,
+    description TEXT,
+    updated_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TRIGGER trg_order_from
+BEFORE INSERT ON test_schema.trigger_order_test
+FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
+
 -- NEW FUNCTION
 CREATE OR REPLACE FUNCTION test_schema.get_user_review_count(user_id_param INTEGER)
 RETURNS INTEGER AS $$

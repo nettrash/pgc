@@ -492,8 +492,7 @@ impl Table {
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
-    /// Get script for the table
-    pub fn get_script(&self) -> String {
+    fn build_script(&self, include_triggers: bool) -> String {
         let mut script = String::new();
 
         if let Some(parent) = &self.partition_of {
@@ -598,8 +597,10 @@ impl Table {
         }
 
         // 7. Add triggers
-        for trigger in &self.triggers {
-            script.push_str(&trigger.get_script());
+        if include_triggers {
+            for trigger in &self.triggers {
+                script.push_str(&trigger.get_script());
+            }
         }
 
         // 8. Enable row-level security before creating policies
@@ -631,6 +632,25 @@ impl Table {
             }
         }
 
+        script
+    }
+
+    /// Get script for the table
+    pub fn get_script(&self) -> String {
+        self.build_script(true)
+    }
+
+    /// Get script for the table without triggers (for deferred trigger creation)
+    pub fn get_script_without_triggers(&self) -> String {
+        self.build_script(false)
+    }
+
+    /// Get trigger creation scripts only
+    pub fn get_trigger_script(&self) -> String {
+        let mut script = String::new();
+        for trigger in &self.triggers {
+            script.push_str(&trigger.get_script());
+        }
         script
     }
 
@@ -682,7 +702,12 @@ impl Table {
         script
     }
 
-    pub fn get_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
+    fn build_alter_script(
+        &self,
+        to_table: &Table,
+        use_drop: bool,
+        include_triggers: bool,
+    ) -> String {
         // If partition key changes (e.g. from LIST to RANGE, or different column), we must recreate the table.
         // Also if table changes from partitioned to non-partitioned or vice versa.
         if self.partition_key != to_table.partition_key {
@@ -706,9 +731,7 @@ impl Table {
         let mut column_drop_script = String::new();
         let mut constraint_post_script = String::new();
         let mut index_script = String::new();
-        let mut trigger_script = String::new();
         let mut index_drop_script = String::new();
-        let mut trigger_drop_script = String::new();
         let mut partition_script = String::new();
         let mut policy_script = String::new();
         let mut policy_drop_script = String::new();
@@ -866,26 +889,6 @@ impl Table {
             }
         }
 
-        // Collect trigger updates
-        for new_trigger in &to_table.triggers {
-            if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
-                if old_trigger != new_trigger {
-                    let drop_cmd = format!(
-                        "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
-                        old_trigger.name, self.schema, self.name
-                    );
-                    if use_drop {
-                        trigger_drop_script.push_str(&drop_cmd);
-                    } else {
-                        trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
-                    }
-                    trigger_script.push_str(&new_trigger.get_script());
-                }
-            } else {
-                trigger_script.push_str(&new_trigger.get_script());
-            }
-        }
-
         // Collect policy updates
         for new_policy in &to_table.policies {
             if let Some(old_policy) = self.policies.iter().find(|p| p.name == new_policy.name) {
@@ -922,20 +925,6 @@ impl Table {
             }
         }
 
-        for old_trigger in &self.triggers {
-            if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
-                let drop_cmd = format!(
-                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
-                    old_trigger.name, self.schema, self.name
-                );
-                if use_drop {
-                    trigger_drop_script.push_str(&drop_cmd);
-                } else {
-                    trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
-                }
-            }
-        }
-
         for old_policy in &self.policies {
             if !to_table.policies.iter().any(|p| p.name == old_policy.name) {
                 let drop_cmd = format!(
@@ -965,17 +954,27 @@ impl Table {
             row_security_script.push_str(&stmt);
         }
 
+        let (trigger_drop_script, trigger_script) = if include_triggers {
+            self.get_trigger_alter_parts(to_table, use_drop)
+        } else {
+            (String::new(), String::new())
+        };
+
         let mut script = String::new();
         script.push_str(&partition_script);
         script.push_str(&constraint_pre_script);
         script.push_str(&column_alter_script);
         script.push_str(&index_drop_script);
-        script.push_str(&trigger_drop_script);
+        if include_triggers {
+            script.push_str(&trigger_drop_script);
+        }
         script.push_str(&policy_drop_script);
         script.push_str(&column_drop_script);
         script.push_str(&constraint_post_script);
         script.push_str(&index_script);
-        script.push_str(&trigger_script);
+        if include_triggers {
+            script.push_str(&trigger_script);
+        }
 
         // When enabling row security, PostgreSQL requires row security to be
         // enabled before policies are created. Adjust the order accordingly.
@@ -987,6 +986,62 @@ impl Table {
             script.push_str(&row_security_script);
         }
         script
+    }
+
+    /// Get script for altering the table (including triggers)
+    pub fn get_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
+        self.build_alter_script(to_table, use_drop, true)
+    }
+
+    /// Get script for altering the table without triggers (for deferred trigger creation)
+    pub fn get_alter_script_without_triggers(&self, to_table: &Table, use_drop: bool) -> String {
+        self.build_alter_script(to_table, use_drop, false)
+    }
+
+    fn get_trigger_alter_parts(&self, to_table: &Table, use_drop: bool) -> (String, String) {
+        let mut trigger_script = String::new();
+        let mut trigger_drop_script = String::new();
+
+        for new_trigger in &to_table.triggers {
+            if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
+                if old_trigger != new_trigger {
+                    let drop_cmd = format!(
+                        "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                        old_trigger.name, self.schema, self.name
+                    );
+                    if use_drop {
+                        trigger_drop_script.push_str(&drop_cmd);
+                    } else {
+                        trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
+                    }
+                    trigger_script.push_str(&new_trigger.get_script());
+                }
+            } else {
+                trigger_script.push_str(&new_trigger.get_script());
+            }
+        }
+
+        for old_trigger in &self.triggers {
+            if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
+                let drop_cmd = format!(
+                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                    old_trigger.name, self.schema, self.name
+                );
+                if use_drop {
+                    trigger_drop_script.push_str(&drop_cmd);
+                } else {
+                    trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
+                }
+            }
+        }
+
+        (trigger_drop_script, trigger_script)
+    }
+
+    /// Trigger-only alter script
+    pub fn get_trigger_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
+        let (drop_part, create_part) = self.get_trigger_alter_parts(to_table, use_drop);
+        format!("{}{}", drop_part, create_part)
     }
 }
 
