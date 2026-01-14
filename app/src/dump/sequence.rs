@@ -204,6 +204,7 @@ impl Sequence {
         let mut clauses = Vec::new();
 
         if let Some(start_value) = self.start_value {
+            // Use START WITH to update the catalog start_value; this avoids re-emitting the diff.
             clauses.push(format!("start with {start_value}"));
         }
         if let Some(increment_by) = self.increment_by {

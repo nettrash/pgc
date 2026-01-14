@@ -262,6 +262,17 @@ CREATE TRIGGER trg_order_from
 BEFORE INSERT ON test_schema.trigger_order_test
 FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
 
+-- Partition type-change scenario (FROM): partition key uses TEXT
+CREATE TABLE test_schema.part_type_change_parent (
+    tenant TEXT NOT NULL,
+    id INTEGER NOT NULL,
+    note TEXT,
+    PRIMARY KEY (tenant, id)
+) PARTITION BY LIST (tenant);
+
+CREATE TABLE test_schema.part_type_change_child PARTITION OF test_schema.part_type_change_parent
+FOR VALUES IN ('from');
+
 -- Drop-order dependency scenario (exists only in FROM)
 -- Custom type used by a table that is referenced by another table and has a trigger/function
 CREATE TYPE test_schema.drop_status AS ENUM ('draft', 'published');
