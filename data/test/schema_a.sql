@@ -244,6 +244,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Trigger ordering scenario (FROM): function then trigger on same table
+CREATE OR REPLACE FUNCTION test_schema.fn_order_from()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.description := COALESCE(NEW.description, 'from');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE test_schema.trigger_order_test (
+    id SERIAL PRIMARY KEY,
+    description TEXT
+);
+
+CREATE TRIGGER trg_order_from
+BEFORE INSERT ON test_schema.trigger_order_test
+FOR EACH ROW EXECUTE FUNCTION test_schema.fn_order_from();
+
 CREATE OR REPLACE FUNCTION test_schema.get_users_by_status(p_status test_schema.status_type)
 RETURNS TABLE(user_id integer, username varchar, email varchar)
 LANGUAGE plpgsql

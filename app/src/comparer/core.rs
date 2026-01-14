@@ -1,5 +1,6 @@
-use crate::dump::{core::Dump, routine::Routine};
+use crate::dump::{core::Dump, routine::Routine, table::Table};
 use std::{
+    cmp::Ordering,
     collections::HashSet,
     fs::File,
     io::{Error, Write},
@@ -20,6 +21,7 @@ pub struct Comparer {
     enum_pre_script: String,
     enum_post_script: String,
     sequence_post_script: String,
+    trigger_post_script: String,
     dropped_views: HashSet<String>,
 }
 
@@ -34,6 +36,7 @@ impl Comparer {
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
             sequence_post_script: String::new(),
+            trigger_post_script: String::new(),
             dropped_views: HashSet::new(),
         };
 
@@ -83,6 +86,10 @@ impl Comparer {
         }
         self.create_views().await?;
         self.compare_routines().await?;
+        if !self.trigger_post_script.is_empty() {
+            self.script.push_str(&self.trigger_post_script);
+            self.trigger_post_script.clear();
+        }
 
         Ok(())
     }
@@ -170,6 +177,16 @@ impl Comparer {
 
     fn normalized_view_key(schema: &str, name: &str) -> String {
         Self::normalized_view_reference(format!("{}.{}", schema, name).as_str())
+    }
+
+    fn ordered_tables(tables: &[Table]) -> Vec<&Table> {
+        let mut ordered: Vec<&Table> = tables.iter().collect();
+        ordered.sort_by(|a, b| match (&a.partition_of, &b.partition_of) {
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            _ => a.schema.cmp(&b.schema).then_with(|| a.name.cmp(&b.name)),
+        });
+        ordered
     }
 
     fn dependent_view_keys(&self) -> HashSet<String> {
@@ -765,8 +782,11 @@ impl Comparer {
     async fn compare_tables(&mut self) -> Result<(), Error> {
         self.script
             .push_str("\n/* ---> Tables: Start section --------------- */\n\n");
+        let ordered_from = Self::ordered_tables(&self.from.tables);
+        let ordered_to = Self::ordered_tables(&self.to.tables);
+
         // We will drop all tables that exists just in "from" dump.
-        for table in &self.from.tables {
+        for table in ordered_from.iter() {
             if let Some(_to_table) = self
                 .to
                 .tables
@@ -797,7 +817,7 @@ impl Comparer {
         }
         // We will find all new tables from "to" dump that are not in "from" dump
         // and add them to the script.
-        for table in &self.to.tables {
+        for table in ordered_to.iter() {
             if table.hash.is_none() {
                 self.script.push_str(
                     format!(
@@ -831,11 +851,14 @@ impl Comparer {
             } else {
                 self.script
                     .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
-                self.script.push_str(table.get_script().as_str());
+                self.script
+                    .push_str(table.get_script_without_triggers().as_str());
+                self.trigger_post_script
+                    .push_str(table.get_trigger_script().as_str());
             }
         }
         // We will find all existing tables in both dumps with different hashes
-        for table in &self.from.tables {
+        for table in ordered_from.iter() {
             if table.hash.is_none() {
                 self.script.push_str(
                     format!(
@@ -866,8 +889,16 @@ impl Comparer {
                     self.script.push_str(
                         format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
                     );
-                    self.script
-                        .push_str(table.get_alter_script(to_table, self.use_drop).as_str());
+                    self.script.push_str(
+                        table
+                            .get_alter_script_without_triggers(to_table, self.use_drop)
+                            .as_str(),
+                    );
+                    self.trigger_post_script.push_str(
+                        table
+                            .get_trigger_alter_script(to_table, self.use_drop)
+                            .as_str(),
+                    );
                 }
             } else {
                 continue; // Table is present in both dumps, we already processed it
@@ -1139,6 +1170,58 @@ mod tests {
     use crate::dump::sequence::Sequence;
     use crate::dump::table::Table;
     use crate::dump::table_column::TableColumn;
+    use crate::dump::table_constraint::TableConstraint;
+
+    fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
+        TableColumn {
+            catalog: "postgres".to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            name: name.to_string(),
+            ordinal_position: ordinal,
+            column_default: None,
+            is_nullable: true,
+            data_type: "integer".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(32),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+            comment: None,
+        }
+    }
 
     #[tokio::test]
     async fn compare_sequences_skips_owned_by_serial_column() {
@@ -1617,5 +1700,100 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(script.contains("Skipping drop of sequence public.test_id_seq as it is owned by identity column public.test.id."));
+    }
+
+    #[tokio::test]
+    async fn tables_create_parent_before_partition_and_fk_after_tables() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Parent partitioned table
+        let mut parent = Table::new(
+            "public".to_string(),
+            "parent".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "parent", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        parent.partition_key = Some("LIST (id)".to_string());
+        parent.hash();
+
+        // Partition table
+        let mut part = Table::new(
+            "public".to_string(),
+            "child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "child", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        part.partition_of = Some("public.parent".to_string());
+        part.partition_bound = Some("FOR VALUES IN (1)".to_string());
+        part.hash();
+
+        // Referencing table with FK to parent
+        let mut orders = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                int_column("public", "orders", "id", 1),
+                int_column("public", "orders", "parent_id", 2),
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "orders_parent_fk".to_string(),
+                table_name: "orders".to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some(
+                    "FOREIGN KEY (parent_id) REFERENCES public.parent(id)".to_string(),
+                ),
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+        orders.hash();
+
+        to_dump.tables.push(parent);
+        to_dump.tables.push(part);
+        to_dump.tables.push(orders);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_parent = script
+            .find("create table \"public\".\"parent\"")
+            .expect("parent table not created");
+        let pos_child = script
+            .find("create table \"public\".\"child\" partition of public.parent")
+            .expect("partition table not created");
+        let pos_orders = script
+            .find("create table \"public\".\"orders\"")
+            .expect("orders table not created");
+        let pos_fk = script
+            .find("alter table \"public\".\"orders\" add constraint \"orders_parent_fk\"")
+            .expect("fk not emitted");
+
+        assert!(
+            pos_parent < pos_child,
+            "parent should be created before partition"
+        );
+        assert!(
+            pos_fk > pos_parent && pos_fk > pos_orders,
+            "foreign key should be created after tables"
+        );
     }
 }
