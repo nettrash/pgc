@@ -235,7 +235,7 @@ impl Table {
 
     /// Fill information about indexes.
     async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
-                let query = format!(
+        let query = format!(
                         "SELECT i.schemaname,
                                         i.tablename,
                                         i.indexname,
@@ -1336,9 +1336,11 @@ mod tests {
 
         let script = table.get_script();
 
-        assert!(script.contains(
-            "create unique index idx_users_email on public.users using btree (email);"
-        ));
+        assert!(
+            script.contains(
+                "create unique index idx_users_email on public.users using btree (email);"
+            )
+        );
     }
 
     #[test]
