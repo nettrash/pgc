@@ -1,6 +1,6 @@
 use crate::dump::{
     table_column::TableColumn, table_constraint::TableConstraint, table_index::TableIndex,
-    table_trigger::TableTrigger,
+    table_policy::TablePolicy, table_trigger::TableTrigger,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,8 @@ pub struct Table {
     pub constraints: Vec<TableConstraint>, // Constraint names
     pub indexes: Vec<TableIndex>,          // Index names
     pub triggers: Vec<TableTrigger>,       // Trigger names
+    #[serde(default)]
+    pub policies: Vec<TablePolicy>, // Row-level security policies
     pub definition: Option<String>,        // Table definition (optional)
     pub partition_key: Option<String>,     // Partition key (PARTITION BY ...)
     pub partition_of: Option<String>,      // Parent table (PARTITION OF ...)
@@ -61,6 +63,7 @@ impl Table {
             constraints,
             indexes,
             triggers,
+            policies: Vec::new(),
             definition,
             partition_key: None,
             partition_of: None,
@@ -77,6 +80,7 @@ impl Table {
         self.fill_indexes(pool).await?;
         self.fill_constraints(pool).await?;
         self.fill_triggers(pool).await?;
+        self.fill_policies(pool).await?;
         self.fill_partition_info(pool).await?;
         self.fill_definition(pool).await?;
         Ok(())
@@ -315,6 +319,57 @@ impl Table {
         Ok(())
     }
 
+    /// Fill information about row-level security policies and row security flag.
+    async fn fill_policies(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let query = format!(
+            "SELECT p.polname,
+                    n.nspname AS schemaname,
+                    c.relname AS tablename,
+                    p.polcmd::text AS polcmd,
+                    p.polpermissive,
+                    array(SELECT rolname::text FROM pg_roles r WHERE r.oid = ANY(p.polroles) ORDER BY rolname) AS roles,
+                    pg_get_expr(p.polqual, p.polrelid) AS using_clause,
+                    pg_get_expr(p.polwithcheck, p.polrelid) AS check_clause,
+                    c.relrowsecurity
+             FROM pg_policy p
+             JOIN pg_class c ON c.oid = p.polrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = '{}' AND c.relname = '{}'
+             ORDER BY p.polname",
+            self.schema.replace('\'', "''"),
+            self.name.replace('\'', "''"),
+        );
+
+        let rows = sqlx::query(&query).fetch_all(pool).await?;
+        self.policies.clear();
+        self.has_rowsecurity = false;
+
+        if !rows.is_empty() {
+            for row in &rows {
+                let policy = TablePolicy::from_row(row)?;
+                self.policies.push(policy);
+            }
+
+            // Rows come from the same table; row security flag is identical across them.
+            self.has_rowsecurity = rows[0].get("relrowsecurity");
+        } else {
+            // No policies; still record whether row security is enabled on the table.
+            let flag_query = format!(
+                "SELECT relrowsecurity FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = '{}' AND c.relname = '{}';",
+                self.schema.replace('\'', "''"),
+                self.name.replace('\'', "''"),
+            );
+
+            if let Some(row) = sqlx::query(&flag_query).fetch_optional(pool).await? {
+                self.has_rowsecurity = row.get("relrowsecurity");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Fill information about partition.
     async fn fill_partition_info(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
@@ -402,6 +457,10 @@ impl Table {
 
         for trigger in &self.triggers {
             trigger.add_to_hasher(&mut hasher);
+        }
+
+        for policy in &self.policies {
+            policy.add_to_hasher(&mut hasher);
         }
 
         if let Some(pk) = &self.partition_key {
@@ -530,7 +589,20 @@ impl Table {
             script.push_str(&trigger.get_script());
         }
 
-        // 8. Add table comment (if any) and column comments
+        // 8. Enable row-level security before creating policies
+        if self.has_rowsecurity {
+            script.push_str(&format!(
+                "alter table \"{}\".\"{}\" enable row level security;\n",
+                self.schema, self.name
+            ));
+        }
+
+        // 9. Add row-level security policies
+        for policy in &self.policies {
+            script.push_str(&policy.get_script());
+        }
+
+        // 10. Add table comment (if any) and column comments
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
                 "comment on table \"{}\".\"{}\" is '{}';\n",
@@ -625,6 +697,9 @@ impl Table {
         let mut index_drop_script = String::new();
         let mut trigger_drop_script = String::new();
         let mut partition_script = String::new();
+        let mut policy_script = String::new();
+        let mut policy_drop_script = String::new();
+        let mut row_security_script = String::new();
 
         // Handle partition changes
         if self.partition_of != to_table.partition_of
@@ -798,6 +873,28 @@ impl Table {
             }
         }
 
+        // Collect policy updates
+        for new_policy in &to_table.policies {
+            if let Some(old_policy) = self.policies.iter().find(|p| p.name == new_policy.name) {
+                if old_policy != new_policy {
+                    let drop_cmd = format!(
+                        "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
+                        old_policy.name.replace('"', "\"\""),
+                        self.schema,
+                        self.name
+                    );
+                    if use_drop {
+                        policy_drop_script.push_str(&drop_cmd);
+                    } else {
+                        policy_drop_script.push_str(&format!("-- {}", drop_cmd));
+                    }
+                    policy_script.push_str(&new_policy.get_script());
+                }
+            } else {
+                policy_script.push_str(&new_policy.get_script());
+            }
+        }
+
         for old_index in &self.indexes {
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
                 let drop_cmd = format!(
@@ -826,17 +923,56 @@ impl Table {
             }
         }
 
+        for old_policy in &self.policies {
+            if !to_table.policies.iter().any(|p| p.name == old_policy.name) {
+                let drop_cmd = format!(
+                    "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
+                    old_policy.name, self.schema, self.name
+                );
+                if use_drop {
+                    policy_drop_script.push_str(&drop_cmd);
+                } else {
+                    policy_drop_script.push_str(&format!("-- {}", drop_cmd));
+                }
+            }
+        }
+
+        if self.has_rowsecurity != to_table.has_rowsecurity {
+            let stmt = if to_table.has_rowsecurity {
+                format!(
+                    "alter table \"{}\".\"{}\" enable row level security;\n",
+                    self.schema, self.name
+                )
+            } else {
+                format!(
+                    "alter table \"{}\".\"{}\" disable row level security;\n",
+                    self.schema, self.name
+                )
+            };
+            row_security_script.push_str(&stmt);
+        }
+
         let mut script = String::new();
         script.push_str(&partition_script);
         script.push_str(&constraint_pre_script);
         script.push_str(&column_alter_script);
         script.push_str(&index_drop_script);
         script.push_str(&trigger_drop_script);
+        script.push_str(&policy_drop_script);
         script.push_str(&column_drop_script);
         script.push_str(&constraint_post_script);
         script.push_str(&index_script);
         script.push_str(&trigger_script);
 
+        // When enabling row security, PostgreSQL requires row security to be
+        // enabled before policies are created. Adjust the order accordingly.
+        if !self.has_rowsecurity && to_table.has_rowsecurity {
+            script.push_str(&row_security_script);
+            script.push_str(&policy_script);
+        } else {
+            script.push_str(&policy_script);
+            script.push_str(&row_security_script);
+        }
         script
     }
 }
@@ -1033,6 +1169,31 @@ mod tests {
         }
     }
 
+    fn policy(
+        name: &str,
+        command: &str,
+        using_clause: Option<&str>,
+        check_clause: Option<&str>,
+    ) -> TablePolicy {
+        TablePolicy {
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            name: name.to_string(),
+            command: command.to_string(),
+            permissive: true,
+            roles: vec!["public".to_string()],
+            using_clause: using_clause.map(|c| c.to_string()),
+            check_clause: check_clause.map(|c| c.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_escape_single_quotes() {
+        let input = "O'Reilly";
+        let escaped = super::escape_single_quotes(input);
+        assert_eq!(escaped, "O''Reilly");
+    }
+
     fn basic_table() -> Table {
         Table::new(
             "public".to_string(),
@@ -1080,6 +1241,24 @@ mod tests {
     }
 
     #[test]
+    fn test_table_hash_changes_with_policy() {
+        let mut table = basic_table();
+        table.hash();
+        let original_hash = table.hash.clone();
+
+        table.policies = vec![policy(
+            "users_rls",
+            "select",
+            Some("tenant_id = current_setting('app.current_tenant')::int"),
+            None,
+        )];
+        table.has_rowsecurity = true;
+        table.hash();
+
+        assert_ne!(original_hash, table.hash);
+    }
+
+    #[test]
     fn test_get_script_generates_full_definition() {
         let table = basic_table();
 
@@ -1097,6 +1276,24 @@ mod tests {
         );
 
         assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_script_includes_policies_and_row_security() {
+        let mut table = basic_table();
+        table.policies = vec![policy(
+            "users_tenant_select",
+            "select",
+            Some("tenant_id = current_setting('app.current_tenant')::int"),
+            None,
+        )];
+        table.has_rowsecurity = true;
+
+        let script = table.get_script();
+
+        assert!(script.contains("create policy \"users_tenant_select\""));
+        assert!(script.contains("for select"));
+        assert!(script.contains("enable row level security"));
     }
 
     #[test]
@@ -1239,6 +1436,30 @@ mod tests {
         assert!(script.contains("notify_user"));
 
         assert!(fk_script.contains("alter table \"public\".\"users\" alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
+    }
+
+    #[test]
+    fn test_get_alter_script_handles_policy_changes() {
+        let mut from_table = basic_table();
+        let mut to_table = basic_table();
+
+        to_table.policies = vec![policy(
+            "users_tenant_insert",
+            "insert",
+            None,
+            Some("tenant_id = current_setting('app.current_tenant')::int"),
+        )];
+        to_table.has_rowsecurity = true;
+
+        let add_script = from_table.get_alter_script(&to_table, true);
+        assert!(add_script.contains("create policy \"users_tenant_insert\""));
+        assert!(add_script.contains("enable row level security"));
+
+        from_table = to_table.clone();
+        let to_table_no_policy = basic_table();
+        let drop_script = from_table.get_alter_script(&to_table_no_policy, true);
+        assert!(drop_script.contains("drop policy if exists \"users_tenant_insert\""));
+        assert!(drop_script.contains("disable row level security"));
     }
 
     #[test]

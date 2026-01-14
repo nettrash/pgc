@@ -371,6 +371,13 @@ CREATE TABLE test_schema."table with spaces" (
     "column with spaces" TEXT
 );
 
+-- Row-level security (FROM: one policy, simple predicate)
+ALTER TABLE test_schema.users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_rls_select ON test_schema.users
+    FOR SELECT
+    TO public
+    USING ((metadata ->> 'tenant_id') = current_setting('app.current_tenant'));
+
 -- Complex Foreign Keys test
 CREATE TABLE test_schema.composite_pk (
     part_one INT,
