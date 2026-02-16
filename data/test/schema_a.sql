@@ -1,10 +1,20 @@
 -- Schema A: Complex PostgreSQL schema for testing database comparison
 -- This schema represents the "FROM" database in comparisons
 
--- Create schemas
 CREATE SCHEMA IF NOT EXISTS test_schema;
 CREATE SCHEMA IF NOT EXISTS shared_schema;
 
+-- Roles used for owner change comparison cases
+DO $$
+BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_from') THEN
+          CREATE ROLE pgc_owner_from;
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_to') THEN
+          CREATE ROLE pgc_owner_to;
+     END IF;
+END
+$$;
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
@@ -22,6 +32,8 @@ CREATE TYPE shared_schema.address_type AS (
 
 -- Composite type
 CREATE TYPE test_schema.user_profile AS (
+-- Owner change scenario (FROM -> TO): owner will differ in schema_b.sql
+ALTER TABLE test_schema.users OWNER TO pgc_owner_from;
     first_name VARCHAR(50),
     last_name VARCHAR(50),
     email VARCHAR(255),
@@ -44,6 +56,8 @@ CREATE SEQUENCE test_schema.order_id_seq
     INCREMENT BY 5
     MINVALUE 1
     MAXVALUE 2147483647
+-- Owner change scenario (FROM -> TO): owner will differ in schema_b.sql
+ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_from;
     CACHE 20;
 
 CREATE SEQUENCE shared_schema.global_counter_seq
@@ -505,4 +519,12 @@ AS $$
     FROM test_schema.products p
     WHERE p.id = p_product_id;
 $$;
+
+-- Owner change coverage (FROM side)
+ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
+ALTER EXTENSION "uuid-ossp" OWNER TO pgc_owner_from;
+ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
+ALTER DOMAIN test_schema.positive_integer OWNER TO pgc_owner_from;
+ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_from;
+ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_from;
 

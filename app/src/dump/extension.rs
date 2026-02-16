@@ -9,6 +9,9 @@ pub struct Extension {
     pub version: String,
     /// Schema where the extension is installed
     pub schema: String,
+    /// Owner of the extension
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 impl Extension {
@@ -18,6 +21,7 @@ impl Extension {
             name,
             version,
             schema,
+            owner: String::new(),
         }
     }
 
@@ -25,7 +29,7 @@ impl Extension {
     pub fn hash(&self) -> String {
         format!(
             "{:x}",
-            md5::compute(format!("{}.{}", self.schema, self.name))
+            md5::compute(format!("{}.{}.{}", self.schema, self.name, self.owner))
         )
     }
 
@@ -36,12 +40,24 @@ impl Extension {
             self.name, self.schema
         );
 
-        script
+        format!("{}{}", script, self.get_owner_script())
     }
 
     /// Returns a string to drop the extension.
     pub fn get_drop_script(&self) -> String {
         format!("drop extension if exists \"{}\";\n", self.name)
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "alter extension \"{}\" owner to \"{}\";\n",
+            self.name,
+            self.owner.replace('"', "\"\"")
+        )
     }
 }
 
@@ -333,9 +349,9 @@ mod tests {
     fn test_known_md5_hash() {
         let extension = Extension::new("test".to_string(), "1.0".to_string(), "public".to_string());
 
-        // The hash is computed from "public.test" (schema.name)
+        // The hash is computed from "public.test." (schema.name.owner)
         // We can verify this produces a consistent MD5 hash
-        let expected_hash = format!("{:x}", md5::compute("public.test"));
+        let expected_hash = format!("{:x}", md5::compute("public.test."));
         assert_eq!(extension.hash(), expected_hash);
     }
 

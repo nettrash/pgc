@@ -254,8 +254,13 @@ impl Comparer {
         // We will find all new schemas from "to" dump that are not in "from" dump
         // and add them to the script.
         for schema in &self.to.schemas {
-            if let Some(_from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
-                continue; // Schema is present in both dumps, we already processed it
+            if let Some(from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
+                if Self::hashes_differ(&from_schema.hash, &schema.hash) {
+                    self.script
+                        .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
+                    self.script
+                        .push_str(from_schema.get_alter_script(schema).as_str());
+                }
             } else {
                 self.script
                     .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
@@ -302,13 +307,18 @@ impl Comparer {
         // and add them to the script.
         // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
         for ext in &self.to.extensions {
-            if let Some(_from_ext) = self
+            if let Some(from_ext) = self
                 .from
                 .extensions
                 .iter()
                 .find(|r| r.name == ext.name && r.schema == ext.schema)
             {
-                continue; // Extension is present in both dumps, we already processed it
+                if from_ext.owner != ext.owner {
+                    self.script.push_str(
+                        format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
+                    );
+                    self.script.push_str(ext.get_owner_script().as_str());
+                }
             } else {
                 self.script
                     .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
@@ -1118,6 +1128,18 @@ impl Comparer {
                 .any(|view| view.schema == to_view.schema && view.name == to_view.name);
 
             if existed_in_from && !self.dropped_views.contains(&normalized_view) {
+                if let Some(from_view) = self
+                    .from
+                    .views
+                    .iter()
+                    .find(|view| view.schema == to_view.schema && view.name == to_view.name)
+                    && from_view.owner != to_view.owner
+                {
+                    self.script.push_str(
+                        format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str(),
+                    );
+                    self.script.push_str(&to_view.get_owner_script());
+                }
                 continue;
             }
 
@@ -1150,7 +1172,9 @@ impl Comparer {
 mod tests {
     use super::*;
     use crate::config::dump_config::DumpConfig;
+    use crate::dump::extension::Extension;
     use crate::dump::routine::Routine;
+    use crate::dump::schema::Schema;
     use sqlx::postgres::types::Oid;
 
     #[tokio::test]
@@ -1290,10 +1314,110 @@ mod tests {
         assert!(pos_plpgsql < pos_sql, "SQL routines should be applied last");
     }
 
+    #[tokio::test]
+    async fn compare_schemas_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("public".to_string(), None);
+        from_schema.owner = "old_owner".to_string();
+        from_schema.hash();
+
+        let mut to_schema = Schema::new("public".to_string(), None);
+        to_schema.owner = "new_owner".to_string();
+        to_schema.hash();
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_schemas().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter schema \"public\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn compare_extensions_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_ext = Extension::new(
+            "hstore".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+        from_ext.owner = "old_owner".to_string();
+
+        let mut to_ext = Extension::new(
+            "hstore".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+        to_ext.owner = "new_owner".to_string();
+
+        from_dump.extensions.push(from_ext);
+        to_dump.extensions.push(to_ext);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_extensions().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter extension \"hstore\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn compare_routines_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        from_routine.owner = "old_owner".to_string();
+        from_routine.hash();
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        to_routine.owner = "new_owner".to_string();
+        to_routine.hash();
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("alter function \"public\".\"test_func\"() owner to \"new_owner\";")
+        );
+    }
+
     use crate::dump::sequence::Sequence;
     use crate::dump::table::Table;
     use crate::dump::table_column::TableColumn;
     use crate::dump::table_constraint::TableConstraint;
+    use crate::dump::view::View;
 
     fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
         TableColumn {
@@ -1570,6 +1694,55 @@ mod tests {
 
         assert!(!script.contains("Skipping sequence"));
         assert!(script.contains("create sequence \"public\".\"test_seq\""));
+    }
+
+    #[tokio::test]
+    async fn compare_sequences_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_sequence = Sequence::new(
+            "public".to_string(),
+            "test_seq".to_string(),
+            "old_owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+
+        let to_sequence = Sequence::new(
+            "public".to_string(),
+            "test_seq".to_string(),
+            "new_owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+
+        from_dump.sequences.push(from_sequence);
+        to_dump.sequences.push(to_sequence);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter sequence \"public\".\"test_seq\" owner to \"new_owner\";"));
     }
 
     #[tokio::test]
@@ -1918,5 +2091,79 @@ mod tests {
             pos_fk > pos_parent && pos_fk > pos_orders,
             "foreign key should be created after tables"
         );
+    }
+
+    #[tokio::test]
+    async fn compare_tables_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "old_owner".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.hash();
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "new_owner".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.hash();
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_tables().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter table \"public\".\"users\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn create_views_emits_owner_change_for_existing_view() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "active_users".to_string(),
+            "select id from public.users".to_string(),
+            "public".to_string(),
+            vec!["public.users".to_string()],
+        );
+        from_view.owner = "old_owner".to_string();
+        from_view.hash();
+
+        let mut to_view = View::new(
+            "active_users".to_string(),
+            "select id from public.users".to_string(),
+            "public".to_string(),
+            vec!["public.users".to_string()],
+        );
+        to_view.owner = "new_owner".to_string();
+        to_view.hash();
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.create_views().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter view \"public\".\"active_users\" owner to \"new_owner\";"));
     }
 }
