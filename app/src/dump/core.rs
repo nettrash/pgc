@@ -206,7 +206,7 @@ impl Dump {
                  where
                     n.nspname like '{}'
                     and t.typtype = 'c'
-                          and c.relkind = 'c'
+                    and c.relkind = 'c'
                     and t.typisdefined = true
                     and a.attnum > 0
                     and a.attisdropped = false
