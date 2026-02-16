@@ -20,6 +20,9 @@ pub struct Routine {
     pub arguments: String,
     /// The default values for the arguments, formatted as a string.
     pub arguments_defaults: Option<String>,
+    /// The owner of the routine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
     /// Optional comment on the routine.
     #[serde(default)]
     pub comment: Option<String>,
@@ -53,6 +56,7 @@ impl Routine {
             return_type,
             arguments,
             arguments_defaults,
+            owner: String::new(),
             comment,
             source_code,
             hash: None,
@@ -64,13 +68,14 @@ impl Routine {
     /// Hash
     pub fn hash(&mut self) {
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
             self.kind,
             self.return_type,
             self.arguments,
+            self.owner,
             self.comment.clone().unwrap_or_default(),
             self.source_code
         );
@@ -129,6 +134,8 @@ impl Routine {
             ));
         }
 
+        script.push_str(&self.get_owner_script());
+
         script
     }
 
@@ -140,6 +147,27 @@ impl Routine {
             self.schema,
             self.name,
             self.arguments
+        )
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        let object_kind = if self.kind.eq_ignore_ascii_case("procedure") {
+            "procedure"
+        } else {
+            "function"
+        };
+
+        format!(
+            "alter {} \"{}\".\"{}\"({}) owner to \"{}\";\n",
+            object_kind,
+            self.schema,
+            self.name,
+            self.arguments,
+            self.owner.replace('"', "\"\"")
         )
     }
 
@@ -250,8 +278,8 @@ mod tests {
         assert_eq!(routine.source_code, source_code);
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}",
-            schema, name, lang, kind, return_type, arguments, "", source_code
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            schema, name, lang, kind, return_type, arguments, "", "", source_code
         );
         let expected_hash = format!("{:x}", md5::compute(expected_src));
         assert_eq!(routine.hash.as_ref(), Some(&expected_hash));
@@ -310,6 +338,16 @@ mod tests {
 
         let expected = "create or replace function \"public\".\"add\"(a integer) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n-- Defaults: DEFAULT 1\n";
         assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn get_script_includes_owner_when_present() {
+        let mut routine = build_function_routine();
+        routine.owner = "pgc_owner".to_string();
+        routine.hash();
+
+        let expected = "create or replace function \"public\".\"add\"(a integer) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n-- Defaults: DEFAULT 1\nalter function \"public\".\"add\"(a integer) owner to \"pgc_owner\";\n";
+        assert_eq!(routine.get_script(), expected);
     }
 
     #[test]

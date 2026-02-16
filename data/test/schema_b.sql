@@ -7,6 +7,18 @@ CREATE SCHEMA IF NOT EXISTS test_schema;
 CREATE SCHEMA IF NOT EXISTS shared_schema;
 CREATE SCHEMA IF NOT EXISTS new_reporting_schema;  -- NEW SCHEMA
 
+-- Roles used for owner change comparison cases
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_from') THEN
+        CREATE ROLE pgc_owner_from;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_to') THEN
+        CREATE ROLE pgc_owner_to;
+    END IF;
+END;
+$$;
+
 -- Extensions (modified list)
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 -- pgcrypto removed
@@ -15,7 +27,7 @@ CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA public;  -- NEW EXTENSION
 
 -- Custom types (some modified, some removed, some added)
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending', 'suspended');  -- MODIFIED: added 'suspended'
--- priority_type removed
+-- priority_type removed (FROM has routines depending on it; TO intentionally omits both type and those routines)
 CREATE TYPE shared_schema.address_type AS (
     street VARCHAR(255),
     city VARCHAR(100),
@@ -31,6 +43,12 @@ CREATE TYPE test_schema.user_profile AS (
     email VARCHAR(255),
     birth_date DATE,
     phone VARCHAR(20)  -- MODIFIED: added phone field
+);
+
+-- Composite type migration case (TO only): should be created when FROM lacks it
+CREATE TYPE test_schema.test_type_B AS (
+    street VARCHAR(255),
+    city VARCHAR(100)
 );
 
 -- New type
@@ -362,6 +380,8 @@ BEGIN
 END;
 $$;
 
+-- get_products_by_priority(test_schema.priority_type) intentionally removed with priority_type
+
 -- Function containing nested $$ to exercise custom dollar quoting (TO database variant of fn_dollar_from)
 CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
 RETURNS text
@@ -578,6 +598,12 @@ CREATE TABLE test_schema.composite_fk (
         REFERENCES test_schema.composite_pk (part_one, part_two) ON DELETE CASCADE
 );
 
+-- Named primary key fixture (TO side): table exists only in TO.
+CREATE TABLE test_schema.table1 (
+    id int4 NOT NULL,
+    CONSTRAINT pk_table1_id PRIMARY KEY (id)
+);
+
 -- Identity column test (New table in TO schema)
 CREATE SCHEMA IF NOT EXISTS data;
 
@@ -652,3 +678,12 @@ AS $$
     FROM test_schema.products p
     WHERE p.id = p_product_id;
 $$;
+
+-- Owner change coverage (TO side)
+ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
+ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;
+ALTER DOMAIN test_schema.positive_integer OWNER TO pgc_owner_to;
+ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_to;
+ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
+ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
+ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;

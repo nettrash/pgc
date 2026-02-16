@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct Schema {
     /// Name of the schema
     pub name: String,
+    /// Owner of the schema
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
     /// Optional comment on the schema
     #[serde(default)]
     pub comment: Option<String>,
@@ -20,18 +23,26 @@ fn escape_single_quotes(value: &str) -> String {
 impl Schema {
     /// Creates a new Schema with the given name
     pub fn new(name: String, comment: Option<String>) -> Self {
+        let mut schema = Self {
+            name,
+            owner: String::new(),
+            comment,
+            hash: None,
+        };
+        schema.hash();
+        schema
+    }
+
+    /// Computes schema hash.
+    pub fn hash(&mut self) {
         let mut hasher = md5::Context::new();
-        hasher.consume(name.as_bytes());
-        if let Some(ref c) = comment {
+        hasher.consume(self.name.as_bytes());
+        hasher.consume(self.owner.as_bytes());
+        if let Some(ref c) = self.comment {
             hasher.consume(c.as_bytes());
         }
 
-        let hash = Some(format!("{:x}", hasher.compute()));
-        Self {
-            name,
-            comment,
-            hash,
-        }
+        self.hash = Some(format!("{:x}", hasher.compute()));
     }
 
     /// Returns a string to create the schema.
@@ -44,6 +55,42 @@ impl Schema {
                 self.name,
                 escape_single_quotes(comment)
             ));
+        }
+
+        script.push_str(&self.get_owner_script());
+
+        script
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "alter schema \"{}\" owner to \"{}\";\n",
+            self.name,
+            self.owner.replace('"', "\"\"")
+        )
+    }
+
+    pub fn get_alter_script(&self, target: &Schema) -> String {
+        let mut script = String::new();
+
+        if self.comment != target.comment {
+            if let Some(comment) = &target.comment {
+                script.push_str(&format!(
+                    "comment on schema \"{}\" is '{}';\n",
+                    target.name,
+                    escape_single_quotes(comment)
+                ));
+            } else {
+                script.push_str(&format!("comment on schema \"{}\" is null;\n", target.name));
+            }
+        }
+
+        if self.owner != target.owner {
+            script.push_str(&target.get_owner_script());
         }
 
         script
@@ -65,6 +112,7 @@ mod tests {
         let schema = Schema::new(name.clone(), None);
 
         assert_eq!(schema.name, name);
+        assert_eq!(schema.owner, "");
         assert!(schema.hash.is_some());
         assert_eq!(
             schema.hash.unwrap(),
@@ -79,6 +127,18 @@ mod tests {
         assert_eq!(
             schema.get_script(),
             "create schema if not exists \"analytics\";\ncomment on schema \"analytics\" is 'reporting';\n"
+        );
+    }
+
+    #[test]
+    fn test_get_script_includes_owner_when_present() {
+        let mut schema = Schema::new("analytics".to_string(), None);
+        schema.owner = "pgc_owner".to_string();
+        schema.hash();
+
+        assert_eq!(
+            schema.get_script(),
+            "create schema if not exists \"analytics\";\nalter schema \"analytics\" owner to \"pgc_owner\";\n"
         );
     }
 

@@ -1,3 +1,11 @@
+2026-02-16      v1.0.5
+
+                Features:
+                    - Fixed support for change owner.
+                    - Fixed types drop, because of routine dependencies possible.
+                    - Fixed support of composite types.
+                    - Fixed primary key names.
+
 2026-01-14      v1.0.4
 
                 Features:

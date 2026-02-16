@@ -10,6 +10,10 @@ fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
@@ -451,6 +455,7 @@ impl Table {
         let mut hasher = Sha256::new();
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
+        hasher.update(self.owner.as_bytes());
         hasher.update(self.has_indexes.to_string().as_bytes());
         hasher.update(self.has_triggers.to_string().as_bytes());
         hasher.update(self.has_rules.to_string().as_bytes());
@@ -535,10 +540,14 @@ impl Table {
             }
 
             // 4. Add primary key constraint if exists
-            let has_pk_constraint = self
+            let pk_constraint = self
                 .constraints
                 .iter()
-                .any(|c| c.constraint_type.to_lowercase() == "primary key");
+                .find(|c| c.constraint_type.eq_ignore_ascii_case("primary key"));
+            let has_pk_constraint = pk_constraint.is_some();
+            let pk_constraint_name = pk_constraint
+                .map(|constraint| quote_ident(&constraint.name))
+                .unwrap_or_default();
 
             if has_pk_constraint {
                 let mut pk_added = false;
@@ -554,14 +563,26 @@ impl Table {
                                     .map(|c| c.trim().trim_matches('"'))
                                     .collect();
                                 if !pk_cols.is_empty() {
-                                    let pk_def = format!(
-                                        "    primary key ({})",
-                                        pk_cols
-                                            .iter()
-                                            .map(|c| format!("\"{c}\""))
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    );
+                                    let pk_def = if pk_constraint_name.is_empty() {
+                                        format!(
+                                            "    primary key ({})",
+                                            pk_cols
+                                                .iter()
+                                                .map(|c| format!("\"{c}\""))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )
+                                    } else {
+                                        format!(
+                                            "    constraint {} primary key ({})",
+                                            pk_constraint_name,
+                                            pk_cols
+                                                .iter()
+                                                .map(|c| format!("\"{c}\""))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )
+                                    };
                                     column_definitions.push(pk_def);
                                     pk_added = true;
                                 }
@@ -587,14 +608,26 @@ impl Table {
                         .map(|c| c.trim().trim_matches('"'))
                         .collect();
                     if !pk_cols.is_empty() {
-                        let pk_def = format!(
-                            "    primary key ({})",
-                            pk_cols
-                                .iter()
-                                .map(|c| format!("\"{c}\""))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
+                        let pk_def = if pk_constraint_name.is_empty() {
+                            format!(
+                                "    primary key ({})",
+                                pk_cols
+                                    .iter()
+                                    .map(|c| format!("\"{c}\""))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        } else {
+                            format!(
+                                "    constraint {} primary key ({})",
+                                pk_constraint_name,
+                                pk_cols
+                                    .iter()
+                                    .map(|c| format!("\"{c}\""))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
                         column_definitions.push(pk_def);
                     }
                 }
@@ -662,6 +695,8 @@ impl Table {
             }
         }
 
+        script.push_str(&self.get_owner_script());
+
         script
     }
 
@@ -689,6 +724,19 @@ impl Table {
         format!(
             "drop table if exists \"{}\".\"{}\";\n",
             self.schema, self.name
+        )
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "alter table \"{}\".\"{}\" owner to {};\n",
+            self.schema,
+            self.name,
+            quote_ident(&self.owner)
         )
     }
 
@@ -1048,6 +1096,11 @@ impl Table {
             script.push_str(&policy_script);
             script.push_str(&row_security_script);
         }
+
+        if self.owner != to_table.owner {
+            script.push_str(&to_table.get_owner_script());
+        }
+
         script
     }
 
@@ -1410,11 +1463,12 @@ mod tests {
             "create table \"public\".\"users\" (\n",
             "    \"id\" integer generated BY DEFAULT as identity not null,\n",
             "    \"name\" text not null,\n",
-            "    primary key (\"id\")\n",
+            "    constraint \"users_pkey\" primary key (\"id\")\n",
             ");\n\n",
             "alter table \"public\".\"users\" add constraint \"users_name_check\" check (name <> '') ;\n",
             "create index idx_users_name on public.users using btree (name);\n",
             "create trigger audit_user before insert on public.users for each row execute function log_user();\n",
+            "alter table \"public\".\"users\" owner to \"postgres\";\n",
         );
 
         assert_eq!(script, expected);

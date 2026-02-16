@@ -1,5 +1,5 @@
 use crate::dump::pg_enum::PgEnum;
-use crate::dump::pg_type::{DomainConstraint, PgType};
+use crate::dump::pg_type::{CompositeAttribute, DomainConstraint, PgType};
 use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
@@ -120,8 +120,11 @@ impl Dump {
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "select n.nspname as schema_name, d.description as schema_comment
+            "select n.nspname as schema_name,
+                    r.rolname as schema_owner,
+                    d.description as schema_comment
              from pg_namespace n
+             left join pg_roles r on r.oid = n.nspowner
              left join pg_description d on d.objoid = n.oid
                  and d.classoid = 'pg_namespace'::regclass
                  and d.objsubid = 0
@@ -142,8 +145,11 @@ impl Dump {
             println!("Schemas found:");
             for row in rows {
                 let schema = row.get("schema_name");
+                let owner: Option<String> = row.get("schema_owner");
                 let comment: Option<String> = row.get("schema_comment");
-                let sch = Schema::new(schema, comment);
+                let mut sch = Schema::new(schema, comment);
+                sch.owner = owner.unwrap_or_default();
+                sch.hash();
                 self.schemas.push(sch.clone());
                 println!(" - {}", sch.name);
             }
@@ -153,7 +159,7 @@ impl Dump {
 
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(format!("select n.nspname, e.* from pg_extension e join pg_namespace n on e.extnamespace = n.oid and (n.nspname like '{}' or n.nspname = 'public')", self.configuration.scheme).as_str())
+        let result = sqlx::query(format!("select n.nspname, e.*, r.rolname as extowner from pg_extension e join pg_namespace n on e.extnamespace = n.oid left join pg_roles r on r.oid = e.extowner where (n.nspname like '{}' or n.nspname = 'public')", self.configuration.scheme).as_str())
             .fetch_all(pool)
             .await;
         if result.is_err() {
@@ -173,6 +179,7 @@ impl Dump {
                     name: row.get("extname"),
                     version: row.get("extversion"),
                     schema: row.get("nspname"),
+                    owner: row.get::<Option<String>, _>("extowner").unwrap_or_default(),
                 };
                 self.extensions.push(ext.clone());
                 println!(
@@ -186,6 +193,45 @@ impl Dump {
 
     // Fetch types from the database and populate the dump.
     async fn get_types(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let composite_attributes_rows = sqlx::query(
+            format!(
+                "select
+                    t.oid as type_oid,
+                    a.attname,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type
+                 from pg_type t
+                 join pg_namespace n on t.typnamespace = n.oid
+                 join pg_class c on c.oid = t.typrelid
+                 join pg_attribute a on a.attrelid = c.oid
+                 where
+                    n.nspname like '{}'
+                    and t.typtype = 'c'
+                    and c.relkind = 'c'
+                    and t.typisdefined = true
+                    and a.attnum > 0
+                    and a.attisdropped = false
+                 order by t.oid, a.attnum",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch composite type attributes: {}.", e)))?;
+
+        let mut composite_attributes_map: HashMap<Oid, Vec<CompositeAttribute>> = HashMap::new();
+        for row in composite_attributes_rows {
+            let type_oid: Oid = row.get("type_oid");
+            let attribute = CompositeAttribute {
+                name: row.get("attname"),
+                data_type: row.get("data_type"),
+            };
+            composite_attributes_map
+                .entry(type_oid)
+                .or_default()
+                .push(attribute);
+        }
+
         let result = sqlx::query(
             format!(
                 "select 
@@ -194,6 +240,7 @@ impl Dump {
                 t.typname,
                 t.typnamespace,
                 t.typowner,
+                owner_role.rolname as typowner_name,
                 t.typlen,
                 t.typbyval,
                 t.typtype,
@@ -225,12 +272,17 @@ impl Dump {
             from 
                 pg_type t 
                 join pg_namespace n on t.typnamespace = n.oid 
+                left join pg_class c on c.oid = t.typrelid
+                left join pg_roles owner_role on owner_role.oid = t.typowner
                 left join pg_description d on d.objoid = t.oid
                     and d.classoid = 'pg_type'::regclass
                     and d.objsubid = 0
             where 
                 n.nspname like '{}' 
-                and t.typtype in ('d', 'e', 'r', 'm') 
+                and (
+                    t.typtype in ('d', 'e', 'r', 'm')
+                    or (t.typtype = 'c' and c.relkind = 'c')
+                )
                 and t.typisdefined = true",
                 self.configuration.scheme
             )
@@ -257,6 +309,9 @@ impl Dump {
                     typname: row.get("typname"),
                     typnamespace: row.get("typnamespace"),
                     typowner: row.get("typowner"),
+                    owner: row
+                        .get::<Option<String>, _>("typowner_name")
+                        .unwrap_or_default(),
                     typlen: row.get("typlen"),
                     typbyval: row.get("typbyval"),
                     typtype: row.get("typtype"),
@@ -287,6 +342,9 @@ impl Dump {
                     comment: row.get::<Option<String>, _>("comment"),
                     enum_labels: Vec::new(),
                     domain_constraints: Vec::new(),
+                    composite_attributes: composite_attributes_map
+                        .remove(&row.get::<Oid, _>("type_oid"))
+                        .unwrap_or_default(),
                     hash: None,
                 };
                 pgtype.hash();
@@ -512,12 +570,14 @@ impl Dump {
                     pg_get_function_result(r.oid) as prorettype,
                     pg_get_function_identity_arguments(r.oid) as proarguments,
                     pg_get_expr(r.proargdefaults, 0) as proargdefaults,
+                    owner_role.rolname as owner_name,
                     r.prosrc,
                     d.description as routine_comment
                 from
                     pg_proc r
                     join pg_namespace n on r.pronamespace = n.oid
                     join pg_language l on r.prolang = l.oid
+                    left join pg_roles owner_role on owner_role.oid = r.proowner
                     left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
                 where
                     n.nspname like '{}'
@@ -555,6 +615,9 @@ impl Dump {
                         .unwrap_or_else(|| "void".to_string()),
                     arguments: row.get("proarguments"),
                     arguments_defaults: row.get::<Option<String>, _>("proargdefaults"),
+                    owner: row
+                        .get::<Option<String>, _>("owner_name")
+                        .unwrap_or_default(),
                     comment: row.get("routine_comment"),
                     source_code: row.get("prosrc"),
                     hash: None,
@@ -651,15 +714,21 @@ impl Dump {
     async fn get_views(&mut self, pool: &PgPool) -> Result<(), Error> {
         let result = sqlx::query(
             format!(
-                "select v.table_schema, v.table_name, v.view_definition, array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation, d.description as view_comment
+                "select v.table_schema,
+                        v.table_name,
+                        v.view_definition,
+                        pv.viewowner as view_owner,
+                        array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
+                        d.description as view_comment
                 from information_schema.views v
                 join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
+                left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
                 left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
                 left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                 where
                     v.table_schema not in ('pg_catalog', 'information_schema')
                     and v.table_schema like '{}'
-                group by v.table_schema, v.table_name, v.view_definition, d.description;",
+                group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description;",
                 self.configuration.scheme
             )
             .as_str(),
@@ -684,6 +753,9 @@ impl Dump {
                     name: row.get("table_name"),
                     definition: row.get("view_definition"),
                     table_relation: row.get("table_relation"),
+                    owner: row
+                        .get::<Option<String>, _>("view_owner")
+                        .unwrap_or_default(),
                     comment: row.get("view_comment"),
                     hash: None,
                 };

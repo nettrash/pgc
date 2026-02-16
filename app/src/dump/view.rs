@@ -11,6 +11,9 @@ pub struct View {
     pub definition: String,
     /// Table relation (list of tables that used by this view)
     pub table_relation: Vec<String>,
+    /// Owner of the view
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
     /// Optional comment on the view
     #[serde(default)]
     pub comment: Option<String>,
@@ -32,6 +35,7 @@ impl View {
             name,
             definition,
             table_relation,
+            owner: String::new(),
             comment: None,
             hash: None,
         };
@@ -44,10 +48,11 @@ impl View {
         self.hash = Some(format!(
             "{:x}",
             md5::compute(format!(
-                "{}.{}.{}.{}",
+                "{}.{}.{}.{}.{}",
                 self.schema,
                 self.name,
                 self.definition,
+                self.owner,
                 self.comment.clone().unwrap_or_default()
             ))
         ));
@@ -60,7 +65,7 @@ impl View {
             self.schema, self.name, self.definition
         );
 
-        if let Some(comment) = &self.comment {
+        let mut script = if let Some(comment) = &self.comment {
             format!(
                 "{}comment on view \"{}\".\"{}\" is '{}';\n",
                 script,
@@ -70,7 +75,10 @@ impl View {
             )
         } else {
             script
-        }
+        };
+
+        script.push_str(&self.get_owner_script());
+        script
     }
 
     /// Returns a string to drop the view.
@@ -78,6 +86,19 @@ impl View {
         format!(
             "drop view if exists \"{}\".\"{}\";\n",
             self.schema, self.name
+        )
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "alter view \"{}\".\"{}\" owner to \"{}\";\n",
+            self.schema,
+            self.name,
+            self.owner.replace('"', "\"\"")
         )
     }
 
@@ -134,7 +155,7 @@ mod tests {
 
         let expected_hash = format!(
             "{:x}",
-            md5::compute(format!("analytics.active_users.{definition}."))
+            md5::compute(format!("analytics.active_users.{definition}.."))
         );
 
         assert_eq!(view.hash.as_deref(), Some(expected_hash.as_str()));
@@ -160,6 +181,18 @@ mod tests {
         assert_eq!(
             view.get_script(),
             "create view \"analytics\".\"active_users\" as\nselect id from public.users\n"
+        );
+    }
+
+    #[test]
+    fn test_get_script_includes_owner_when_present() {
+        let mut view = create_view("select id from public.users");
+        view.owner = "pgc_owner".to_string();
+        view.hash();
+
+        assert_eq!(
+            view.get_script(),
+            "create view \"analytics\".\"active_users\" as\nselect id from public.users\nalter view \"analytics\".\"active_users\" owner to \"pgc_owner\";\n"
         );
     }
 

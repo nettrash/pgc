@@ -1,10 +1,20 @@
 -- Schema A: Complex PostgreSQL schema for testing database comparison
 -- This schema represents the "FROM" database in comparisons
 
--- Create schemas
 CREATE SCHEMA IF NOT EXISTS test_schema;
 CREATE SCHEMA IF NOT EXISTS shared_schema;
 
+-- Roles used for owner change comparison cases
+DO $$
+BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_from') THEN
+          CREATE ROLE pgc_owner_from;
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_to') THEN
+          CREATE ROLE pgc_owner_to;
+     END IF;
+END;
+$$;
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
@@ -26,6 +36,12 @@ CREATE TYPE test_schema.user_profile AS (
     last_name VARCHAR(50),
     email VARCHAR(255),
     birth_date DATE
+);
+
+-- Composite type migration case (FROM only): should be dropped when TO lacks it
+CREATE TYPE test_schema.test_type_A AS (
+    first_name_2 VARCHAR(50),
+    last_name_2 VARCHAR(50)
 );
 
 -- Domain type
@@ -317,6 +333,19 @@ BEGIN
 END;
 $$;
 
+-- FROM-only routine depending on FROM-only type (priority_type)
+CREATE OR REPLACE FUNCTION test_schema.get_products_by_priority(p_priority test_schema.priority_type)
+RETURNS TABLE(product_id uuid, product_name varchar)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT p.id, p.name
+    FROM test_schema.products p
+    WHERE p.priority = p_priority;
+END;
+$$;
+
 -- Function containing nested $$ to exercise custom dollar quoting
 CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
 RETURNS text
@@ -425,6 +454,7 @@ COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer with no uppe
 COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 1000 (FROM)';
 COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with basic stock buckets (FROM)';
 COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users filtered by status (FROM)';
+COMMENT ON FUNCTION test_schema.get_products_by_priority(test_schema.priority_type) IS 'FROM-only routine using FROM-only type to validate drop order';
 
 -- Special characters test
 CREATE TABLE test_schema."special$table" (
@@ -471,6 +501,9 @@ CREATE TABLE test_schema.composite_fk (
         REFERENCES test_schema.composite_pk (part_one, part_two)
 );
 
+-- Named primary key fixture (FROM side): table intentionally absent.
+-- TO defines test_schema.table1 with CONSTRAINT pk_table1_id PRIMARY KEY (id).
+
 -- Identity column test (Schema exists, table missing)
 CREATE SCHEMA IF NOT EXISTS data;
 
@@ -505,4 +538,13 @@ AS $$
     FROM test_schema.products p
     WHERE p.id = p_product_id;
 $$;
+
+-- Owner change coverage (FROM side)
+ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
+ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
+ALTER DOMAIN test_schema.positive_integer OWNER TO pgc_owner_from;
+ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_from;
+ALTER TABLE test_schema.users OWNER TO pgc_owner_from;
+ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_from;
+ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_from;
 

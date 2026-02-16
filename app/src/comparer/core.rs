@@ -78,6 +78,11 @@ impl Comparer {
         self.drop_views().await?;
         self.compare_tables().await?;
         self.compare_foreign_keys().await?;
+        if !self.sequence_post_script.is_empty() {
+            self.script.push_str(&self.sequence_post_script);
+            self.sequence_post_script.clear();
+        }
+        self.compare_routines().await?;
         if !self.type_post_script.is_empty() {
             self.script.push_str(&self.type_post_script);
             self.type_post_script.clear();
@@ -86,11 +91,6 @@ impl Comparer {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        if !self.sequence_post_script.is_empty() {
-            self.script.push_str(&self.sequence_post_script);
-            self.sequence_post_script.clear();
-        }
-        self.compare_routines().await?;
         self.create_views().await?;
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
@@ -254,8 +254,13 @@ impl Comparer {
         // We will find all new schemas from "to" dump that are not in "from" dump
         // and add them to the script.
         for schema in &self.to.schemas {
-            if let Some(_from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
-                continue; // Schema is present in both dumps, we already processed it
+            if let Some(from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
+                if Self::hashes_differ(&from_schema.hash, &schema.hash) {
+                    self.script
+                        .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
+                    self.script
+                        .push_str(from_schema.get_alter_script(schema).as_str());
+                }
             } else {
                 self.script
                     .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
@@ -302,13 +307,24 @@ impl Comparer {
         // and add them to the script.
         // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
         for ext in &self.to.extensions {
-            if let Some(_from_ext) = self
+            if let Some(from_ext) = self
                 .from
                 .extensions
                 .iter()
                 .find(|r| r.name == ext.name && r.schema == ext.schema)
             {
-                continue; // Extension is present in both dumps, we already processed it
+                if from_ext.owner != ext.owner {
+                    self.script.push_str(
+                        format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
+                    );
+                    self.script.push_str(
+                        format!(
+                            "-- Extension owner change is not supported by PostgreSQL ALTER EXTENSION syntax ({} -> {}).\n",
+                            from_ext.owner, ext.owner
+                        )
+                        .as_str(),
+                    );
+                }
             } else {
                 self.script
                     .push_str(format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str());
@@ -405,7 +421,7 @@ impl Comparer {
 
                 if drop_section.is_empty() {
                     drop_section.push_str(
-                        "\n/* ---> Types: Drop section (execute after dependent tables) --------------- */\n\n",
+                        "\n/* ---> Types: Drop section (execute after dependent objects, including routines) --------------- */\n\n",
                     );
                 }
 
@@ -519,7 +535,7 @@ impl Comparer {
 
                 if drop_section.is_empty() {
                     drop_section.push_str(
-                        "\n/* ---> Enums: Drop section (execute after dependent types) --------------- */\n\n",
+                        "\n/* ---> Enums: Drop section (execute after dependent objects, including types and routines) --------------- */\n\n",
                     );
                 }
                 drop_section.push_str(
@@ -1118,6 +1134,18 @@ impl Comparer {
                 .any(|view| view.schema == to_view.schema && view.name == to_view.name);
 
             if existed_in_from && !self.dropped_views.contains(&normalized_view) {
+                if let Some(from_view) = self
+                    .from
+                    .views
+                    .iter()
+                    .find(|view| view.schema == to_view.schema && view.name == to_view.name)
+                    && from_view.owner != to_view.owner
+                {
+                    self.script.push_str(
+                        format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str(),
+                    );
+                    self.script.push_str(&to_view.get_owner_script());
+                }
                 continue;
             }
 
@@ -1150,8 +1178,91 @@ impl Comparer {
 mod tests {
     use super::*;
     use crate::config::dump_config::DumpConfig;
+    use crate::dump::extension::Extension;
+    use crate::dump::pg_type::{CompositeAttribute, PgType};
     use crate::dump::routine::Routine;
+    use crate::dump::schema::Schema;
     use sqlx::postgres::types::Oid;
+
+    fn make_domain_type(schema: &str, name: &str, oid: u32) -> PgType {
+        PgType::new(
+            Oid(oid),
+            schema.to_string(),
+            name.to_string(),
+            Oid(2200),
+            Oid(10),
+            "postgres".to_string(),
+            -1,
+            false,
+            'd' as i8,
+            'U' as i8,
+            false,
+            true,
+            ',' as i8,
+            None,
+            None,
+            None,
+            None,
+            "domain_in".to_string(),
+            "domain_out".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            'i' as i8,
+            'x' as i8,
+            false,
+            Some(Oid(25)),
+            None,
+            0,
+            None,
+            None,
+            Some("text".to_string()),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn make_enum_type(schema: &str, name: &str, oid: u32, labels: Vec<&str>) -> PgType {
+        let mut enum_type = make_domain_type(schema, name, oid);
+        enum_type.typtype = 'e' as i8;
+        enum_type.typcategory = 'E' as i8;
+        enum_type.typinput = "enum_in".to_string();
+        enum_type.typoutput = "enum_out".to_string();
+        enum_type.typbasetype = None;
+        enum_type.formatted_basetype = None;
+        enum_type.enum_labels = labels.into_iter().map(|label| label.to_string()).collect();
+        enum_type.domain_constraints.clear();
+        enum_type.hash();
+        enum_type
+    }
+
+    fn make_composite_type(
+        schema: &str,
+        name: &str,
+        oid: u32,
+        attributes: Vec<(&str, &str)>,
+    ) -> PgType {
+        let mut composite_type = make_domain_type(schema, name, oid);
+        composite_type.typtype = 'c' as i8;
+        composite_type.typcategory = 'C' as i8;
+        composite_type.typinput = "record_in".to_string();
+        composite_type.typoutput = "record_out".to_string();
+        composite_type.typbasetype = None;
+        composite_type.formatted_basetype = None;
+        composite_type.domain_constraints.clear();
+        composite_type.composite_attributes = attributes
+            .into_iter()
+            .map(|(attribute_name, data_type)| CompositeAttribute {
+                name: attribute_name.to_string(),
+                data_type: data_type.to_string(),
+            })
+            .collect();
+        composite_type.hash();
+        composite_type
+    }
 
     #[tokio::test]
     async fn compare_routines_drops_and_recreates_on_return_type_change() {
@@ -1290,10 +1401,226 @@ mod tests {
         assert!(pos_plpgsql < pos_sql, "SQL routines should be applied last");
     }
 
+    #[tokio::test]
+    async fn compare_drops_types_after_routines() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let dropped_type = make_domain_type("test_schema", "status_type", 501);
+        from_dump.types.push(dropped_type);
+
+        let dropped_routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "get_users_by_status".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "status test_schema.status_type".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        from_dump.routines.push(dropped_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let routine_drop_pos = script
+            .find("drop function if exists \"test_schema\".\"get_users_by_status\"")
+            .expect("routine drop script not found");
+        let type_drop_pos = script
+            .find("drop type if exists \"test_schema\".\"status_type\";")
+            .expect("type drop script not found");
+
+        assert!(
+            routine_drop_pos < type_drop_pos,
+            "Type drops must be emitted after routine drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_drops_enums_after_routines() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let dropped_enum = make_enum_type(
+            "test_schema",
+            "status_enum",
+            502,
+            vec!["active", "inactive"],
+        );
+        from_dump.types.push(dropped_enum);
+
+        let dropped_routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "get_users_by_status_enum".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "status test_schema.status_enum".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        from_dump.routines.push(dropped_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let routine_drop_pos = script
+            .find("drop function if exists \"test_schema\".\"get_users_by_status_enum\"")
+            .expect("routine drop script not found");
+        let enum_drop_pos = script
+            .find("drop type if exists \"test_schema\".\"status_enum\";")
+            .expect("enum drop script not found");
+
+        assert!(
+            routine_drop_pos < enum_drop_pos,
+            "Enum drops must be emitted after routine drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_composite_types_drops_removed_and_creates_new() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        from_dump.types.push(make_composite_type(
+            "test_schema",
+            "test_type_A",
+            601,
+            vec![
+                ("first_name_2", "varchar(50)"),
+                ("last_name_2", "varchar(50)"),
+            ],
+        ));
+        to_dump.types.push(make_composite_type(
+            "test_schema",
+            "test_type_B",
+            602,
+            vec![("street", "varchar(255)"), ("city", "varchar(100)")],
+        ));
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("create type \"test_schema\".\"test_type_B\" as ("));
+        assert!(script.contains("\"street\" varchar(255)"));
+        assert!(script.contains("\"city\" varchar(100)"));
+        assert!(script.contains("drop type if exists \"test_schema\".\"test_type_A\";"));
+    }
+
+    #[tokio::test]
+    async fn compare_schemas_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("public".to_string(), None);
+        from_schema.owner = "old_owner".to_string();
+        from_schema.hash();
+
+        let mut to_schema = Schema::new("public".to_string(), None);
+        to_schema.owner = "new_owner".to_string();
+        to_schema.hash();
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_schemas().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter schema \"public\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn compare_extensions_notes_owner_change_as_unsupported() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_ext = Extension::new(
+            "hstore".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+        from_ext.owner = "old_owner".to_string();
+
+        let mut to_ext = Extension::new(
+            "hstore".to_string(),
+            "1.0".to_string(),
+            "public".to_string(),
+        );
+        to_ext.owner = "new_owner".to_string();
+
+        from_dump.extensions.push(from_ext);
+        to_dump.extensions.push(to_ext);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_extensions().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains(
+            "-- Extension owner change is not supported by PostgreSQL ALTER EXTENSION syntax (old_owner -> new_owner)."
+        ));
+    }
+
+    #[tokio::test]
+    async fn compare_routines_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        from_routine.owner = "old_owner".to_string();
+        from_routine.hash();
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "test_func".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        to_routine.owner = "new_owner".to_string();
+        to_routine.hash();
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("alter function \"public\".\"test_func\"() owner to \"new_owner\";")
+        );
+    }
+
     use crate::dump::sequence::Sequence;
     use crate::dump::table::Table;
     use crate::dump::table_column::TableColumn;
     use crate::dump::table_constraint::TableConstraint;
+    use crate::dump::view::View;
 
     fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
         TableColumn {
@@ -1570,6 +1897,55 @@ mod tests {
 
         assert!(!script.contains("Skipping sequence"));
         assert!(script.contains("create sequence \"public\".\"test_seq\""));
+    }
+
+    #[tokio::test]
+    async fn compare_sequences_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_sequence = Sequence::new(
+            "public".to_string(),
+            "test_seq".to_string(),
+            "old_owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+
+        let to_sequence = Sequence::new(
+            "public".to_string(),
+            "test_seq".to_string(),
+            "new_owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(1000),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+
+        from_dump.sequences.push(from_sequence);
+        to_dump.sequences.push(to_sequence);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter sequence \"public\".\"test_seq\" owner to \"new_owner\";"));
     }
 
     #[tokio::test]
@@ -1918,5 +2294,79 @@ mod tests {
             pos_fk > pos_parent && pos_fk > pos_orders,
             "foreign key should be created after tables"
         );
+    }
+
+    #[tokio::test]
+    async fn compare_tables_emits_owner_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "old_owner".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.hash();
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "new_owner".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.hash();
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_tables().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter table \"public\".\"users\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn create_views_emits_owner_change_for_existing_view() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "active_users".to_string(),
+            "select id from public.users".to_string(),
+            "public".to_string(),
+            vec!["public.users".to_string()],
+        );
+        from_view.owner = "old_owner".to_string();
+        from_view.hash();
+
+        let mut to_view = View::new(
+            "active_users".to_string(),
+            "select id from public.users".to_string(),
+            "public".to_string(),
+            vec!["public.users".to_string()],
+        );
+        to_view.owner = "new_owner".to_string();
+        to_view.hash();
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.create_views().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("alter view \"public\".\"active_users\" owner to \"new_owner\";"));
     }
 }

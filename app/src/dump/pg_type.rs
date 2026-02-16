@@ -9,6 +9,12 @@ pub struct DomainConstraint {
     pub definition: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompositeAttribute {
+    pub name: String,
+    pub data_type: String,
+}
+
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -20,46 +26,50 @@ fn escape_single_quotes(value: &str) -> String {
 // This is an information about a PostgreSQL type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PgType {
-    pub oid: Oid,                     // Unique identifier of the type
-    pub schema: String,               // Schema where the type is defined
-    pub typname: String,              // Name of the type
-    pub typnamespace: Oid,            // Schema where the type is defined
-    pub typowner: Oid,                // Owner of the type
-    pub typlen: i16,                  // Length of the type in bytes
-    pub typbyval: bool,               // Whether the type is passed by value
-    pub typtype: i8,                  // Type of the type (e.g., base, composite, domain)
-    pub typcategory: i8,              // Category of the type (e.g., numeric, string)
-    pub typispreferred: bool,         // Whether the type is preferred for implicit casts
-    pub typisdefined: bool,           // Whether the type is defined
-    pub typdelim: i8,                 // Delimiter for array types
-    pub typrelid: Option<Oid>,        // Type of the type if it is a domain
+    pub oid: Oid,          // Unique identifier of the type
+    pub schema: String,    // Schema where the type is defined
+    pub typname: String,   // Name of the type
+    pub typnamespace: Oid, // Schema where the type is defined
+    pub typowner: Oid,     // Owner of the type
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String, // Owner role name of the type
+    pub typlen: i16,       // Length of the type in bytes
+    pub typbyval: bool,    // Whether the type is passed by value
+    pub typtype: i8,       // Type of the type (e.g., base, composite, domain)
+    pub typcategory: i8,   // Category of the type (e.g., numeric, string)
+    pub typispreferred: bool, // Whether the type is preferred for implicit casts
+    pub typisdefined: bool, // Whether the type is defined
+    pub typdelim: i8,      // Delimiter for array types
+    pub typrelid: Option<Oid>, // Type of the type if it is a domain
     pub typsubscript: Option<String>, // Subscript type if it is an array
-    pub typelem: Option<Oid>,         // Element type if it is an array
-    pub typarray: Option<Oid>,        // Array type if it is an array
-    pub typinput: String,             // Input function for the type
-    pub typoutput: String,            // Output function for the type
-    pub typreceive: Option<String>,   // Receive function for the type
-    pub typsend: Option<String>,      // Send function for the type
-    pub typmodin: Option<String>,     // Type modifier input function
-    pub typmodout: Option<String>,    // Type modifier output function
-    pub typanalyze: Option<String>,   // Analyze function for the type
-    pub typalign: i8,                 // Alignment of the type (e.g., char, int, double)
-    pub typstorage: i8,               // Storage type of the type (e.g., plain, extended)
-    pub typnotnull: bool,             // Whether the type is not null
-    pub typbasetype: Option<Oid>,     // Base type if it is a domain
-    pub typtypmod: Option<i32>,       // Type modifier for the type
-    pub typndims: i32,                // Number of dimensions if it is an array
-    pub typcollation: Option<Oid>,    // Collation for the type
-    pub typdefault: Option<String>,   // Default value for the type
+    pub typelem: Option<Oid>, // Element type if it is an array
+    pub typarray: Option<Oid>, // Array type if it is an array
+    pub typinput: String,  // Input function for the type
+    pub typoutput: String, // Output function for the type
+    pub typreceive: Option<String>, // Receive function for the type
+    pub typsend: Option<String>, // Send function for the type
+    pub typmodin: Option<String>, // Type modifier input function
+    pub typmodout: Option<String>, // Type modifier output function
+    pub typanalyze: Option<String>, // Analyze function for the type
+    pub typalign: i8,      // Alignment of the type (e.g., char, int, double)
+    pub typstorage: i8,    // Storage type of the type (e.g., plain, extended)
+    pub typnotnull: bool,  // Whether the type is not null
+    pub typbasetype: Option<Oid>, // Base type if it is a domain
+    pub typtypmod: Option<i32>, // Type modifier for the type
+    pub typndims: i32,     // Number of dimensions if it is an array
+    pub typcollation: Option<Oid>, // Collation for the type
+    pub typdefault: Option<String>, // Default value for the type
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formatted_basetype: Option<String>, // Human-readable base type (for domains)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enum_labels: Vec<String>, // Enum labels ordered by sort order
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_constraints: Vec<DomainConstraint>, // Domain constraints (check, etc.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub composite_attributes: Vec<CompositeAttribute>, // Composite type attributes ordered by attnum
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>, // Optional comment on the type
-    pub hash: Option<String>,         // SHA256 hash of the type definition
+    pub hash: Option<String>, // SHA256 hash of the type definition
 }
 
 impl PgType {
@@ -71,6 +81,7 @@ impl PgType {
         typname: String,
         typnamespace: Oid,
         typowner: Oid,
+        owner: String,
         typlen: i16,
         typbyval: bool,
         typtype: i8,
@@ -108,6 +119,7 @@ impl PgType {
             typname,
             typnamespace,
             typowner,
+            owner,
             typlen,
             typbyval,
             typtype,
@@ -137,6 +149,7 @@ impl PgType {
             formatted_basetype,
             enum_labels,
             domain_constraints,
+            composite_attributes: Vec::new(),
             comment,
             hash: None,
         };
@@ -155,6 +168,7 @@ impl PgType {
         hasher.update(self.typname.as_bytes());
         hasher.update(self.typnamespace.0.to_be_bytes());
         hasher.update(self.typowner.0.to_be_bytes());
+        hasher.update(self.owner.as_bytes());
         hasher.update(self.typlen.to_be_bytes());
         hasher.update([self.typbyval as u8]);
         hasher.update(self.typtype.to_be_bytes());
@@ -229,6 +243,14 @@ impl PgType {
             hasher.update(constraint.definition.as_bytes());
         }
 
+        hasher.update((self.composite_attributes.len() as u32).to_be_bytes());
+        for attribute in &self.composite_attributes {
+            hasher.update((attribute.name.len() as u32).to_be_bytes());
+            hasher.update(attribute.name.as_bytes());
+            hasher.update((attribute.data_type.len() as u32).to_be_bytes());
+            hasher.update(attribute.data_type.as_bytes());
+        }
+
         if let Some(comment) = &self.comment {
             hasher.update((comment.len() as u32).to_be_bytes());
             hasher.update(comment.as_bytes());
@@ -268,6 +290,8 @@ impl PgType {
                         escape_single_quotes(comment)
                     ));
                 }
+
+                script.push_str(&self.get_owner_script());
 
                 script
             }
@@ -315,6 +339,47 @@ impl PgType {
                         escape_single_quotes(comment)
                     ));
                 }
+
+                script.push_str(&self.get_owner_script());
+
+                script
+            }
+            'c' => {
+                if self.composite_attributes.is_empty() {
+                    return format!(
+                        "-- Composite type {}.{} has no attributes available in dump\n",
+                        self.schema, self.typname
+                    );
+                }
+
+                let attributes = self
+                    .composite_attributes
+                    .iter()
+                    .map(|attribute| {
+                        format!(
+                            "    \"{}\" {}",
+                            attribute.name.replace('"', "\"\""),
+                            attribute.data_type
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",\n");
+
+                let mut script = format!(
+                    "create type \"{}\".\"{}\" as (\n{}\n);\n",
+                    self.schema, self.typname, attributes
+                );
+
+                if let Some(comment) = &self.comment {
+                    script.push_str(&format!(
+                        "comment on type \"{}\".\"{}\" is '{}';\n",
+                        self.schema,
+                        self.typname,
+                        escape_single_quotes(comment)
+                    ));
+                }
+
+                script.push_str(&self.get_owner_script());
 
                 script
             }
@@ -561,7 +626,31 @@ impl PgType {
             script.push_str(&comment_stmt);
         }
 
+        if self.owner != target.owner {
+            script.push_str(&target.get_owner_script());
+        }
+
         script
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        let object_keyword = if (self.typtype as u8 as char) == 'd' {
+            "domain"
+        } else {
+            "type"
+        };
+
+        format!(
+            "alter {} \"{}\".\"{}\" owner to \"{}\";\n",
+            object_keyword,
+            self.schema,
+            self.typname,
+            self.owner.replace('"', "\"\"")
+        )
     }
 }
 
@@ -589,6 +678,7 @@ mod tests {
             typname: "my_type".to_string(),
             typnamespace: Oid(2200),
             typowner: Oid(10),
+            owner: String::new(),
             typlen: -1,
             typbyval: false,
             typtype: typtype as i8,
@@ -618,6 +708,7 @@ mod tests {
             formatted_basetype: None,
             enum_labels: Vec::new(),
             domain_constraints: Vec::new(),
+            composite_attributes: Vec::new(),
             comment: None,
             hash: None,
         }
@@ -771,6 +862,27 @@ alter domain \"public\".\"amount\" add constraint \"FreshConstraint\" check (val
     }
 
     #[test]
+    fn composite_get_script_generates_create_statement() {
+        let mut pg_type = base_pg_type('c');
+        pg_type.typname = "address_type".to_string();
+        pg_type.composite_attributes = vec![
+            CompositeAttribute {
+                name: "street".to_string(),
+                data_type: "varchar(255)".to_string(),
+            },
+            CompositeAttribute {
+                name: "city".to_string(),
+                data_type: "varchar(100)".to_string(),
+            },
+        ];
+
+        let script = pg_type.get_script();
+
+        let expected = "create type \"public\".\"address_type\" as (\n    \"street\" varchar(255),\n    \"city\" varchar(100)\n);\n";
+        assert_eq!(script, expected);
+    }
+
+    #[test]
     fn get_drop_script_returns_drop_statement() {
         let pg_type = base_pg_type('e');
 
@@ -778,5 +890,20 @@ alter domain \"public\".\"amount\" add constraint \"FreshConstraint\" check (val
             pg_type.get_drop_script(),
             "drop type if exists \"public\".\"my_type\";\n"
         );
+    }
+
+    #[test]
+    fn get_alter_script_includes_owner_change() {
+        let mut current = base_pg_type('e');
+        current.typname = "status".to_string();
+        current.enum_labels = vec!["pending".to_string()];
+        current.owner = "old_owner".to_string();
+
+        let mut target = current.clone();
+        target.owner = "new_owner".to_string();
+
+        let script = current.get_alter_script(&target);
+
+        assert!(script.contains("alter type \"public\".\"status\" owner to \"new_owner\";"));
     }
 }
