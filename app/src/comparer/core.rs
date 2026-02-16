@@ -1225,6 +1225,20 @@ mod tests {
         )
     }
 
+    fn make_enum_type(schema: &str, name: &str, oid: u32, labels: Vec<&str>) -> PgType {
+        let mut enum_type = make_domain_type(schema, name, oid);
+        enum_type.typtype = 'e' as i8;
+        enum_type.typcategory = 'E' as i8;
+        enum_type.typinput = "enum_in".to_string();
+        enum_type.typoutput = "enum_out".to_string();
+        enum_type.typbasetype = None;
+        enum_type.formatted_basetype = None;
+        enum_type.enum_labels = labels.into_iter().map(|label| label.to_string()).collect();
+        enum_type.domain_constraints.clear();
+        enum_type.hash();
+        enum_type
+    }
+
     #[tokio::test]
     async fn compare_routines_drops_and_recreates_on_return_type_change() {
         let mut from_dump = Dump::new(DumpConfig::default());
@@ -1398,6 +1412,45 @@ mod tests {
         assert!(
             routine_drop_pos < type_drop_pos,
             "Type drops must be emitted after routine drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_drops_enums_after_routines() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let dropped_enum = make_enum_type("test_schema", "status_enum", 502, vec!["active", "inactive"]);
+        from_dump.types.push(dropped_enum);
+
+        let dropped_routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "get_users_by_status_enum".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "status test_schema.status_enum".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        from_dump.routines.push(dropped_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let routine_drop_pos = script
+            .find("drop function if exists \"test_schema\".\"get_users_by_status_enum\"")
+            .expect("routine drop script not found");
+        let enum_drop_pos = script
+            .find("drop type if exists \"test_schema\".\"status_enum\";")
+            .expect("enum drop script not found");
+
+        assert!(
+            routine_drop_pos < enum_drop_pos,
+            "Enum drops must be emitted after routine drops"
         );
     }
 
