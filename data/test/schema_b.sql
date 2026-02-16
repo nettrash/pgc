@@ -59,9 +59,6 @@ CREATE SEQUENCE test_schema.user_id_seq
     MAXVALUE 9223372036854775807
     CACHE 10;
 
--- Owner change scenario (FROM -> TO): differs from schema_a.sql
-ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_to;
-
 -- order_id_seq removed
 
 CREATE SEQUENCE shared_schema.global_counter_seq
@@ -100,9 +97,6 @@ CREATE TABLE test_schema.users (
     two_factor_enabled BOOLEAN DEFAULT FALSE
     -- last_login removed in modified version
 );
-
--- Owner change scenario (FROM -> TO): differs from schema_a.sql
-ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
 
 CREATE TABLE test_schema.categories (
     id SERIAL PRIMARY KEY,
@@ -673,8 +667,9 @@ $$;
 
 -- Owner change coverage (TO side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
-ALTER EXTENSION "uuid-ossp" OWNER TO pgc_owner_to;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;
 ALTER DOMAIN test_schema.positive_integer OWNER TO pgc_owner_to;
+ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_to;
+ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
 ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;

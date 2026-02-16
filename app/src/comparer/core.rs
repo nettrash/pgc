@@ -317,7 +317,13 @@ impl Comparer {
                     self.script.push_str(
                         format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
                     );
-                    self.script.push_str(ext.get_owner_script().as_str());
+                    self.script.push_str(
+                        format!(
+                            "-- Extension owner change is not supported by PostgreSQL ALTER EXTENSION syntax ({} -> {}).\n",
+                            from_ext.owner, ext.owner
+                        )
+                        .as_str(),
+                    );
                 }
             } else {
                 self.script
@@ -1338,7 +1344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compare_extensions_emits_owner_change() {
+    async fn compare_extensions_notes_owner_change_as_unsupported() {
         let mut from_dump = Dump::new(DumpConfig::default());
         let mut to_dump = Dump::new(DumpConfig::default());
 
@@ -1363,7 +1369,9 @@ mod tests {
         comparer.compare_extensions().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter extension \"hstore\" owner to \"new_owner\";"));
+        assert!(script.contains(
+            "-- Extension owner change is not supported by PostgreSQL ALTER EXTENSION syntax (old_owner -> new_owner)."
+        ));
     }
 
     #[tokio::test]

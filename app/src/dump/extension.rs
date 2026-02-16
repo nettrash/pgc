@@ -35,29 +35,15 @@ impl Extension {
 
     /// Returns a string to create the extension.
     pub fn get_script(&self) -> String {
-        let script = format!(
+        format!(
             "create extension if not exists \"{}\" with schema \"{}\";\n",
             self.name, self.schema
-        );
-
-        format!("{}{}", script, self.get_owner_script())
+        )
     }
 
     /// Returns a string to drop the extension.
     pub fn get_drop_script(&self) -> String {
         format!("drop extension if exists \"{}\";\n", self.name)
-    }
-
-    pub fn get_owner_script(&self) -> String {
-        if self.owner.is_empty() {
-            return String::new();
-        }
-
-        format!(
-            "alter extension \"{}\" owner to \"{}\";\n",
-            self.name,
-            self.owner.replace('"', "\"\"")
-        )
     }
 }
 
