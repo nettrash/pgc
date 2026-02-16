@@ -1179,7 +1179,7 @@ mod tests {
     use super::*;
     use crate::config::dump_config::DumpConfig;
     use crate::dump::extension::Extension;
-    use crate::dump::pg_type::PgType;
+    use crate::dump::pg_type::{CompositeAttribute, PgType};
     use crate::dump::routine::Routine;
     use crate::dump::schema::Schema;
     use sqlx::postgres::types::Oid;
@@ -1237,6 +1237,31 @@ mod tests {
         enum_type.domain_constraints.clear();
         enum_type.hash();
         enum_type
+    }
+
+    fn make_composite_type(
+        schema: &str,
+        name: &str,
+        oid: u32,
+        attributes: Vec<(&str, &str)>,
+    ) -> PgType {
+        let mut composite_type = make_domain_type(schema, name, oid);
+        composite_type.typtype = 'c' as i8;
+        composite_type.typcategory = 'C' as i8;
+        composite_type.typinput = "record_in".to_string();
+        composite_type.typoutput = "record_out".to_string();
+        composite_type.typbasetype = None;
+        composite_type.formatted_basetype = None;
+        composite_type.domain_constraints.clear();
+        composite_type.composite_attributes = attributes
+            .into_iter()
+            .map(|(attribute_name, data_type)| CompositeAttribute {
+                name: attribute_name.to_string(),
+                data_type: data_type.to_string(),
+            })
+            .collect();
+        composite_type.hash();
+        composite_type
     }
 
     #[tokio::test]
@@ -1457,6 +1482,37 @@ mod tests {
             routine_drop_pos < enum_drop_pos,
             "Enum drops must be emitted after routine drops"
         );
+    }
+
+    #[tokio::test]
+    async fn compare_composite_types_drops_removed_and_creates_new() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        from_dump.types.push(make_composite_type(
+            "test_schema",
+            "test_type_A",
+            601,
+            vec![
+                ("first_name_2", "varchar(50)"),
+                ("last_name_2", "varchar(50)"),
+            ],
+        ));
+        to_dump.types.push(make_composite_type(
+            "test_schema",
+            "test_type_B",
+            602,
+            vec![("street", "varchar(255)"), ("city", "varchar(100)")],
+        ));
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(script.contains("create type \"test_schema\".\"test_type_B\" as ("));
+        assert!(script.contains("\"street\" varchar(255)"));
+        assert!(script.contains("\"city\" varchar(100)"));
+        assert!(script.contains("drop type if exists \"test_schema\".\"test_type_A\";"));
     }
 
     #[tokio::test]
