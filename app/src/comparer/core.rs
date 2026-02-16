@@ -1420,7 +1420,12 @@ mod tests {
         let mut from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
 
-        let dropped_enum = make_enum_type("test_schema", "status_enum", 502, vec!["active", "inactive"]);
+        let dropped_enum = make_enum_type(
+            "test_schema",
+            "status_enum",
+            502,
+            vec!["active", "inactive"],
+        );
         from_dump.types.push(dropped_enum);
 
         let dropped_routine = Routine::new(
