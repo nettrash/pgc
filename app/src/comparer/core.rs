@@ -78,6 +78,11 @@ impl Comparer {
         self.drop_views().await?;
         self.compare_tables().await?;
         self.compare_foreign_keys().await?;
+        if !self.sequence_post_script.is_empty() {
+            self.script.push_str(&self.sequence_post_script);
+            self.sequence_post_script.clear();
+        }
+        self.compare_routines().await?;
         if !self.type_post_script.is_empty() {
             self.script.push_str(&self.type_post_script);
             self.type_post_script.clear();
@@ -86,11 +91,6 @@ impl Comparer {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        if !self.sequence_post_script.is_empty() {
-            self.script.push_str(&self.sequence_post_script);
-            self.sequence_post_script.clear();
-        }
-        self.compare_routines().await?;
         self.create_views().await?;
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
@@ -421,7 +421,7 @@ impl Comparer {
 
                 if drop_section.is_empty() {
                     drop_section.push_str(
-                        "\n/* ---> Types: Drop section (execute after dependent tables) --------------- */\n\n",
+                        "\n/* ---> Types: Drop section (execute after dependent objects, including routines) --------------- */\n\n",
                     );
                 }
 
@@ -535,7 +535,7 @@ impl Comparer {
 
                 if drop_section.is_empty() {
                     drop_section.push_str(
-                        "\n/* ---> Enums: Drop section (execute after dependent types) --------------- */\n\n",
+                        "\n/* ---> Enums: Drop section (execute after dependent objects, including types and routines) --------------- */\n\n",
                     );
                 }
                 drop_section.push_str(
@@ -1179,9 +1179,51 @@ mod tests {
     use super::*;
     use crate::config::dump_config::DumpConfig;
     use crate::dump::extension::Extension;
+    use crate::dump::pg_type::PgType;
     use crate::dump::routine::Routine;
     use crate::dump::schema::Schema;
     use sqlx::postgres::types::Oid;
+
+    fn make_domain_type(schema: &str, name: &str, oid: u32) -> PgType {
+        PgType::new(
+            Oid(oid),
+            schema.to_string(),
+            name.to_string(),
+            Oid(2200),
+            Oid(10),
+            "postgres".to_string(),
+            -1,
+            false,
+            'd' as i8,
+            'U' as i8,
+            false,
+            true,
+            ',' as i8,
+            None,
+            None,
+            None,
+            None,
+            "domain_in".to_string(),
+            "domain_out".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            'i' as i8,
+            'x' as i8,
+            false,
+            Some(Oid(25)),
+            None,
+            0,
+            None,
+            None,
+            Some("text".to_string()),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+    }
 
     #[tokio::test]
     async fn compare_routines_drops_and_recreates_on_return_type_change() {
@@ -1318,6 +1360,45 @@ mod tests {
             .expect("sql routine script not found");
 
         assert!(pos_plpgsql < pos_sql, "SQL routines should be applied last");
+    }
+
+    #[tokio::test]
+    async fn compare_drops_types_after_routines() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let dropped_type = make_domain_type("test_schema", "status_type", 501);
+        from_dump.types.push(dropped_type);
+
+        let dropped_routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "get_users_by_status".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "status test_schema.status_type".to_string(),
+            None,
+            None,
+            "BEGIN RETURN 1; END".to_string(),
+        );
+        from_dump.routines.push(dropped_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let routine_drop_pos = script
+            .find("drop function if exists \"test_schema\".\"get_users_by_status\"")
+            .expect("routine drop script not found");
+        let type_drop_pos = script
+            .find("drop type if exists \"test_schema\".\"status_type\";")
+            .expect("type drop script not found");
+
+        assert!(
+            routine_drop_pos < type_drop_pos,
+            "Type drops must be emitted after routine drops"
+        );
     }
 
     #[tokio::test]
