@@ -206,6 +206,7 @@ impl Dump {
                  where
                     n.nspname like '{}'
                     and t.typtype = 'c'
+                          and c.relkind = 'c'
                     and t.typisdefined = true
                     and a.attnum > 0
                     and a.attisdropped = false
@@ -271,13 +272,17 @@ impl Dump {
             from 
                 pg_type t 
                 join pg_namespace n on t.typnamespace = n.oid 
+                left join pg_class c on c.oid = t.typrelid
                 left join pg_roles owner_role on owner_role.oid = t.typowner
                 left join pg_description d on d.objoid = t.oid
                     and d.classoid = 'pg_type'::regclass
                     and d.objsubid = 0
             where 
                 n.nspname like '{}' 
-                and t.typtype in ('d', 'e', 'c', 'r', 'm') 
+                and (
+                    t.typtype in ('d', 'e', 'r', 'm')
+                    or (t.typtype = 'c' and c.relkind = 'c')
+                )
                 and t.typisdefined = true",
                 self.configuration.scheme
             )
