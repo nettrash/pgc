@@ -38,6 +38,12 @@ CREATE TYPE test_schema.user_profile AS (
     birth_date DATE
 );
 
+-- Composite type migration case (FROM only): should be dropped when TO lacks it
+CREATE TYPE test_schema.test_type_A AS (
+    first_name_2 VARCHAR(50),
+    last_name_2 VARCHAR(50)
+);
+
 -- Domain type
 CREATE DOMAIN test_schema.positive_integer AS INTEGER CHECK (VALUE > 0);
 

@@ -45,6 +45,12 @@ CREATE TYPE test_schema.user_profile AS (
     phone VARCHAR(20)  -- MODIFIED: added phone field
 );
 
+-- Composite type migration case (TO only): should be created when FROM lacks it
+CREATE TYPE test_schema.test_type_B AS (
+    street VARCHAR(255),
+    city VARCHAR(100)
+);
+
 -- New type
 CREATE TYPE test_schema.contact_type AS ENUM ('email', 'phone', 'sms', 'mail');
 

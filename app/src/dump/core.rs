@@ -1,5 +1,5 @@
 use crate::dump::pg_enum::PgEnum;
-use crate::dump::pg_type::{DomainConstraint, PgType};
+use crate::dump::pg_type::{CompositeAttribute, DomainConstraint, PgType};
 use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
@@ -193,6 +193,45 @@ impl Dump {
 
     // Fetch types from the database and populate the dump.
     async fn get_types(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let composite_attributes_rows = sqlx::query(
+            format!(
+                "select
+                    t.oid as type_oid,
+                    a.attname,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type
+                 from pg_type t
+                 join pg_namespace n on t.typnamespace = n.oid
+                 join pg_class c on c.oid = t.typrelid
+                 join pg_attribute a on a.attrelid = c.oid
+                 where
+                    n.nspname like '{}'
+                    and t.typtype = 'c'
+                    and c.relkind = 'c'
+                    and t.typisdefined = true
+                    and a.attnum > 0
+                    and a.attisdropped = false
+                 order by t.oid, a.attnum",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch composite type attributes: {}.", e)))?;
+
+        let mut composite_attributes_map: HashMap<Oid, Vec<CompositeAttribute>> = HashMap::new();
+        for row in composite_attributes_rows {
+            let type_oid: Oid = row.get("type_oid");
+            let attribute = CompositeAttribute {
+                name: row.get("attname"),
+                data_type: row.get("data_type"),
+            };
+            composite_attributes_map
+                .entry(type_oid)
+                .or_default()
+                .push(attribute);
+        }
+
         let result = sqlx::query(
             format!(
                 "select 
@@ -233,13 +272,17 @@ impl Dump {
             from 
                 pg_type t 
                 join pg_namespace n on t.typnamespace = n.oid 
+                left join pg_class c on c.oid = t.typrelid
                 left join pg_roles owner_role on owner_role.oid = t.typowner
                 left join pg_description d on d.objoid = t.oid
                     and d.classoid = 'pg_type'::regclass
                     and d.objsubid = 0
             where 
                 n.nspname like '{}' 
-                and t.typtype in ('d', 'e', 'r', 'm') 
+                and (
+                    t.typtype in ('d', 'e', 'r', 'm')
+                    or (t.typtype = 'c' and c.relkind = 'c')
+                )
                 and t.typisdefined = true",
                 self.configuration.scheme
             )
@@ -299,6 +342,9 @@ impl Dump {
                     comment: row.get::<Option<String>, _>("comment"),
                     enum_labels: Vec::new(),
                     domain_constraints: Vec::new(),
+                    composite_attributes: composite_attributes_map
+                        .remove(&row.get::<Oid, _>("type_oid"))
+                        .unwrap_or_default(),
                     hash: None,
                 };
                 pgtype.hash();

@@ -9,6 +9,12 @@ pub struct DomainConstraint {
     pub definition: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompositeAttribute {
+    pub name: String,
+    pub data_type: String,
+}
+
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -59,6 +65,8 @@ pub struct PgType {
     pub enum_labels: Vec<String>, // Enum labels ordered by sort order
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_constraints: Vec<DomainConstraint>, // Domain constraints (check, etc.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub composite_attributes: Vec<CompositeAttribute>, // Composite type attributes ordered by attnum
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>, // Optional comment on the type
     pub hash: Option<String>, // SHA256 hash of the type definition
@@ -141,6 +149,7 @@ impl PgType {
             formatted_basetype,
             enum_labels,
             domain_constraints,
+            composite_attributes: Vec::new(),
             comment,
             hash: None,
         };
@@ -234,6 +243,14 @@ impl PgType {
             hasher.update(constraint.definition.as_bytes());
         }
 
+        hasher.update((self.composite_attributes.len() as u32).to_be_bytes());
+        for attribute in &self.composite_attributes {
+            hasher.update((attribute.name.len() as u32).to_be_bytes());
+            hasher.update(attribute.name.as_bytes());
+            hasher.update((attribute.data_type.len() as u32).to_be_bytes());
+            hasher.update(attribute.data_type.as_bytes());
+        }
+
         if let Some(comment) = &self.comment {
             hasher.update((comment.len() as u32).to_be_bytes());
             hasher.update(comment.as_bytes());
@@ -317,6 +334,45 @@ impl PgType {
                 if let Some(comment) = &self.comment {
                     script.push_str(&format!(
                         "comment on domain \"{}\".\"{}\" is '{}';\n",
+                        self.schema,
+                        self.typname,
+                        escape_single_quotes(comment)
+                    ));
+                }
+
+                script.push_str(&self.get_owner_script());
+
+                script
+            }
+            'c' => {
+                if self.composite_attributes.is_empty() {
+                    return format!(
+                        "-- Composite type {}.{} has no attributes available in dump\n",
+                        self.schema, self.typname
+                    );
+                }
+
+                let attributes = self
+                    .composite_attributes
+                    .iter()
+                    .map(|attribute| {
+                        format!(
+                            "    \"{}\" {}",
+                            attribute.name.replace('"', "\"\""),
+                            attribute.data_type
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",\n");
+
+                let mut script = format!(
+                    "create type \"{}\".\"{}\" as (\n{}\n);\n",
+                    self.schema, self.typname, attributes
+                );
+
+                if let Some(comment) = &self.comment {
+                    script.push_str(&format!(
+                        "comment on type \"{}\".\"{}\" is '{}';\n",
                         self.schema,
                         self.typname,
                         escape_single_quotes(comment)
@@ -652,6 +708,7 @@ mod tests {
             formatted_basetype: None,
             enum_labels: Vec::new(),
             domain_constraints: Vec::new(),
+            composite_attributes: Vec::new(),
             comment: None,
             hash: None,
         }
@@ -801,6 +858,27 @@ alter domain \"public\".\"amount\" drop constraint \"ValueCheck\";\n\
 alter domain \"public\".\"amount\" add constraint \"ValueCheck\" check (value >= 0);\n\
 alter domain \"public\".\"amount\" add constraint \"FreshConstraint\" check (value <> 0);\n";
 
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn composite_get_script_generates_create_statement() {
+        let mut pg_type = base_pg_type('c');
+        pg_type.typname = "address_type".to_string();
+        pg_type.composite_attributes = vec![
+            CompositeAttribute {
+                name: "street".to_string(),
+                data_type: "varchar(255)".to_string(),
+            },
+            CompositeAttribute {
+                name: "city".to_string(),
+                data_type: "varchar(100)".to_string(),
+            },
+        ];
+
+        let script = pg_type.get_script();
+
+        let expected = "create type \"public\".\"address_type\" as (\n    \"street\" varchar(255),\n    \"city\" varchar(100)\n);\n";
         assert_eq!(script, expected);
     }
 
