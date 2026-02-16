@@ -16,7 +16,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_to') THEN
         CREATE ROLE pgc_owner_to;
     END IF;
-END
+END;
 $$;
 
 -- Extensions (modified list)
