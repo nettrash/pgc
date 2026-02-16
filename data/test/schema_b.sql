@@ -27,7 +27,7 @@ CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA public;  -- NEW EXTENSION
 
 -- Custom types (some modified, some removed, some added)
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending', 'suspended');  -- MODIFIED: added 'suspended'
--- priority_type removed
+-- priority_type removed (FROM has routines depending on it; TO intentionally omits both type and those routines)
 CREATE TYPE shared_schema.address_type AS (
     street VARCHAR(255),
     city VARCHAR(100),
@@ -373,6 +373,8 @@ BEGIN
     RETURN QUERY SELECT id, username, email, created_at FROM test_schema.users WHERE status = p_status;
 END;
 $$;
+
+-- get_products_by_priority(test_schema.priority_type) intentionally removed with priority_type
 
 -- Function containing nested $$ to exercise custom dollar quoting (TO database variant of fn_dollar_from)
 CREATE OR REPLACE FUNCTION test_schema.fn_dollar_from()
