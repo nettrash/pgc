@@ -10,6 +10,10 @@ fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
@@ -451,6 +455,7 @@ impl Table {
         let mut hasher = Sha256::new();
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
+        hasher.update(self.owner.as_bytes());
         hasher.update(self.has_indexes.to_string().as_bytes());
         hasher.update(self.has_triggers.to_string().as_bytes());
         hasher.update(self.has_rules.to_string().as_bytes());
@@ -662,6 +667,8 @@ impl Table {
             }
         }
 
+        script.push_str(&self.get_owner_script());
+
         script
     }
 
@@ -689,6 +696,19 @@ impl Table {
         format!(
             "drop table if exists \"{}\".\"{}\";\n",
             self.schema, self.name
+        )
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "alter table \"{}\".\"{}\" owner to {};\n",
+            self.schema,
+            self.name,
+            quote_ident(&self.owner)
         )
     }
 
@@ -1048,6 +1068,11 @@ impl Table {
             script.push_str(&policy_script);
             script.push_str(&row_security_script);
         }
+
+        if self.owner != to_table.owner {
+            script.push_str(&to_table.get_owner_script());
+        }
+
         script
     }
 
@@ -1415,6 +1440,7 @@ mod tests {
             "alter table \"public\".\"users\" add constraint \"users_name_check\" check (name <> '') ;\n",
             "create index idx_users_name on public.users using btree (name);\n",
             "create trigger audit_user before insert on public.users for each row execute function log_user();\n",
+            "alter table \"public\".\"users\" owner to \"postgres\";\n",
         );
 
         assert_eq!(script, expected);

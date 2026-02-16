@@ -84,15 +84,12 @@ pub async fn main() -> Result<(), Error> {
         let _ = cmd.print_help();
         return Ok(());
     }
-    if args.config.is_some() {
-        println!(
-            "Using configuration file: {}",
-            args.config.as_ref().unwrap()
-        );
-        return run_by_config(args.config.unwrap()).await;
-    } else if args.command.is_some() {
-        match args.command.as_deref() {
-            Some("dump") => {
+    if let Some(config) = args.config.clone() {
+        println!("Using configuration file: {config}");
+        return run_by_config(config).await;
+    } else if let Some(command) = args.command.as_deref() {
+        match command {
+            "dump" => {
                 println!("Dumping database...");
                 return create_dump(DumpConfig {
                     host: args.server.unwrap(),
@@ -106,7 +103,7 @@ pub async fn main() -> Result<(), Error> {
                 })
                 .await;
             }
-            Some("compare") => {
+            "compare" => {
                 println!("Comparing databases...");
                 return compare_dumps(
                     args.from.unwrap(),
@@ -117,7 +114,7 @@ pub async fn main() -> Result<(), Error> {
                 .await;
             }
             _ => {
-                eprintln!("Unknown command: {}", args.command.unwrap());
+                eprintln!("Unknown command: {command}");
                 return Ok(());
             }
         }

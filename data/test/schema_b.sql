@@ -7,6 +7,18 @@ CREATE SCHEMA IF NOT EXISTS test_schema;
 CREATE SCHEMA IF NOT EXISTS shared_schema;
 CREATE SCHEMA IF NOT EXISTS new_reporting_schema;  -- NEW SCHEMA
 
+-- Roles used for owner change comparison cases
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_from') THEN
+        CREATE ROLE pgc_owner_from;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_owner_to') THEN
+        CREATE ROLE pgc_owner_to;
+    END IF;
+END;
+$$;
+
 -- Extensions (modified list)
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 -- pgcrypto removed
@@ -652,3 +664,12 @@ AS $$
     FROM test_schema.products p
     WHERE p.id = p_product_id;
 $$;
+
+-- Owner change coverage (TO side)
+ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
+ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;
+ALTER DOMAIN test_schema.positive_integer OWNER TO pgc_owner_to;
+ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_to;
+ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
+ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
+ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;

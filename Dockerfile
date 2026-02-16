@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.88-slim AS builder
+FROM rust:1.93-slim AS builder
 
 # Install system dependencies needed for building
 RUN apt-get update && apt-get install -y \
@@ -67,9 +67,9 @@ CMD ["pgc", "--help"]
 # Metadata
 LABEL maintainer="nettrash" \
       description="PostgreSQL Database Comparer (PGC) - A tool for comparing PostgreSQL database schemas" \
-      version="1.0.0" \
+      version="1.0.5" \
       org.opencontainers.image.title="pgc" \
       org.opencontainers.image.description="PostgreSQL Database Comparer" \
-      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.version="1.0.5" \
       org.opencontainers.image.source="https://github.com/nettrash/pgc" \
-      org.opencontainers.image.licenses="GPL-3.0"
+      org.opencontainers.image.licenses="MIT"

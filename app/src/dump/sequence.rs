@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 // This is an information about a PostgreSQL sequence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sequence {
@@ -77,6 +81,7 @@ impl Sequence {
 
         hasher.update(self.schema.as_bytes());
         hasher.update(self.name.as_bytes());
+        hasher.update(self.owner.as_bytes());
         hasher.update(self.data_type.as_bytes());
         if let Some(start_value) = self.start_value {
             hasher.update(start_value.to_string().as_bytes());
@@ -181,6 +186,8 @@ impl Sequence {
 
         script.push_str(";\n");
 
+        script.push_str(&self.get_owner_script());
+
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
                 "comment on sequence \"{}\".\"{}\" is '{}';\n",
@@ -240,6 +247,8 @@ impl Sequence {
         }
         script.push_str(";\n");
 
+        script.push_str(&self.get_owner_script());
+
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
                 "comment on sequence \"{}\".\"{}\" is '{}';\n",
@@ -250,6 +259,19 @@ impl Sequence {
         }
 
         script
+    }
+
+    pub fn get_owner_script(&self) -> String {
+        if self.owner.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "alter sequence \"{}\".\"{}\" owner to {};\n",
+            self.schema,
+            self.name,
+            quote_ident(&self.owner)
+        )
     }
 }
 
@@ -283,6 +305,7 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update("public".as_bytes());
         hasher.update("order_id_seq".as_bytes());
+        hasher.update("postgres".as_bytes());
         hasher.update("bigint".as_bytes());
         hasher.update("1".as_bytes());
         hasher.update("1".as_bytes());
@@ -305,7 +328,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\n",
+            "create sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\nalter sequence \"public\".\"order_id_seq\" owner to \"postgres\";\n",
         );
     }
 
@@ -330,7 +353,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_script(),
-            "create sequence \"public\".\"minimal_seq\" no minvalue no maxvalue no cycle;\n",
+            "create sequence \"public\".\"minimal_seq\" no minvalue no maxvalue no cycle;\nalter sequence \"public\".\"minimal_seq\" owner to \"postgres\";\n",
         );
     }
 
@@ -349,7 +372,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\n",
+            "alter sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\nalter sequence \"public\".\"order_id_seq\" owner to \"postgres\";\n",
         );
     }
 
@@ -374,7 +397,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence \"audit\".\"event_seq\" start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\n",
+            "alter sequence \"audit\".\"event_seq\" start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\nalter sequence \"audit\".\"event_seq\" owner to \"postgres\";\n",
         );
     }
 }
