@@ -356,7 +356,11 @@ impl PgType {
                     .composite_attributes
                     .iter()
                     .map(|attribute| {
-                        format!("    \"{}\" {}", attribute.name.replace('"', "\"\""), attribute.data_type)
+                        format!(
+                            "    \"{}\" {}",
+                            attribute.name.replace('"', "\"\""),
+                            attribute.data_type
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",\n");
