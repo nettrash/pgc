@@ -598,6 +598,12 @@ CREATE TABLE test_schema.composite_fk (
         REFERENCES test_schema.composite_pk (part_one, part_two) ON DELETE CASCADE
 );
 
+-- Named primary key fixture (TO side): table exists only in TO.
+CREATE TABLE test_schema.table1 (
+    id int4 NOT NULL,
+    CONSTRAINT pk_table1_id PRIMARY KEY (id)
+);
+
 -- Identity column test (New table in TO schema)
 CREATE SCHEMA IF NOT EXISTS data;
 

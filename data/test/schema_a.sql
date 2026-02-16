@@ -501,6 +501,9 @@ CREATE TABLE test_schema.composite_fk (
         REFERENCES test_schema.composite_pk (part_one, part_two)
 );
 
+-- Named primary key fixture (FROM side): table intentionally absent.
+-- TO defines test_schema.table1 with CONSTRAINT pk_table1_id PRIMARY KEY (id).
+
 -- Identity column test (Schema exists, table missing)
 CREATE SCHEMA IF NOT EXISTS data;
 
