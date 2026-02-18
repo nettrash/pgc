@@ -1,7 +1,6 @@
 use crate::dump::{core::Dump, routine::Routine, table::Table};
 use std::{
-    cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Error, Write},
 };
@@ -185,23 +184,94 @@ impl Comparer {
         Self::normalized_view_reference(format!("{}.{}", schema, name).as_str())
     }
 
+    /// Returns the fully-quoted key used to match a table's `partition_of` reference.
+    fn table_key(schema: &str, name: &str) -> String {
+        format!("\"{}\".\"{}\"", schema, name)
+    }
+
+    /// Normalise a `partition_of` reference so it can be compared against `table_key`.
+    /// Handles both quoted ("schema"."name") and unquoted (schema.name) forms.
+    fn normalise_partition_of(s: &str) -> String {
+        s.split('.')
+            .map(|part| {
+                let trimmed = part.trim().trim_matches('"');
+                format!("\"{}\"", trimmed)
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// Compute the partition depth of every table (0 = not a partition / root,
+    /// 1 = direct child of a partitioned table, 2 = grandchild, …).
+    /// This handles arbitrary nesting depths (sub-partitions of sub-partitions).
+    fn partition_depths(tables: &[Table]) -> HashMap<String, usize> {
+        // Build a map from normalised key → depth, iterating until stable.
+        let keys: Vec<String> = tables
+            .iter()
+            .map(|t| Self::table_key(&t.schema, &t.name))
+            .collect();
+        let mut depths: HashMap<String, usize> = keys.iter().cloned().map(|k| (k, 0)).collect();
+
+        // Propagate: a table's depth is parent_depth + 1.  Repeat until no change.
+        loop {
+            let mut changed = false;
+            for table in tables {
+                if let Some(parent_ref) = &table.partition_of {
+                    let parent_key = Self::normalise_partition_of(parent_ref);
+                    let parent_depth = depths.get(&parent_key).copied().unwrap_or(0);
+                    let child_key = Self::table_key(&table.schema, &table.name);
+                    let current = depths.get(&child_key).copied().unwrap_or(0);
+                    let required = parent_depth + 1;
+                    if required > current {
+                        depths.insert(child_key, required);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        depths
+    }
+
+    /// Order tables for CREATE: parents before their partitions (all levels).
     fn ordered_tables(tables: &[Table]) -> Vec<&Table> {
+        let depths = Self::partition_depths(tables);
         let mut ordered: Vec<&Table> = tables.iter().collect();
-        ordered.sort_by(|a, b| match (&a.partition_of, &b.partition_of) {
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            _ => a.schema.cmp(&b.schema).then_with(|| a.name.cmp(&b.name)),
+        ordered.sort_by(|a, b| {
+            let da = depths
+                .get(&Self::table_key(&a.schema, &a.name))
+                .copied()
+                .unwrap_or(0);
+            let db = depths
+                .get(&Self::table_key(&b.schema, &b.name))
+                .copied()
+                .unwrap_or(0);
+            da.cmp(&db)
+                .then_with(|| a.schema.cmp(&b.schema))
+                .then_with(|| a.name.cmp(&b.name))
         });
         ordered
     }
 
+    /// Order tables for DROP: deepest partitions first (reverse of CREATE order).
     fn ordered_tables_for_drop(tables: &[Table]) -> Vec<&Table> {
+        let depths = Self::partition_depths(tables);
         let mut ordered: Vec<&Table> = tables.iter().collect();
-        ordered.sort_by(|a, b| match (&a.partition_of, &b.partition_of) {
-            // Drop partitions before parents
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            _ => a.schema.cmp(&b.schema).then_with(|| a.name.cmp(&b.name)),
+        ordered.sort_by(|a, b| {
+            let da = depths
+                .get(&Self::table_key(&a.schema, &a.name))
+                .copied()
+                .unwrap_or(0);
+            let db = depths
+                .get(&Self::table_key(&b.schema, &b.name))
+                .copied()
+                .unwrap_or(0);
+            // Higher depth (deeper child) should come first when dropping
+            db.cmp(&da)
+                .then_with(|| a.schema.cmp(&b.schema))
+                .then_with(|| a.name.cmp(&b.name))
         });
         ordered
     }
@@ -2368,5 +2438,166 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(script.contains("alter view \"public\".\"active_users\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn tables_multilevel_partitions_created_in_depth_order() {
+        // Hierarchy: grandparent (RANGE) -> parent_2023 (LIST, sub-partition) -> child_2023_a (leaf)
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Level 0: grandparent partitioned by RANGE
+        let mut grandparent = Table::new(
+            "public".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        grandparent.partition_key = Some("RANGE (id)".to_string());
+        grandparent.hash();
+
+        // Level 1: sub-partition parent (is both a partition child AND partitioned by LIST)
+        let mut sub_parent = Table::new(
+            "public".to_string(),
+            "events_2023".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events_2023", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        sub_parent.partition_of = Some("\"public\".\"events\"".to_string());
+        sub_parent.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
+        sub_parent.partition_key = Some("LIST (id)".to_string());
+        sub_parent.hash();
+
+        // Level 2: leaf partition
+        let mut leaf = Table::new(
+            "public".to_string(),
+            "events_2023_a".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events_2023_a", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        leaf.partition_of = Some("\"public\".\"events_2023\"".to_string());
+        leaf.partition_bound = Some("FOR VALUES IN (1)".to_string());
+        leaf.hash();
+
+        // Push in reverse order to stress the sorting
+        to_dump.tables.push(leaf);
+        to_dump.tables.push(grandparent);
+        to_dump.tables.push(sub_parent);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_gp = script
+            .find("create table \"public\".\"events\"")
+            .expect("grandparent not created");
+        let pos_sp = script
+            .find("create table \"public\".\"events_2023\" partition of")
+            .expect("sub-partition parent not created");
+        let pos_leaf = script
+            .find("create table \"public\".\"events_2023_a\" partition of")
+            .expect("leaf partition not created");
+
+        assert!(
+            pos_gp < pos_sp,
+            "grandparent must be created before sub-partition parent"
+        );
+        assert!(
+            pos_sp < pos_leaf,
+            "sub-partition parent must be created before leaf partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn tables_multilevel_partitions_dropped_in_reverse_depth_order() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let mut grandparent = Table::new(
+            "public".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        grandparent.partition_key = Some("RANGE (id)".to_string());
+        grandparent.hash();
+
+        let mut sub_parent = Table::new(
+            "public".to_string(),
+            "events_2023".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events_2023", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        sub_parent.partition_of = Some("\"public\".\"events\"".to_string());
+        sub_parent.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
+        sub_parent.partition_key = Some("LIST (id)".to_string());
+        sub_parent.hash();
+
+        let mut leaf = Table::new(
+            "public".to_string(),
+            "events_2023_a".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events_2023_a", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        leaf.partition_of = Some("\"public\".\"events_2023\"".to_string());
+        leaf.partition_bound = Some("FOR VALUES IN (1)".to_string());
+        leaf.hash();
+
+        from_dump.tables.push(grandparent);
+        from_dump.tables.push(sub_parent);
+        from_dump.tables.push(leaf);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_gp = script
+            .find("drop table if exists \"public\".\"events\";")
+            .expect("grandparent drop not found");
+        let pos_sp = script
+            .find("drop table if exists \"public\".\"events_2023\";")
+            .expect("sub-partition parent drop not found");
+        let pos_leaf = script
+            .find("drop table if exists \"public\".\"events_2023_a\";")
+            .expect("leaf partition drop not found");
+
+        assert!(
+            pos_leaf < pos_sp,
+            "leaf must be dropped before sub-partition parent"
+        );
+        assert!(
+            pos_sp < pos_gp,
+            "sub-partition parent must be dropped before grandparent"
+        );
     }
 }

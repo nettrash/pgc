@@ -641,6 +641,53 @@ CREATE TABLE test_schema.issue_identity_default_test (
     data TEXT
 );
 
+-- Multi-level partition test (TO: 3-level, events_2023 is now a sub-partition parent by LIST(region))
+CREATE TABLE data.events (
+    id        BIGINT NOT NULL,
+    year      INT    NOT NULL,
+    region    TEXT   NOT NULL,
+    payload   TEXT,
+    CONSTRAINT events_pkey PRIMARY KEY (id, year, region)
+) PARTITION BY RANGE (year);
+
+-- events_2023 changes from a leaf to a sub-partition parent (partition_key change → recreate)
+CREATE TABLE data.events_2023
+    PARTITION OF data.events
+    FOR VALUES FROM (2023) TO (2024)
+    PARTITION BY LIST (region);
+
+CREATE TABLE data.events_2023_us
+    PARTITION OF data.events_2023
+    FOR VALUES IN ('us');
+
+CREATE TABLE data.events_2023_eu
+    PARTITION OF data.events_2023
+    FOR VALUES IN ('eu');
+
+-- sensor_data hierarchy removed in TO (tests deep drop ordering: leaf → mid → parent)
+
+-- New 3-level hierarchy only in TO (tests deep create ordering: parent → mid → leaf)
+CREATE TABLE data.metrics (
+    id     BIGINT NOT NULL,
+    year   INT    NOT NULL,
+    type   TEXT   NOT NULL,
+    value  NUMERIC,
+    CONSTRAINT metrics_pkey PRIMARY KEY (id, year, type)
+) PARTITION BY RANGE (year);
+
+CREATE TABLE data.metrics_2024
+    PARTITION OF data.metrics
+    FOR VALUES FROM (2024) TO (2025)
+    PARTITION BY LIST (type);
+
+CREATE TABLE data.metrics_2024_cpu
+    PARTITION OF data.metrics_2024
+    FOR VALUES IN ('cpu');
+
+CREATE TABLE data.metrics_2024_mem
+    PARTITION OF data.metrics_2024
+    FOR VALUES IN ('mem');
+
 -- Partitioned table test
 CREATE TABLE data.partition_test (
     id bigserial NOT NULL,
