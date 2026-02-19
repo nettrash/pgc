@@ -513,6 +513,36 @@ CREATE TABLE test_schema.identity_update_test (
     payload TEXT
 );
 
+-- Multi-level partition test (FROM: 2-level flat, events_2023 is a plain leaf partition)
+CREATE TABLE data.events (
+    id        BIGINT NOT NULL,
+    year      INT    NOT NULL,
+    region    TEXT   NOT NULL,
+    payload   TEXT,
+    CONSTRAINT events_pkey PRIMARY KEY (id, year, region)
+) PARTITION BY RANGE (year);
+
+CREATE TABLE data.events_2023
+    PARTITION OF data.events
+    FOR VALUES FROM (2023) TO (2024);
+
+-- Sub-partition drop-order test (FROM only: 3-level hierarchy that is fully removed in TO)
+CREATE TABLE data.sensor_data (
+    id         BIGINT NOT NULL,
+    sensor INT NOT NULL,
+    region TEXT NOT NULL,
+    CONSTRAINT sensor_data_pkey PRIMARY KEY (id, sensor, region)
+) PARTITION BY LIST (region);
+
+CREATE TABLE data.sensor_data_eu
+    PARTITION OF data.sensor_data
+    FOR VALUES IN ('eu')
+    PARTITION BY RANGE (sensor);
+
+CREATE TABLE data.sensor_data_eu_1
+    PARTITION OF data.sensor_data_eu
+    FOR VALUES FROM (1) TO (100);
+
 -- Partition bound change test (FROM: value 'active')
 CREATE TABLE data.partition_bound_test (
     id int,
