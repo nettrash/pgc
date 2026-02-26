@@ -392,6 +392,35 @@ CREATE TRIGGER trigger_orders_audit
     EXECUTE FUNCTION shared_schema.audit_trigger();
 
 -- Views
+
+-- MATERIALIZED VIEWS
+-- Case 1: exists in FROM only → should be dropped
+CREATE MATERIALIZED VIEW test_schema.from_only_mat AS
+SELECT
+    u.id,
+    u.username,
+    u.email,
+    u.status
+FROM test_schema.users u
+WHERE u.is_admin = FALSE;
+
+-- Case 2: exists in both, definition differs → should be dropped and recreated
+CREATE MATERIALIZED VIEW test_schema.active_users_mat AS
+SELECT
+    u.id,
+    u.username,
+    u.email
+FROM test_schema.users u
+WHERE u.status = 'active';
+
+-- Case 3: exists in both, unchanged → no change expected
+CREATE MATERIALIZED VIEW test_schema.user_count_mat AS
+SELECT
+    status,
+    COUNT(*) AS cnt
+FROM test_schema.users
+GROUP BY status;
+
 CREATE VIEW test_schema.user_order_summary AS
 SELECT 
     u.id,
@@ -453,6 +482,7 @@ COMMENT ON TYPE test_schema.status_type IS 'User status values (active/inactive/
 COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer with no upper bound in FROM';
 COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 1000 (FROM)';
 COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with basic stock buckets (FROM)';
+COMMENT ON MATERIALIZED VIEW test_schema.active_users_mat IS 'Active users snapshot (FROM version)';
 COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users filtered by status (FROM)';
 COMMENT ON FUNCTION test_schema.get_products_by_priority(test_schema.priority_type) IS 'FROM-only routine using FROM-only type to validate drop order';
 
@@ -577,4 +607,5 @@ ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_from;
 ALTER TABLE test_schema.users OWNER TO pgc_owner_from;
 ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_from;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_from;
+ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_from;
 

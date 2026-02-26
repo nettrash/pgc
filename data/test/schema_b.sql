@@ -441,6 +441,38 @@ CREATE TRIGGER trigger_reviews_audit
 -- Views (some modified, some removed, some added)
 -- user_order_summary removed (orders table doesn't exist)
 
+-- MATERIALIZED VIEWS
+-- Case 1 from_only_mat: removed (exists only in FROM → should be dropped)
+
+-- Case 2: exists in both, definition changed → should be dropped and recreated
+CREATE MATERIALIZED VIEW test_schema.active_users_mat AS
+SELECT
+    u.id,
+    u.username,
+    u.email,
+    u.status  -- MODIFIED: added status column
+FROM test_schema.users u
+WHERE u.status = 'active';
+
+-- Case 3: unchanged → no change expected
+CREATE MATERIALIZED VIEW test_schema.user_count_mat AS
+SELECT
+    status,
+    COUNT(*) AS cnt
+FROM test_schema.users
+GROUP BY status;
+
+-- Case 4: exists only in TO → should be created
+CREATE MATERIALIZED VIEW test_schema.product_stock_mat AS
+SELECT
+    p.id,
+    p.name,
+    p.sku,
+    p.stock_quantity,
+    p.status
+FROM test_schema.products p
+WHERE p.stock_quantity > 0;
+
 -- MODIFIED VIEW
 CREATE VIEW test_schema.product_inventory AS
 SELECT 
@@ -525,6 +557,7 @@ COMMENT ON COLUMN test_schema.products.barcode IS 'Product barcode for inventory
 COMMENT ON TYPE test_schema.status_type IS 'User status values including suspended (TO)';
 COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer capped at 1,000,000 (TO)';
 COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 2000 (TO)';
+COMMENT ON MATERIALIZED VIEW test_schema.active_users_mat IS 'Active users snapshot (TO version)';
 COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with featured flag (TO)';
 COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users with created_at for status filter (TO)';
 
@@ -734,3 +767,4 @@ ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_to;
 ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
 ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;
+ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_to;
