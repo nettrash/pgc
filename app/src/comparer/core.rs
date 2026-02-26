@@ -1,6 +1,6 @@
-use crate::dump::{core::Dump, routine::Routine, table::Table};
+use crate::dump::{core::Dump, routine::Routine, table::Table, view::View};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::{Error, Write},
 };
@@ -81,7 +81,7 @@ impl Comparer {
             self.script.push_str(&self.sequence_post_script);
             self.sequence_post_script.clear();
         }
-        self.compare_routines().await?;
+        self.compare_routines_and_views().await?;
         if !self.type_post_script.is_empty() {
             self.script.push_str(&self.type_post_script);
             self.type_post_script.clear();
@@ -90,7 +90,6 @@ impl Comparer {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        self.create_views().await?;
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
             self.trigger_post_script.clear();
@@ -182,6 +181,91 @@ impl Comparer {
 
     fn normalized_view_key(schema: &str, name: &str) -> String {
         Self::normalized_view_reference(format!("{}.{}", schema, name).as_str())
+    }
+
+    /// Check whether `text` contains an occurrence of the qualified name
+    /// `schema.name` as a whole identifier (not as a substring of a longer
+    /// identifier).  Both quoted (`"schema"."name"`) and unquoted forms are
+    /// recognised.
+    fn text_references_qualified_name(text: &str, schema: &str, name: &str) -> bool {
+        let pattern = format!("{}.{}", schema.to_lowercase(), name.to_lowercase());
+        let lower = text.to_lowercase();
+        if Self::has_whole_qualified_name(&lower, &pattern) {
+            return true;
+        }
+        // Also try with all double-quotes stripped (handles quoted identifiers).
+        let unquoted: String = lower.chars().filter(|c| *c != '"').collect();
+        Self::has_whole_qualified_name(&unquoted, &pattern)
+    }
+
+    /// Return `true` when `text` contains `qualified` delimited by
+    /// non-identifier characters on both sides.
+    fn has_whole_qualified_name(text: &str, qualified: &str) -> bool {
+        let bytes = text.as_bytes();
+        for (idx, _) in text.match_indices(qualified) {
+            if idx > 0 {
+                let before = bytes[idx - 1];
+                if before.is_ascii_alphanumeric() || before == b'_' {
+                    continue;
+                }
+            }
+            let end = idx + qualified.len();
+            if end < bytes.len() {
+                let after = bytes[end];
+                if after.is_ascii_alphanumeric() || after == b'_' || after == b'.' {
+                    continue;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Kahn's topological sort for an index-based dependency graph.
+    /// Returns indices so that dependencies come before dependents.
+    /// Ties are broken by `sort_key` for deterministic output.
+    /// Cycles are handled by appending remaining nodes in sort_key order.
+    fn kahn_toposort<K: Ord>(
+        n: usize,
+        depends_on: &[HashSet<usize>],
+        sort_key: impl Fn(usize) -> K,
+    ) -> Vec<usize> {
+        let mut in_degree: Vec<usize> = depends_on.iter().map(|d| d.len()).collect();
+        let mut reverse_adj: Vec<Vec<usize>> = vec![vec![]; n];
+        for (i, deps) in depends_on.iter().enumerate() {
+            for &j in deps {
+                reverse_adj[j].push(i);
+            }
+        }
+
+        let mut queue: VecDeque<usize> = {
+            let mut zero: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+            zero.sort_by_key(|a| sort_key(*a));
+            VecDeque::from(zero)
+        };
+
+        let mut sorted = Vec::with_capacity(n);
+        while let Some(node) = queue.pop_front() {
+            sorted.push(node);
+            let mut newly_free: Vec<usize> = Vec::new();
+            for &dependent in &reverse_adj[node] {
+                in_degree[dependent] -= 1;
+                if in_degree[dependent] == 0 {
+                    newly_free.push(dependent);
+                }
+            }
+            newly_free.sort_by_key(|a| sort_key(*a));
+            queue.extend(newly_free);
+        }
+
+        if sorted.len() < n {
+            let in_sorted: HashSet<usize> = sorted.iter().copied().collect();
+            let mut remaining: Vec<usize> = (0..n).filter(|i| !in_sorted.contains(i)).collect();
+            remaining.sort_by_key(|a| sort_key(*a));
+            sorted.extend(remaining);
+        }
+
+        sorted
     }
 
     /// Returns the fully-quoted key used to match a table's `partition_of` reference.
@@ -872,6 +956,7 @@ impl Comparer {
     }
 
     // Comparing routines
+    #[cfg(test)]
     async fn compare_routines(&mut self) -> Result<(), Error> {
         self.script
             .push_str("\n/* ---> Routines: Start section --------------- */\n\n");
@@ -1195,7 +1280,10 @@ impl Comparer {
         let dependent_views = self.dependent_view_keys();
         self.dropped_views.clear();
 
-        for from_view in &self.from.views {
+        // Collect all views that should be dropped: (from_view index, normalized_key, force_drop)
+        let mut candidates: Vec<(usize, String, bool)> = Vec::new();
+
+        for (idx, from_view) in self.from.views.iter().enumerate() {
             let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
 
             // Determine why this view should be dropped (if at all):
@@ -1222,24 +1310,79 @@ impl Comparer {
                 is_dependent || (self.use_drop && is_from_only) || is_changed_mat_view;
 
             if should_drop {
-                self.script.push_str(
-                    format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
-                );
-
-                let drop_script = from_view.get_drop_script();
-                if self.use_drop || is_changed_mat_view {
-                    self.script.push_str(drop_script.as_str());
-                } else {
-                    self.script.push_str(
-                        drop_script
-                            .lines()
-                            .map(|l| format!("-- {}\n", l))
-                            .collect::<String>()
-                            .as_str(),
-                    );
-                }
-                self.dropped_views.insert(normalized_view);
+                let force_drop = self.use_drop || is_changed_mat_view;
+                candidates.push((idx, normalized_view, force_drop));
             }
+        }
+
+        // Sort drops in reverse dependency order (dependents first).
+        let drop_order = if candidates.len() > 1 {
+            let key_to_pos: HashMap<String, usize> = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, (_, key, _))| (key.clone(), i))
+                .collect();
+
+            let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); candidates.len()];
+
+            for (i, (view_idx, _, _)) in candidates.iter().enumerate() {
+                let view = &self.from.views[*view_idx];
+                // Check table_relation
+                for rel in &view.table_relation {
+                    let normalized = Self::normalized_view_reference(rel);
+                    if let Some(&j) = key_to_pos.get(&normalized)
+                        && i != j
+                    {
+                        depends_on[i].insert(j);
+                    }
+                }
+                // Check definition text for references to other dropping views
+                for (j, (other_idx, _, _)) in candidates.iter().enumerate() {
+                    if i != j {
+                        let other = &self.from.views[*other_idx];
+                        if Self::text_references_qualified_name(
+                            &view.definition,
+                            &other.schema,
+                            &other.name,
+                        ) {
+                            depends_on[i].insert(j);
+                        }
+                    }
+                }
+            }
+
+            // Topological sort in creation order, then reverse for drops.
+            let mut sorted = Self::kahn_toposort(candidates.len(), &depends_on, |i| {
+                let (idx, _, _) = &candidates[i];
+                let v = &self.from.views[*idx];
+                (v.schema.to_lowercase(), v.name.to_lowercase())
+            });
+            sorted.reverse();
+            sorted
+        } else {
+            (0..candidates.len()).collect()
+        };
+
+        for &i in &drop_order {
+            let (view_idx, ref normalized_view, force_drop) = candidates[i];
+            let from_view = &self.from.views[view_idx];
+
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str());
+
+            let drop_script = from_view.get_drop_script();
+            if force_drop {
+                self.script.push_str(drop_script.as_str());
+            } else {
+                self.script.push_str(
+                    drop_script
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>()
+                        .as_str(),
+                );
+            }
+            self.dropped_views.insert(normalized_view.clone());
         }
 
         self.script
@@ -1248,6 +1391,7 @@ impl Comparer {
     }
 
     // Create views from TO dump
+    #[cfg(test)]
     async fn create_views(&mut self) -> Result<(), Error> {
         self.script
             .push_str("\n/* ---> Views CREATE: Start section --------------- */\n\n");
@@ -1306,6 +1450,294 @@ impl Comparer {
 
         self.script
             .push_str("\n/* ---> Views CREATE: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    /// Emit the CREATE (or CREATE OR REPLACE) script for a single target view.
+    fn emit_view_create(&mut self, to_view: &View) {
+        self.script
+            .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+
+        if to_view.is_materialized {
+            self.script.push_str(&to_view.get_script());
+        } else {
+            let mut view_script = to_view.get_script();
+            if !view_script
+                .to_uppercase()
+                .contains("CREATE OR REPLACE VIEW")
+            {
+                const TARGET: &str = "create view";
+                const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
+                if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
+                    view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
+                }
+            }
+            self.script.push_str(&view_script);
+        }
+    }
+
+    /// Compare routines and views together, respecting cross-dependencies.
+    ///
+    /// Instead of processing all routines before all views (which breaks when
+    /// a view depends on a function, or a function depends on a view), this
+    /// method builds a dependency graph across both object types and emits
+    /// CREATE / UPDATE statements in topological order.
+    ///
+    /// Drop statements for routines that exist only in the FROM dump are
+    /// emitted first, also in reverse dependency order.
+    async fn compare_routines_and_views(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Routines & Views: Start section --------------- */\n\n");
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 1 – Drop routines that are not present in TO
+        // ──────────────────────────────────────────────────────────
+        let routines_to_drop: Vec<Routine> = self
+            .from
+            .routines
+            .iter()
+            .filter(|r| {
+                !self
+                    .to
+                    .routines
+                    .iter()
+                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+            })
+            .cloned()
+            .collect();
+
+        if !routines_to_drop.is_empty() {
+            // Build inter-routine dependency graph and sort drops in
+            // reverse dependency order (dependents first).
+            let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
+
+            let drop_names: Vec<(String, String)> = routines_to_drop
+                .iter()
+                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .collect();
+
+            for (i, routine) in routines_to_drop.iter().enumerate() {
+                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                    {
+                        drop_deps[i].insert(j);
+                    }
+                }
+            }
+
+            let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
+                drop_names[i].clone()
+            });
+            drop_order.reverse();
+
+            for idx in drop_order {
+                let routine = &routines_to_drop[idx];
+                self.script.push_str(
+                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                );
+                self.script
+                    .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
+                let drop_script = routine.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 2 – Determine which objects need create / update
+        // ──────────────────────────────────────────────────────────
+        // Each item is (is_view, index_in_to_vec).
+        let mut action_items: Vec<(bool, usize)> = Vec::new();
+        let mut no_action_view_indices: Vec<usize> = Vec::new();
+
+        for (idx, routine) in self.to.routines.iter().enumerate() {
+            if routine.hash.is_none() {
+                continue;
+            }
+            let from_routine = self
+                .from
+                .routines
+                .iter()
+                .find(|r| r.name == routine.name && r.schema == routine.schema);
+            let needs_action = match from_routine {
+                None => true,
+                Some(fr) => fr.hash.is_some() && Self::hashes_differ(&fr.hash, &routine.hash),
+            };
+            if needs_action {
+                action_items.push((false, idx));
+            }
+        }
+
+        for (idx, view) in self.to.views.iter().enumerate() {
+            let normalized_view = Self::normalized_view_key(&view.schema, &view.name);
+            let from_view = self
+                .from
+                .views
+                .iter()
+                .find(|v| v.schema == view.schema && v.name == view.name);
+            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let definition_changed = from_view
+                .map(|fv| Self::hashes_differ(&fv.hash, &view.hash))
+                .unwrap_or(false);
+            let needs_action = from_view.is_none() || was_dropped || definition_changed;
+            if needs_action {
+                action_items.push((true, idx));
+            } else {
+                no_action_view_indices.push(idx);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 3 – Build dependency graph among action items
+        // ──────────────────────────────────────────────────────────
+        // Precompute info we need for each action item so we don't
+        // hold any reference to `self` while building the graph.
+        struct ItemInfo {
+            text: String,
+            schema_lower: String,
+            name_lower: String,
+            is_view: bool,
+            orig_idx: usize,
+            sort_key: (u8, String, String),
+            table_relation_keys: Vec<String>,
+        }
+
+        let items: Vec<ItemInfo> = action_items
+            .iter()
+            .map(|&(is_view, orig_idx)| {
+                if is_view {
+                    let v = &self.to.views[orig_idx];
+                    let table_relation_keys: Vec<String> = v
+                        .table_relation
+                        .iter()
+                        .map(|rel| Self::normalized_view_reference(rel))
+                        .collect();
+                    ItemInfo {
+                        text: v.definition.clone(),
+                        schema_lower: v.schema.to_lowercase(),
+                        name_lower: v.name.to_lowercase(),
+                        is_view: true,
+                        orig_idx,
+                        sort_key: (2, v.schema.to_lowercase(), v.name.to_lowercase()),
+                        table_relation_keys,
+                    }
+                } else {
+                    let r = &self.to.routines[orig_idx];
+                    let priority = if r.lang.eq_ignore_ascii_case("sql") {
+                        1
+                    } else {
+                        0
+                    };
+                    ItemInfo {
+                        text: r.source_code.clone(),
+                        schema_lower: r.schema.to_lowercase(),
+                        name_lower: r.name.to_lowercase(),
+                        is_view: false,
+                        orig_idx,
+                        sort_key: (priority, r.schema.to_lowercase(), r.name.to_lowercase()),
+                        table_relation_keys: Vec::new(),
+                    }
+                }
+            })
+            .collect();
+
+        // Reverse lookup: (schema, name) -> list of item indices
+        let mut name_to_items: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (i, item) in items.iter().enumerate() {
+            name_to_items
+                .entry((item.schema_lower.clone(), item.name_lower.clone()))
+                .or_default()
+                .push(i);
+        }
+
+        // Build edges: i depends on j  =>  j must be emitted before i.
+        let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); items.len()];
+
+        for (i, item) in items.iter().enumerate() {
+            // Scan the object body for qualified references to other action items.
+            for ((schema, name), targets) in &name_to_items {
+                if Self::text_references_qualified_name(&item.text, schema, name) {
+                    for &j in targets {
+                        if j != i {
+                            depends_on[i].insert(j);
+                        }
+                    }
+                }
+            }
+
+            // For views, also honour the explicit table_relation metadata
+            // (which captures referenced tables / views but not functions).
+            if item.is_view {
+                for dep_key in &item.table_relation_keys {
+                    if let Some(dot_pos) = dep_key.find('.') {
+                        let schema = dep_key[..dot_pos].to_string();
+                        let name = dep_key[dot_pos + 1..].to_string();
+                        if let Some(targets) = name_to_items.get(&(schema, name)) {
+                            for &j in targets {
+                                if j != i {
+                                    depends_on[i].insert(j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 4 – Topological sort
+        // ──────────────────────────────────────────────────────────
+        let sorted = Self::kahn_toposort(items.len(), &depends_on, |i| items[i].sort_key.clone());
+
+        // Prepare the emit plan (is_view, orig_idx) so we can drop `items`.
+        let emit_order: Vec<(bool, usize)> = sorted
+            .iter()
+            .map(|&i| (items[i].is_view, items[i].orig_idx))
+            .collect();
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 5 – Emit creates / updates in dependency order
+        // ──────────────────────────────────────────────────────────
+        for &(is_view, orig_idx) in &emit_order {
+            if is_view {
+                let view = self.to.views[orig_idx].clone();
+                self.emit_view_create(&view);
+            } else {
+                let routine = self.to.routines[orig_idx].clone();
+                self.process_target_routine(&routine);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 6 – Unchanged views: emit owner changes only
+        // ──────────────────────────────────────────────────────────
+        for &idx in &no_action_view_indices {
+            let to_view = &self.to.views[idx];
+            if let Some(fv) = self
+                .from
+                .views
+                .iter()
+                .find(|v| v.schema == to_view.schema && v.name == to_view.name)
+                && fv.owner != to_view.owner
+            {
+                self.script
+                    .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+                self.script.push_str(&to_view.get_owner_script());
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> Routines & Views: End section --------------- */\n\n");
         Ok(())
     }
 }
@@ -2504,6 +2936,208 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(script.contains("alter view \"public\".\"active_users\" owner to \"new_owner\";"));
+    }
+
+    #[tokio::test]
+    async fn compare_creates_routines_and_views_in_dependency_order() {
+        // Scenario from the user report:
+        //   get_user_count()   – function, no view dependency
+        //   v_user_stats       – view that calls get_user_count()
+        //   report_user_stats  – function that reads v_user_stats
+        //   print_user_stats   – procedure that reads v_user_stats
+        //
+        // Correct creation order: get_user_count → v_user_stats → report/print
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        to_dump
+            .schemas
+            .push(Schema::new("test_schema".to_string(), None));
+
+        let get_user_count = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "get_user_count".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "  SELECT count(*) FROM test_schema.users;\n".to_string(),
+        );
+
+        let report_user_stats = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "report_user_stats".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "text".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "  SELECT 'Total users in view: ' || total_users\n  FROM test_schema.v_user_stats\n  LIMIT 1;\n".to_string(),
+        );
+
+        let print_user_stats = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "print_user_stats".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\nDECLARE\n    cnt int;\nBEGIN\n    SELECT total_users INTO cnt\n    FROM test_schema.v_user_stats\n    LIMIT 1;\n    RAISE NOTICE 'Total users in view: %', cnt;\nEND;\n".to_string(),
+        );
+
+        let mut v_user_stats = View::new(
+            "v_user_stats".to_string(),
+            " SELECT test_schema.get_user_count() AS total_users,\n    users.name\n   FROM test_schema.users;\n".to_string(),
+            "test_schema".to_string(),
+            vec!["test_schema.users".to_string()],
+        );
+        v_user_stats.owner = "postgres".to_string();
+        v_user_stats.hash();
+
+        // Intentionally add in wrong order to test sorting
+        to_dump.routines.push(print_user_stats);
+        to_dump.routines.push(report_user_stats);
+        to_dump.routines.push(get_user_count);
+        to_dump.views.push(v_user_stats);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_get_user_count = script
+            .find("create or replace function \"test_schema\".\"get_user_count\"")
+            .expect("get_user_count not found in script");
+        let pos_view = script
+            .find("\"test_schema\".\"v_user_stats\"")
+            .expect("v_user_stats not found in script");
+        let pos_report = script
+            .find("create or replace function \"test_schema\".\"report_user_stats\"")
+            .expect("report_user_stats not found in script");
+        let pos_print = script
+            .find("create or replace procedure \"test_schema\".\"print_user_stats\"")
+            .expect("print_user_stats not found in script");
+
+        assert!(
+            pos_get_user_count < pos_view,
+            "get_user_count() must be created before v_user_stats (function is used by view)"
+        );
+        assert!(
+            pos_view < pos_report,
+            "v_user_stats must be created before report_user_stats() (view is used by function)"
+        );
+        assert!(
+            pos_view < pos_print,
+            "v_user_stats must be created before print_user_stats() (view is used by procedure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_creates_materialized_view_after_dependent_routine() {
+        // Materialized view that uses a function should be created after that function.
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let helper_fn = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "helper".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "SELECT 42;\n".to_string(),
+        );
+
+        let mut mat_view = View::new(
+            "mv_data".to_string(),
+            " SELECT public.helper() AS value;\n".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        mat_view.is_materialized = true;
+        mat_view.hash();
+
+        to_dump.routines.push(helper_fn);
+        to_dump.views.push(mat_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_fn = script
+            .find("create or replace function \"public\".\"helper\"")
+            .expect("helper function not found");
+        let pos_mv = script
+            .find("\"public\".\"mv_data\"")
+            .expect("mv_data not found");
+
+        assert!(
+            pos_fn < pos_mv,
+            "helper() must be created before mv_data (materialized view depends on function)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_drops_routines_in_reverse_dependency_order() {
+        // Routine A calls Routine B; when both are dropped, A should be dropped first.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let routine_b = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "base_fn".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "SELECT 1;\n".to_string(),
+        );
+
+        let routine_a = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "caller_fn".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "SELECT public.base_fn();\n".to_string(),
+        );
+
+        // Add in wrong order
+        from_dump.routines.push(routine_b);
+        from_dump.routines.push(routine_a);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_caller = script
+            .find("drop function if exists \"public\".\"caller_fn\"")
+            .expect("caller_fn drop not found");
+        let pos_base = script
+            .find("drop function if exists \"public\".\"base_fn\"")
+            .expect("base_fn drop not found");
+
+        assert!(
+            pos_caller < pos_base,
+            "caller_fn (dependent) must be dropped before base_fn"
+        );
     }
 
     #[tokio::test]
