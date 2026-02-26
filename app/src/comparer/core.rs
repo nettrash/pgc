@@ -999,38 +999,50 @@ impl Comparer {
         self.script
             .push_str("\n/* ---> Routines: Start section --------------- */\n\n");
 
-        // Apply non-SQL routines first, then SQL routines last.
-        let (sql_routines, other_routines): (Vec<_>, Vec<_>) = self
-            .to
+        // ── Drop routines not present in TO (reverse dependency order) ──
+        let routines_to_drop: Vec<Routine> = self
+            .from
             .routines
             .iter()
+            .filter(|r| {
+                !self
+                    .to
+                    .routines
+                    .iter()
+                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+            })
             .cloned()
-            .partition(|r| r.lang.eq_ignore_ascii_case("sql"));
+            .collect();
 
-        for routine in &other_routines {
-            self.process_target_routine(routine);
-        }
-
-        for routine in &sql_routines {
-            self.process_target_routine(routine);
-        }
-
-        for routine in &self.from.routines {
-            if let Some(_to_routine) = self
-                .to
-                .routines
+        if !routines_to_drop.is_empty() {
+            let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
+            let drop_names: Vec<(String, String)> = routines_to_drop
                 .iter()
-                .find(|r| r.name == routine.name && r.schema == routine.schema)
-            {
-                continue; // Routine is present in both dumps, we already processed it
-            } else {
-                // Routine is not present in 'to' dump and should be dropped.
+                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .collect();
+
+            for (i, routine) in routines_to_drop.iter().enumerate() {
+                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                    {
+                        drop_deps[i].insert(j);
+                    }
+                }
+            }
+
+            let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
+                drop_names[i].clone()
+            });
+            drop_order.reverse();
+
+            for idx in drop_order {
+                let routine = &routines_to_drop[idx];
                 self.script.push_str(
                     format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
-
                 let drop_script = routine.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
@@ -1043,6 +1055,50 @@ impl Comparer {
                             .as_str(),
                     );
                 }
+            }
+        }
+
+        // ── Create / update routines in dependency order ──
+        let create_routines: Vec<(usize, Routine)> = self
+            .to
+            .routines
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.hash.is_some())
+            .map(|(i, r)| (i, r.clone()))
+            .collect();
+
+        if !create_routines.is_empty() {
+            let n = create_routines.len();
+            let names: Vec<(String, String)> = create_routines
+                .iter()
+                .map(|(_, r)| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .collect();
+
+            let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+            for (i, (_, routine)) in create_routines.iter().enumerate() {
+                for (j, (schema, name)) in names.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                    {
+                        depends_on[i].insert(j);
+                    }
+                }
+            }
+
+            let sorted = Self::kahn_toposort(n, &depends_on, |i| {
+                let r = &create_routines[i].1;
+                let priority: u8 = if r.lang.eq_ignore_ascii_case("sql") {
+                    1
+                } else {
+                    0
+                };
+                (priority, r.schema.to_lowercase(), r.name.to_lowercase())
+            });
+
+            for idx in sorted {
+                let routine = &create_routines[idx].1;
+                self.process_target_routine(routine);
             }
         }
 
@@ -2219,6 +2275,282 @@ mod tests {
 
         assert!(
             script.contains("alter function \"public\".\"test_func\"() owner to \"new_owner\";")
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_orders_by_dependencies() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // r_base_value: no dependencies
+        let r_base = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "r_base_value".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT 10;\n".to_string(),
+        );
+
+        // x_step_one: depends on r_base_value
+        let x_step = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "x_step_one".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.r_base_value() + 5;\n".to_string(),
+        );
+
+        // a_middle_layer: depends on x_step_one and r_base_value
+        let a_middle = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "a_middle_layer".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.x_step_one() * test_schema.r_base_value();\n".to_string(),
+        );
+
+        // z_final_report: depends on a_middle_layer
+        let z_final = Routine::new(
+            "test_schema".to_string(),
+            Oid(4),
+            "z_final_report".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\nDECLARE\n    result integer;\nBEGIN\n    SELECT test_schema.a_middle_layer() INTO result;\n    RAISE NOTICE 'Final result: %', result;\nEND;\n".to_string(),
+        );
+
+        // Push in deliberately wrong alphabetical / type order.
+        to_dump.routines.push(z_final);
+        to_dump.routines.push(x_step);
+        to_dump.routines.push(a_middle);
+        to_dump.routines.push(r_base);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_base = script
+            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .expect("r_base_value not found");
+        let pos_step = script
+            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .expect("x_step_one not found");
+        let pos_middle = script
+            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .expect("a_middle_layer not found");
+        let pos_final = script
+            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .expect("z_final_report not found");
+
+        assert!(
+            pos_base < pos_step,
+            "r_base_value must come before x_step_one (depends on it)"
+        );
+        assert!(
+            pos_base < pos_middle,
+            "r_base_value must come before a_middle_layer (depends on it)"
+        );
+        assert!(
+            pos_step < pos_middle,
+            "x_step_one must come before a_middle_layer (depends on it)"
+        );
+        assert!(
+            pos_middle < pos_final,
+            "a_middle_layer must come before z_final_report (depends on it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_drops_in_reverse_dependency_order() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        // r_base_value: no dependencies
+        let r_base = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "r_base_value".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT 10;\n".to_string(),
+        );
+
+        // x_step_one: depends on r_base_value
+        let x_step = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "x_step_one".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.r_base_value() + 5;\n".to_string(),
+        );
+
+        // a_middle_layer: depends on x_step_one and r_base_value
+        let a_middle = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "a_middle_layer".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.x_step_one() * test_schema.r_base_value();\n".to_string(),
+        );
+
+        from_dump.routines.push(r_base);
+        from_dump.routines.push(x_step);
+        from_dump.routines.push(a_middle);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_base = script
+            .find("drop function if exists \"test_schema\".\"r_base_value\"")
+            .expect("r_base_value drop not found");
+        let pos_step = script
+            .find("drop function if exists \"test_schema\".\"x_step_one\"")
+            .expect("x_step_one drop not found");
+        let pos_middle = script
+            .find("drop function if exists \"test_schema\".\"a_middle_layer\"")
+            .expect("a_middle_layer drop not found");
+
+        // Drops should go in reverse dependency order: dependents first.
+        assert!(
+            pos_middle < pos_step,
+            "a_middle_layer must be dropped before x_step_one"
+        );
+        assert!(
+            pos_step < pos_base,
+            "x_step_one must be dropped before r_base_value"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_and_views_orders_by_dependencies() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let r_base = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "r_base_value".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT 10;\n".to_string(),
+        );
+
+        let x_step = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "x_step_one".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.r_base_value() + 5;\n".to_string(),
+        );
+
+        let a_middle = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "a_middle_layer".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.x_step_one() * test_schema.r_base_value();\n".to_string(),
+        );
+
+        let z_final = Routine::new(
+            "test_schema".to_string(),
+            Oid(4),
+            "z_final_report".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\nDECLARE\n    result integer;\nBEGIN\n    SELECT test_schema.a_middle_layer() INTO result;\n    RAISE NOTICE 'Final result: %', result;\nEND;\n".to_string(),
+        );
+
+        // Push in deliberately wrong order.
+        to_dump.routines.push(z_final);
+        to_dump.routines.push(x_step);
+        to_dump.routines.push(a_middle);
+        to_dump.routines.push(r_base);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines_and_views().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_base = script
+            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .expect("r_base_value not found");
+        let pos_step = script
+            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .expect("x_step_one not found");
+        let pos_middle = script
+            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .expect("a_middle_layer not found");
+        let pos_final = script
+            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .expect("z_final_report not found");
+
+        assert!(
+            pos_base < pos_step,
+            "r_base_value must come before x_step_one"
+        );
+        assert!(
+            pos_base < pos_middle,
+            "r_base_value must come before a_middle_layer"
+        );
+        assert!(
+            pos_step < pos_middle,
+            "x_step_one must come before a_middle_layer"
+        );
+        assert!(
+            pos_middle < pos_final,
+            "a_middle_layer must come before z_final_report"
         );
     }
 

@@ -793,6 +793,46 @@ BEGIN
 END;
 $$;
 
+-- Routine dependency ordering test (TO side)
+-- These routines are NEW (not present in schema_a / FROM).
+-- The migration script must create them in dependency order:
+--   1. r_base_value   – no dependencies (leaf)
+--   2. x_step_one     – depends on r_base_value
+--   3. a_middle_layer – depends on x_step_one and r_base_value
+--   4. z_final_report – depends on a_middle_layer
+
+CREATE FUNCTION test_schema.r_base_value()
+RETURNS integer
+LANGUAGE sql
+AS $$
+    SELECT 10;
+$$;
+
+CREATE FUNCTION test_schema.x_step_one()
+RETURNS integer
+LANGUAGE sql
+AS $$
+    SELECT test_schema.r_base_value() + 5;
+$$;
+
+CREATE FUNCTION test_schema.a_middle_layer()
+RETURNS integer
+LANGUAGE sql
+AS $$
+    SELECT test_schema.x_step_one() * test_schema.r_base_value();
+$$;
+
+CREATE PROCEDURE test_schema.z_final_report()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    result integer;
+BEGIN
+    SELECT test_schema.a_middle_layer() INTO result;
+    RAISE NOTICE 'Final result: %', result;
+END;
+$$;
+
 -- Owner change coverage (TO side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;
