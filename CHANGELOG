@@ -4,7 +4,7 @@
                     - Partitioning support.
                     - Fixed ordering routines and views.
                     - Fixed serial and bigserial column creation.
-                    - Fixed routine orders for creation. Affected SQL routines.
+                    - Fixed dependency-based ordering of routines for creation and drop.
 
 2026-02-16      v1.0.5
 
