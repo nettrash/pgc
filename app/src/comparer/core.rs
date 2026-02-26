@@ -115,12 +115,9 @@ impl Comparer {
                     .tables
                     .iter_mut()
                     .find(|t| t.schema == schema && t.name == table)
+                    && let Some(to_column) = to_table.columns.iter_mut().find(|c| c.name == column)
                 {
-                    if let Some(to_column) =
-                        to_table.columns.iter_mut().find(|c| c.name == column)
-                    {
-                        to_column.serial_type = Some(serial_type.clone());
-                    }
+                    to_column.serial_type = Some(serial_type.clone());
                 }
             }
         }
@@ -848,9 +845,10 @@ impl Comparer {
                     && let Some(to_column) = to_table.columns.iter().find(|c| c.name == *column)
                 {
                     let is_identity = to_column.is_identity;
-                    let is_serial = to_column.column_default.as_ref().is_some_and(|d| {
-                        d.to_lowercase().contains("nextval(")
-                    });
+                    let is_serial = to_column
+                        .column_default
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains("nextval("));
 
                     if is_identity || is_serial {
                         if is_serial {
@@ -3460,7 +3458,9 @@ mod tests {
             table: "test_bigserial".to_string(),
             name: "id".to_string(),
             ordinal_position: 1,
-            column_default: Some("nextval('test_schema.test_bigserial_id_seq'::regclass)".to_string()),
+            column_default: Some(
+                "nextval('test_schema.test_bigserial_id_seq'::regclass)".to_string(),
+            ),
             is_nullable: false,
             data_type: "bigint".to_string(),
             character_maximum_length: None,
@@ -3516,9 +3516,10 @@ mod tests {
         );
         to_dump.tables.push(bigserial_table);
 
-        to_dump
-            .schemas
-            .push(crate::dump::schema::Schema::new("test_schema".to_string(), None));
+        to_dump.schemas.push(crate::dump::schema::Schema::new(
+            "test_schema".to_string(),
+            None,
+        ));
 
         let mut comparer = Comparer::new(from_dump, to_dump, false);
         comparer.compare().await.unwrap();
