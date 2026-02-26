@@ -2,6 +2,7 @@
 
                 Features:
                     - Partitioning support.
+                    - Fixed ordering routines and views.
 
 2026-02-16      v1.0.5
 

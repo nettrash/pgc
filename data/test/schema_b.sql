@@ -759,6 +759,40 @@ AS $$
     WHERE p.id = p_product_id;
 $$;
 
+-- View ↔ Routine cross-dependency test (TO side)
+-- These objects are NEW (not present in schema_a / FROM).
+-- The migration script must create them in dependency order:
+--   1. get_user_count()       – function, depends only on test_schema.users
+--   2. v_user_stats           – view that calls get_user_count() and reads users
+--   3. report_user_stats()    – function that reads v_user_stats
+--   4. print_user_stats()     – procedure that reads v_user_stats
+
+CREATE FUNCTION test_schema.get_user_count() RETURNS int AS $$
+  SELECT count(*) FROM test_schema.users;
+$$ LANGUAGE sql;
+
+CREATE VIEW test_schema.v_user_stats AS
+SELECT test_schema.get_user_count() AS total_users,
+       username
+FROM test_schema.users;
+
+CREATE FUNCTION test_schema.report_user_stats() RETURNS text AS $$
+  SELECT 'Total users in view: ' || total_users
+  FROM test_schema.v_user_stats
+  LIMIT 1;
+$$ LANGUAGE sql;
+
+CREATE PROCEDURE test_schema.print_user_stats() LANGUAGE plpgsql AS $$
+DECLARE
+    cnt int;
+BEGIN
+    SELECT total_users INTO cnt
+    FROM test_schema.v_user_stats
+    LIMIT 1;
+    RAISE NOTICE 'Total users in view: %', cnt;
+END;
+$$;
+
 -- Owner change coverage (TO side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;

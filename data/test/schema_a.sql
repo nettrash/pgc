@@ -599,6 +599,12 @@ AS $$
     WHERE p.id = p_product_id;
 $$;
 
+-- View ↔ Routine cross-dependency test (FROM side)
+-- These objects are intentionally absent in schema_a.
+-- Schema_b (TO) defines them so the generated migration script must create
+-- them in the correct dependency order:
+--   get_user_count()  →  v_user_stats  →  report_user_stats() / print_user_stats()
+
 -- Owner change coverage (FROM side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
