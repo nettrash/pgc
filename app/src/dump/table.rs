@@ -243,6 +243,7 @@ impl Table {
                         views
                     }),
                     comment: row.get("column_comment"),
+                    serial_type: None,
                 };
 
                 self.columns.push(table_column.clone());
@@ -1255,6 +1256,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         }
     }
 
@@ -2036,6 +2038,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         }
     }
 

@@ -23,6 +23,9 @@ pub struct Comparer {
     sequence_post_script: String,
     trigger_post_script: String,
     dropped_views: HashSet<String>,
+    // Tracks columns that should use serial/bigserial/smallserial type.
+    // Key: "schema.table.column", Value: "serial", "bigserial", or "smallserial".
+    serial_columns: HashMap<String, String>,
 }
 
 impl Comparer {
@@ -39,6 +42,7 @@ impl Comparer {
             sequence_post_script: String::new(),
             trigger_post_script: String::new(),
             dropped_views: HashSet::new(),
+            serial_columns: HashMap::new(),
         };
 
         comparer.script.push_str("/*\n");
@@ -74,6 +78,7 @@ impl Comparer {
         // Therefore, we compare sequences and drop views before comparing tables,
         // and defer sequence drops until after tables to avoid dependency errors.
         self.compare_sequences().await?;
+        self.mark_serial_columns();
         self.drop_views().await?;
         self.compare_tables().await?;
         self.compare_foreign_keys().await?;
@@ -96,6 +101,29 @@ impl Comparer {
         }
 
         Ok(())
+    }
+
+    /// Mark columns in `self.to.tables` that should be output as serial/bigserial/smallserial.
+    /// Called after `compare_sequences()` which populates `self.serial_columns`.
+    fn mark_serial_columns(&mut self) {
+        for (key, serial_type) in &self.serial_columns {
+            let parts: Vec<&str> = key.splitn(3, '.').collect();
+            if parts.len() == 3 {
+                let (schema, table, column) = (parts[0], parts[1], parts[2]);
+                if let Some(to_table) = self
+                    .to
+                    .tables
+                    .iter_mut()
+                    .find(|t| t.schema == schema && t.name == table)
+                {
+                    if let Some(to_column) =
+                        to_table.columns.iter_mut().find(|c| c.name == column)
+                    {
+                        to_column.serial_type = Some(serial_type.clone());
+                    }
+                }
+            }
+        }
     }
 
     #[inline]
@@ -820,9 +848,21 @@ impl Comparer {
                     && let Some(to_column) = to_table.columns.iter().find(|c| c.name == *column)
                 {
                     let is_identity = to_column.is_identity;
-                    let is_serial = to_column.data_type.to_lowercase().contains("serial");
+                    let is_serial = to_column.column_default.as_ref().is_some_and(|d| {
+                        d.to_lowercase().contains("nextval(")
+                    });
 
                     if is_identity || is_serial {
+                        if is_serial {
+                            let serial_type = match to_column.data_type.to_lowercase().as_str() {
+                                "integer" => "serial",
+                                "bigint" => "bigserial",
+                                "smallint" => "smallserial",
+                                _ => "serial",
+                            };
+                            let key = format!("{}.{}.{}", schema, table, column);
+                            self.serial_columns.insert(key, serial_type.to_string());
+                        }
                         self.script.push_str(
                                     format!(
                                         "/* Skipping sequence {}.{} as it will be created by column {}.{}.{} (identity/serial) */\n",
@@ -2238,6 +2278,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         }
     }
 
@@ -2274,7 +2315,7 @@ mod tests {
             ordinal_position: 1,
             column_default: Some("nextval('test_id_seq'::regclass)".to_string()),
             is_nullable: false,
-            data_type: "bigserial".to_string(), // This triggers the skip
+            data_type: "bigint".to_string(), // PostgreSQL reports bigserial as bigint with nextval default
             character_maximum_length: None,
             character_octet_length: None,
             numeric_precision: Some(64),
@@ -2313,6 +2354,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let table = Table::new(
@@ -2410,6 +2452,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let table = Table::new(
@@ -2588,6 +2631,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let table = Table::new(
@@ -2682,6 +2726,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let from_table = Table::new(
@@ -2747,6 +2792,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let to_table = Table::new(
@@ -3298,6 +3344,222 @@ mod tests {
         assert!(
             pos_sp < pos_gp,
             "sub-partition parent must be dropped before grandparent"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_column_uses_serial_type_in_table_script() {
+        // When a serial/bigserial column's sequence is skipped, the table script
+        // should use serial/bigserial type instead of integer/bigint with nextval default.
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // serial column (integer + nextval)
+        let serial_seq = Sequence::new(
+            "test_schema".to_string(),
+            "test_serial_id_seq".to_string(),
+            "postgres".to_string(),
+            "integer".to_string(),
+            Some(1),
+            Some(1),
+            Some(2147483647),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("test_schema".to_string()),
+            Some("test_serial".to_string()),
+            Some("id".to_string()),
+        );
+        to_dump.sequences.push(serial_seq);
+
+        let serial_col = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "test_schema".to_string(),
+            table: "test_serial".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: Some("nextval('test_schema.test_serial_id_seq'::regclass)".to_string()),
+            is_nullable: false,
+            data_type: "integer".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(32),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+            comment: None,
+            serial_type: None,
+        };
+        let serial_table = Table::new(
+            "test_schema".to_string(),
+            "test_serial".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![serial_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(serial_table);
+
+        // bigserial column (bigint + nextval)
+        let bigserial_seq = Sequence::new(
+            "test_schema".to_string(),
+            "test_bigserial_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("test_schema".to_string()),
+            Some("test_bigserial".to_string()),
+            Some("id".to_string()),
+        );
+        to_dump.sequences.push(bigserial_seq);
+
+        let bigserial_col = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "test_schema".to_string(),
+            table: "test_bigserial".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: Some("nextval('test_schema.test_bigserial_id_seq'::regclass)".to_string()),
+            is_nullable: false,
+            data_type: "bigint".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+            comment: None,
+            serial_type: None,
+        };
+        let bigserial_table = Table::new(
+            "test_schema".to_string(),
+            "test_bigserial".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![bigserial_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(bigserial_table);
+
+        to_dump
+            .schemas
+            .push(crate::dump::schema::Schema::new("test_schema".to_string(), None));
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        // Sequences should be skipped
+        assert!(
+            script.contains("Skipping sequence test_schema.test_serial_id_seq"),
+            "serial sequence should be skipped"
+        );
+        assert!(
+            script.contains("Skipping sequence test_schema.test_bigserial_id_seq"),
+            "bigserial sequence should be skipped"
+        );
+        assert!(
+            !script.contains("create sequence \"test_schema\".\"test_serial_id_seq\""),
+            "serial sequence should not be created separately"
+        );
+        assert!(
+            !script.contains("create sequence \"test_schema\".\"test_bigserial_id_seq\""),
+            "bigserial sequence should not be created separately"
+        );
+
+        // Table columns should use serial/bigserial types
+        assert!(
+            script.contains("\"id\" serial"),
+            "serial column should use 'serial' type, got:\n{script}"
+        );
+        assert!(
+            script.contains("\"id\" bigserial"),
+            "bigserial column should use 'bigserial' type, got:\n{script}"
+        );
+
+        // Should NOT contain nextval defaults for these columns
+        assert!(
+            !script.contains("nextval('test_schema.test_serial_id_seq'"),
+            "serial column should not have explicit nextval default"
+        );
+        assert!(
+            !script.contains("nextval('test_schema.test_bigserial_id_seq'"),
+            "bigserial column should not have explicit nextval default"
         );
     }
 }
