@@ -615,6 +615,16 @@ ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_from;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_from;
 ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_from;
 
+-- Routine dependency ordering test
+-- These routines are intentionally absent in schema_a (FROM).
+-- Schema_b (TO) defines four routines with inter-dependencies:
+--   r_base_value   → no dependencies (leaf)
+--   x_step_one     → depends on r_base_value
+--   a_middle_layer → depends on x_step_one and r_base_value
+--   z_final_report → depends on a_middle_layer
+-- The generated migration script must create them in topological
+-- (dependency) order, not alphabetical or insertion order.
+
 -- Serial / bigserial / identity column test
 -- These tables are intentionally absent in schema_a (FROM).
 -- Schema_b (TO) defines them so the generated migration script must:
