@@ -615,3 +615,10 @@ ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_from;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_from;
 ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_from;
 
+-- Serial / bigserial / identity column test
+-- These tables are intentionally absent in schema_a (FROM).
+-- Schema_b (TO) defines them so the generated migration script must:
+--   1. Skip creating separate sequences for serial/bigserial columns
+--   2. Use serial/bigserial types in the CREATE TABLE statement
+--   3. Correctly handle identity columns (skip sequence as well)
+

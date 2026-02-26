@@ -3,6 +3,7 @@
                 Features:
                     - Partitioning support.
                     - Fixed ordering routines and views.
+                    - Fixed serial and bigserial column creation.
 
 2026-02-16      v1.0.5
 

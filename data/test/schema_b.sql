@@ -802,3 +802,20 @@ ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
 ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;
 ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_to;
+
+-- Serial / bigserial / identity column test (TO side)
+-- These tables are NEW (not present in schema_a / FROM).
+-- The migration script must use serial/bigserial types instead of
+-- creating separate sequences + integer/bigint with nextval defaults.
+
+CREATE TABLE test_schema.test_serial (
+    id serial
+);
+
+CREATE TABLE test_schema.test_bigserial (
+    id bigserial
+);
+
+CREATE TABLE test_schema.test_identity (
+    id integer GENERATED ALWAYS AS IDENTITY
+);
