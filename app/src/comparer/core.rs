@@ -279,6 +279,27 @@ impl Comparer {
     fn dependent_view_keys(&self) -> HashSet<String> {
         let mut dependent_views = HashSet::new();
 
+        // Collect normalised keys for every table that will be altered or dropped,
+        // so we can cheaply look them up when scanning materialized view relations.
+        let altered_or_dropped: HashSet<String> = self
+            .from
+            .tables
+            .iter()
+            .filter(|table| {
+                let matching = self
+                    .to
+                    .tables
+                    .iter()
+                    .find(|t| t.schema == table.schema && t.name == table.name);
+                let will_be_dropped = matching.is_none() && self.use_drop;
+                let will_be_altered = matching
+                    .map(|target| Self::hashes_differ(&target.hash, &table.hash))
+                    .unwrap_or(false);
+                will_be_dropped || will_be_altered
+            })
+            .map(|table| Self::normalized_view_key(&table.schema, &table.name))
+            .collect();
+
         for table in &self.from.tables {
             let matching_table = self
                 .to
@@ -304,6 +325,20 @@ impl Comparer {
                         }
                     }
                 }
+            }
+        }
+
+        // Materialized views are not tracked in information_schema.view_column_usage,
+        // so they may be absent from column.related_views in older dumps.  Use the
+        // view's table_relation as a reliable fallback: if a mat-view touches any
+        // table that is being altered or dropped, it must be dropped first.
+        for view in self.from.views.iter().filter(|v| v.is_materialized) {
+            let touches = view
+                .table_relation
+                .iter()
+                .any(|rel| altered_or_dropped.contains(&Self::normalized_view_reference(rel)));
+            if touches {
+                dependent_views.insert(Self::normalized_view_key(&view.schema, &view.name));
             }
         }
 
@@ -1160,17 +1195,39 @@ impl Comparer {
         let dependent_views = self.dependent_view_keys();
         self.dropped_views.clear();
 
-        // Drop views that are referenced by table columns in the source dump and exist in the target dump.
         for from_view in &self.from.views {
             let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
 
-            if dependent_views.contains(&normalized_view) {
+            // Determine why this view should be dropped (if at all):
+            // 1. It is temporarily needed before a table alteration/drop (dependent).
+            // 2. It no longer exists in the target dump (FROM-only permanent drop).
+            // 3. It is a materialized view whose definition has changed — mat views
+            //    cannot use CREATE OR REPLACE, so they must be dropped and recreated.
+            let is_dependent = dependent_views.contains(&normalized_view);
+
+            let to_view = self
+                .to
+                .views
+                .iter()
+                .find(|v| v.schema == from_view.schema && v.name == from_view.name);
+
+            let is_from_only = to_view.is_none();
+
+            let is_changed_mat_view = from_view.is_materialized
+                && to_view
+                    .map(|tv| Self::hashes_differ(&from_view.hash, &tv.hash))
+                    .unwrap_or(false);
+
+            let should_drop =
+                is_dependent || (self.use_drop && is_from_only) || is_changed_mat_view;
+
+            if should_drop {
                 self.script.push_str(
                     format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
                 );
 
                 let drop_script = from_view.get_drop_script();
-                if self.use_drop {
+                if self.use_drop || is_changed_mat_view {
                     self.script.push_str(drop_script.as_str());
                 } else {
                     self.script.push_str(
@@ -1197,19 +1254,23 @@ impl Comparer {
 
         for to_view in &self.to.views {
             let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
-            let existed_in_from = self
+
+            let from_view = self
                 .from
                 .views
                 .iter()
-                .any(|view| view.schema == to_view.schema && view.name == to_view.name);
+                .find(|view| view.schema == to_view.schema && view.name == to_view.name);
 
-            if existed_in_from && !self.dropped_views.contains(&normalized_view) {
-                if let Some(from_view) = self
-                    .from
-                    .views
-                    .iter()
-                    .find(|view| view.schema == to_view.schema && view.name == to_view.name)
-                    && from_view.owner != to_view.owner
+            let existed_in_from = from_view.is_some();
+            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let definition_changed = from_view
+                .map(|fv| Self::hashes_differ(&fv.hash, &to_view.hash))
+                .unwrap_or(false);
+
+            if existed_in_from && !was_dropped && !definition_changed {
+                // Unchanged view — only emit owner change if needed.
+                if let Some(fv) = from_view
+                    && fv.owner != to_view.owner
                 {
                     self.script.push_str(
                         format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str(),
@@ -1222,20 +1283,25 @@ impl Comparer {
             self.script
                 .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
 
-            let mut view_script = to_view.get_script();
-            if !view_script
-                .to_uppercase()
-                .contains("CREATE OR REPLACE VIEW")
-            {
-                const TARGET: &str = "create view";
-                const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
+            if to_view.is_materialized {
+                // Materialized views do not support CREATE OR REPLACE — get_script()
+                // already emits the correct CREATE MATERIALIZED VIEW syntax.
+                self.script.push_str(&to_view.get_script());
+            } else {
+                let mut view_script = to_view.get_script();
+                if !view_script
+                    .to_uppercase()
+                    .contains("CREATE OR REPLACE VIEW")
+                {
+                    const TARGET: &str = "create view";
+                    const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
 
-                if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
-                    view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
+                    if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
+                        view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
+                    }
                 }
+                self.script.push_str(&view_script);
             }
-
-            self.script.push_str(&view_script);
         }
 
         self.script
