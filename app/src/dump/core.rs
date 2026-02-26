@@ -712,6 +712,7 @@ impl Dump {
     }
 
     async fn get_views(&mut self, pool: &PgPool) -> Result<(), Error> {
+        // Fetch regular (non-materialized) views.
         let result = sqlx::query(
             format!(
                 "select v.table_schema,
@@ -757,6 +758,7 @@ impl Dump {
                         .get::<Option<String>, _>("view_owner")
                         .unwrap_or_default(),
                     comment: row.get("view_comment"),
+                    is_materialized: false,
                     hash: None,
                 };
                 view.hash();
@@ -770,6 +772,74 @@ impl Dump {
                 );
             }
         }
+
+        // Fetch materialized views.
+        let mat_result = sqlx::query(
+            format!(
+                "select
+                        mv.schemaname as table_schema,
+                        mv.matviewname as table_name,
+                        mv.definition as view_definition,
+                        mv.matviewowner as view_owner,
+                        array(
+                            select distinct n.nspname || '.' || dc.relname
+                            from pg_depend dep
+                            join pg_class dc on dc.oid = dep.refobjid
+                            join pg_namespace n on n.oid = dc.relnamespace
+                            where dep.objid = c.oid
+                              and dep.deptype = 'n'
+                              and dc.relkind in ('r', 'v', 'm')
+                        ) as table_relation,
+                        d.description as view_comment
+                from pg_matviews mv
+                join pg_class c on c.relname = mv.matviewname
+                    and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
+                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+                where mv.schemaname not in ('pg_catalog', 'information_schema')
+                    and mv.schemaname like '{}';",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+        if mat_result.is_err() {
+            return Err(Error::other(format!(
+                "Failed to fetch materialized views: {}.",
+                mat_result.err().unwrap()
+            )));
+        }
+        let mat_rows = mat_result.unwrap();
+
+        if mat_rows.is_empty() {
+            println!("No materialized views found.");
+        } else {
+            println!("Materialized views found:");
+            for row in mat_rows {
+                let mut view = View {
+                    schema: row.get("table_schema"),
+                    name: row.get("table_name"),
+                    definition: row.get("view_definition"),
+                    table_relation: row.get("table_relation"),
+                    owner: row
+                        .get::<Option<String>, _>("view_owner")
+                        .unwrap_or_default(),
+                    comment: row.get("view_comment"),
+                    is_materialized: true,
+                    hash: None,
+                };
+                view.hash();
+                self.views.push(view.clone());
+
+                println!(
+                    " - {}.{} (materialized, hash: {})",
+                    view.schema,
+                    view.name,
+                    view.hash.as_deref().unwrap_or("None")
+                );
+            }
+        }
+
         Ok(())
     }
 

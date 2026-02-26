@@ -144,11 +144,29 @@ impl Table {
                                 c.is_updatable,
                                 pd.description as column_comment,
                                 (
-                                        SELECT string_agg(DISTINCT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name), ', ')
-                                        FROM information_schema.view_column_usage v
-                                        WHERE v.table_schema = c.table_schema
-                                            AND v.table_name  = c.table_name
-                                            AND v.column_name = c.column_name
+                                        SELECT string_agg(DISTINCT rel, ', ')
+                                        FROM (
+                                            SELECT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name) AS rel
+                                            FROM information_schema.view_column_usage v
+                                            WHERE v.table_schema = c.table_schema
+                                                AND v.table_name  = c.table_name
+                                                AND v.column_name = c.column_name
+                                            UNION ALL
+                                            SELECT quote_ident(mn.nspname) || '.' || quote_ident(mc.relname) AS rel
+                                            FROM pg_attribute  pa
+                                            JOIN pg_class      tc  ON tc.oid           = pa.attrelid
+                                            JOIN pg_namespace  tn  ON tn.oid           = tc.relnamespace
+                                            JOIN pg_depend     dep ON dep.refobjid     = pa.attrelid
+                                                                  AND dep.refobjsubid  = pa.attnum
+                                                                  AND dep.deptype      = 'n'
+                                            JOIN pg_class      mc  ON mc.oid = dep.objid AND mc.relkind = 'm'
+                                            JOIN pg_namespace  mn  ON mn.oid = mc.relnamespace
+                                            WHERE tn.nspname = c.table_schema
+                                              AND tc.relname = c.table_name
+                                              AND pa.attname = c.column_name
+                                              AND pa.attnum  > 0
+                                              AND pa.attisdropped = false
+                                        ) sub
                                 ) AS related_views
                          FROM information_schema.columns c
                          JOIN pg_catalog.pg_namespace ns
