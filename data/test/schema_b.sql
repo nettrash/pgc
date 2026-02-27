@@ -833,6 +833,64 @@ BEGIN
 END;
 $$;
 
+-- =============================================================================
+-- Extension object exclusion test
+-- =============================================================================
+-- Extensions create their own objects (functions, types, operators, casts, etc.)
+-- in the database. These extension-owned objects must NOT be included in the dump
+-- or comparison output. Only the extensions themselves should be compared.
+--
+-- In TO (schema_b):
+--   - uuid-ossp  → creates uuid_generate_v4(), uuid_generate_v1(), etc.
+--   - pg_trgm    → creates similarity(), show_trgm(), gin_trgm_ops, etc.
+--   - hstore     → creates hstore type, hstore(), akeys(), avals(), each(), etc.
+--   (pgcrypto removed compared to FROM)
+--
+-- Expected comparison behavior:
+--   - Extension diff: DROP pgcrypto, CREATE hstore.
+--   - hstore's own type, functions, operators, casts must NOT appear as
+--     individual object creates in the comparison script.
+--   - pgcrypto's own functions must NOT appear as individual object drops.
+--   - User-defined objects that reference extension types/functions should
+--     still be compared normally.
+-- =============================================================================
+
+-- User-defined function wrapping extension function (different from FROM).
+-- FROM used pgcrypto's gen_random_bytes; TO uses a different implementation
+-- since pgcrypto is removed. This tests that the user function is compared
+-- (hash changed) while extension functions themselves are excluded.
+CREATE OR REPLACE FUNCTION test_schema.generate_token(length INTEGER DEFAULT 32)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- pgcrypto removed in TO, use md5-based approach instead
+    RETURN substr(md5(random()::text || clock_timestamp()::text), 1, length);
+END;
+$$;
+
+-- User-defined function that uses uuid-ossp extension function (same as FROM → no diff).
+CREATE OR REPLACE FUNCTION test_schema.new_entity_id()
+RETURNS UUID
+LANGUAGE sql
+AS $$
+    SELECT uuid_generate_v4();
+$$;
+
+-- Table using hstore extension type.
+-- This is a user-defined table and SHOULD appear in the dump/comparison,
+-- even though the hstore type itself is extension-owned.
+-- This table only exists in TO (new table).
+CREATE TABLE test_schema.user_preferences (
+    user_id INTEGER NOT NULL REFERENCES test_schema.users(id),
+    preferences hstore DEFAULT ''::hstore,
+    settings hstore DEFAULT ''::hstore,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id)
+);
+
+CREATE INDEX idx_user_preferences_prefs ON test_schema.user_preferences USING GIN(preferences);
+
 -- Owner change coverage (TO side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;

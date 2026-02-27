@@ -605,6 +605,47 @@ $$;
 -- them in the correct dependency order:
 --   get_user_count()  →  v_user_stats  →  report_user_stats() / print_user_stats()
 
+-- =============================================================================
+-- Extension object exclusion test
+-- =============================================================================
+-- Extensions create their own objects (functions, types, operators, casts, etc.)
+-- in the database. These extension-owned objects must NOT be included in the dump
+-- or comparison output. Only the extensions themselves should be compared.
+--
+-- In FROM (schema_a):
+--   - uuid-ossp  → creates uuid_generate_v4(), uuid_generate_v1(), etc.
+--   - pgcrypto   → creates gen_random_uuid(), crypt(), gen_salt(), digest(), etc.
+--   - pg_trgm    → creates similarity(), show_trgm(), gin_trgm_ops, etc.
+--
+-- Expected behavior:
+--   - The dump should include the three extensions above.
+--   - The dump must NOT include any functions, types, operators, or casts
+--     created by those extensions (deptype = 'e' in pg_depend).
+--   - User-defined objects that REFERENCE extension functions/types should
+--     still be included in the dump (they are not owned by the extension).
+-- =============================================================================
+
+-- User-defined function that wraps an extension function (pgcrypto).
+-- This function itself is NOT extension-owned, so it SHOULD appear in the dump.
+-- But pgcrypto's own gen_random_bytes(), digest(), etc. should NOT.
+CREATE OR REPLACE FUNCTION test_schema.generate_token(length INTEGER DEFAULT 32)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN encode(gen_random_bytes(length), 'hex');
+END;
+$$;
+
+-- User-defined function that uses uuid-ossp extension function.
+-- This should appear in the dump; uuid_generate_v4() itself should not.
+CREATE OR REPLACE FUNCTION test_schema.new_entity_id()
+RETURNS UUID
+LANGUAGE sql
+AS $$
+    SELECT uuid_generate_v4();
+$$;
+
 -- Owner change coverage (FROM side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
