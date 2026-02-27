@@ -392,6 +392,35 @@ CREATE TRIGGER trigger_orders_audit
     EXECUTE FUNCTION shared_schema.audit_trigger();
 
 -- Views
+
+-- MATERIALIZED VIEWS
+-- Case 1: exists in FROM only → should be dropped
+CREATE MATERIALIZED VIEW test_schema.from_only_mat AS
+SELECT
+    u.id,
+    u.username,
+    u.email,
+    u.status
+FROM test_schema.users u
+WHERE u.is_admin = FALSE;
+
+-- Case 2: exists in both, definition differs → should be dropped and recreated
+CREATE MATERIALIZED VIEW test_schema.active_users_mat AS
+SELECT
+    u.id,
+    u.username,
+    u.email
+FROM test_schema.users u
+WHERE u.status = 'active';
+
+-- Case 3: exists in both, unchanged → no change expected
+CREATE MATERIALIZED VIEW test_schema.user_count_mat AS
+SELECT
+    status,
+    COUNT(*) AS cnt
+FROM test_schema.users
+GROUP BY status;
+
 CREATE VIEW test_schema.user_order_summary AS
 SELECT 
     u.id,
@@ -453,6 +482,7 @@ COMMENT ON TYPE test_schema.status_type IS 'User status values (active/inactive/
 COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer with no upper bound in FROM';
 COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 1000 (FROM)';
 COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with basic stock buckets (FROM)';
+COMMENT ON MATERIALIZED VIEW test_schema.active_users_mat IS 'Active users snapshot (FROM version)';
 COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users filtered by status (FROM)';
 COMMENT ON FUNCTION test_schema.get_products_by_priority(test_schema.priority_type) IS 'FROM-only routine using FROM-only type to validate drop order';
 
@@ -569,6 +599,53 @@ AS $$
     WHERE p.id = p_product_id;
 $$;
 
+-- View ↔ Routine cross-dependency test (FROM side)
+-- These objects are intentionally absent in schema_a.
+-- Schema_b (TO) defines them so the generated migration script must create
+-- them in the correct dependency order:
+--   get_user_count()  →  v_user_stats  →  report_user_stats() / print_user_stats()
+
+-- =============================================================================
+-- Extension object exclusion test
+-- =============================================================================
+-- Extensions create their own objects (functions, types, operators, casts, etc.)
+-- in the database. These extension-owned objects must NOT be included in the dump
+-- or comparison output. Only the extensions themselves should be compared.
+--
+-- In FROM (schema_a):
+--   - uuid-ossp  → creates uuid_generate_v4(), uuid_generate_v1(), etc.
+--   - pgcrypto   → creates gen_random_uuid(), crypt(), gen_salt(), digest(), etc.
+--   - pg_trgm    → creates similarity(), show_trgm(), gin_trgm_ops, etc.
+--
+-- Expected behavior:
+--   - The dump should include the three extensions above.
+--   - The dump must NOT include any functions, types, operators, or casts
+--     created by those extensions (deptype = 'e' in pg_depend).
+--   - User-defined objects that REFERENCE extension functions/types should
+--     still be included in the dump (they are not owned by the extension).
+-- =============================================================================
+
+-- User-defined function that wraps an extension function (pgcrypto).
+-- This function itself is NOT extension-owned, so it SHOULD appear in the dump.
+-- But pgcrypto's own gen_random_bytes(), digest(), etc. should NOT.
+CREATE OR REPLACE FUNCTION test_schema.generate_token(length INTEGER DEFAULT 32)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN encode(gen_random_bytes(length), 'hex');
+END;
+$$;
+
+-- User-defined function that uses uuid-ossp extension function.
+-- This should appear in the dump; uuid_generate_v4() itself should not.
+CREATE OR REPLACE FUNCTION test_schema.new_entity_id()
+RETURNS UUID
+LANGUAGE sql
+AS $$
+    SELECT uuid_generate_v4();
+$$;
+
 -- Owner change coverage (FROM side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
@@ -577,4 +654,22 @@ ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_from;
 ALTER TABLE test_schema.users OWNER TO pgc_owner_from;
 ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_from;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_from;
+ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_from;
+
+-- Routine dependency ordering test
+-- These routines are intentionally absent in schema_a (FROM).
+-- Schema_b (TO) defines four routines with inter-dependencies:
+--   r_base_value   → no dependencies (leaf)
+--   x_step_one     → depends on r_base_value
+--   a_middle_layer → depends on x_step_one and r_base_value
+--   z_final_report → depends on a_middle_layer
+-- The generated migration script must create them in topological
+-- (dependency) order, not alphabetical or insertion order.
+
+-- Serial / bigserial / identity column test
+-- These tables are intentionally absent in schema_a (FROM).
+-- Schema_b (TO) defines them so the generated migration script must:
+--   1. Skip creating separate sequences for serial/bigserial columns
+--   2. Use serial/bigserial types in the CREATE TABLE statement
+--   3. Correctly handle identity columns (skip sequence as well)
 

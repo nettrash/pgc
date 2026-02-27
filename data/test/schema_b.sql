@@ -441,6 +441,38 @@ CREATE TRIGGER trigger_reviews_audit
 -- Views (some modified, some removed, some added)
 -- user_order_summary removed (orders table doesn't exist)
 
+-- MATERIALIZED VIEWS
+-- Case 1 from_only_mat: removed (exists only in FROM → should be dropped)
+
+-- Case 2: exists in both, definition changed → should be dropped and recreated
+CREATE MATERIALIZED VIEW test_schema.active_users_mat AS
+SELECT
+    u.id,
+    u.username,
+    u.email,
+    u.status  -- MODIFIED: added status column
+FROM test_schema.users u
+WHERE u.status = 'active';
+
+-- Case 3: unchanged → no change expected
+CREATE MATERIALIZED VIEW test_schema.user_count_mat AS
+SELECT
+    status,
+    COUNT(*) AS cnt
+FROM test_schema.users
+GROUP BY status;
+
+-- Case 4: exists only in TO → should be created
+CREATE MATERIALIZED VIEW test_schema.product_stock_mat AS
+SELECT
+    p.id,
+    p.name,
+    p.sku,
+    p.stock_quantity,
+    p.status
+FROM test_schema.products p
+WHERE p.stock_quantity > 0;
+
 -- MODIFIED VIEW
 CREATE VIEW test_schema.product_inventory AS
 SELECT 
@@ -525,6 +557,7 @@ COMMENT ON COLUMN test_schema.products.barcode IS 'Product barcode for inventory
 COMMENT ON TYPE test_schema.status_type IS 'User status values including suspended (TO)';
 COMMENT ON DOMAIN test_schema.positive_integer IS 'Positive integer capped at 1,000,000 (TO)';
 COMMENT ON SEQUENCE test_schema.user_id_seq IS 'User id sequence starting at 2000 (TO)';
+COMMENT ON MATERIALIZED VIEW test_schema.active_users_mat IS 'Active users snapshot (TO version)';
 COMMENT ON VIEW test_schema.product_inventory IS 'Inventory overview with featured flag (TO)';
 COMMENT ON FUNCTION test_schema.get_users_by_status(test_schema.status_type) IS 'Returns users with created_at for status filter (TO)';
 
@@ -726,6 +759,138 @@ AS $$
     WHERE p.id = p_product_id;
 $$;
 
+-- View ↔ Routine cross-dependency test (TO side)
+-- These objects are NEW (not present in schema_a / FROM).
+-- The migration script must create them in dependency order:
+--   1. get_user_count()       – function, depends only on test_schema.users
+--   2. v_user_stats           – view that calls get_user_count() and reads users
+--   3. report_user_stats()    – function that reads v_user_stats
+--   4. print_user_stats()     – procedure that reads v_user_stats
+
+CREATE FUNCTION test_schema.get_user_count() RETURNS int AS $$
+  SELECT count(*) FROM test_schema.users;
+$$ LANGUAGE sql;
+
+CREATE VIEW test_schema.v_user_stats AS
+SELECT test_schema.get_user_count() AS total_users,
+       username
+FROM test_schema.users;
+
+CREATE FUNCTION test_schema.report_user_stats() RETURNS text AS $$
+  SELECT 'Total users in view: ' || total_users
+  FROM test_schema.v_user_stats
+  LIMIT 1;
+$$ LANGUAGE sql;
+
+CREATE PROCEDURE test_schema.print_user_stats() LANGUAGE plpgsql AS $$
+DECLARE
+    cnt int;
+BEGIN
+    SELECT total_users INTO cnt
+    FROM test_schema.v_user_stats
+    LIMIT 1;
+    RAISE NOTICE 'Total users in view: %', cnt;
+END;
+$$;
+
+-- Routine dependency ordering test (TO side)
+-- These routines are NEW (not present in schema_a / FROM).
+-- The migration script must create them in dependency order:
+--   1. r_base_value   – no dependencies (leaf)
+--   2. x_step_one     – depends on r_base_value
+--   3. a_middle_layer – depends on x_step_one and r_base_value
+--   4. z_final_report – depends on a_middle_layer
+
+CREATE FUNCTION test_schema.r_base_value()
+RETURNS integer
+LANGUAGE sql
+AS $$
+    SELECT 10;
+$$;
+
+CREATE FUNCTION test_schema.x_step_one()
+RETURNS integer
+LANGUAGE sql
+AS $$
+    SELECT test_schema.r_base_value() + 5;
+$$;
+
+CREATE FUNCTION test_schema.a_middle_layer()
+RETURNS integer
+LANGUAGE sql
+AS $$
+    SELECT test_schema.x_step_one() * test_schema.r_base_value();
+$$;
+
+CREATE PROCEDURE test_schema.z_final_report()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    result integer;
+BEGIN
+    SELECT test_schema.a_middle_layer() INTO result;
+    RAISE NOTICE 'Final result: %', result;
+END;
+$$;
+
+-- =============================================================================
+-- Extension object exclusion test
+-- =============================================================================
+-- Extensions create their own objects (functions, types, operators, casts, etc.)
+-- in the database. These extension-owned objects must NOT be included in the dump
+-- or comparison output. Only the extensions themselves should be compared.
+--
+-- In TO (schema_b):
+--   - uuid-ossp  → creates uuid_generate_v4(), uuid_generate_v1(), etc.
+--   - pg_trgm    → creates similarity(), show_trgm(), gin_trgm_ops, etc.
+--   - hstore     → creates hstore type, hstore(), akeys(), avals(), each(), etc.
+--   (pgcrypto removed compared to FROM)
+--
+-- Expected comparison behavior:
+--   - Extension diff: DROP pgcrypto, CREATE hstore.
+--   - hstore's own type, functions, operators, casts must NOT appear as
+--     individual object creates in the comparison script.
+--   - pgcrypto's own functions must NOT appear as individual object drops.
+--   - User-defined objects that reference extension types/functions should
+--     still be compared normally.
+-- =============================================================================
+
+-- User-defined function wrapping extension function (different from FROM).
+-- FROM used pgcrypto's gen_random_bytes; TO uses a different implementation
+-- since pgcrypto is removed. This tests that the user function is compared
+-- (hash changed) while extension functions themselves are excluded.
+CREATE OR REPLACE FUNCTION test_schema.generate_token(length INTEGER DEFAULT 32)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- pgcrypto removed in TO, use md5-based approach instead
+    RETURN substr(md5(random()::text || clock_timestamp()::text), 1, length);
+END;
+$$;
+
+-- User-defined function that uses uuid-ossp extension function (same as FROM → no diff).
+CREATE OR REPLACE FUNCTION test_schema.new_entity_id()
+RETURNS UUID
+LANGUAGE sql
+AS $$
+    SELECT uuid_generate_v4();
+$$;
+
+-- Table using hstore extension type.
+-- This is a user-defined table and SHOULD appear in the dump/comparison,
+-- even though the hstore type itself is extension-owned.
+-- This table only exists in TO (new table).
+CREATE TABLE test_schema.user_preferences (
+    user_id INTEGER NOT NULL REFERENCES test_schema.users(id),
+    preferences hstore DEFAULT ''::hstore,
+    settings hstore DEFAULT ''::hstore,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id)
+);
+
+CREATE INDEX idx_user_preferences_prefs ON test_schema.user_preferences USING GIN(preferences);
+
 -- Owner change coverage (TO side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;
@@ -734,3 +899,21 @@ ALTER SEQUENCE test_schema.user_id_seq OWNER TO pgc_owner_to;
 ALTER TABLE test_schema.users OWNER TO pgc_owner_to;
 ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;
+ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_to;
+
+-- Serial / bigserial / identity column test (TO side)
+-- These tables are NEW (not present in schema_a / FROM).
+-- The migration script must use serial/bigserial types instead of
+-- creating separate sequences + integer/bigint with nextval defaults.
+
+CREATE TABLE test_schema.test_serial (
+    id serial
+);
+
+CREATE TABLE test_schema.test_bigserial (
+    id bigserial
+);
+
+CREATE TABLE test_schema.test_identity (
+    id integer GENERATED ALWAYS AS IDENTITY
+);

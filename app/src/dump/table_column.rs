@@ -51,6 +51,8 @@ pub struct TableColumn {
     pub related_views: Option<Vec<String>>,    // Related views (optional)
     #[serde(default)]
     pub comment: Option<String>, // Column comment
+    #[serde(skip)]
+    pub serial_type: Option<String>, // Transient: set at comparison time to "serial", "bigserial", or "smallserial"
 }
 
 impl TableColumn {
@@ -292,6 +294,16 @@ impl TableColumn {
         let mut script = String::new();
         // Name
         script.push_str(&format!("\"{}\" ", self.name));
+
+        // If this column is a serial/bigserial/smallserial type, output the serial type directly
+        // and skip the default clause (the sequence is created automatically by PostgreSQL).
+        if let Some(ref serial_type) = self.serial_type {
+            script.push_str(serial_type);
+            if !self.is_nullable {
+                script.push_str(" not null");
+            }
+            return script.trim_end().to_string();
+        }
 
         // Data type with length/precision/scale if applicable
         script.push_str(&self.data_type);
@@ -714,6 +726,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         }
     }
 

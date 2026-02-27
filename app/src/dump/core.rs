@@ -210,6 +210,11 @@ impl Dump {
                     and t.typisdefined = true
                     and a.attnum > 0
                     and a.attisdropped = false
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = t.oid
+                        and ext_dep.deptype = 'e'
+                    )
                  order by t.oid, a.attnum",
                 self.configuration.scheme
             )
@@ -283,7 +288,12 @@ impl Dump {
                     t.typtype in ('d', 'e', 'r', 'm')
                     or (t.typtype = 'c' and c.relkind = 'c')
                 )
-                and t.typisdefined = true",
+                and t.typisdefined = true
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = t.oid
+                    and ext_dep.deptype = 'e'
+                )",
                 self.configuration.scheme
             )
             .as_str(),
@@ -362,7 +372,7 @@ impl Dump {
 
     // Fetch enums from the database and populate the dump.
     async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query("select * from pg_enum").fetch_all(pool).await;
+        let result = sqlx::query("select e.* from pg_enum e where not exists (select 1 from pg_depend ext_dep where ext_dep.objid = e.enumtypid and ext_dep.deptype = 'e')").fetch_all(pool).await;
         if result.is_err() {
             return Err(Error::other(format!(
                 "Failed to fetch enums: {}.",
@@ -420,6 +430,11 @@ impl Dump {
             where c.contype = 'c'
               and c.contypid <> 0
               and n.nspname like '{}'
+              and not exists (
+                  select 1 from pg_depend ext_dep
+                  where ext_dep.objid = c.contypid
+                  and ext_dep.deptype = 'e'
+              )
             order by c.contypid, c.conname",
             self.configuration.scheme
         );
@@ -498,7 +513,12 @@ impl Dump {
                     left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
                         and owner_attr.attnum = dep.refobjsubid
                 where
-                    seq.schemaname like '%{}%'",
+                    seq.schemaname like '%{}%'
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = seq_class.oid
+                        and ext_dep.deptype = 'e'
+                    )",
                 self.configuration.scheme
             )
             .as_str(),
@@ -583,7 +603,12 @@ impl Dump {
                     n.nspname like '{}'
                     and n.nspname not in ('pg_catalog', 'information_schema')
                     and l.lanname not in ('c', 'internal')
-                    and r.prokind in ('f', 'p');
+                    and r.prokind in ('f', 'p')
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = r.oid
+                        and ext_dep.deptype = 'e'
+                    );
                 ",
                 self.configuration.scheme
             )
@@ -652,7 +677,12 @@ impl Dump {
                     where 
                         t.schemaname not in ('pg_catalog', 'information_schema') 
                         and t.schemaname like '{}' 
-                        and t.tablename not like 'pg_%';",
+                        and t.tablename not like 'pg_%'
+                        and not exists (
+                            select 1 from pg_depend ext_dep
+                            where ext_dep.objid = c.oid
+                            and ext_dep.deptype = 'e'
+                        );",
                 self.configuration.scheme
             )
             .as_str(),
@@ -712,6 +742,7 @@ impl Dump {
     }
 
     async fn get_views(&mut self, pool: &PgPool) -> Result<(), Error> {
+        // Fetch regular (non-materialized) views.
         let result = sqlx::query(
             format!(
                 "select v.table_schema,
@@ -728,6 +759,11 @@ impl Dump {
                 where
                     v.table_schema not in ('pg_catalog', 'information_schema')
                     and v.table_schema like '{}'
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = c.oid
+                        and ext_dep.deptype = 'e'
+                    )
                 group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description;",
                 self.configuration.scheme
             )
@@ -757,6 +793,7 @@ impl Dump {
                         .get::<Option<String>, _>("view_owner")
                         .unwrap_or_default(),
                     comment: row.get("view_comment"),
+                    is_materialized: false,
                     hash: None,
                 };
                 view.hash();
@@ -770,6 +807,79 @@ impl Dump {
                 );
             }
         }
+
+        // Fetch materialized views.
+        let mat_result = sqlx::query(
+            format!(
+                "select
+                        mv.schemaname as table_schema,
+                        mv.matviewname as table_name,
+                        mv.definition as view_definition,
+                        mv.matviewowner as view_owner,
+                        array(
+                            select distinct n.nspname || '.' || dc.relname
+                            from pg_depend dep
+                            join pg_class dc on dc.oid = dep.refobjid
+                            join pg_namespace n on n.oid = dc.relnamespace
+                            where dep.objid = c.oid
+                              and dep.deptype = 'n'
+                              and dc.relkind in ('r', 'v', 'm')
+                        ) as table_relation,
+                        d.description as view_comment
+                from pg_matviews mv
+                join pg_class c on c.relname = mv.matviewname
+                    and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
+                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+                where mv.schemaname not in ('pg_catalog', 'information_schema')
+                    and mv.schemaname like '{}'
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = c.oid
+                        and ext_dep.deptype = 'e'
+                    );",
+                self.configuration.scheme
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await;
+        if mat_result.is_err() {
+            return Err(Error::other(format!(
+                "Failed to fetch materialized views: {}.",
+                mat_result.err().unwrap()
+            )));
+        }
+        let mat_rows = mat_result.unwrap();
+
+        if mat_rows.is_empty() {
+            println!("No materialized views found.");
+        } else {
+            println!("Materialized views found:");
+            for row in mat_rows {
+                let mut view = View {
+                    schema: row.get("table_schema"),
+                    name: row.get("table_name"),
+                    definition: row.get("view_definition"),
+                    table_relation: row.get("table_relation"),
+                    owner: row
+                        .get::<Option<String>, _>("view_owner")
+                        .unwrap_or_default(),
+                    comment: row.get("view_comment"),
+                    is_materialized: true,
+                    hash: None,
+                };
+                view.hash();
+                self.views.push(view.clone());
+
+                println!(
+                    " - {}.{} (materialized, hash: {})",
+                    view.schema,
+                    view.name,
+                    view.hash.as_deref().unwrap_or("None")
+                );
+            }
+        }
+
         Ok(())
     }
 

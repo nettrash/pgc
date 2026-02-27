@@ -17,6 +17,9 @@ pub struct View {
     /// Optional comment on the view
     #[serde(default)]
     pub comment: Option<String>,
+    /// Whether this is a materialized view
+    #[serde(default)]
+    pub is_materialized: bool,
     /// Hash of the view
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -37,10 +40,20 @@ impl View {
             table_relation,
             owner: String::new(),
             comment: None,
+            is_materialized: false,
             hash: None,
         };
         view.hash();
         view
+    }
+
+    /// Returns the SQL keyword for this view type ("view" or "materialized view")
+    fn view_keyword(&self) -> &'static str {
+        if self.is_materialized {
+            "materialized view"
+        } else {
+            "view"
+        }
     }
 
     /// Hash
@@ -48,27 +61,30 @@ impl View {
         self.hash = Some(format!(
             "{:x}",
             md5::compute(format!(
-                "{}.{}.{}.{}.{}",
+                "{}.{}.{}.{}.{}.{}",
                 self.schema,
                 self.name,
                 self.definition,
                 self.owner,
-                self.comment.clone().unwrap_or_default()
+                self.comment.clone().unwrap_or_default(),
+                self.is_materialized
             ))
         ));
     }
 
     /// Returns a string to create the view.
     pub fn get_script(&self) -> String {
+        let keyword = self.view_keyword();
         let script = format!(
-            "create view \"{}\".\"{}\" as\n{}\n",
-            self.schema, self.name, self.definition
+            "create {} \"{}\".\"{}\" as\n{}\n",
+            keyword, self.schema, self.name, self.definition
         );
 
         let mut script = if let Some(comment) = &self.comment {
             format!(
-                "{}comment on view \"{}\".\"{}\" is '{}';\n",
+                "{}comment on {} \"{}\".\"{}\" is '{}';\n",
                 script,
+                keyword,
                 self.schema,
                 self.name,
                 comment.replace('\'', "''")
@@ -84,8 +100,10 @@ impl View {
     /// Returns a string to drop the view.
     pub fn get_drop_script(&self) -> String {
         format!(
-            "drop view if exists \"{}\".\"{}\";\n",
-            self.schema, self.name
+            "drop {} if exists \"{}\".\"{}\";\n",
+            self.view_keyword(),
+            self.schema,
+            self.name
         )
     }
 
@@ -95,7 +113,8 @@ impl View {
         }
 
         format!(
-            "alter view \"{}\".\"{}\" owner to \"{}\";\n",
+            "alter {} \"{}\".\"{}\" owner to \"{}\";\n",
+            self.view_keyword(),
             self.schema,
             self.name,
             self.owner.replace('"', "\"\"")
@@ -114,11 +133,18 @@ impl View {
         let current_definition = self.definition.trim();
         let desired_definition = target.definition.trim();
 
-        if current_definition == desired_definition {
+        if current_definition == desired_definition
+            && self.is_materialized == target.is_materialized
+        {
             return format!(
                 "-- View {}.{} requires no changes.\n",
                 self.schema, self.name
             );
+        }
+
+        // Materialized views do not support CREATE OR REPLACE; drop and recreate instead.
+        if target.is_materialized {
+            return format!("{}{}", target.get_drop_script(), target.get_script());
         }
 
         let script = target.get_script();
@@ -148,6 +174,18 @@ mod tests {
         )
     }
 
+    fn create_materialized_view(definition: &str) -> View {
+        let mut view = View::new(
+            "active_users".to_string(),
+            definition.to_string(),
+            "analytics".to_string(),
+            vec!["public.users".to_string()],
+        );
+        view.is_materialized = true;
+        view.hash();
+        view
+    }
+
     #[test]
     fn test_view_new_initializes_hash() {
         let definition = "select id from public.users where active";
@@ -155,7 +193,7 @@ mod tests {
 
         let expected_hash = format!(
             "{:x}",
-            md5::compute(format!("analytics.active_users.{definition}.."))
+            md5::compute(format!("analytics.active_users.{definition}...false"))
         );
 
         assert_eq!(view.hash.as_deref(), Some(expected_hash.as_str()));
@@ -185,6 +223,15 @@ mod tests {
     }
 
     #[test]
+    fn test_get_script_returns_create_materialized_statement() {
+        let view = create_materialized_view("select id from public.users");
+        assert_eq!(
+            view.get_script(),
+            "create materialized view \"analytics\".\"active_users\" as\nselect id from public.users\n"
+        );
+    }
+
+    #[test]
     fn test_get_script_includes_owner_when_present() {
         let mut view = create_view("select id from public.users");
         view.owner = "pgc_owner".to_string();
@@ -197,11 +244,32 @@ mod tests {
     }
 
     #[test]
+    fn test_get_script_includes_owner_for_materialized_view() {
+        let mut view = create_materialized_view("select id from public.users");
+        view.owner = "pgc_owner".to_string();
+        view.hash();
+
+        assert_eq!(
+            view.get_script(),
+            "create materialized view \"analytics\".\"active_users\" as\nselect id from public.users\nalter materialized view \"analytics\".\"active_users\" owner to \"pgc_owner\";\n"
+        );
+    }
+
+    #[test]
     fn test_get_drop_script_returns_drop_statement() {
         let view = create_view("select id from public.users");
         assert_eq!(
             view.get_drop_script(),
             "drop view if exists \"analytics\".\"active_users\";\n"
+        );
+    }
+
+    #[test]
+    fn test_get_drop_script_returns_drop_materialized_statement() {
+        let view = create_materialized_view("select id from public.users");
+        assert_eq!(
+            view.get_drop_script(),
+            "drop materialized view if exists \"analytics\".\"active_users\";\n"
         );
     }
 
@@ -252,6 +320,17 @@ mod tests {
         assert_eq!(
             current.get_alter_script(&target),
             "CREATE OR REPLACE VIEW \"analytics\".\"active_users\" AS\nselect id, active from public.users where active\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_materialized_drops_and_recreates() {
+        let current = create_materialized_view("select 1");
+        let target = create_materialized_view("select id from public.users");
+
+        assert_eq!(
+            current.get_alter_script(&target),
+            "drop materialized view if exists \"analytics\".\"active_users\";\ncreate materialized view \"analytics\".\"active_users\" as\nselect id from public.users\n"
         );
     }
 }

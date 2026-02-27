@@ -1,6 +1,6 @@
-use crate::dump::{core::Dump, routine::Routine, table::Table};
+use crate::dump::{core::Dump, routine::Routine, table::Table, view::View};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::{Error, Write},
 };
@@ -23,6 +23,9 @@ pub struct Comparer {
     sequence_post_script: String,
     trigger_post_script: String,
     dropped_views: HashSet<String>,
+    // Tracks columns that should use serial/bigserial/smallserial type.
+    // Key: "schema.table.column", Value: "serial", "bigserial", or "smallserial".
+    serial_columns: HashMap<String, String>,
 }
 
 impl Comparer {
@@ -39,6 +42,7 @@ impl Comparer {
             sequence_post_script: String::new(),
             trigger_post_script: String::new(),
             dropped_views: HashSet::new(),
+            serial_columns: HashMap::new(),
         };
 
         comparer.script.push_str("/*\n");
@@ -74,6 +78,7 @@ impl Comparer {
         // Therefore, we compare sequences and drop views before comparing tables,
         // and defer sequence drops until after tables to avoid dependency errors.
         self.compare_sequences().await?;
+        self.mark_serial_columns();
         self.drop_views().await?;
         self.compare_tables().await?;
         self.compare_foreign_keys().await?;
@@ -81,7 +86,7 @@ impl Comparer {
             self.script.push_str(&self.sequence_post_script);
             self.sequence_post_script.clear();
         }
-        self.compare_routines().await?;
+        self.compare_routines_and_views().await?;
         if !self.type_post_script.is_empty() {
             self.script.push_str(&self.type_post_script);
             self.type_post_script.clear();
@@ -90,13 +95,32 @@ impl Comparer {
             self.script.push_str(&self.enum_post_script);
             self.enum_post_script.clear();
         }
-        self.create_views().await?;
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
             self.trigger_post_script.clear();
         }
 
         Ok(())
+    }
+
+    /// Mark columns in `self.to.tables` that should be output as serial/bigserial/smallserial.
+    /// Called after `compare_sequences()` which populates `self.serial_columns`.
+    fn mark_serial_columns(&mut self) {
+        for (key, serial_type) in &self.serial_columns {
+            let parts: Vec<&str> = key.splitn(3, '.').collect();
+            if parts.len() == 3 {
+                let (schema, table, column) = (parts[0], parts[1], parts[2]);
+                if let Some(to_table) = self
+                    .to
+                    .tables
+                    .iter_mut()
+                    .find(|t| t.schema == schema && t.name == table)
+                    && let Some(to_column) = to_table.columns.iter_mut().find(|c| c.name == column)
+                {
+                    to_column.serial_type = Some(serial_type.clone());
+                }
+            }
+        }
     }
 
     #[inline]
@@ -140,6 +164,7 @@ impl Comparer {
             if Self::hashes_differ(&from_routine.hash, &routine.hash) {
                 if from_routine.return_type != routine.return_type
                     || from_routine.arguments != routine.arguments
+                    || from_routine.arguments_defaults != routine.arguments_defaults
                 {
                     let drop_script = from_routine.get_drop_script();
                     if self.use_drop {
@@ -182,6 +207,91 @@ impl Comparer {
 
     fn normalized_view_key(schema: &str, name: &str) -> String {
         Self::normalized_view_reference(format!("{}.{}", schema, name).as_str())
+    }
+
+    /// Check whether `text` contains an occurrence of the qualified name
+    /// `schema.name` as a whole identifier (not as a substring of a longer
+    /// identifier).  Both quoted (`"schema"."name"`) and unquoted forms are
+    /// recognised.
+    fn text_references_qualified_name(text: &str, schema: &str, name: &str) -> bool {
+        let pattern = format!("{}.{}", schema.to_lowercase(), name.to_lowercase());
+        let lower = text.to_lowercase();
+        if Self::has_whole_qualified_name(&lower, &pattern) {
+            return true;
+        }
+        // Also try with all double-quotes stripped (handles quoted identifiers).
+        let unquoted: String = lower.chars().filter(|c| *c != '"').collect();
+        Self::has_whole_qualified_name(&unquoted, &pattern)
+    }
+
+    /// Return `true` when `text` contains `qualified` delimited by
+    /// non-identifier characters on both sides.
+    fn has_whole_qualified_name(text: &str, qualified: &str) -> bool {
+        let bytes = text.as_bytes();
+        for (idx, _) in text.match_indices(qualified) {
+            if idx > 0 {
+                let before = bytes[idx - 1];
+                if before.is_ascii_alphanumeric() || before == b'_' {
+                    continue;
+                }
+            }
+            let end = idx + qualified.len();
+            if end < bytes.len() {
+                let after = bytes[end];
+                if after.is_ascii_alphanumeric() || after == b'_' || after == b'.' {
+                    continue;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Kahn's topological sort for an index-based dependency graph.
+    /// Returns indices so that dependencies come before dependents.
+    /// Ties are broken by `sort_key` for deterministic output.
+    /// Cycles are handled by appending remaining nodes in sort_key order.
+    fn kahn_toposort<K: Ord>(
+        n: usize,
+        depends_on: &[HashSet<usize>],
+        sort_key: impl Fn(usize) -> K,
+    ) -> Vec<usize> {
+        let mut in_degree: Vec<usize> = depends_on.iter().map(|d| d.len()).collect();
+        let mut reverse_adj: Vec<Vec<usize>> = vec![vec![]; n];
+        for (i, deps) in depends_on.iter().enumerate() {
+            for &j in deps {
+                reverse_adj[j].push(i);
+            }
+        }
+
+        let mut queue: VecDeque<usize> = {
+            let mut zero: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+            zero.sort_by_key(|a| sort_key(*a));
+            VecDeque::from(zero)
+        };
+
+        let mut sorted = Vec::with_capacity(n);
+        while let Some(node) = queue.pop_front() {
+            sorted.push(node);
+            let mut newly_free: Vec<usize> = Vec::new();
+            for &dependent in &reverse_adj[node] {
+                in_degree[dependent] -= 1;
+                if in_degree[dependent] == 0 {
+                    newly_free.push(dependent);
+                }
+            }
+            newly_free.sort_by_key(|a| sort_key(*a));
+            queue.extend(newly_free);
+        }
+
+        if sorted.len() < n {
+            let in_sorted: HashSet<usize> = sorted.iter().copied().collect();
+            let mut remaining: Vec<usize> = (0..n).filter(|i| !in_sorted.contains(i)).collect();
+            remaining.sort_by_key(|a| sort_key(*a));
+            sorted.extend(remaining);
+        }
+
+        sorted
     }
 
     /// Returns the fully-quoted key used to match a table's `partition_of` reference.
@@ -279,6 +389,27 @@ impl Comparer {
     fn dependent_view_keys(&self) -> HashSet<String> {
         let mut dependent_views = HashSet::new();
 
+        // Collect normalised keys for every table that will be altered or dropped,
+        // so we can cheaply look them up when scanning materialized view relations.
+        let altered_or_dropped: HashSet<String> = self
+            .from
+            .tables
+            .iter()
+            .filter(|table| {
+                let matching = self
+                    .to
+                    .tables
+                    .iter()
+                    .find(|t| t.schema == table.schema && t.name == table.name);
+                let will_be_dropped = matching.is_none() && self.use_drop;
+                let will_be_altered = matching
+                    .map(|target| Self::hashes_differ(&target.hash, &table.hash))
+                    .unwrap_or(false);
+                will_be_dropped || will_be_altered
+            })
+            .map(|table| Self::normalized_view_key(&table.schema, &table.name))
+            .collect();
+
         for table in &self.from.tables {
             let matching_table = self
                 .to
@@ -304,6 +435,20 @@ impl Comparer {
                         }
                     }
                 }
+            }
+        }
+
+        // Materialized views are not tracked in information_schema.view_column_usage,
+        // so they may be absent from column.related_views in older dumps.  Use the
+        // view's table_relation as a reliable fallback: if a mat-view touches any
+        // table that is being altered or dropped, it must be dropped first.
+        for view in self.from.views.iter().filter(|v| v.is_materialized) {
+            let touches = view
+                .table_relation
+                .iter()
+                .any(|rel| altered_or_dropped.contains(&Self::normalized_view_reference(rel)));
+            if touches {
+                dependent_views.insert(Self::normalized_view_key(&view.schema, &view.name));
             }
         }
 
@@ -701,9 +846,22 @@ impl Comparer {
                     && let Some(to_column) = to_table.columns.iter().find(|c| c.name == *column)
                 {
                     let is_identity = to_column.is_identity;
-                    let is_serial = to_column.data_type.to_lowercase().contains("serial");
+                    let is_serial = to_column
+                        .column_default
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains("nextval("));
 
                     if is_identity || is_serial {
+                        if is_serial {
+                            let serial_type = match to_column.data_type.to_lowercase().as_str() {
+                                "integer" => "serial",
+                                "bigint" => "bigserial",
+                                "smallint" => "smallserial",
+                                _ => "serial",
+                            };
+                            let key = format!("{}.{}.{}", schema, table, column);
+                            self.serial_columns.insert(key, serial_type.to_string());
+                        }
                         self.script.push_str(
                                     format!(
                                         "/* Skipping sequence {}.{} as it will be created by column {}.{}.{} (identity/serial) */\n",
@@ -837,42 +995,55 @@ impl Comparer {
     }
 
     // Comparing routines
+    #[cfg(test)]
     async fn compare_routines(&mut self) -> Result<(), Error> {
         self.script
             .push_str("\n/* ---> Routines: Start section --------------- */\n\n");
 
-        // Apply non-SQL routines first, then SQL routines last.
-        let (sql_routines, other_routines): (Vec<_>, Vec<_>) = self
-            .to
+        // ── Drop routines not present in TO (reverse dependency order) ──
+        let routines_to_drop: Vec<Routine> = self
+            .from
             .routines
             .iter()
+            .filter(|r| {
+                !self
+                    .to
+                    .routines
+                    .iter()
+                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+            })
             .cloned()
-            .partition(|r| r.lang.eq_ignore_ascii_case("sql"));
+            .collect();
 
-        for routine in &other_routines {
-            self.process_target_routine(routine);
-        }
-
-        for routine in &sql_routines {
-            self.process_target_routine(routine);
-        }
-
-        for routine in &self.from.routines {
-            if let Some(_to_routine) = self
-                .to
-                .routines
+        if !routines_to_drop.is_empty() {
+            let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
+            let drop_names: Vec<(String, String)> = routines_to_drop
                 .iter()
-                .find(|r| r.name == routine.name && r.schema == routine.schema)
-            {
-                continue; // Routine is present in both dumps, we already processed it
-            } else {
-                // Routine is not present in 'to' dump and should be dropped.
+                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .collect();
+
+            for (i, routine) in routines_to_drop.iter().enumerate() {
+                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                    {
+                        drop_deps[i].insert(j);
+                    }
+                }
+            }
+
+            let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
+                drop_names[i].clone()
+            });
+            drop_order.reverse();
+
+            for idx in drop_order {
+                let routine = &routines_to_drop[idx];
                 self.script.push_str(
                     format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
-
                 let drop_script = routine.get_drop_script();
                 if self.use_drop {
                     self.script.push_str(drop_script.as_str());
@@ -885,6 +1056,50 @@ impl Comparer {
                             .as_str(),
                     );
                 }
+            }
+        }
+
+        // ── Create / update routines in dependency order ──
+        let create_routines: Vec<(usize, Routine)> = self
+            .to
+            .routines
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.hash.is_some())
+            .map(|(i, r)| (i, r.clone()))
+            .collect();
+
+        if !create_routines.is_empty() {
+            let n = create_routines.len();
+            let names: Vec<(String, String)> = create_routines
+                .iter()
+                .map(|(_, r)| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .collect();
+
+            let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+            for (i, (_, routine)) in create_routines.iter().enumerate() {
+                for (j, (schema, name)) in names.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                    {
+                        depends_on[i].insert(j);
+                    }
+                }
+            }
+
+            let sorted = Self::kahn_toposort(n, &depends_on, |i| {
+                let r = &create_routines[i].1;
+                let priority: u8 = if r.lang.eq_ignore_ascii_case("sql") {
+                    1
+                } else {
+                    0
+                };
+                (priority, r.schema.to_lowercase(), r.name.to_lowercase())
+            });
+
+            for idx in sorted {
+                let routine = &create_routines[idx].1;
+                self.process_target_routine(routine);
             }
         }
 
@@ -1160,29 +1375,109 @@ impl Comparer {
         let dependent_views = self.dependent_view_keys();
         self.dropped_views.clear();
 
-        // Drop views that are referenced by table columns in the source dump and exist in the target dump.
-        for from_view in &self.from.views {
+        // Collect all views that should be dropped: (from_view index, normalized_key, force_drop)
+        let mut candidates: Vec<(usize, String, bool)> = Vec::new();
+
+        for (idx, from_view) in self.from.views.iter().enumerate() {
             let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
 
-            if dependent_views.contains(&normalized_view) {
-                self.script.push_str(
-                    format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str(),
-                );
+            // Determine why this view should be dropped (if at all):
+            // 1. It is temporarily needed before a table alteration/drop (dependent).
+            // 2. It no longer exists in the target dump (FROM-only permanent drop).
+            // 3. It is a materialized view whose definition has changed — mat views
+            //    cannot use CREATE OR REPLACE, so they must be dropped and recreated.
+            let is_dependent = dependent_views.contains(&normalized_view);
 
-                let drop_script = from_view.get_drop_script();
-                if self.use_drop {
-                    self.script.push_str(drop_script.as_str());
-                } else {
-                    self.script.push_str(
-                        drop_script
-                            .lines()
-                            .map(|l| format!("-- {}\n", l))
-                            .collect::<String>()
-                            .as_str(),
-                    );
-                }
-                self.dropped_views.insert(normalized_view);
+            let to_view = self
+                .to
+                .views
+                .iter()
+                .find(|v| v.schema == from_view.schema && v.name == from_view.name);
+
+            let is_from_only = to_view.is_none();
+
+            let is_changed_mat_view = from_view.is_materialized
+                && to_view
+                    .map(|tv| Self::hashes_differ(&from_view.hash, &tv.hash))
+                    .unwrap_or(false);
+
+            let should_drop =
+                is_dependent || (self.use_drop && is_from_only) || is_changed_mat_view;
+
+            if should_drop {
+                let force_drop = self.use_drop || is_changed_mat_view;
+                candidates.push((idx, normalized_view, force_drop));
             }
+        }
+
+        // Sort drops in reverse dependency order (dependents first).
+        let drop_order = if candidates.len() > 1 {
+            let key_to_pos: HashMap<String, usize> = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, (_, key, _))| (key.clone(), i))
+                .collect();
+
+            let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); candidates.len()];
+
+            for (i, (view_idx, _, _)) in candidates.iter().enumerate() {
+                let view = &self.from.views[*view_idx];
+                // Check table_relation
+                for rel in &view.table_relation {
+                    let normalized = Self::normalized_view_reference(rel);
+                    if let Some(&j) = key_to_pos.get(&normalized)
+                        && i != j
+                    {
+                        depends_on[i].insert(j);
+                    }
+                }
+                // Check definition text for references to other dropping views
+                for (j, (other_idx, _, _)) in candidates.iter().enumerate() {
+                    if i != j {
+                        let other = &self.from.views[*other_idx];
+                        if Self::text_references_qualified_name(
+                            &view.definition,
+                            &other.schema,
+                            &other.name,
+                        ) {
+                            depends_on[i].insert(j);
+                        }
+                    }
+                }
+            }
+
+            // Topological sort in creation order, then reverse for drops.
+            let mut sorted = Self::kahn_toposort(candidates.len(), &depends_on, |i| {
+                let (idx, _, _) = &candidates[i];
+                let v = &self.from.views[*idx];
+                (v.schema.to_lowercase(), v.name.to_lowercase())
+            });
+            sorted.reverse();
+            sorted
+        } else {
+            (0..candidates.len()).collect()
+        };
+
+        for &i in &drop_order {
+            let (view_idx, ref normalized_view, force_drop) = candidates[i];
+            let from_view = &self.from.views[view_idx];
+
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", from_view.schema, from_view.name).as_str());
+
+            let drop_script = from_view.get_drop_script();
+            if force_drop {
+                self.script.push_str(drop_script.as_str());
+            } else {
+                self.script.push_str(
+                    drop_script
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>()
+                        .as_str(),
+                );
+            }
+            self.dropped_views.insert(normalized_view.clone());
         }
 
         self.script
@@ -1191,25 +1486,30 @@ impl Comparer {
     }
 
     // Create views from TO dump
+    #[cfg(test)]
     async fn create_views(&mut self) -> Result<(), Error> {
         self.script
             .push_str("\n/* ---> Views CREATE: Start section --------------- */\n\n");
 
         for to_view in &self.to.views {
             let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
-            let existed_in_from = self
+
+            let from_view = self
                 .from
                 .views
                 .iter()
-                .any(|view| view.schema == to_view.schema && view.name == to_view.name);
+                .find(|view| view.schema == to_view.schema && view.name == to_view.name);
 
-            if existed_in_from && !self.dropped_views.contains(&normalized_view) {
-                if let Some(from_view) = self
-                    .from
-                    .views
-                    .iter()
-                    .find(|view| view.schema == to_view.schema && view.name == to_view.name)
-                    && from_view.owner != to_view.owner
+            let existed_in_from = from_view.is_some();
+            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let definition_changed = from_view
+                .map(|fv| Self::hashes_differ(&fv.hash, &to_view.hash))
+                .unwrap_or(false);
+
+            if existed_in_from && !was_dropped && !definition_changed {
+                // Unchanged view — only emit owner change if needed.
+                if let Some(fv) = from_view
+                    && fv.owner != to_view.owner
                 {
                     self.script.push_str(
                         format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str(),
@@ -1222,6 +1522,40 @@ impl Comparer {
             self.script
                 .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
 
+            if to_view.is_materialized {
+                // Materialized views do not support CREATE OR REPLACE — get_script()
+                // already emits the correct CREATE MATERIALIZED VIEW syntax.
+                self.script.push_str(&to_view.get_script());
+            } else {
+                let mut view_script = to_view.get_script();
+                if !view_script
+                    .to_uppercase()
+                    .contains("CREATE OR REPLACE VIEW")
+                {
+                    const TARGET: &str = "create view";
+                    const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
+
+                    if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
+                        view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
+                    }
+                }
+                self.script.push_str(&view_script);
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> Views CREATE: End section --------------- */\n\n");
+        Ok(())
+    }
+
+    /// Emit the CREATE (or CREATE OR REPLACE) script for a single target view.
+    fn emit_view_create(&mut self, to_view: &View) {
+        self.script
+            .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+
+        if to_view.is_materialized {
+            self.script.push_str(&to_view.get_script());
+        } else {
             let mut view_script = to_view.get_script();
             if !view_script
                 .to_uppercase()
@@ -1229,17 +1563,276 @@ impl Comparer {
             {
                 const TARGET: &str = "create view";
                 const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
-
                 if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
                     view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
                 }
             }
-
             self.script.push_str(&view_script);
+        }
+    }
+
+    /// Compare routines and views together, respecting cross-dependencies.
+    ///
+    /// Instead of processing all routines before all views (which breaks when
+    /// a view depends on a function, or a function depends on a view), this
+    /// method builds a dependency graph across both object types and emits
+    /// CREATE / UPDATE statements in topological order.
+    ///
+    /// Drop statements for routines that exist only in the FROM dump are
+    /// emitted first, also in reverse dependency order.
+    async fn compare_routines_and_views(&mut self) -> Result<(), Error> {
+        self.script
+            .push_str("\n/* ---> Routines & Views: Start section --------------- */\n\n");
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 1 – Drop routines that are not present in TO
+        // ──────────────────────────────────────────────────────────
+        let routines_to_drop: Vec<Routine> = self
+            .from
+            .routines
+            .iter()
+            .filter(|r| {
+                !self
+                    .to
+                    .routines
+                    .iter()
+                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+            })
+            .cloned()
+            .collect();
+
+        if !routines_to_drop.is_empty() {
+            // Build inter-routine dependency graph and sort drops in
+            // reverse dependency order (dependents first).
+            let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
+
+            let drop_names: Vec<(String, String)> = routines_to_drop
+                .iter()
+                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .collect();
+
+            for (i, routine) in routines_to_drop.iter().enumerate() {
+                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                    {
+                        drop_deps[i].insert(j);
+                    }
+                }
+            }
+
+            let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
+                drop_names[i].clone()
+            });
+            drop_order.reverse();
+
+            for idx in drop_order {
+                let routine = &routines_to_drop[idx];
+                self.script.push_str(
+                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                );
+                self.script
+                    .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
+                let drop_script = routine.get_drop_script();
+                if self.use_drop {
+                    self.script.push_str(drop_script.as_str());
+                } else {
+                    self.script.push_str(
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 2 – Determine which objects need create / update
+        // ──────────────────────────────────────────────────────────
+        // Each item is (is_view, index_in_to_vec).
+        let mut action_items: Vec<(bool, usize)> = Vec::new();
+        let mut no_action_view_indices: Vec<usize> = Vec::new();
+
+        for (idx, routine) in self.to.routines.iter().enumerate() {
+            if routine.hash.is_none() {
+                continue;
+            }
+            let from_routine = self
+                .from
+                .routines
+                .iter()
+                .find(|r| r.name == routine.name && r.schema == routine.schema);
+            let needs_action = match from_routine {
+                None => true,
+                Some(fr) => fr.hash.is_some() && Self::hashes_differ(&fr.hash, &routine.hash),
+            };
+            if needs_action {
+                action_items.push((false, idx));
+            }
+        }
+
+        for (idx, view) in self.to.views.iter().enumerate() {
+            let normalized_view = Self::normalized_view_key(&view.schema, &view.name);
+            let from_view = self
+                .from
+                .views
+                .iter()
+                .find(|v| v.schema == view.schema && v.name == view.name);
+            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let definition_changed = from_view
+                .map(|fv| Self::hashes_differ(&fv.hash, &view.hash))
+                .unwrap_or(false);
+            let needs_action = from_view.is_none() || was_dropped || definition_changed;
+            if needs_action {
+                action_items.push((true, idx));
+            } else {
+                no_action_view_indices.push(idx);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 3 – Build dependency graph among action items
+        // ──────────────────────────────────────────────────────────
+        // Precompute info we need for each action item so we don't
+        // hold any reference to `self` while building the graph.
+        struct ItemInfo {
+            text: String,
+            schema_lower: String,
+            name_lower: String,
+            is_view: bool,
+            orig_idx: usize,
+            sort_key: (u8, String, String),
+            table_relation_keys: Vec<String>,
+        }
+
+        let items: Vec<ItemInfo> = action_items
+            .iter()
+            .map(|&(is_view, orig_idx)| {
+                if is_view {
+                    let v = &self.to.views[orig_idx];
+                    let table_relation_keys: Vec<String> = v
+                        .table_relation
+                        .iter()
+                        .map(|rel| Self::normalized_view_reference(rel))
+                        .collect();
+                    ItemInfo {
+                        text: v.definition.clone(),
+                        schema_lower: v.schema.to_lowercase(),
+                        name_lower: v.name.to_lowercase(),
+                        is_view: true,
+                        orig_idx,
+                        sort_key: (2, v.schema.to_lowercase(), v.name.to_lowercase()),
+                        table_relation_keys,
+                    }
+                } else {
+                    let r = &self.to.routines[orig_idx];
+                    let priority = if r.lang.eq_ignore_ascii_case("sql") {
+                        1
+                    } else {
+                        0
+                    };
+                    ItemInfo {
+                        text: r.source_code.clone(),
+                        schema_lower: r.schema.to_lowercase(),
+                        name_lower: r.name.to_lowercase(),
+                        is_view: false,
+                        orig_idx,
+                        sort_key: (priority, r.schema.to_lowercase(), r.name.to_lowercase()),
+                        table_relation_keys: Vec::new(),
+                    }
+                }
+            })
+            .collect();
+
+        // Reverse lookup: (schema, name) -> list of item indices
+        let mut name_to_items: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (i, item) in items.iter().enumerate() {
+            name_to_items
+                .entry((item.schema_lower.clone(), item.name_lower.clone()))
+                .or_default()
+                .push(i);
+        }
+
+        // Build edges: i depends on j  =>  j must be emitted before i.
+        let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); items.len()];
+
+        for (i, item) in items.iter().enumerate() {
+            // Scan the object body for qualified references to other action items.
+            for ((schema, name), targets) in &name_to_items {
+                if Self::text_references_qualified_name(&item.text, schema, name) {
+                    for &j in targets {
+                        if j != i {
+                            depends_on[i].insert(j);
+                        }
+                    }
+                }
+            }
+
+            // For views, also honour the explicit table_relation metadata
+            // (which captures referenced tables / views but not functions).
+            if item.is_view {
+                for dep_key in &item.table_relation_keys {
+                    if let Some(dot_pos) = dep_key.find('.') {
+                        let schema = dep_key[..dot_pos].to_string();
+                        let name = dep_key[dot_pos + 1..].to_string();
+                        if let Some(targets) = name_to_items.get(&(schema, name)) {
+                            for &j in targets {
+                                if j != i {
+                                    depends_on[i].insert(j);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 4 – Topological sort
+        // ──────────────────────────────────────────────────────────
+        let sorted = Self::kahn_toposort(items.len(), &depends_on, |i| items[i].sort_key.clone());
+
+        // Prepare the emit plan (is_view, orig_idx) so we can drop `items`.
+        let emit_order: Vec<(bool, usize)> = sorted
+            .iter()
+            .map(|&i| (items[i].is_view, items[i].orig_idx))
+            .collect();
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 5 – Emit creates / updates in dependency order
+        // ──────────────────────────────────────────────────────────
+        for &(is_view, orig_idx) in &emit_order {
+            if is_view {
+                let view = self.to.views[orig_idx].clone();
+                self.emit_view_create(&view);
+            } else {
+                let routine = self.to.routines[orig_idx].clone();
+                self.process_target_routine(&routine);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Phase 6 – Unchanged views: emit owner changes only
+        // ──────────────────────────────────────────────────────────
+        for &idx in &no_action_view_indices {
+            let to_view = &self.to.views[idx];
+            if let Some(fv) = self
+                .from
+                .views
+                .iter()
+                .find(|v| v.schema == to_view.schema && v.name == to_view.name)
+                && fv.owner != to_view.owner
+            {
+                self.script
+                    .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+                self.script.push_str(&to_view.get_owner_script());
+            }
         }
 
         self.script
-            .push_str("\n/* ---> Views CREATE: End section --------------- */\n\n");
+            .push_str("\n/* ---> Routines & Views: End section --------------- */\n\n");
         Ok(())
     }
 }
@@ -1686,6 +2279,282 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compare_routines_orders_by_dependencies() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // r_base_value: no dependencies
+        let r_base = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "r_base_value".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT 10;\n".to_string(),
+        );
+
+        // x_step_one: depends on r_base_value
+        let x_step = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "x_step_one".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.r_base_value() + 5;\n".to_string(),
+        );
+
+        // a_middle_layer: depends on x_step_one and r_base_value
+        let a_middle = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "a_middle_layer".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.x_step_one() * test_schema.r_base_value();\n".to_string(),
+        );
+
+        // z_final_report: depends on a_middle_layer
+        let z_final = Routine::new(
+            "test_schema".to_string(),
+            Oid(4),
+            "z_final_report".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\nDECLARE\n    result integer;\nBEGIN\n    SELECT test_schema.a_middle_layer() INTO result;\n    RAISE NOTICE 'Final result: %', result;\nEND;\n".to_string(),
+        );
+
+        // Push in deliberately wrong alphabetical / type order.
+        to_dump.routines.push(z_final);
+        to_dump.routines.push(x_step);
+        to_dump.routines.push(a_middle);
+        to_dump.routines.push(r_base);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_base = script
+            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .expect("r_base_value not found");
+        let pos_step = script
+            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .expect("x_step_one not found");
+        let pos_middle = script
+            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .expect("a_middle_layer not found");
+        let pos_final = script
+            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .expect("z_final_report not found");
+
+        assert!(
+            pos_base < pos_step,
+            "r_base_value must come before x_step_one (depends on it)"
+        );
+        assert!(
+            pos_base < pos_middle,
+            "r_base_value must come before a_middle_layer (depends on it)"
+        );
+        assert!(
+            pos_step < pos_middle,
+            "x_step_one must come before a_middle_layer (depends on it)"
+        );
+        assert!(
+            pos_middle < pos_final,
+            "a_middle_layer must come before z_final_report (depends on it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_drops_in_reverse_dependency_order() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        // r_base_value: no dependencies
+        let r_base = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "r_base_value".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT 10;\n".to_string(),
+        );
+
+        // x_step_one: depends on r_base_value
+        let x_step = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "x_step_one".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.r_base_value() + 5;\n".to_string(),
+        );
+
+        // a_middle_layer: depends on x_step_one and r_base_value
+        let a_middle = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "a_middle_layer".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.x_step_one() * test_schema.r_base_value();\n".to_string(),
+        );
+
+        from_dump.routines.push(r_base);
+        from_dump.routines.push(x_step);
+        from_dump.routines.push(a_middle);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_base = script
+            .find("drop function if exists \"test_schema\".\"r_base_value\"")
+            .expect("r_base_value drop not found");
+        let pos_step = script
+            .find("drop function if exists \"test_schema\".\"x_step_one\"")
+            .expect("x_step_one drop not found");
+        let pos_middle = script
+            .find("drop function if exists \"test_schema\".\"a_middle_layer\"")
+            .expect("a_middle_layer drop not found");
+
+        // Drops should go in reverse dependency order: dependents first.
+        assert!(
+            pos_middle < pos_step,
+            "a_middle_layer must be dropped before x_step_one"
+        );
+        assert!(
+            pos_step < pos_base,
+            "x_step_one must be dropped before r_base_value"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_and_views_orders_by_dependencies() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let r_base = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "r_base_value".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT 10;\n".to_string(),
+        );
+
+        let x_step = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "x_step_one".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.r_base_value() + 5;\n".to_string(),
+        );
+
+        let a_middle = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "a_middle_layer".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\n    SELECT test_schema.x_step_one() * test_schema.r_base_value();\n".to_string(),
+        );
+
+        let z_final = Routine::new(
+            "test_schema".to_string(),
+            Oid(4),
+            "z_final_report".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\nDECLARE\n    result integer;\nBEGIN\n    SELECT test_schema.a_middle_layer() INTO result;\n    RAISE NOTICE 'Final result: %', result;\nEND;\n".to_string(),
+        );
+
+        // Push in deliberately wrong order.
+        to_dump.routines.push(z_final);
+        to_dump.routines.push(x_step);
+        to_dump.routines.push(a_middle);
+        to_dump.routines.push(r_base);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare_routines_and_views().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_base = script
+            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .expect("r_base_value not found");
+        let pos_step = script
+            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .expect("x_step_one not found");
+        let pos_middle = script
+            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .expect("a_middle_layer not found");
+        let pos_final = script
+            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .expect("z_final_report not found");
+
+        assert!(
+            pos_base < pos_step,
+            "r_base_value must come before x_step_one"
+        );
+        assert!(
+            pos_base < pos_middle,
+            "r_base_value must come before a_middle_layer"
+        );
+        assert!(
+            pos_step < pos_middle,
+            "x_step_one must come before a_middle_layer"
+        );
+        assert!(
+            pos_middle < pos_final,
+            "a_middle_layer must come before z_final_report"
+        );
+    }
+
     use crate::dump::sequence::Sequence;
     use crate::dump::table::Table;
     use crate::dump::table_column::TableColumn;
@@ -1740,6 +2609,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         }
     }
 
@@ -1776,7 +2646,7 @@ mod tests {
             ordinal_position: 1,
             column_default: Some("nextval('test_id_seq'::regclass)".to_string()),
             is_nullable: false,
-            data_type: "bigserial".to_string(), // This triggers the skip
+            data_type: "bigint".to_string(), // PostgreSQL reports bigserial as bigint with nextval default
             character_maximum_length: None,
             character_octet_length: None,
             numeric_precision: Some(64),
@@ -1815,6 +2685,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let table = Table::new(
@@ -1912,6 +2783,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let table = Table::new(
@@ -2090,6 +2962,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let table = Table::new(
@@ -2184,6 +3057,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let from_table = Table::new(
@@ -2249,6 +3123,7 @@ mod tests {
             is_updatable: true,
             related_views: None,
             comment: None,
+            serial_type: None,
         };
 
         let to_table = Table::new(
@@ -2441,6 +3316,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compare_creates_routines_and_views_in_dependency_order() {
+        // Scenario from the user report:
+        //   get_user_count()   – function, no view dependency
+        //   v_user_stats       – view that calls get_user_count()
+        //   report_user_stats  – function that reads v_user_stats
+        //   print_user_stats   – procedure that reads v_user_stats
+        //
+        // Correct creation order: get_user_count → v_user_stats → report/print
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        to_dump
+            .schemas
+            .push(Schema::new("test_schema".to_string(), None));
+
+        let get_user_count = Routine::new(
+            "test_schema".to_string(),
+            Oid(1),
+            "get_user_count".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "  SELECT count(*) FROM test_schema.users;\n".to_string(),
+        );
+
+        let report_user_stats = Routine::new(
+            "test_schema".to_string(),
+            Oid(2),
+            "report_user_stats".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "text".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "  SELECT 'Total users in view: ' || total_users\n  FROM test_schema.v_user_stats\n  LIMIT 1;\n".to_string(),
+        );
+
+        let print_user_stats = Routine::new(
+            "test_schema".to_string(),
+            Oid(3),
+            "print_user_stats".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "\nDECLARE\n    cnt int;\nBEGIN\n    SELECT total_users INTO cnt\n    FROM test_schema.v_user_stats\n    LIMIT 1;\n    RAISE NOTICE 'Total users in view: %', cnt;\nEND;\n".to_string(),
+        );
+
+        let mut v_user_stats = View::new(
+            "v_user_stats".to_string(),
+            " SELECT test_schema.get_user_count() AS total_users,\n    users.name\n   FROM test_schema.users;\n".to_string(),
+            "test_schema".to_string(),
+            vec!["test_schema.users".to_string()],
+        );
+        v_user_stats.owner = "postgres".to_string();
+        v_user_stats.hash();
+
+        // Intentionally add in wrong order to test sorting
+        to_dump.routines.push(print_user_stats);
+        to_dump.routines.push(report_user_stats);
+        to_dump.routines.push(get_user_count);
+        to_dump.views.push(v_user_stats);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_get_user_count = script
+            .find("create or replace function \"test_schema\".\"get_user_count\"")
+            .expect("get_user_count not found in script");
+        let pos_view = script
+            .find("\"test_schema\".\"v_user_stats\"")
+            .expect("v_user_stats not found in script");
+        let pos_report = script
+            .find("create or replace function \"test_schema\".\"report_user_stats\"")
+            .expect("report_user_stats not found in script");
+        let pos_print = script
+            .find("create or replace procedure \"test_schema\".\"print_user_stats\"")
+            .expect("print_user_stats not found in script");
+
+        assert!(
+            pos_get_user_count < pos_view,
+            "get_user_count() must be created before v_user_stats (function is used by view)"
+        );
+        assert!(
+            pos_view < pos_report,
+            "v_user_stats must be created before report_user_stats() (view is used by function)"
+        );
+        assert!(
+            pos_view < pos_print,
+            "v_user_stats must be created before print_user_stats() (view is used by procedure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_creates_materialized_view_after_dependent_routine() {
+        // Materialized view that uses a function should be created after that function.
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let helper_fn = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "helper".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "SELECT 42;\n".to_string(),
+        );
+
+        let mut mat_view = View::new(
+            "mv_data".to_string(),
+            " SELECT public.helper() AS value;\n".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        mat_view.is_materialized = true;
+        mat_view.hash();
+
+        to_dump.routines.push(helper_fn);
+        to_dump.views.push(mat_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_fn = script
+            .find("create or replace function \"public\".\"helper\"")
+            .expect("helper function not found");
+        let pos_mv = script
+            .find("\"public\".\"mv_data\"")
+            .expect("mv_data not found");
+
+        assert!(
+            pos_fn < pos_mv,
+            "helper() must be created before mv_data (materialized view depends on function)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_drops_routines_in_reverse_dependency_order() {
+        // Routine A calls Routine B; when both are dropped, A should be dropped first.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let routine_b = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "base_fn".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "SELECT 1;\n".to_string(),
+        );
+
+        let routine_a = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "caller_fn".to_string(),
+            "sql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "SELECT public.base_fn();\n".to_string(),
+        );
+
+        // Add in wrong order
+        from_dump.routines.push(routine_b);
+        from_dump.routines.push(routine_a);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_caller = script
+            .find("drop function if exists \"public\".\"caller_fn\"")
+            .expect("caller_fn drop not found");
+        let pos_base = script
+            .find("drop function if exists \"public\".\"base_fn\"")
+            .expect("base_fn drop not found");
+
+        assert!(
+            pos_caller < pos_base,
+            "caller_fn (dependent) must be dropped before base_fn"
+        );
+    }
+
+    #[tokio::test]
     async fn tables_multilevel_partitions_created_in_depth_order() {
         // Hierarchy: grandparent (RANGE) -> parent_2023 (LIST, sub-partition) -> child_2023_a (leaf)
         let from_dump = Dump::new(DumpConfig::default());
@@ -2598,6 +3675,225 @@ mod tests {
         assert!(
             pos_sp < pos_gp,
             "sub-partition parent must be dropped before grandparent"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_column_uses_serial_type_in_table_script() {
+        // When a serial/bigserial column's sequence is skipped, the table script
+        // should use serial/bigserial type instead of integer/bigint with nextval default.
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // serial column (integer + nextval)
+        let serial_seq = Sequence::new(
+            "test_schema".to_string(),
+            "test_serial_id_seq".to_string(),
+            "postgres".to_string(),
+            "integer".to_string(),
+            Some(1),
+            Some(1),
+            Some(2147483647),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("test_schema".to_string()),
+            Some("test_serial".to_string()),
+            Some("id".to_string()),
+        );
+        to_dump.sequences.push(serial_seq);
+
+        let serial_col = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "test_schema".to_string(),
+            table: "test_serial".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: Some("nextval('test_schema.test_serial_id_seq'::regclass)".to_string()),
+            is_nullable: false,
+            data_type: "integer".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(32),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+            comment: None,
+            serial_type: None,
+        };
+        let serial_table = Table::new(
+            "test_schema".to_string(),
+            "test_serial".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![serial_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(serial_table);
+
+        // bigserial column (bigint + nextval)
+        let bigserial_seq = Sequence::new(
+            "test_schema".to_string(),
+            "test_bigserial_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("test_schema".to_string()),
+            Some("test_bigserial".to_string()),
+            Some("id".to_string()),
+        );
+        to_dump.sequences.push(bigserial_seq);
+
+        let bigserial_col = TableColumn {
+            catalog: "postgres".to_string(),
+            schema: "test_schema".to_string(),
+            table: "test_bigserial".to_string(),
+            name: "id".to_string(),
+            ordinal_position: 1,
+            column_default: Some(
+                "nextval('test_schema.test_bigserial_id_seq'::regclass)".to_string(),
+            ),
+            is_nullable: false,
+            data_type: "bigint".to_string(),
+            character_maximum_length: None,
+            character_octet_length: None,
+            numeric_precision: Some(64),
+            numeric_precision_radix: Some(2),
+            numeric_scale: Some(0),
+            datetime_precision: None,
+            interval_type: None,
+            interval_precision: None,
+            character_set_catalog: None,
+            character_set_schema: None,
+            character_set_name: None,
+            collation_catalog: None,
+            collation_schema: None,
+            collation_name: None,
+            domain_catalog: None,
+            domain_schema: None,
+            domain_name: None,
+            udt_catalog: None,
+            udt_schema: None,
+            udt_name: None,
+            scope_catalog: None,
+            scope_schema: None,
+            scope_name: None,
+            maximum_cardinality: None,
+            dtd_identifier: None,
+            is_self_referencing: false,
+            is_identity: false,
+            identity_generation: None,
+            identity_start: None,
+            identity_increment: None,
+            identity_maximum: None,
+            identity_minimum: None,
+            identity_cycle: false,
+            is_generated: "NEVER".to_string(),
+            generation_expression: None,
+            is_updatable: true,
+            related_views: None,
+            comment: None,
+            serial_type: None,
+        };
+        let bigserial_table = Table::new(
+            "test_schema".to_string(),
+            "test_bigserial".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![bigserial_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_dump.tables.push(bigserial_table);
+
+        to_dump.schemas.push(crate::dump::schema::Schema::new(
+            "test_schema".to_string(),
+            None,
+        ));
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        // Sequences should be skipped
+        assert!(
+            script.contains("Skipping sequence test_schema.test_serial_id_seq"),
+            "serial sequence should be skipped"
+        );
+        assert!(
+            script.contains("Skipping sequence test_schema.test_bigserial_id_seq"),
+            "bigserial sequence should be skipped"
+        );
+        assert!(
+            !script.contains("create sequence \"test_schema\".\"test_serial_id_seq\""),
+            "serial sequence should not be created separately"
+        );
+        assert!(
+            !script.contains("create sequence \"test_schema\".\"test_bigserial_id_seq\""),
+            "bigserial sequence should not be created separately"
+        );
+
+        // Table columns should use serial/bigserial types
+        assert!(
+            script.contains("\"id\" serial"),
+            "serial column should use 'serial' type, got:\n{script}"
+        );
+        assert!(
+            script.contains("\"id\" bigserial"),
+            "bigserial column should use 'bigserial' type, got:\n{script}"
+        );
+
+        // Should NOT contain nextval defaults for these columns
+        assert!(
+            !script.contains("nextval('test_schema.test_serial_id_seq'"),
+            "serial column should not have explicit nextval default"
+        );
+        assert!(
+            !script.contains("nextval('test_schema.test_bigserial_id_seq'"),
+            "bigserial column should not have explicit nextval default"
         );
     }
 }
