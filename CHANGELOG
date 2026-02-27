@@ -1,4 +1,4 @@
-2026-02-19      v1.0.6
+2026-02-27      v1.0.7
 
                 Features:
                     - Partitioning support.
@@ -6,6 +6,11 @@
                     - Fixed serial and bigserial column creation.
                     - Fixed dependency-based ordering of routines for creation and drop.
                     - Fixed work with extensions.
+
+2026-02-19      v1.0.6
+
+                Features:
+                    - Partitioning support.
 
 2026-02-16      v1.0.5
 
