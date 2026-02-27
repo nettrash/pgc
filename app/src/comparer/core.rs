@@ -164,6 +164,7 @@ impl Comparer {
             if Self::hashes_differ(&from_routine.hash, &routine.hash) {
                 if from_routine.return_type != routine.return_type
                     || from_routine.arguments != routine.arguments
+                    || from_routine.arguments_defaults != routine.arguments_defaults
                 {
                     let drop_script = from_routine.get_drop_script();
                     if self.use_drop {

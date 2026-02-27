@@ -91,12 +91,14 @@ impl Routine {
             "$$".to_string()
         };
 
+        let arguments_with_defaults = self.arguments_with_defaults();
+
         let script_body = match kind.as_str() {
             "procedure" => format!(
                 "create or replace procedure \"{}\".\"{}\"({}) language {} as {d}{body}{d};\n",
                 self.schema,
                 self.name,
-                self.arguments,
+                arguments_with_defaults,
                 self.lang,
                 d = delimiter,
                 body = self.source_code
@@ -106,7 +108,7 @@ impl Routine {
                 kind,
                 self.schema,
                 self.name,
-                self.arguments,
+                arguments_with_defaults,
                 self.return_type,
                 self.lang,
                 d = delimiter,
@@ -115,10 +117,6 @@ impl Routine {
         };
 
         let mut script = script_body;
-
-        if let Some(defaults) = &self.arguments_defaults {
-            script.push_str(&format!("-- Defaults: {defaults}\n"));
-        }
 
         if let Some(comment) = &self.comment {
             let object_kind = match kind.as_str() {
@@ -137,6 +135,89 @@ impl Routine {
         script.push_str(&self.get_owner_script());
 
         script
+    }
+
+    /// Returns the argument list with default values embedded.
+    ///
+    /// PostgreSQL stores defaults separately from the argument list in pg_proc.
+    /// `pg_get_function_identity_arguments()` returns arguments without defaults,
+    /// while `pg_get_expr(proargdefaults, 0)` returns a comma-separated list of
+    /// default expressions that apply to the **last N** arguments.
+    ///
+    /// This method merges them back so `CREATE OR REPLACE` includes the defaults
+    /// and doesn't fail with "cannot remove parameter defaults from existing function".
+    fn arguments_with_defaults(&self) -> String {
+        let defaults_str = match &self.arguments_defaults {
+            Some(d) if !d.is_empty() => d,
+            _ => return self.arguments.clone(),
+        };
+
+        if self.arguments.is_empty() {
+            return self.arguments.clone();
+        }
+
+        // Split arguments respecting parenthesized type expressions (e.g. "numeric(10,2)")
+        let args = Self::split_arguments(&self.arguments);
+        // Split defaults — these are simple expressions, but may contain commas inside
+        // function calls; use the same splitter for safety.
+        let defaults = Self::split_arguments(defaults_str);
+
+        if defaults.is_empty() || defaults.len() > args.len() {
+            return self.arguments.clone();
+        }
+
+        // Defaults apply to the last N arguments
+        let first_default_idx = args.len() - defaults.len();
+        let mut result_parts: Vec<String> = Vec::with_capacity(args.len());
+
+        for (i, arg) in args.iter().enumerate() {
+            if i >= first_default_idx {
+                let default_val = defaults[i - first_default_idx].trim();
+                if default_val.to_uppercase().starts_with("DEFAULT ") {
+                    result_parts.push(format!("{} {}", arg.trim(), default_val));
+                } else {
+                    result_parts.push(format!("{} DEFAULT {}", arg.trim(), default_val));
+                }
+            } else {
+                result_parts.push(arg.trim().to_string());
+            }
+        }
+
+        result_parts.join(", ")
+    }
+
+    /// Splits a comma-separated string respecting parenthesized groups.
+    /// E.g. "a numeric(10,2), b text" → ["a numeric(10,2)", " b text"]
+    fn split_arguments(s: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut depth = 0;
+        let mut current = String::new();
+
+        for ch in s.chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    parts.push(current.clone());
+                    current.clear();
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            parts.push(current);
+        }
+
+        parts
     }
 
     /// Returns a string to drop the routine.
@@ -336,7 +417,7 @@ mod tests {
         let routine = build_function_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace function \"public\".\"add\"(a integer) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n-- Defaults: DEFAULT 1\n";
+        let expected = "create or replace function \"public\".\"add\"(a integer DEFAULT 1) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -346,7 +427,7 @@ mod tests {
         routine.owner = "pgc_owner".to_string();
         routine.hash();
 
-        let expected = "create or replace function \"public\".\"add\"(a integer) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\n-- Defaults: DEFAULT 1\nalter function \"public\".\"add\"(a integer) owner to \"pgc_owner\";\n";
+        let expected = "create or replace function \"public\".\"add\"(a integer DEFAULT 1) returns integer language plpgsql as $$BEGIN RETURN a + 1; END$$;\nalter function \"public\".\"add\"(a integer) owner to \"pgc_owner\";\n";
         assert_eq!(routine.get_script(), expected);
     }
 
