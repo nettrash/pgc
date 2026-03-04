@@ -623,6 +623,96 @@ BEGIN
 END;
 $$;
 
+-- =============================================================================
+-- Routine flags & special routine kinds test
+-- =============================================================================
+
+-- VOLATILE PARALLEL UNSAFE function (TO)
+-- FROM had STABLE STRICT PARALLEL SAFE → flag-only diff
+CREATE OR REPLACE FUNCTION test_schema.lookup_username(p_id integer)
+RETURNS varchar
+LANGUAGE sql
+VOLATILE PARALLEL UNSAFE
+AS $$
+    SELECT username FROM test_schema.users WHERE id = p_id;
+$$;
+
+-- normalize_email_from removed (FROM-only → should be dropped)
+
+-- SECURITY DEFINER function (unchanged between FROM and TO)
+CREATE OR REPLACE FUNCTION test_schema.get_secure_setting(key text)
+RETURNS text
+LANGUAGE plpgsql
+STABLE SECURITY DEFINER
+AS $$
+BEGIN
+    RETURN current_setting(key, true);
+END;
+$$;
+
+-- SECURITY INVOKER procedure (TO — default, no SECURITY DEFINER)
+-- FROM had SECURITY DEFINER → flag-only diff
+CREATE OR REPLACE PROCEDURE test_schema.admin_reset_counters()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE test_schema.users SET login_count = 1;
+END;
+$$;
+
+-- STABLE STRICT PARALLEL RESTRICTED function (TO)
+-- FROM had IMMUTABLE STRICT PARALLEL SAFE → volatility & parallel change
+CREATE OR REPLACE FUNCTION test_schema.tax_label(rate numeric)
+RETURNS text
+LANGUAGE sql
+STABLE STRICT PARALLEL RESTRICTED
+AS $$
+    SELECT CASE WHEN rate > 0.2 THEN 'high' ELSE 'low' END;
+$$;
+
+-- AGGREGATE function (unchanged between FROM and TO)
+CREATE OR REPLACE FUNCTION test_schema.running_sum_sfunc(state bigint, val integer)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE STRICT
+AS $$
+    SELECT state + val::bigint;
+$$;
+
+CREATE AGGREGATE test_schema.running_sum(integer) (
+    SFUNC = test_schema.running_sum_sfunc,
+    STYPE = bigint,
+    INITCOND = '0'
+);
+
+-- concat_agg removed (FROM-only → should be dropped)
+-- concat_agg_sfunc also removed (FROM-only)
+
+-- AGGREGATE function (TO only → should be created)
+CREATE OR REPLACE FUNCTION test_schema.product_agg_sfunc(state numeric, val numeric, weight numeric)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE STRICT
+AS $$
+    SELECT state + val * weight;
+$$;
+
+CREATE AGGREGATE test_schema.weighted_sum(numeric, numeric) (
+    SFUNC = test_schema.product_agg_sfunc,
+    STYPE = numeric,
+    INITCOND = '0'
+);
+COMMENT ON AGGREGATE test_schema.weighted_sum(numeric, numeric) IS 'Weighted sum aggregate (TO only)';
+
+-- IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE function (TO only → should be created with all flags)
+CREATE OR REPLACE FUNCTION test_schema.normalize_email_to(raw text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE
+AS $$
+    SELECT lower(trim(raw));
+$$;
+
 CREATE TABLE test_schema.composite_fk (
     id SERIAL PRIMARY KEY,
     ref_part_one INT,
