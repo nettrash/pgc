@@ -764,6 +764,14 @@ impl Dump {
 
     // Fetch tables from the database and populate the dump.
     async fn get_tables(&mut self, pool: &PgPool) -> Result<(), Error> {
+        // Check once whether the pg_get_tabledef extension function exists.
+        let has_tabledef_fn =
+            sqlx::query("select proname from pg_proc where proname = 'pg_get_tabledef';")
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .is_some();
+
         let result = sqlx::query(
             format!(
                 "
@@ -822,7 +830,7 @@ impl Dump {
                     comment: row.get("table_comment"),
                     hash: None,
                 };
-                table.fill(pool).await.map_err(|e| {
+                table.fill(pool, has_tabledef_fn).await.map_err(|e| {
                     Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
 
