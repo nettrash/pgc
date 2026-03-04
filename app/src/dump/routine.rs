@@ -530,13 +530,25 @@ impl Routine {
                 "comment on aggregate \"{}\".\"{}\"({}) is '{}';\n",
                 self.schema,
                 self.name,
-                self.arguments,
+                self.signature_args(),
                 comment.replace('\'', "''")
             ));
         }
 
         script.push_str(&self.get_owner_script());
         script
+    }
+
+    /// Returns the argument signature suitable for SQL statements.
+    ///
+    /// For aggregates with an empty argument list PostgreSQL requires `(*)`
+    /// rather than `()`, so this helper centralises that logic.
+    fn signature_args(&self) -> String {
+        if self.kind.to_lowercase() == "aggregate" && self.arguments.is_empty() {
+            "*".to_string()
+        } else {
+            self.arguments.clone()
+        }
     }
 
     /// Returns a string to drop the routine.
@@ -547,7 +559,10 @@ impl Routine {
         };
         format!(
             "drop {} if exists \"{}\".\"{}\" ({});\n",
-            drop_kind, self.schema, self.name, self.arguments
+            drop_kind,
+            self.schema,
+            self.name,
+            self.signature_args()
         )
     }
 
@@ -567,7 +582,7 @@ impl Routine {
             object_kind,
             self.schema,
             self.name,
-            self.arguments,
+            self.signature_args(),
             self.owner.replace('"', "\"\"")
         )
     }
