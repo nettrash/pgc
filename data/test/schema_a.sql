@@ -523,6 +523,92 @@ BEGIN
 END;
 $$;
 
+-- =============================================================================
+-- Routine flags & special routine kinds test
+-- =============================================================================
+
+-- STABLE STRICT PARALLEL SAFE function (FROM)
+-- TO changes flags to VOLATILE PARALLEL UNSAFE → flag-only diff
+CREATE OR REPLACE FUNCTION test_schema.lookup_username(p_id integer)
+RETURNS varchar
+LANGUAGE sql
+STABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT username FROM test_schema.users WHERE id = p_id;
+$$;
+
+-- IMMUTABLE LEAKPROOF function (FROM only → should be dropped in TO)
+CREATE OR REPLACE FUNCTION test_schema.normalize_email_from(raw text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE LEAKPROOF PARALLEL SAFE
+AS $$
+    SELECT lower(trim(raw));
+$$;
+
+-- SECURITY DEFINER function (unchanged between FROM and TO)
+CREATE OR REPLACE FUNCTION test_schema.get_secure_setting(key text)
+RETURNS text
+LANGUAGE plpgsql
+STABLE SECURITY DEFINER
+AS $$
+BEGIN
+    RETURN current_setting(key, true);
+END;
+$$;
+
+-- SECURITY DEFINER procedure (FROM)
+-- TO changes to SECURITY INVOKER (default) → flag-only diff
+CREATE OR REPLACE PROCEDURE test_schema.admin_reset_counters()
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    UPDATE test_schema.users SET login_count = 1;
+END;
+$$;
+
+-- IMMUTABLE STRICT function (FROM)
+-- TO changes to STABLE STRICT PARALLEL RESTRICTED → volatility & parallel change
+CREATE OR REPLACE FUNCTION test_schema.tax_label(rate numeric)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT CASE WHEN rate > 0.2 THEN 'high' ELSE 'low' END;
+$$;
+
+-- AGGREGATE function (unchanged between FROM and TO)
+CREATE OR REPLACE FUNCTION test_schema.running_sum_sfunc(state bigint, val integer)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE STRICT
+AS $$
+    SELECT state + val::bigint;
+$$;
+
+CREATE AGGREGATE test_schema.running_sum(integer) (
+    SFUNC = test_schema.running_sum_sfunc,
+    STYPE = bigint,
+    INITCOND = '0'
+);
+
+-- AGGREGATE function (FROM only → should be dropped in TO)
+CREATE OR REPLACE FUNCTION test_schema.concat_agg_sfunc(state text, val text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE WHEN state = '' THEN val ELSE state || ',' || val END;
+$$;
+
+CREATE AGGREGATE test_schema.concat_agg(text) (
+    SFUNC = test_schema.concat_agg_sfunc,
+    STYPE = text,
+    INITCOND = ''
+);
+COMMENT ON AGGREGATE test_schema.concat_agg(text) IS 'Simple string concatenation aggregate (FROM only)';
+
 CREATE TABLE test_schema.composite_fk (
     id SERIAL PRIMARY KEY,
     ref_part_one INT,
