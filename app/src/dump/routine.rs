@@ -282,8 +282,8 @@ impl Routine {
             }
         }
 
-        // STRICT
-        if self.is_strict {
+        // STRICT (not valid for procedures)
+        if kind != "procedure" && self.is_strict {
             flags.push("STRICT".to_string());
         }
 
