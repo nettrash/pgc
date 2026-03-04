@@ -248,8 +248,17 @@ impl Routine {
 
     /// Hash
     pub fn hash(&mut self) {
+        let agg_repr = match &self.aggregate_info {
+            Some(agg) => format!(
+                "{}.{}.{}",
+                agg.kind,
+                agg.num_direct_args,
+                agg.get_options_body()
+            ),
+            None => String::new(),
+        };
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
@@ -264,6 +273,7 @@ impl Routine {
             self.is_leakproof,
             self.parallel,
             self.security_definer,
+            agg_repr,
         );
         self.hash = Some(format!("{:x}", md5::compute(src)));
     }
@@ -700,7 +710,7 @@ mod tests {
         assert!(routine.aggregate_info.is_none());
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             schema,
             name,
             lang,
@@ -715,6 +725,7 @@ mod tests {
             false,
             "unsafe",
             false,
+            "",
         );
         let expected_hash = format!("{:x}", md5::compute(expected_src));
         assert_eq!(routine.hash.as_ref(), Some(&expected_hash));
