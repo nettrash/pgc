@@ -224,6 +224,38 @@ impl Comparer {
         Self::has_whole_qualified_name(&unquoted, &pattern)
     }
 
+    /// Check whether a routine's `aggregate_info` references a function
+    /// identified by `(schema, name)` (both lowercase).  Aggregate transition
+    /// functions, final functions, etc. are stored as qualified or unqualified
+    /// names; this helper normalises and compares them.
+    fn aggregate_references_function(routine: &Routine, schema: &str, name: &str) -> bool {
+        let agg = match &routine.aggregate_info {
+            Some(a) => a,
+            None => return false,
+        };
+        let qualified = format!("{}.{}", schema, name);
+        let refs: Vec<&str> = [
+            Some(agg.sfunc.as_str()),
+            agg.finalfunc.as_deref(),
+            agg.combinefunc.as_deref(),
+            agg.serialfunc.as_deref(),
+            agg.deserialfunc.as_deref(),
+            agg.msfunc.as_deref(),
+            agg.minvfunc.as_deref(),
+            agg.mfinalfunc.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for r in refs {
+            let lower = r.to_lowercase().replace('"', "");
+            if lower == qualified || lower == name {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Return `true` when `text` contains `qualified` delimited by
     /// non-identifier characters on both sides.
     fn has_whole_qualified_name(text: &str, qualified: &str) -> bool {
@@ -1025,7 +1057,11 @@ impl Comparer {
             for (i, routine) in routines_to_drop.iter().enumerate() {
                 for (j, (schema, name)) in drop_names.iter().enumerate() {
                     if i != j
-                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                        && (Self::text_references_qualified_name(
+                            &routine.source_code,
+                            schema,
+                            name,
+                        ) || Self::aggregate_references_function(routine, schema, name))
                     {
                         drop_deps[i].insert(j);
                     }
@@ -1080,7 +1116,11 @@ impl Comparer {
             for (i, (_, routine)) in create_routines.iter().enumerate() {
                 for (j, (schema, name)) in names.iter().enumerate() {
                     if i != j
-                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                        && (Self::text_references_qualified_name(
+                            &routine.source_code,
+                            schema,
+                            name,
+                        ) || Self::aggregate_references_function(routine, schema, name))
                     {
                         depends_on[i].insert(j);
                     }
@@ -1614,7 +1654,11 @@ impl Comparer {
             for (i, routine) in routines_to_drop.iter().enumerate() {
                 for (j, (schema, name)) in drop_names.iter().enumerate() {
                     if i != j
-                        && Self::text_references_qualified_name(&routine.source_code, schema, name)
+                        && (Self::text_references_qualified_name(
+                            &routine.source_code,
+                            schema,
+                            name,
+                        ) || Self::aggregate_references_function(routine, schema, name))
                     {
                         drop_deps[i].insert(j);
                     }
@@ -1765,6 +1809,23 @@ impl Comparer {
                     for &j in targets {
                         if j != i {
                             depends_on[i].insert(j);
+                        }
+                    }
+                }
+            }
+
+            // For aggregate routines, check if their sfunc/finalfunc/etc.
+            // reference any other action item.
+            if !item.is_view {
+                let routine = &self.to.routines[item.orig_idx];
+                if routine.aggregate_info.is_some() {
+                    for ((schema, name), targets) in &name_to_items {
+                        if Self::aggregate_references_function(routine, schema, name) {
+                            for &j in targets {
+                                if j != i {
+                                    depends_on[i].insert(j);
+                                }
+                            }
                         }
                     }
                 }

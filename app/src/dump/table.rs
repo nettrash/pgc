@@ -79,19 +79,53 @@ impl Table {
         table
     }
     /// Fill information about table.
-    pub async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
-        self.fill_columns(pool).await?;
-        self.fill_indexes(pool).await?;
-        self.fill_constraints(pool).await?;
-        self.fill_triggers(pool).await?;
-        self.fill_policies(pool).await?;
-        self.fill_partition_info(pool).await?;
-        self.fill_definition(pool).await?;
+    ///
+    /// All sub-queries (columns, indexes, constraints, triggers, policies,
+    /// partition info, definition) are fired **concurrently** via
+    /// `tokio::try_join!` so that the total wall-clock time is dominated by
+    /// the single slowest query rather than the sum of all seven.
+    ///
+    /// `has_tabledef_fn` should be pre-checked once per dump run so we don't
+    /// repeat the `pg_proc` lookup for every table.
+    pub async fn fill(&mut self, pool: &PgPool, has_tabledef_fn: bool) -> Result<(), Error> {
+        let schema = self.schema.clone();
+        let name = self.name.clone();
+
+        let (columns, indexes, constraints, triggers, policies_data, partition, definition) = tokio::try_join!(
+            Self::fetch_columns(pool, &schema, &name),
+            Self::fetch_indexes(pool, &schema, &name),
+            Self::fetch_constraints(pool, &schema, &name),
+            Self::fetch_triggers(pool, &schema, &name),
+            Self::fetch_policies(pool, &schema, &name),
+            Self::fetch_partition_info(pool, &schema, &name),
+            Self::fetch_definition(pool, &schema, &name, has_tabledef_fn),
+        )?;
+
+        self.columns = columns;
+        self.indexes = indexes;
+        self.constraints = constraints;
+        self.triggers = triggers;
+
+        let (policies, rowsecurity) = policies_data;
+        self.policies = policies;
+        self.has_rowsecurity = rowsecurity;
+
+        let (partition_key, partition_of, partition_bound) = partition;
+        self.partition_key = partition_key;
+        self.partition_of = partition_of;
+        self.partition_bound = partition_bound;
+
+        self.definition = definition;
+
         Ok(())
     }
 
-    /// Fill information about columns.
-    async fn fill_columns(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch columns for the given table.
+    async fn fetch_columns(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<TableColumn>, Error> {
         let query = format!(
                         "SELECT
                                 c.table_catalog,
@@ -184,11 +218,12 @@ impl Table {
                             AND pd.objsubid = a.attnum
                         WHERE c.table_schema = '{}' AND c.table_name = '{}'
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position",
-                        self.schema.replace('\'', "''"),
-                        self.name.replace('\'', "''")
+                        escape_single_quotes(schema),
+                        escape_single_quotes(name)
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
+        let mut columns = Vec::new();
         if !rows.is_empty() {
             for row in rows {
                 let table_column = TableColumn {
@@ -246,18 +281,21 @@ impl Table {
                     serial_type: None,
                 };
 
-                self.columns.push(table_column.clone());
+                columns.push(table_column);
             }
 
-            self.columns
-                .sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
+            columns.sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
         }
 
-        Ok(())
+        Ok(columns)
     }
 
-    /// Fill information about indexes.
-    async fn fill_indexes(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch indexes for the given table.
+    async fn fetch_indexes(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<TableIndex>, Error> {
         let query = format!(
                         "SELECT i.schemaname,
                                         i.tablename,
@@ -273,11 +311,12 @@ impl Table {
                              AND (idx.indisunique = false OR con.oid IS NULL)
                              AND i.schemaname = '{}' AND i.tablename = '{}'
                          ORDER BY i.schemaname, i.tablename, i.indexname",
-                        self.schema.replace('\'', "''"),
-                        self.name.replace('\'', "''")
+                        escape_single_quotes(schema),
+                        escape_single_quotes(name)
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
+        let mut indexes = Vec::new();
         if !rows.is_empty() {
             for row in rows {
                 let table_index = TableIndex {
@@ -288,75 +327,78 @@ impl Table {
                     indexdef: row.get("indexdef"),
                 };
 
-                self.indexes.push(table_index.clone());
+                indexes.push(table_index);
             }
 
-            self.indexes
-                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            indexes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
 
-        Ok(())
+        Ok(indexes)
     }
 
-    /// Fill information about constraints.
-    async fn fill_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch constraints for the given table.
+    async fn fetch_constraints(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<TableConstraint>, Error> {
         let query = format!(
             "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' ELSE c.contype::text END AS constraint_type, c.condeferrable AS is_deferrable, c.condeferred AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') AND c.conislocal ORDER BY n.nspname, t.relname, c.conname;",
-            self.schema.replace('\'', "''"),
-            self.name.replace('\'', "''")
+            escape_single_quotes(schema),
+            escape_single_quotes(name)
         );
 
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        if !rows.is_empty() {
-            for row in rows {
-                let table_constraint = TableConstraint {
-                    catalog: row.get("catalog"),
-                    schema: row.get("schema"),
-                    name: row.get("constraint_name"),
-                    table_name: row.get("table_name"),
-                    constraint_type: row.get("constraint_type"),
-                    is_deferrable: row.get("is_deferrable"),
-                    initially_deferred: row.get("initially_deferred"),
-                    definition: row.get("definition"),
-                };
-
-                self.constraints.push(table_constraint.clone());
-            }
+        let mut constraints = Vec::new();
+        for row in rows {
+            constraints.push(TableConstraint {
+                catalog: row.get("catalog"),
+                schema: row.get("schema"),
+                name: row.get("constraint_name"),
+                table_name: row.get("table_name"),
+                constraint_type: row.get("constraint_type"),
+                is_deferrable: row.get("is_deferrable"),
+                initially_deferred: row.get("initially_deferred"),
+                definition: row.get("definition"),
+            });
         }
 
-        Ok(())
+        Ok(constraints)
     }
 
-    /// Fill information about triggers.
-    async fn fill_triggers(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch triggers for the given table.
+    async fn fetch_triggers(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<TableTrigger>, Error> {
         let query = format!(
             "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '\"{}\".\"{}\"'::regclass and tgisinternal = false ORDER BY tgname",
-            self.schema.replace('"', "\"\""),
-            self.name.replace('"', "\"\"")
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\"")
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        if !rows.is_empty() {
-            for row in rows {
-                let table_trigger = TableTrigger {
-                    oid: row.get("oid"),
-                    name: row.get("tgname"),
-                    definition: row.get("tgdef"),
-                };
-
-                self.triggers.push(table_trigger.clone());
-            }
-
-            self.triggers
-                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let mut triggers = Vec::new();
+        for row in rows {
+            triggers.push(TableTrigger {
+                oid: row.get("oid"),
+                name: row.get("tgname"),
+                definition: row.get("tgdef"),
+            });
         }
+        triggers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
-        Ok(())
+        Ok(triggers)
     }
 
-    /// Fill information about row-level security policies and row security flag.
-    async fn fill_policies(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch row-level security policies and the row security flag.
+    async fn fetch_policies(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+    ) -> Result<(Vec<TablePolicy>, bool), Error> {
         let query = format!(
             "SELECT p.polname,
                     n.nspname AS schemaname,
@@ -372,42 +414,47 @@ impl Table {
              JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = '{}' AND c.relname = '{}'
              ORDER BY p.polname",
-            self.schema.replace('\'', "''"),
-            self.name.replace('\'', "''"),
+            escape_single_quotes(schema),
+            escape_single_quotes(name),
         );
 
         let rows = sqlx::query(&query).fetch_all(pool).await?;
-        self.policies.clear();
-        self.has_rowsecurity = false;
 
         if !rows.is_empty() {
+            let mut policies = Vec::new();
             for row in &rows {
-                let policy = TablePolicy::from_row(row)?;
-                self.policies.push(policy);
+                policies.push(TablePolicy::from_row(row)?);
             }
-
-            // Rows come from the same table; row security flag is identical across them.
-            self.has_rowsecurity = rows[0].get("relrowsecurity");
+            let rowsecurity: bool = rows[0].get("relrowsecurity");
+            Ok((policies, rowsecurity))
         } else {
             // No policies; still record whether row security is enabled on the table.
             let flag_query = format!(
                 "SELECT relrowsecurity FROM pg_class c
                  JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname = '{}' AND c.relname = '{}';",
-                self.schema.replace('\'', "''"),
-                self.name.replace('\'', "''"),
+                escape_single_quotes(schema),
+                escape_single_quotes(name),
             );
 
-            if let Some(row) = sqlx::query(&flag_query).fetch_optional(pool).await? {
-                self.has_rowsecurity = row.get("relrowsecurity");
-            }
+            let rowsecurity =
+                if let Some(row) = sqlx::query(&flag_query).fetch_optional(pool).await? {
+                    row.get("relrowsecurity")
+                } else {
+                    false
+                };
+            Ok((Vec::new(), rowsecurity))
         }
-
-        Ok(())
     }
 
-    /// Fill information about partition.
-    async fn fill_partition_info(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch partition information for the given table.
+    ///
+    /// Returns (partition_key, partition_of, partition_bound).
+    async fn fetch_partition_info(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+    ) -> Result<(Option<String>, Option<String>, Option<String>), Error> {
         let query = format!(
             "SELECT
                 c.relkind::text,
@@ -421,8 +468,8 @@ impl Table {
             LEFT JOIN pg_class p ON p.oid = i.inhparent
             LEFT JOIN pg_namespace pn ON pn.oid = p.relnamespace
             WHERE n.nspname = '{}' AND c.relname = '{}'",
-            self.schema.replace('\'', "''"),
-            self.name.replace('\'', "''")
+            escape_single_quotes(schema),
+            escape_single_quotes(name)
         );
 
         let row = sqlx::query(&query).fetch_optional(pool).await?;
@@ -430,43 +477,51 @@ impl Table {
         if let Some(row) = row {
             let relkind: String = row.get("relkind");
 
-            // If it is a partitioned table (parent)
-            if relkind == "p" {
-                self.partition_key = row.get("partition_key");
-            }
+            let partition_key = if relkind == "p" {
+                row.get("partition_key")
+            } else {
+                None
+            };
 
-            // If it is a partition (child)
-            if let Some(parent_table) = row.get::<Option<String>, _>("parent_table")
+            let (partition_of, partition_bound) = if let Some(parent_table) =
+                row.get::<Option<String>, _>("parent_table")
                 && let Some(parent_schema) = row.get::<Option<String>, _>("parent_schema")
             {
-                self.partition_of = Some(format!("\"{}\".\"{}\"", parent_schema, parent_table));
-                self.partition_bound = row.get("partition_bound");
-            }
+                (
+                    Some(format!("\"{}\".\"{}\"", parent_schema, parent_table)),
+                    row.get("partition_bound"),
+                )
+            } else {
+                (None, None)
+            };
+
+            Ok((partition_key, partition_of, partition_bound))
+        } else {
+            Ok((None, None, None))
         }
-        Ok(())
     }
 
-    /// Fill table definition.
-    async fn fill_definition(&mut self, pool: &PgPool) -> Result<(), Error> {
-        // Check if pg_get_tabledef exists
-        let check_func = "select proname from pg_proc where proname = 'pg_get_tabledef';";
-        let func_row = sqlx::query(check_func).fetch_optional(pool).await?;
-        if func_row.is_some() {
+    /// Fetch the table definition using `pg_get_tabledef` if available.
+    ///
+    /// The `has_tabledef_fn` flag should be pre-checked once per dump run to
+    /// avoid repeating the `pg_proc` lookup for every table.
+    async fn fetch_definition(
+        pool: &PgPool,
+        schema: &str,
+        name: &str,
+        has_tabledef_fn: bool,
+    ) -> Result<Option<String>, Error> {
+        if has_tabledef_fn {
             let query = format!(
                 "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '\"{}\"'::regnamespace;",
-                self.name.replace('\'', "''"),
-                self.schema.replace('"', "\"\"")
+                escape_single_quotes(name),
+                schema.replace('"', "\"\"")
             );
             let row = sqlx::query(&query).fetch_one(pool).await?;
-            if let Some(definition) = row.get::<Option<String>, _>("definition") {
-                self.definition = Some(definition);
-            } else {
-                self.definition = None;
-            }
+            Ok(row.get::<Option<String>, _>("definition"))
         } else {
-            self.definition = None;
+            Ok(None)
         }
-        Ok(())
     }
 
     /// Hash the table

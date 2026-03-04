@@ -586,24 +586,57 @@ impl Dump {
                     r.oid,
                     r.proname,
                     l.lanname as prolang,
-                    case when r.prokind = 'f' then 'function' else 'procedure' end as prokind,
+                    case r.prokind
+                        when 'f' then 'function'
+                        when 'p' then 'procedure'
+                        when 'a' then 'aggregate'
+                        when 'w' then 'window'
+                    end as prokind,
                     pg_get_function_result(r.oid) as prorettype,
                     pg_get_function_identity_arguments(r.oid) as proarguments,
                     pg_get_expr(r.proargdefaults, 0) as proargdefaults,
                     owner_role.rolname as owner_name,
                     r.prosrc,
-                    d.description as routine_comment
+                    d.description as routine_comment,
+                    r.provolatile::text as provolatile,
+                    r.proisstrict,
+                    r.proleakproof,
+                    r.proparallel::text as proparallel,
+                    r.prosecdef,
+                    -- aggregate details (NULL for non-aggregates)
+                    agg.aggtransfn::regproc::text as agg_sfunc,
+                    format_type(agg.aggtranstype, null) as agg_stype,
+                    agg.aggtransspace as agg_sspace,
+                    case when agg.aggfinalfn != 0 then agg.aggfinalfn::regproc::text end as agg_finalfunc,
+                    agg.aggfinalextra as agg_finalfunc_extra,
+                    agg.aggfinalmodify::text as agg_finalfunc_modify,
+                    case when agg.aggcombinefn != 0 then agg.aggcombinefn::regproc::text end as agg_combinefunc,
+                    case when agg.aggserialfn != 0 then agg.aggserialfn::regproc::text end as agg_serialfunc,
+                    case when agg.aggdeserialfn != 0 then agg.aggdeserialfn::regproc::text end as agg_deserialfunc,
+                    agg.agginitval as agg_initcond,
+                    case when agg.aggmtransfn != 0 then agg.aggmtransfn::regproc::text end as agg_msfunc,
+                    case when agg.aggminvtransfn != 0 then agg.aggminvtransfn::regproc::text end as agg_minvfunc,
+                    case when agg.aggmtransfn != 0 then format_type(agg.aggmtranstype, null) end as agg_mstype,
+                    agg.aggmtransspace as agg_msspace,
+                    case when agg.aggmfinalfn != 0 then agg.aggmfinalfn::regproc::text end as agg_mfinalfunc,
+                    agg.aggmfinalextra as agg_mfinalfunc_extra,
+                    agg.aggmfinalmodify::text as agg_mfinalfunc_modify,
+                    agg.aggminitval as agg_minitcond,
+                    case when agg.aggsortop != 0 then agg.aggsortop::regoper::text end as agg_sortop,
+                    agg.aggkind::text as agg_kind,
+                    agg.aggnumdirectargs as agg_numdirectargs
                 from
                     pg_proc r
                     join pg_namespace n on r.pronamespace = n.oid
                     join pg_language l on r.prolang = l.oid
                     left join pg_roles owner_role on owner_role.oid = r.proowner
                     left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
+                    left join pg_aggregate agg on agg.aggfnoid = r.oid
                 where
                     n.nspname like '{}'
                     and n.nspname not in ('pg_catalog', 'information_schema')
-                    and l.lanname not in ('c', 'internal')
-                    and r.prokind in ('f', 'p')
+                    and (l.lanname not in ('c', 'internal') or r.prokind in ('a', 'w'))
+                    and r.prokind in ('f', 'p', 'a', 'w')
                     and not exists (
                         select 1 from pg_depend ext_dep
                         where ext_dep.objid = r.oid
@@ -629,12 +662,72 @@ impl Dump {
         } else {
             println!("Routines found:");
             for row in rows {
+                let prokind: String = row.get("prokind");
+                let is_aggregate = prokind == "aggregate";
+
+                let volatility = match row.get::<String, _>("provolatile").as_str() {
+                    "i" => "immutable".to_string(),
+                    "s" => "stable".to_string(),
+                    _ => "volatile".to_string(),
+                };
+                let parallel = match row.get::<String, _>("proparallel").as_str() {
+                    "s" => "safe".to_string(),
+                    "r" => "restricted".to_string(),
+                    _ => "unsafe".to_string(),
+                };
+
+                let aggregate_info = if is_aggregate {
+                    let agg_kind_str: Option<String> = row.get("agg_kind");
+                    let agg_kind = agg_kind_str
+                        .as_deref()
+                        .and_then(|s| s.chars().next())
+                        .unwrap_or('n');
+                    let finalfunc_modify: Option<String> = row.get("agg_finalfunc_modify");
+                    let mfinalfunc_modify: Option<String> = row.get("agg_mfinalfunc_modify");
+
+                    Some(crate::dump::routine::AggregateInfo {
+                        sfunc: row
+                            .get::<Option<String>, _>("agg_sfunc")
+                            .unwrap_or_default(),
+                        stype: row
+                            .get::<Option<String>, _>("agg_stype")
+                            .unwrap_or_default(),
+                        sspace: row.get::<Option<i32>, _>("agg_sspace"),
+                        finalfunc: row.get("agg_finalfunc"),
+                        finalfunc_extra: row
+                            .get::<Option<bool>, _>("agg_finalfunc_extra")
+                            .unwrap_or(false),
+                        finalfunc_modify: finalfunc_modify.filter(|v| v != "r"),
+                        combinefunc: row.get("agg_combinefunc"),
+                        serialfunc: row.get("agg_serialfunc"),
+                        deserialfunc: row.get("agg_deserialfunc"),
+                        initcond: row.get("agg_initcond"),
+                        msfunc: row.get("agg_msfunc"),
+                        minvfunc: row.get("agg_minvfunc"),
+                        mstype: row.get("agg_mstype"),
+                        msspace: row.get::<Option<i32>, _>("agg_msspace"),
+                        mfinalfunc: row.get("agg_mfinalfunc"),
+                        mfinalfunc_extra: row
+                            .get::<Option<bool>, _>("agg_mfinalfunc_extra")
+                            .unwrap_or(false),
+                        mfinalfunc_modify: mfinalfunc_modify.filter(|v| v != "r"),
+                        minitcond: row.get("agg_minitcond"),
+                        sortop: row.get("agg_sortop"),
+                        kind: agg_kind,
+                        num_direct_args: row
+                            .get::<Option<i16>, _>("agg_numdirectargs")
+                            .unwrap_or(0),
+                    })
+                } else {
+                    None
+                };
+
                 let mut routine = Routine {
                     schema: row.get("nspname"),
                     oid: row.get("oid"),
                     name: row.get("proname"),
                     lang: row.get("prolang"),
-                    kind: row.get("prokind"),
+                    kind: prokind,
                     return_type: row
                         .get::<Option<String>, _>("prorettype")
                         .unwrap_or_else(|| "void".to_string()),
@@ -645,6 +738,12 @@ impl Dump {
                         .unwrap_or_default(),
                     comment: row.get("routine_comment"),
                     source_code: row.get("prosrc"),
+                    volatility,
+                    is_strict: row.get("proisstrict"),
+                    is_leakproof: row.get("proleakproof"),
+                    parallel,
+                    security_definer: row.get("prosecdef"),
+                    aggregate_info,
                     hash: None,
                 };
                 routine.hash();
@@ -665,6 +764,14 @@ impl Dump {
 
     // Fetch tables from the database and populate the dump.
     async fn get_tables(&mut self, pool: &PgPool) -> Result<(), Error> {
+        // Check once whether the pg_get_tabledef extension function exists.
+        let has_tabledef_fn =
+            sqlx::query("select proname from pg_proc where proname = 'pg_get_tabledef';")
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .is_some();
+
         let result = sqlx::query(
             format!(
                 "
@@ -723,7 +830,7 @@ impl Dump {
                     comment: row.get("table_comment"),
                     hash: None,
                 };
-                table.fill(pool).await.map_err(|e| {
+                table.fill(pool, has_tabledef_fn).await.map_err(|e| {
                     Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
 
