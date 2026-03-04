@@ -62,6 +62,10 @@ pub struct AggregateInfo {
     /// Aggregate kind: 'n' for normal, 'o' for ordered-set, 'h' for hypothetical-set
     #[serde(default = "AggregateInfo::default_kind")]
     pub kind: char,
+    /// Number of direct (non-aggregated) arguments for ordered-set/hypothetical-set aggregates.
+    /// For normal aggregates this is 0.
+    #[serde(default)]
+    pub num_direct_args: i16,
 }
 
 impl AggregateInfo {
@@ -471,6 +475,37 @@ impl Routine {
         if let Some(ref agg) = self.aggregate_info {
             let args = if self.arguments.is_empty() {
                 "*".to_string()
+            } else if (agg.kind == 'o' || agg.kind == 'h') && agg.num_direct_args >= 0 {
+                // Ordered-set and hypothetical-set aggregates use the syntax:
+                //   CREATE AGGREGATE name(direct_args ORDER BY sorted_args) (...)
+                // pg_get_function_identity_arguments returns all args comma-separated;
+                // we split at num_direct_args to insert ORDER BY.
+                let all_args = Self::split_arguments(&self.arguments);
+                let n_direct = agg.num_direct_args as usize;
+                if n_direct == 0 {
+                    // No direct args: ORDER BY sorted_args
+                    format!(
+                        "ORDER BY {}",
+                        all_args
+                            .iter()
+                            .map(|a| a.trim().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else if n_direct < all_args.len() {
+                    let direct: Vec<String> = all_args[..n_direct]
+                        .iter()
+                        .map(|a| a.trim().to_string())
+                        .collect();
+                    let sorted: Vec<String> = all_args[n_direct..]
+                        .iter()
+                        .map(|a| a.trim().to_string())
+                        .collect();
+                    format!("{} ORDER BY {}", direct.join(", "), sorted.join(", "))
+                } else {
+                    // All args are direct (edge case) – fall back to normal syntax
+                    self.arguments.clone()
+                }
             } else {
                 self.arguments.clone()
             };
@@ -845,6 +880,7 @@ mod tests {
             minitcond: None,
             sortop: None,
             kind: 'n',
+            num_direct_args: 0,
         });
         routine.hash();
 
@@ -883,5 +919,150 @@ mod tests {
         let h2 = routine.hash.clone();
 
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn get_aggregate_script_ordered_set() {
+        let mut routine = Routine::new(
+            "public".to_string(),
+            Oid(500),
+            "my_percentile".to_string(),
+            "internal".to_string(),
+            "aggregate".to_string(),
+            "double precision".to_string(),
+            "double precision, double precision".to_string(),
+            None,
+            None,
+            "-".to_string(),
+        );
+        routine.aggregate_info = Some(AggregateInfo {
+            sfunc: "ordered_set_transition".to_string(),
+            stype: "internal".to_string(),
+            sspace: None,
+            finalfunc: Some("percentile_disc_final".to_string()),
+            finalfunc_extra: true,
+            finalfunc_modify: None,
+            combinefunc: None,
+            serialfunc: None,
+            deserialfunc: None,
+            initcond: None,
+            msfunc: None,
+            minvfunc: None,
+            mstype: None,
+            msspace: None,
+            mfinalfunc: None,
+            mfinalfunc_extra: false,
+            mfinalfunc_modify: None,
+            minitcond: None,
+            sortop: None,
+            kind: 'o',
+            num_direct_args: 1,
+        });
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("create aggregate \"public\".\"my_percentile\"(double precision ORDER BY double precision)"),
+            "Expected ordered-set syntax with ORDER BY, got: {}",
+            script
+        );
+        assert!(script.contains("SFUNC = ordered_set_transition"));
+        assert!(script.contains("FINALFUNC = percentile_disc_final"));
+        assert!(script.contains("FINALFUNC_EXTRA"));
+    }
+
+    #[test]
+    fn get_aggregate_script_hypothetical_set() {
+        let mut routine = Routine::new(
+            "public".to_string(),
+            Oid(501),
+            "my_rank".to_string(),
+            "internal".to_string(),
+            "aggregate".to_string(),
+            "bigint".to_string(),
+            "\"any\", \"any\"".to_string(),
+            None,
+            None,
+            "-".to_string(),
+        );
+        routine.aggregate_info = Some(AggregateInfo {
+            sfunc: "hypothetical_rank_sfunc".to_string(),
+            stype: "internal".to_string(),
+            sspace: None,
+            finalfunc: Some("hypothetical_rank_final".to_string()),
+            finalfunc_extra: true,
+            finalfunc_modify: None,
+            combinefunc: None,
+            serialfunc: None,
+            deserialfunc: None,
+            initcond: None,
+            msfunc: None,
+            minvfunc: None,
+            mstype: None,
+            msspace: None,
+            mfinalfunc: None,
+            mfinalfunc_extra: false,
+            mfinalfunc_modify: None,
+            minitcond: None,
+            sortop: None,
+            kind: 'h',
+            num_direct_args: 1,
+        });
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("create aggregate \"public\".\"my_rank\"(\"any\" ORDER BY \"any\")"),
+            "Expected hypothetical-set syntax with ORDER BY, got: {}",
+            script
+        );
+        assert!(script.contains("HYPOTHETICAL"));
+    }
+
+    #[test]
+    fn get_aggregate_script_ordered_set_no_direct_args() {
+        let mut routine = Routine::new(
+            "public".to_string(),
+            Oid(502),
+            "my_mode".to_string(),
+            "internal".to_string(),
+            "aggregate".to_string(),
+            "anyelement".to_string(),
+            "anyelement".to_string(),
+            None,
+            None,
+            "-".to_string(),
+        );
+        routine.aggregate_info = Some(AggregateInfo {
+            sfunc: "ordered_set_transition".to_string(),
+            stype: "internal".to_string(),
+            sspace: None,
+            finalfunc: Some("mode_final".to_string()),
+            finalfunc_extra: true,
+            finalfunc_modify: None,
+            combinefunc: None,
+            serialfunc: None,
+            deserialfunc: None,
+            initcond: None,
+            msfunc: None,
+            minvfunc: None,
+            mstype: None,
+            msspace: None,
+            mfinalfunc: None,
+            mfinalfunc_extra: false,
+            mfinalfunc_modify: None,
+            minitcond: None,
+            sortop: None,
+            kind: 'o',
+            num_direct_args: 0,
+        });
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("create aggregate \"public\".\"my_mode\"(ORDER BY anyelement)"),
+            "Expected ordered-set syntax with no direct args, got: {}",
+            script
+        );
     }
 }

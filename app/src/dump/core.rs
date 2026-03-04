@@ -623,7 +623,8 @@ impl Dump {
                     agg.aggmfinalmodify::text as agg_mfinalfunc_modify,
                     agg.aggminitval as agg_minitcond,
                     case when agg.aggsortop != 0 then agg.aggsortop::regoper::text end as agg_sortop,
-                    agg.aggkind::text as agg_kind
+                    agg.aggkind::text as agg_kind,
+                    agg.aggnumdirectargs as agg_numdirectargs
                 from
                     pg_proc r
                     join pg_namespace n on r.pronamespace = n.oid
@@ -713,6 +714,9 @@ impl Dump {
                         minitcond: row.get("agg_minitcond"),
                         sortop: row.get("agg_sortop"),
                         kind: agg_kind,
+                        num_direct_args: row
+                            .get::<Option<i16>, _>("agg_numdirectargs")
+                            .unwrap_or(0),
                     })
                 } else {
                     None
