@@ -9,6 +9,8 @@ pub struct TableIndex {
     pub name: String,            // Index name
     pub catalog: Option<String>, // Catalog name
     pub indexdef: String,        // Index definition
+    #[serde(default)]
+    pub is_partition_index: bool, // Whether this index is inherited from a partitioned parent
 }
 
 impl TableIndex {
@@ -52,6 +54,7 @@ mod tests {
             catalog: Some("postgres".to_string()),
             indexdef: "CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email)"
                 .to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -63,6 +66,7 @@ mod tests {
             catalog: None,
             indexdef: "CREATE INDEX idx_orders_date ON app.orders USING btree (created_at)"
                 .to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -73,6 +77,7 @@ mod tests {
             name: "idx_events_composite".to_string(),
             catalog: Some("analytics_db".to_string()),
             indexdef: "CREATE INDEX idx_events_composite ON analytics.events USING gin ((data ->> 'type'::text), (data ->> 'timestamp'::text)) WHERE active = true".to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -83,6 +88,7 @@ mod tests {
             name: "idx_products_active".to_string(),
             catalog: None,
             indexdef: "CREATE INDEX idx_products_active ON public.products (name, price) WHERE active = true".to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -276,6 +282,7 @@ mod tests {
             catalog: None,
             indexdef: "CREATE UNIQUE INDEX IDX_USERS_NAME ON PUBLIC.USERS USING BTREE (NAME)"
                 .to_string(),
+            is_partition_index: false,
         };
 
         let script = index.get_script();
@@ -291,6 +298,7 @@ mod tests {
             name: "empty_idx".to_string(),
             catalog: None,
             indexdef: "".to_string(),
+            is_partition_index: false,
         };
 
         let script = index.get_script();
@@ -441,6 +449,7 @@ mod tests {
             name: "".to_string(),
             catalog: None,
             indexdef: "".to_string(),
+            is_partition_index: false,
         };
 
         // Should handle empty strings gracefully
@@ -467,6 +476,7 @@ mod tests {
             name: "".to_string(),
             catalog: None,
             indexdef: "".to_string(),
+            is_partition_index: false,
         };
         assert_eq!(index, index2);
     }
@@ -479,6 +489,7 @@ mod tests {
             name: "idx_special@name".to_string(),
             catalog: Some("catalog#db".to_string()),
             indexdef: "CREATE INDEX \"idx_special@name\" ON \"test-schema\".\"table$name\" USING btree (\"column-name\")".to_string(),
+            is_partition_index: false,
         };
 
         // Should handle special characters in all fields
@@ -504,6 +515,7 @@ mod tests {
                 name: "btree_idx".to_string(),
                 catalog: None,
                 indexdef: "CREATE INDEX btree_idx ON public.users USING btree (email)".to_string(),
+                is_partition_index: false,
             },
             TableIndex {
                 schema: "public".to_string(),
@@ -512,6 +524,7 @@ mod tests {
                 catalog: None,
                 indexdef: "CREATE INDEX gin_idx ON public.documents USING gin (content)"
                     .to_string(),
+                is_partition_index: false,
             },
             TableIndex {
                 schema: "public".to_string(),
@@ -520,6 +533,7 @@ mod tests {
                 catalog: None,
                 indexdef: "CREATE INDEX gist_idx ON public.locations USING gist (coordinates)"
                     .to_string(),
+                is_partition_index: false,
             },
             TableIndex {
                 schema: "public".to_string(),
@@ -527,6 +541,7 @@ mod tests {
                 name: "hash_idx".to_string(),
                 catalog: None,
                 indexdef: "CREATE INDEX hash_idx ON public.numbers USING hash (value)".to_string(),
+                is_partition_index: false,
             },
         ];
 
@@ -552,6 +567,7 @@ mod tests {
             name: "idx".to_string(),
             catalog: Some("cat".to_string()),
             indexdef: "definition".to_string(),
+            is_partition_index: false,
         };
 
         // Create the same hash as the implementation
@@ -578,6 +594,7 @@ mod tests {
             name: "idx".to_string(),
             catalog: None,
             indexdef: "definition".to_string(),
+            is_partition_index: false,
         };
 
         // Create the same hash as the implementation (catalog=None means no update)
@@ -605,6 +622,7 @@ mod tests {
             name: "multiline_idx".to_string(),
             catalog: None,
             indexdef: "CREATE INDEX multiline_idx ON public.complex_table\n    USING gin (data)\n    WHERE active = true".to_string(),
+            is_partition_index: false,
         };
 
         let script = index.get_script();
