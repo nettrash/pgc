@@ -301,7 +301,8 @@ impl Table {
                                         i.tablename,
                                         i.indexname,
                                         i.tablespace,
-                                        i.indexdef
+                                        i.indexdef,
+                                        EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index
                          FROM pg_indexes i
                          JOIN pg_class ic ON ic.relname = i.indexname
                          JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
@@ -325,6 +326,7 @@ impl Table {
                     name: row.get("indexname"),
                     catalog: row.get("tablespace"),
                     indexdef: row.get("indexdef"),
+                    is_partition_index: row.get("is_partition_index"),
                 };
 
                 indexes.push(table_index);
@@ -738,9 +740,9 @@ impl Table {
             }
         }
 
-        // 6. Add indexes (excluding primary key indexes)
+        // 6. Add indexes (excluding primary key indexes and partition-inherited indexes)
         for index in &self.indexes {
-            if !index.indexdef.to_lowercase().contains("primary key") {
+            if !index.indexdef.to_lowercase().contains("primary key") && !index.is_partition_index {
                 script.push_str(&index.get_script());
             }
         }
@@ -1066,8 +1068,11 @@ impl Table {
             constraint_post_script.push_str(&comment_stmt);
         }
 
-        // Collect index updates
+        // Collect index updates (skip partition-inherited indexes, managed by parent)
         for new_index in &to_table.indexes {
+            if new_index.is_partition_index {
+                continue;
+            }
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
                     let drop_cmd = format!(
@@ -1109,6 +1114,9 @@ impl Table {
         }
 
         for old_index in &self.indexes {
+            if old_index.is_partition_index {
+                continue;
+            }
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
                 let drop_cmd = format!(
                     "drop index if exists \"{}\".\"{}\";\n",
@@ -1409,6 +1417,7 @@ mod tests {
             indexdef:
                 "create unique index users_pkey on public.users using btree (\"id\") primary key (\"id\")"
                     .to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -1419,6 +1428,7 @@ mod tests {
             name: "idx_users_name".to_string(),
             catalog: None,
             indexdef: definition.to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -1429,6 +1439,7 @@ mod tests {
             name: "idx_users_old".to_string(),
             catalog: None,
             indexdef: "create index idx_users_old on public.users using btree (legacy)".to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -1440,6 +1451,7 @@ mod tests {
             catalog: None,
             indexdef: "create index idx_users_email on public.users using btree (email)"
                 .to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -1451,6 +1463,7 @@ mod tests {
             catalog: None,
             indexdef: "create unique index idx_users_email on public.users using btree (email)"
                 .to_string(),
+            is_partition_index: false,
         }
     }
 

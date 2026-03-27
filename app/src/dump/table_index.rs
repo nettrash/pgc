@@ -9,6 +9,8 @@ pub struct TableIndex {
     pub name: String,            // Index name
     pub catalog: Option<String>, // Catalog name
     pub indexdef: String,        // Index definition
+    #[serde(default)]
+    pub is_partition_index: bool, // Whether this index is inherited from a partitioned parent
 }
 
 impl TableIndex {
@@ -52,6 +54,7 @@ mod tests {
             catalog: Some("postgres".to_string()),
             indexdef: "CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email)"
                 .to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -63,6 +66,7 @@ mod tests {
             catalog: None,
             indexdef: "CREATE INDEX idx_orders_date ON app.orders USING btree (created_at)"
                 .to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -73,6 +77,7 @@ mod tests {
             name: "idx_events_composite".to_string(),
             catalog: Some("analytics_db".to_string()),
             indexdef: "CREATE INDEX idx_events_composite ON analytics.events USING gin ((data ->> 'type'::text), (data ->> 'timestamp'::text)) WHERE active = true".to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -83,6 +88,7 @@ mod tests {
             name: "idx_products_active".to_string(),
             catalog: None,
             indexdef: "CREATE INDEX idx_products_active ON public.products (name, price) WHERE active = true".to_string(),
+            is_partition_index: false,
         }
     }
 
@@ -276,6 +282,7 @@ mod tests {
             catalog: None,
             indexdef: "CREATE UNIQUE INDEX IDX_USERS_NAME ON PUBLIC.USERS USING BTREE (NAME)"
                 .to_string(),
+            is_partition_index: false,
         };
 
         let script = index.get_script();
@@ -291,6 +298,7 @@ mod tests {
             name: "empty_idx".to_string(),
             catalog: None,
             indexdef: "".to_string(),
+            is_partition_index: false,
         };
 
         let script = index.get_script();
@@ -441,6 +449,7 @@ mod tests {
             name: "".to_string(),
             catalog: None,
             indexdef: "".to_string(),
+            is_partition_index: false,
         };
 
         // Should handle empty strings gracefully
@@ -467,6 +476,7 @@ mod tests {
             name: "".to_string(),
             catalog: None,
             indexdef: "".to_string(),
+            is_partition_index: false,
         };
         assert_eq!(index, index2);
     }
@@ -479,6 +489,7 @@ mod tests {
             name: "idx_special@name".to_string(),
             catalog: Some("catalog#db".to_string()),
             indexdef: "CREATE INDEX \"idx_special@name\" ON \"test-schema\".\"table$name\" USING btree (\"column-name\")".to_string(),
+            is_partition_index: false,
         };
 
         // Should handle special characters in all fields
@@ -504,6 +515,7 @@ mod tests {
                 name: "btree_idx".to_string(),
                 catalog: None,
                 indexdef: "CREATE INDEX btree_idx ON public.users USING btree (email)".to_string(),
+                is_partition_index: false,
             },
             TableIndex {
                 schema: "public".to_string(),
@@ -512,6 +524,7 @@ mod tests {
                 catalog: None,
                 indexdef: "CREATE INDEX gin_idx ON public.documents USING gin (content)"
                     .to_string(),
+                is_partition_index: false,
             },
             TableIndex {
                 schema: "public".to_string(),
@@ -520,6 +533,7 @@ mod tests {
                 catalog: None,
                 indexdef: "CREATE INDEX gist_idx ON public.locations USING gist (coordinates)"
                     .to_string(),
+                is_partition_index: false,
             },
             TableIndex {
                 schema: "public".to_string(),
@@ -527,6 +541,7 @@ mod tests {
                 name: "hash_idx".to_string(),
                 catalog: None,
                 indexdef: "CREATE INDEX hash_idx ON public.numbers USING hash (value)".to_string(),
+                is_partition_index: false,
             },
         ];
 
@@ -552,6 +567,7 @@ mod tests {
             name: "idx".to_string(),
             catalog: Some("cat".to_string()),
             indexdef: "definition".to_string(),
+            is_partition_index: false,
         };
 
         // Create the same hash as the implementation
@@ -578,6 +594,7 @@ mod tests {
             name: "idx".to_string(),
             catalog: None,
             indexdef: "definition".to_string(),
+            is_partition_index: false,
         };
 
         // Create the same hash as the implementation (catalog=None means no update)
@@ -605,6 +622,7 @@ mod tests {
             name: "multiline_idx".to_string(),
             catalog: None,
             indexdef: "CREATE INDEX multiline_idx ON public.complex_table\n    USING gin (data)\n    WHERE active = true".to_string(),
+            is_partition_index: false,
         };
 
         let script = index.get_script();
@@ -618,5 +636,126 @@ mod tests {
         index.add_to_hasher(&mut hasher);
         let hash = format!("{:x}", hasher.finalize());
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn test_is_partition_index_default_false() {
+        let index = create_test_index();
+        assert!(!index.is_partition_index);
+    }
+
+    #[test]
+    fn test_is_partition_index_true() {
+        let index = TableIndex {
+            schema: "public".to_string(),
+            table: "orders_2024".to_string(),
+            name: "orders_2024_created_at_idx".to_string(),
+            catalog: None,
+            indexdef: "CREATE INDEX orders_2024_created_at_idx ON public.orders_2024 USING btree (created_at)".to_string(),
+            is_partition_index: true,
+        };
+        assert!(index.is_partition_index);
+    }
+
+    #[test]
+    fn test_serde_default_is_partition_index() {
+        // JSON without is_partition_index should deserialize with default false
+        let json = r#"{
+            "schema": "public",
+            "table": "users",
+            "name": "idx_users_email",
+            "catalog": null,
+            "indexdef": "CREATE INDEX idx_users_email ON public.users (email)"
+        }"#;
+        let index: TableIndex = serde_json::from_str(json).expect("Failed to deserialize");
+        assert!(!index.is_partition_index);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_is_partition_index_true() {
+        let index = TableIndex {
+            schema: "data".to_string(),
+            table: "logs_2024".to_string(),
+            name: "logs_2024_message_idx".to_string(),
+            catalog: None,
+            indexdef: "CREATE INDEX logs_2024_message_idx ON data.logs_2024 (message)".to_string(),
+            is_partition_index: true,
+        };
+        let json = serde_json::to_string(&index).expect("Failed to serialize");
+        assert!(json.contains("\"is_partition_index\":true"));
+
+        let deserialized: TableIndex = serde_json::from_str(&json).expect("Failed to deserialize");
+        assert!(deserialized.is_partition_index);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_is_partition_index_false() {
+        let index = create_test_index();
+        let json = serde_json::to_string(&index).expect("Failed to serialize");
+        let deserialized: TableIndex = serde_json::from_str(&json).expect("Failed to deserialize");
+        assert!(!deserialized.is_partition_index);
+        assert_eq!(index, deserialized);
+    }
+
+    #[test]
+    fn test_partial_eq_ignores_is_partition_index() {
+        let mut idx_a = create_test_index();
+        let mut idx_b = create_test_index();
+        idx_a.is_partition_index = false;
+        idx_b.is_partition_index = true;
+
+        // PartialEq must not consider is_partition_index
+        assert_eq!(idx_a, idx_b);
+    }
+
+    #[test]
+    fn test_hash_ignores_is_partition_index() {
+        let mut idx_a = create_test_index();
+        let mut idx_b = create_test_index();
+        idx_a.is_partition_index = false;
+        idx_b.is_partition_index = true;
+
+        let mut hasher_a = Sha256::new();
+        let mut hasher_b = Sha256::new();
+        idx_a.add_to_hasher(&mut hasher_a);
+        idx_b.add_to_hasher(&mut hasher_b);
+
+        assert_eq!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+        );
+    }
+
+    #[test]
+    fn test_get_script_unaffected_by_is_partition_index() {
+        let mut index = create_test_index();
+        let script_normal = index.get_script();
+
+        index.is_partition_index = true;
+        let script_partition = index.get_script();
+
+        assert_eq!(script_normal, script_partition);
+    }
+
+    #[test]
+    fn test_clone_preserves_is_partition_index() {
+        let index = TableIndex {
+            schema: "public".to_string(),
+            table: "events_2024".to_string(),
+            name: "events_2024_idx".to_string(),
+            catalog: None,
+            indexdef: "CREATE INDEX events_2024_idx ON public.events_2024 (id)".to_string(),
+            is_partition_index: true,
+        };
+        let cloned = index.clone();
+        assert!(cloned.is_partition_index);
+    }
+
+    #[test]
+    fn test_debug_includes_is_partition_index() {
+        let mut index = create_test_index();
+        index.is_partition_index = true;
+        let debug = format!("{index:?}");
+        assert!(debug.contains("is_partition_index: true"));
     }
 }

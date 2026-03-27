@@ -832,6 +832,53 @@ CREATE TABLE data.partition_bound_test (
 
 CREATE TABLE data.partition_bound_test_active PARTITION OF data.partition_bound_test FOR VALUES IN ('inactive');
 
+-- =============================================================================
+-- Partition index test: existing partitioned table with index gains a new partition
+-- FROM has parent + index + one partition; TO adds a second partition.
+-- The comparer must NOT emit explicit CREATE INDEX for the new partition
+-- because PostgreSQL auto-creates inherited indexes on PARTITION OF.
+-- =============================================================================
+CREATE TABLE data.logs (
+    id         BIGINT NOT NULL,
+    created_at DATE   NOT NULL,
+    message    TEXT,
+    CONSTRAINT logs_pkey PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE data.logs_2024
+    PARTITION OF data.logs
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+-- NEW: second partition only in TO
+CREATE TABLE data.logs_2025
+    PARTITION OF data.logs
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX idx_logs_message ON data.logs (message);
+
+-- =============================================================================
+-- Partition index test: brand-new partitioned table with index (TO only)
+-- The comparer creates parent + partitions from scratch. Indexes on the parent
+-- must be emitted once; the partitions must NOT get explicit CREATE INDEX
+-- because PostgreSQL propagates parent indexes to partitions automatically.
+-- =============================================================================
+CREATE TABLE data.tagged_items (
+    id     BIGINT  NOT NULL,
+    tag    TEXT    NOT NULL,
+    detail TEXT,
+    CONSTRAINT tagged_items_pkey PRIMARY KEY (id, tag)
+) PARTITION BY LIST (tag);
+
+CREATE TABLE data.tagged_items_alpha
+    PARTITION OF data.tagged_items
+    FOR VALUES IN ('alpha');
+
+CREATE TABLE data.tagged_items_beta
+    PARTITION OF data.tagged_items
+    FOR VALUES IN ('beta');
+
+CREATE INDEX idx_tagged_items_detail ON data.tagged_items (detail);
+
 -- SQL routines to test dependency handling
 CREATE OR REPLACE FUNCTION test_schema.get_active_usernames_sql()
 RETURNS TABLE(username varchar, preferred_contact test_schema.contact_type)

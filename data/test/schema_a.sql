@@ -668,6 +668,25 @@ CREATE TABLE data.partition_bound_test (
 
 CREATE TABLE data.partition_bound_test_active PARTITION OF data.partition_bound_test FOR VALUES IN ('active');
 
+-- =============================================================================
+-- Partition index test: existing partitioned table with index gains a new partition
+-- FROM has parent + index + one partition; TO adds a second partition.
+-- The comparer must NOT emit explicit CREATE INDEX for the new partition
+-- because PostgreSQL auto-creates inherited indexes on PARTITION OF.
+-- =============================================================================
+CREATE TABLE data.logs (
+    id         BIGINT NOT NULL,
+    created_at DATE   NOT NULL,
+    message    TEXT,
+    CONSTRAINT logs_pkey PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE data.logs_2024
+    PARTITION OF data.logs
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE INDEX idx_logs_message ON data.logs (message);
+
 -- SQL routines to test dependency handling
 CREATE OR REPLACE FUNCTION test_schema.get_active_usernames_sql()
 RETURNS TABLE(username varchar)

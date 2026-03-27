@@ -1,3 +1,9 @@
+2026-03-27      v1.0.9
+
+                Features:
+                    - Fixed duplicate CREATE INDEX generation for partitions when parent table has an index
+                    - Added permissions check for schemas before dump
+
 2026-03-04      v1.0.8
 
                 Features:
