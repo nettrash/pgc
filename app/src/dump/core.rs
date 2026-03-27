@@ -105,8 +105,26 @@ impl Dump {
         Ok(())
     }
 
+    /// Returns a SQL IN-clause for accessible schemas, e.g. `('public', 'data')`.
+    /// Falls back to a no-match condition when there are no accessible schemas.
+    fn accessible_schema_filter(&self) -> String {
+        if self.schemas.is_empty() {
+            return "(NULL)".to_string();
+        }
+        let names: Vec<String> = self
+            .schemas
+            .iter()
+            .map(|s| format!("'{}'", s.name.replace('\'', "''")))
+            .collect();
+        format!("({})", names.join(", "))
+    }
+
     async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         self.get_schemas(pool).await?;
+        if self.schemas.is_empty() {
+            println!("No accessible schemas to dump.");
+            return Ok(());
+        }
         self.get_extensions(pool).await?;
         self.get_types(pool).await?;
         self.get_domain_constraints(pool).await?;
@@ -122,7 +140,8 @@ impl Dump {
         let query = format!(
             "select n.nspname as schema_name,
                     r.rolname as schema_owner,
-                    d.description as schema_comment
+                    d.description as schema_comment,
+                    has_schema_privilege(n.nspname, 'USAGE') as has_usage
              from pg_namespace n
              left join pg_roles r on r.oid = n.nspowner
              left join pg_description d on d.objoid = n.oid
@@ -144,14 +163,21 @@ impl Dump {
         } else {
             println!("Schemas found:");
             for row in rows {
-                let schema = row.get("schema_name");
+                let schema_name: String = row.get("schema_name");
+                let has_usage: bool = row.get("has_usage");
+
+                if !has_usage {
+                    println!(" - {} (skipped: no USAGE privilege)", schema_name);
+                    continue;
+                }
+
                 let owner: Option<String> = row.get("schema_owner");
                 let comment: Option<String> = row.get("schema_comment");
-                let mut sch = Schema::new(schema, comment);
+                let mut sch = Schema::new(schema_name, comment);
                 sch.owner = owner.unwrap_or_default();
                 sch.hash();
-                self.schemas.push(sch.clone());
                 println!(" - {}", sch.name);
+                self.schemas.push(sch);
             }
         }
         Ok(())
@@ -159,7 +185,8 @@ impl Dump {
 
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(format!("select n.nspname, e.*, r.rolname as extowner from pg_extension e join pg_namespace n on e.extnamespace = n.oid left join pg_roles r on r.oid = e.extowner where (n.nspname like '{}' or n.nspname = 'public')", self.configuration.scheme).as_str())
+        let schema_filter = self.accessible_schema_filter();
+        let result = sqlx::query(format!("select n.nspname, e.*, r.rolname as extowner from pg_extension e join pg_namespace n on e.extnamespace = n.oid left join pg_roles r on r.oid = e.extowner where (n.nspname in {} or n.nspname = 'public')", schema_filter).as_str())
             .fetch_all(pool)
             .await;
         if result.is_err() {
@@ -204,7 +231,7 @@ impl Dump {
                  join pg_class c on c.oid = t.typrelid
                  join pg_attribute a on a.attrelid = c.oid
                  where
-                    n.nspname like '{}'
+                    n.nspname in {}
                     and t.typtype = 'c'
                     and c.relkind = 'c'
                     and t.typisdefined = true
@@ -216,7 +243,7 @@ impl Dump {
                         and ext_dep.deptype = 'e'
                     )
                  order by t.oid, a.attnum",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
@@ -283,7 +310,7 @@ impl Dump {
                     and d.classoid = 'pg_type'::regclass
                     and d.objsubid = 0
             where 
-                n.nspname like '{}' 
+                n.nspname in {} 
                 and (
                     t.typtype in ('d', 'e', 'r', 'm')
                     or (t.typtype = 'c' and c.relkind = 'c')
@@ -294,7 +321,7 @@ impl Dump {
                     where ext_dep.objid = t.oid
                     and ext_dep.deptype = 'e'
                 )",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
@@ -429,14 +456,14 @@ impl Dump {
             join pg_namespace n on n.oid = t.typnamespace
             where c.contype = 'c'
               and c.contypid <> 0
-              and n.nspname like '{}'
+              and n.nspname in {}
               and not exists (
                   select 1 from pg_depend ext_dep
                   where ext_dep.objid = c.contypid
                   and ext_dep.deptype = 'e'
               )
             order by c.contypid, c.conname",
-            self.configuration.scheme
+            self.accessible_schema_filter()
         );
 
         let result = sqlx::query(query.as_str()).fetch_all(pool).await;
@@ -513,13 +540,13 @@ impl Dump {
                     left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
                         and owner_attr.attnum = dep.refobjsubid
                 where
-                    seq.schemaname like '%{}%'
+                    seq.schemaname in {}
                     and not exists (
                         select 1 from pg_depend ext_dep
                         where ext_dep.objid = seq_class.oid
                         and ext_dep.deptype = 'e'
                     )",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
@@ -633,7 +660,7 @@ impl Dump {
                     left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
                     left join pg_aggregate agg on agg.aggfnoid = r.oid
                 where
-                    n.nspname like '{}'
+                    n.nspname in {}
                     and n.nspname not in ('pg_catalog', 'information_schema')
                     and (l.lanname not in ('c', 'internal') or r.prokind in ('a', 'w'))
                     and r.prokind in ('f', 'p', 'a', 'w')
@@ -643,7 +670,7 @@ impl Dump {
                         and ext_dep.deptype = 'e'
                     );
                 ",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
@@ -783,14 +810,14 @@ impl Dump {
                     left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                     where 
                         t.schemaname not in ('pg_catalog', 'information_schema') 
-                        and t.schemaname like '{}' 
+                        and t.schemaname in {} 
                         and t.tablename not like 'pg_%'
                         and not exists (
                             select 1 from pg_depend ext_dep
                             where ext_dep.objid = c.oid
                             and ext_dep.deptype = 'e'
                         );",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
@@ -865,14 +892,14 @@ impl Dump {
                 left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                 where
                     v.table_schema not in ('pg_catalog', 'information_schema')
-                    and v.table_schema like '{}'
+                    and v.table_schema in {}
                     and not exists (
                         select 1 from pg_depend ext_dep
                         where ext_dep.objid = c.oid
                         and ext_dep.deptype = 'e'
                     )
                 group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description;",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
@@ -938,13 +965,13 @@ impl Dump {
                     and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
                 left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                 where mv.schemaname not in ('pg_catalog', 'information_schema')
-                    and mv.schemaname like '{}'
+                    and mv.schemaname in {}
                     and not exists (
                         select 1 from pg_depend ext_dep
                         where ext_dep.objid = c.oid
                         and ext_dep.deptype = 'e'
                     );",
-                self.configuration.scheme
+                self.accessible_schema_filter()
             )
             .as_str(),
         )
