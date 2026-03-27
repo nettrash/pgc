@@ -637,4 +637,125 @@ mod tests {
         let hash = format!("{:x}", hasher.finalize());
         assert_eq!(hash.len(), 64);
     }
+
+    #[test]
+    fn test_is_partition_index_default_false() {
+        let index = create_test_index();
+        assert!(!index.is_partition_index);
+    }
+
+    #[test]
+    fn test_is_partition_index_true() {
+        let index = TableIndex {
+            schema: "public".to_string(),
+            table: "orders_2024".to_string(),
+            name: "orders_2024_created_at_idx".to_string(),
+            catalog: None,
+            indexdef: "CREATE INDEX orders_2024_created_at_idx ON public.orders_2024 USING btree (created_at)".to_string(),
+            is_partition_index: true,
+        };
+        assert!(index.is_partition_index);
+    }
+
+    #[test]
+    fn test_serde_default_is_partition_index() {
+        // JSON without is_partition_index should deserialize with default false
+        let json = r#"{
+            "schema": "public",
+            "table": "users",
+            "name": "idx_users_email",
+            "catalog": null,
+            "indexdef": "CREATE INDEX idx_users_email ON public.users (email)"
+        }"#;
+        let index: TableIndex = serde_json::from_str(json).expect("Failed to deserialize");
+        assert!(!index.is_partition_index);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_is_partition_index_true() {
+        let index = TableIndex {
+            schema: "data".to_string(),
+            table: "logs_2024".to_string(),
+            name: "logs_2024_message_idx".to_string(),
+            catalog: None,
+            indexdef: "CREATE INDEX logs_2024_message_idx ON data.logs_2024 (message)".to_string(),
+            is_partition_index: true,
+        };
+        let json = serde_json::to_string(&index).expect("Failed to serialize");
+        assert!(json.contains("\"is_partition_index\":true"));
+
+        let deserialized: TableIndex = serde_json::from_str(&json).expect("Failed to deserialize");
+        assert!(deserialized.is_partition_index);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_is_partition_index_false() {
+        let index = create_test_index();
+        let json = serde_json::to_string(&index).expect("Failed to serialize");
+        let deserialized: TableIndex = serde_json::from_str(&json).expect("Failed to deserialize");
+        assert!(!deserialized.is_partition_index);
+        assert_eq!(index, deserialized);
+    }
+
+    #[test]
+    fn test_partial_eq_ignores_is_partition_index() {
+        let mut idx_a = create_test_index();
+        let mut idx_b = create_test_index();
+        idx_a.is_partition_index = false;
+        idx_b.is_partition_index = true;
+
+        // PartialEq must not consider is_partition_index
+        assert_eq!(idx_a, idx_b);
+    }
+
+    #[test]
+    fn test_hash_ignores_is_partition_index() {
+        let mut idx_a = create_test_index();
+        let mut idx_b = create_test_index();
+        idx_a.is_partition_index = false;
+        idx_b.is_partition_index = true;
+
+        let mut hasher_a = Sha256::new();
+        let mut hasher_b = Sha256::new();
+        idx_a.add_to_hasher(&mut hasher_a);
+        idx_b.add_to_hasher(&mut hasher_b);
+
+        assert_eq!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+        );
+    }
+
+    #[test]
+    fn test_get_script_unaffected_by_is_partition_index() {
+        let mut index = create_test_index();
+        let script_normal = index.get_script();
+
+        index.is_partition_index = true;
+        let script_partition = index.get_script();
+
+        assert_eq!(script_normal, script_partition);
+    }
+
+    #[test]
+    fn test_clone_preserves_is_partition_index() {
+        let index = TableIndex {
+            schema: "public".to_string(),
+            table: "events_2024".to_string(),
+            name: "events_2024_idx".to_string(),
+            catalog: None,
+            indexdef: "CREATE INDEX events_2024_idx ON public.events_2024 (id)".to_string(),
+            is_partition_index: true,
+        };
+        let cloned = index.clone();
+        assert!(cloned.is_partition_index);
+    }
+
+    #[test]
+    fn test_debug_includes_is_partition_index() {
+        let mut index = create_test_index();
+        index.is_partition_index = true;
+        let debug = format!("{index:?}");
+        assert!(debug.contains("is_partition_index: true"));
+    }
 }
