@@ -36,14 +36,14 @@ impl Extension {
     /// Returns a string to create the extension.
     pub fn get_script(&self) -> String {
         format!(
-            "create extension if not exists \"{}\" with schema \"{}\";\n",
+            "create extension if not exists {} with schema {};\n",
             self.name, self.schema
         )
     }
 
     /// Returns a string to drop the extension.
     pub fn get_drop_script(&self) -> String {
-        format!("drop extension if exists \"{}\";\n", self.name)
+        format!("drop extension if exists {};\n", self.name)
     }
 }
 
@@ -54,12 +54,12 @@ mod tests {
     #[test]
     fn test_extension_new() {
         let extension = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
 
-        assert_eq!(extension.name, "uuid-ossp");
+        assert_eq!(extension.name, "\"uuid-ossp\"");
         assert_eq!(extension.version, "1.1");
         assert_eq!(extension.schema, "public");
     }
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn test_extension_hash() {
         let extension = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
@@ -148,13 +148,13 @@ mod tests {
     #[test]
     fn test_get_script() {
         let extension = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists \"uuid-ossp\" with schema \"public\";\n";
+        let expected = "create extension if not exists \"uuid-ossp\" with schema public;\n";
 
         assert_eq!(script, expected);
     }
@@ -168,7 +168,7 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists \"postgis\" with schema \"extensions\";\n";
+        let expected = "create extension if not exists postgis with schema extensions;\n";
 
         assert_eq!(script, expected);
     }
@@ -176,14 +176,14 @@ mod tests {
     #[test]
     fn test_get_script_with_special_characters() {
         let extension = Extension::new(
-            "test-ext_name".to_string(),
+            "\"test-ext_name\"".to_string(),
             "1.0.0".to_string(),
             "custom_schema".to_string(),
         );
 
         let script = extension.get_script();
         let expected =
-            "create extension if not exists \"test-ext_name\" with schema \"custom_schema\";\n";
+            "create extension if not exists \"test-ext_name\" with schema custom_schema;\n";
 
         assert_eq!(script, expected);
     }
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn test_get_drop_script() {
         let extension = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
@@ -211,7 +211,7 @@ mod tests {
         );
 
         let drop_script = extension.get_drop_script();
-        let expected = "drop extension if exists \"postgis\";\n";
+        let expected = "drop extension if exists postgis;\n";
 
         assert_eq!(drop_script, expected);
     }
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_get_drop_script_with_special_characters() {
         let extension = Extension::new(
-            "test-ext_name".to_string(),
+            "\"test-ext_name\"".to_string(),
             "1.0.0".to_string(),
             "custom_schema".to_string(),
         );
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn test_extension_clone() {
         let original = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let extension = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
@@ -302,13 +302,10 @@ mod tests {
 
         // Scripts should work with empty strings
         let script = extension.get_script();
-        assert_eq!(
-            script,
-            "create extension if not exists \"\" with schema \"\";\n"
-        );
+        assert_eq!(script, "create extension if not exists  with schema ;\n");
 
         let drop_script = extension.get_drop_script();
-        assert_eq!(drop_script, "drop extension if exists \"\";\n");
+        assert_eq!(drop_script, "drop extension if exists ;\n");
     }
 
     #[test]
@@ -344,7 +341,7 @@ mod tests {
     #[test]
     fn test_extension_json_serialization_format() {
         let extension = Extension::new(
-            "uuid-ossp".to_string(),
+            "\"uuid-ossp\"".to_string(),
             "1.1".to_string(),
             "public".to_string(),
         );
@@ -352,7 +349,7 @@ mod tests {
         let json = serde_json::to_string(&extension).expect("serialization should succeed");
         assert_eq!(
             json,
-            r#"{"name":"uuid-ossp","version":"1.1","schema":"public"}"#
+            r#"{"name":"\"uuid-ossp\"","version":"1.1","schema":"public"}"#
         );
     }
 

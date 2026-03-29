@@ -1252,7 +1252,7 @@ impl Comparer {
             // Drop triggers on the table
             for trigger in &table.triggers {
                 pre_drop.push_str(&format!(
-                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                    "drop trigger if exists {} on {}.{};\n",
                     trigger.name, table.schema, table.name
                 ));
             }
@@ -2026,10 +2026,8 @@ mod tests {
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("drop function if exists \"public\".\"test_func\" ();"));
-        assert!(
-            script.contains("create or replace function \"public\".\"test_func\"() returns text")
-        );
+        assert!(script.contains("drop function if exists public.test_func ();"));
+        assert!(script.contains("create or replace function public.test_func() returns text"));
     }
 
     #[tokio::test]
@@ -2070,10 +2068,10 @@ mod tests {
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("drop function if exists \"public\".\"test_func\" (a integer);"));
-        assert!(script.contains(
-            "create or replace function \"public\".\"test_func\"(a text) returns integer"
-        ));
+        assert!(script.contains("drop function if exists public.test_func (a integer);"));
+        assert!(
+            script.contains("create or replace function public.test_func(a text) returns integer")
+        );
     }
 
     #[tokio::test]
@@ -2116,10 +2114,10 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_plpgsql = script
-            .find("create or replace function \"public\".\"fn_plpgsql\"")
+            .find("create or replace function public.fn_plpgsql")
             .expect("plpgsql routine script not found");
         let pos_sql = script
-            .find("create or replace function \"public\".\"fn_sql\"")
+            .find("create or replace function public.fn_sql")
             .expect("sql routine script not found");
 
         assert!(pos_plpgsql < pos_sql, "SQL routines should be applied last");
@@ -2152,10 +2150,10 @@ mod tests {
         let script = comparer.get_script();
 
         let routine_drop_pos = script
-            .find("drop function if exists \"test_schema\".\"get_users_by_status\"")
+            .find("drop function if exists test_schema.get_users_by_status")
             .expect("routine drop script not found");
         let type_drop_pos = script
-            .find("drop type if exists \"test_schema\".\"status_type\";")
+            .find("drop type if exists test_schema.status_type;")
             .expect("type drop script not found");
 
         assert!(
@@ -2196,10 +2194,10 @@ mod tests {
         let script = comparer.get_script();
 
         let routine_drop_pos = script
-            .find("drop function if exists \"test_schema\".\"get_users_by_status_enum\"")
+            .find("drop function if exists test_schema.get_users_by_status_enum")
             .expect("routine drop script not found");
         let enum_drop_pos = script
-            .find("drop type if exists \"test_schema\".\"status_enum\";")
+            .find("drop type if exists test_schema.status_enum;")
             .expect("enum drop script not found");
 
         assert!(
@@ -2233,10 +2231,10 @@ mod tests {
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("create type \"test_schema\".\"test_type_B\" as ("));
+        assert!(script.contains("create type test_schema.test_type_B as ("));
         assert!(script.contains("\"street\" varchar(255)"));
         assert!(script.contains("\"city\" varchar(100)"));
-        assert!(script.contains("drop type if exists \"test_schema\".\"test_type_A\";"));
+        assert!(script.contains("drop type if exists test_schema.test_type_A;"));
     }
 
     #[tokio::test]
@@ -2244,11 +2242,11 @@ mod tests {
         let mut from_dump = Dump::new(DumpConfig::default());
         let mut to_dump = Dump::new(DumpConfig::default());
 
-        let mut from_schema = Schema::new("public".to_string(), None);
+        let mut from_schema = Schema::new("public".to_string(), "public".to_string(), None);
         from_schema.owner = "old_owner".to_string();
         from_schema.hash();
 
-        let mut to_schema = Schema::new("public".to_string(), None);
+        let mut to_schema = Schema::new("public".to_string(), "public".to_string(), None);
         to_schema.owner = "new_owner".to_string();
         to_schema.hash();
 
@@ -2259,7 +2257,7 @@ mod tests {
         comparer.compare_schemas().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter schema \"public\" owner to \"new_owner\";"));
+        assert!(script.contains("alter schema public owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -2335,9 +2333,7 @@ mod tests {
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(
-            script.contains("alter function \"public\".\"test_func\"() owner to \"new_owner\";")
-        );
+        assert!(script.contains("alter function public.test_func() owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -2412,16 +2408,16 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_base = script
-            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .find("create or replace function test_schema.r_base_value")
             .expect("r_base_value not found");
         let pos_step = script
-            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .find("create or replace function test_schema.x_step_one")
             .expect("x_step_one not found");
         let pos_middle = script
-            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .find("create or replace function test_schema.a_middle_layer")
             .expect("a_middle_layer not found");
         let pos_final = script
-            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .find("create or replace procedure test_schema.z_final_report")
             .expect("z_final_report not found");
 
         assert!(
@@ -2498,13 +2494,13 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_base = script
-            .find("drop function if exists \"test_schema\".\"r_base_value\"")
+            .find("drop function if exists test_schema.r_base_value")
             .expect("r_base_value drop not found");
         let pos_step = script
-            .find("drop function if exists \"test_schema\".\"x_step_one\"")
+            .find("drop function if exists test_schema.x_step_one")
             .expect("x_step_one drop not found");
         let pos_middle = script
-            .find("drop function if exists \"test_schema\".\"a_middle_layer\"")
+            .find("drop function if exists test_schema.a_middle_layer")
             .expect("a_middle_layer drop not found");
 
         // Drops should go in reverse dependency order: dependents first.
@@ -2586,16 +2582,16 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_base = script
-            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .find("create or replace function test_schema.r_base_value")
             .expect("r_base_value not found");
         let pos_step = script
-            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .find("create or replace function test_schema.x_step_one")
             .expect("x_step_one not found");
         let pos_middle = script
-            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .find("create or replace function test_schema.a_middle_layer")
             .expect("a_middle_layer not found");
         let pos_final = script
-            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .find("create or replace procedure test_schema.z_final_report")
             .expect("z_final_report not found");
 
         assert!(
@@ -2752,6 +2748,8 @@ mod tests {
         let table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![column],
@@ -2850,6 +2848,8 @@ mod tests {
         let table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![column],
@@ -2899,7 +2899,7 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(!script.contains("Skipping sequence"));
-        assert!(script.contains("create sequence \"public\".\"test_seq\""));
+        assert!(script.contains("create sequence public.test_seq"));
     }
 
     #[tokio::test]
@@ -2948,7 +2948,7 @@ mod tests {
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter sequence \"public\".\"test_seq\" owner to \"new_owner\";"));
+        assert!(script.contains("alter sequence public.test_seq owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -3027,6 +3027,8 @@ mod tests {
         };
 
         let table = Table::new(
+            "public".to_string(),
+            "test".to_string(),
             "public".to_string(),
             "test".to_string(),
             "postgres".to_string(),
@@ -3124,6 +3126,8 @@ mod tests {
         let from_table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![from_column],
@@ -3190,6 +3194,8 @@ mod tests {
         let to_table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![to_column],
@@ -3216,6 +3222,8 @@ mod tests {
         let mut parent = Table::new(
             "public".to_string(),
             "parent".to_string(),
+            "public".to_string(),
+            "parent".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "parent", "id", 1)],
@@ -3229,6 +3237,8 @@ mod tests {
 
         // Partition table
         let mut part = Table::new(
+            "public".to_string(),
+            "child".to_string(),
             "public".to_string(),
             "child".to_string(),
             "postgres".to_string(),
@@ -3245,6 +3255,8 @@ mod tests {
 
         // Referencing table with FK to parent
         let mut orders = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
             "public".to_string(),
             "orders".to_string(),
             "postgres".to_string(),
@@ -3280,16 +3292,16 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_parent = script
-            .find("create table \"public\".\"parent\"")
+            .find("create table public.parent")
             .expect("parent table not created");
         let pos_child = script
-            .find("create table \"public\".\"child\" partition of public.parent")
+            .find("create table public.child partition of public.parent")
             .expect("partition table not created");
         let pos_orders = script
-            .find("create table \"public\".\"orders\"")
+            .find("create table public.orders")
             .expect("orders table not created");
         let pos_fk = script
-            .find("alter table \"public\".\"orders\" add constraint \"orders_parent_fk\"")
+            .find("alter table public.orders add constraint orders_parent_fk")
             .expect("fk not emitted");
 
         assert!(
@@ -3310,6 +3322,8 @@ mod tests {
         let mut from_table = Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "old_owner".to_string(),
             None,
             vec![int_column("public", "users", "id", 1)],
@@ -3321,6 +3335,8 @@ mod tests {
         from_table.hash();
 
         let mut to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "new_owner".to_string(),
@@ -3340,7 +3356,7 @@ mod tests {
         comparer.compare_tables().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter table \"public\".\"users\" owner to \"new_owner\";"));
+        assert!(script.contains("alter table public.users owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -3373,7 +3389,7 @@ mod tests {
         comparer.create_views().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter view \"public\".\"active_users\" owner to \"new_owner\";"));
+        assert!(script.contains("alter view public.active_users owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -3388,9 +3404,11 @@ mod tests {
         let from_dump = Dump::new(DumpConfig::default());
         let mut to_dump = Dump::new(DumpConfig::default());
 
-        to_dump
-            .schemas
-            .push(Schema::new("test_schema".to_string(), None));
+        to_dump.schemas.push(Schema::new(
+            "test_schema".to_string(),
+            "test_schema".to_string(),
+            None,
+        ));
 
         let get_user_count = Routine::new(
             "test_schema".to_string(),
@@ -3451,16 +3469,16 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_get_user_count = script
-            .find("create or replace function \"test_schema\".\"get_user_count\"")
+            .find("create or replace function test_schema.get_user_count")
             .expect("get_user_count not found in script");
         let pos_view = script
-            .find("\"test_schema\".\"v_user_stats\"")
+            .find("test_schema.v_user_stats")
             .expect("v_user_stats not found in script");
         let pos_report = script
-            .find("create or replace function \"test_schema\".\"report_user_stats\"")
+            .find("create or replace function test_schema.report_user_stats")
             .expect("report_user_stats not found in script");
         let pos_print = script
-            .find("create or replace procedure \"test_schema\".\"print_user_stats\"")
+            .find("create or replace procedure test_schema.print_user_stats")
             .expect("print_user_stats not found in script");
 
         assert!(
@@ -3513,11 +3531,9 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_fn = script
-            .find("create or replace function \"public\".\"helper\"")
+            .find("create or replace function public.helper")
             .expect("helper function not found");
-        let pos_mv = script
-            .find("\"public\".\"mv_data\"")
-            .expect("mv_data not found");
+        let pos_mv = script.find("public.mv_data").expect("mv_data not found");
 
         assert!(
             pos_fn < pos_mv,
@@ -3566,10 +3582,10 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_caller = script
-            .find("drop function if exists \"public\".\"caller_fn\"")
+            .find("drop function if exists public.caller_fn")
             .expect("caller_fn drop not found");
         let pos_base = script
-            .find("drop function if exists \"public\".\"base_fn\"")
+            .find("drop function if exists public.base_fn")
             .expect("base_fn drop not found");
 
         assert!(
@@ -3588,6 +3604,8 @@ mod tests {
         let mut grandparent = Table::new(
             "public".to_string(),
             "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events", "id", 1)],
@@ -3601,6 +3619,8 @@ mod tests {
 
         // Level 1: sub-partition parent (is both a partition child AND partitioned by LIST)
         let mut sub_parent = Table::new(
+            "public".to_string(),
+            "events_2023".to_string(),
             "public".to_string(),
             "events_2023".to_string(),
             "postgres".to_string(),
@@ -3618,6 +3638,8 @@ mod tests {
 
         // Level 2: leaf partition
         let mut leaf = Table::new(
+            "public".to_string(),
+            "events_2023_a".to_string(),
             "public".to_string(),
             "events_2023_a".to_string(),
             "postgres".to_string(),
@@ -3642,13 +3664,13 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_gp = script
-            .find("create table \"public\".\"events\"")
+            .find("create table public.events")
             .expect("grandparent not created");
         let pos_sp = script
-            .find("create table \"public\".\"events_2023\" partition of")
+            .find("create table public.events_2023 partition of")
             .expect("sub-partition parent not created");
         let pos_leaf = script
-            .find("create table \"public\".\"events_2023_a\" partition of")
+            .find("create table public.events_2023_a partition of")
             .expect("leaf partition not created");
 
         assert!(
@@ -3669,6 +3691,8 @@ mod tests {
         let mut grandparent = Table::new(
             "public".to_string(),
             "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events", "id", 1)],
@@ -3683,6 +3707,8 @@ mod tests {
         let mut sub_parent = Table::new(
             "public".to_string(),
             "events_2023".to_string(),
+            "public".to_string(),
+            "events_2023".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events_2023", "id", 1)],
@@ -3691,12 +3717,14 @@ mod tests {
             vec![],
             None,
         );
-        sub_parent.partition_of = Some("\"public\".\"events\"".to_string());
+        sub_parent.partition_of = Some("public.events".to_string());
         sub_parent.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
         sub_parent.partition_key = Some("LIST (id)".to_string());
         sub_parent.hash();
 
         let mut leaf = Table::new(
+            "public".to_string(),
+            "events_2023_a".to_string(),
             "public".to_string(),
             "events_2023_a".to_string(),
             "postgres".to_string(),
@@ -3707,7 +3735,7 @@ mod tests {
             vec![],
             None,
         );
-        leaf.partition_of = Some("\"public\".\"events_2023\"".to_string());
+        leaf.partition_of = Some("public.events_2023".to_string());
         leaf.partition_bound = Some("FOR VALUES IN (1)".to_string());
         leaf.hash();
 
@@ -3720,13 +3748,13 @@ mod tests {
         let script = comparer.get_script();
 
         let pos_gp = script
-            .find("drop table if exists \"public\".\"events\";")
+            .find("drop table if exists public.events;")
             .expect("grandparent drop not found");
         let pos_sp = script
-            .find("drop table if exists \"public\".\"events_2023\";")
+            .find("drop table if exists public.events_2023;")
             .expect("sub-partition parent drop not found");
         let pos_leaf = script
-            .find("drop table if exists \"public\".\"events_2023_a\";")
+            .find("drop table if exists public.events_2023_a;")
             .expect("leaf partition drop not found");
 
         assert!(
@@ -3817,6 +3845,8 @@ mod tests {
         let serial_table = Table::new(
             "test_schema".to_string(),
             "test_serial".to_string(),
+            "test_schema".to_string(),
+            "test_serial".to_string(),
             "postgres".to_string(),
             None,
             vec![serial_col],
@@ -3900,6 +3930,8 @@ mod tests {
         let bigserial_table = Table::new(
             "test_schema".to_string(),
             "test_bigserial".to_string(),
+            "test_schema".to_string(),
+            "test_bigserial".to_string(),
             "postgres".to_string(),
             None,
             vec![bigserial_col],
@@ -3911,6 +3943,7 @@ mod tests {
         to_dump.tables.push(bigserial_table);
 
         to_dump.schemas.push(crate::dump::schema::Schema::new(
+            "test_schema".to_string(),
             "test_schema".to_string(),
             None,
         ));
@@ -3929,21 +3962,21 @@ mod tests {
             "bigserial sequence should be skipped"
         );
         assert!(
-            !script.contains("create sequence \"test_schema\".\"test_serial_id_seq\""),
+            !script.contains("create sequence test_schema.test_serial_id_seq"),
             "serial sequence should not be created separately"
         );
         assert!(
-            !script.contains("create sequence \"test_schema\".\"test_bigserial_id_seq\""),
+            !script.contains("create sequence test_schema.test_bigserial_id_seq"),
             "bigserial sequence should not be created separately"
         );
 
         // Table columns should use serial/bigserial types
         assert!(
-            script.contains("\"id\" serial"),
+            script.contains("id serial"),
             "serial column should use 'serial' type, got:\n{script}"
         );
         assert!(
-            script.contains("\"id\" bigserial"),
+            script.contains("id bigserial"),
             "bigserial column should use 'bigserial' type, got:\n{script}"
         );
 

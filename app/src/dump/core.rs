@@ -114,7 +114,7 @@ impl Dump {
         let names: Vec<String> = self
             .schemas
             .iter()
-            .map(|s| format!("'{}'", s.name.replace('\'', "''")))
+            .map(|s| format!("'{}'", s.raw_name.replace('\'', "''")))
             .collect();
         format!("({})", names.join(", "))
     }
@@ -138,8 +138,10 @@ impl Dump {
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
         let query = format!(
-            "select n.nspname as schema_name,
-                    r.rolname as schema_owner,
+            "select
+                    quote_ident(n.nspname) as schema_name,
+                    n.nspname as raw_schema_name,
+                    quote_ident(r.rolname) as schema_owner,
                     d.description as schema_comment,
                     has_schema_privilege(n.nspname, 'USAGE') as has_usage
              from pg_namespace n
@@ -164,6 +166,7 @@ impl Dump {
             println!("Schemas found:");
             for row in rows {
                 let schema_name: String = row.get("schema_name");
+                let raw_schema_name: String = row.get("raw_schema_name");
                 let has_usage: bool = row.get("has_usage");
 
                 if !has_usage {
@@ -173,7 +176,7 @@ impl Dump {
 
                 let owner: Option<String> = row.get("schema_owner");
                 let comment: Option<String> = row.get("schema_comment");
-                let mut sch = Schema::new(schema_name, comment);
+                let mut sch = Schema::new(schema_name, raw_schema_name, comment);
                 sch.owner = owner.unwrap_or_default();
                 sch.hash();
                 println!(" - {}", sch.name);
@@ -186,9 +189,24 @@ impl Dump {
     // Fetch extensions from the database and populate the dump.
     async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
         let schema_filter = self.accessible_schema_filter();
-        let result = sqlx::query(format!("select n.nspname, e.*, r.rolname as extowner from pg_extension e join pg_namespace n on e.extnamespace = n.oid left join pg_roles r on r.oid = e.extowner where (n.nspname in {} or n.nspname = 'public')", schema_filter).as_str())
-            .fetch_all(pool)
-            .await;
+
+        let query = format!(
+            "
+            select
+                quote_ident(n.nspname) as nspname,
+                quote_ident(e.extname) as extname,
+                e.extversion,
+                quote_ident(r.rolname) as extowner
+            from
+                pg_extension e
+                join pg_namespace n on e.extnamespace = n.oid
+                left join pg_roles r on r.oid = e.extowner
+            where
+                (n.nspname in {} or n.nspname = 'public')",
+            schema_filter
+        );
+
+        let result = sqlx::query(query.as_str()).fetch_all(pool).await;
         if result.is_err() {
             return Err(Error::other(format!(
                 "Failed to fetch extensions: {}.",
@@ -267,12 +285,12 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "select 
-                n.nspname, 
+                quote_ident(n.nspname) as nspname,
                 t.oid as type_oid,
-                t.typname,
+                quote_ident(t.typname) as typname,
                 t.typnamespace,
                 t.typowner,
-                owner_role.rolname as typowner_name,
+                quote_ident(owner_role.rolname) as typowner_name,
                 t.typlen,
                 t.typbyval,
                 t.typtype,
@@ -511,9 +529,9 @@ impl Dump {
             format!(
                 "
                 select
-                    seq.schemaname,
-                    seq.sequencename,
-                    seq.sequenceowner,
+                    quote_ident(seq.schemaname) as schemaname,
+                    quote_ident(seq.sequencename) as sequencename,
+                    quote_ident(seq.sequenceowner) as sequenceowner,
                     seq.data_type::varchar as sequencedatatype,
                     seq.start_value,
                     seq.min_value,
@@ -522,9 +540,9 @@ impl Dump {
                     seq.cycle,
                     seq.cache_size,
                     seq.last_value,
-                    owner_ns.nspname as owned_by_schema,
-                    owner_table.relname as owned_by_table,
-                    owner_attr.attname as owned_by_column,
+                    quote_ident(owner_ns.nspname) as owned_by_schema,
+                    quote_ident(owner_table.relname) as owned_by_table,
+                    quote_ident(owner_attr.attname) as owned_by_column,
                     dep.deptype::text as dependency_type,
                     seq_desc.description as seq_comment
                 from
@@ -609,9 +627,9 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "select
-                    n.nspname,
+                    quote_ident(n.nspname) as nspname,
                     r.oid,
-                    r.proname,
+                    quote_ident(r.proname) as proname,
                     l.lanname as prolang,
                     case r.prokind
                         when 'f' then 'function'
@@ -622,7 +640,7 @@ impl Dump {
                     pg_get_function_result(r.oid) as prorettype,
                     pg_get_function_identity_arguments(r.oid) as proarguments,
                     pg_get_expr(r.proargdefaults, 0) as proargdefaults,
-                    owner_role.rolname as owner_name,
+                    quote_ident(owner_role.rolname) as owner_name,
                     r.prosrc,
                     d.description as routine_comment,
                     r.provolatile::text as provolatile,
@@ -802,7 +820,18 @@ impl Dump {
         let result = sqlx::query(
             format!(
                 "
-                    select t.*, d.description as table_comment
+                    select
+                        quote_ident(t.schemaname) as schemaname,
+                        quote_ident(t.tablename) as tablename,
+                        quote_ident(t.tableowner) as tableowner,
+                        t.schemaname as raw_schema_name,
+                        t.tablename as raw_table_name,
+                        t.tablespace,
+                        t.hasindexes,
+                        t.hastriggers,
+                        t.hasrules,
+                        t.rowsecurity,
+                        d.description as table_comment
                     from pg_tables t
                     left join pg_class c on c.relname = t.tablename
                         and c.relkind in ('r','p')
@@ -839,6 +868,8 @@ impl Dump {
                 let mut table = Table {
                     schema: row.get("schemaname"),
                     name: row.get("tablename"),
+                    raw_schema: row.get("raw_schema_name"),
+                    raw_name: row.get("raw_table_name"),
                     owner: row.get("tableowner"),
                     space: row.get("tablespace"),
                     has_indexes: row.get("hasindexes"),
@@ -879,10 +910,11 @@ impl Dump {
         // Fetch regular (non-materialized) views.
         let result = sqlx::query(
             format!(
-                "select v.table_schema,
-                        v.table_name,
+                "select 
+                        quote_ident(v.table_schema) as table_schema,
+                        quote_ident(v.table_name) as table_name,
                         v.view_definition,
-                        pv.viewowner as view_owner,
+                        quote_ident(pv.viewowner) as view_owner,
                         array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
                         d.description as view_comment
                 from information_schema.views v

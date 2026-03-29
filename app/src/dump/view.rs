@@ -76,13 +76,13 @@ impl View {
     pub fn get_script(&self) -> String {
         let keyword = self.view_keyword();
         let script = format!(
-            "create {} \"{}\".\"{}\" as\n{}\n",
+            "create {} {}.{} as\n{}\n",
             keyword, self.schema, self.name, self.definition
         );
 
         let mut script = if let Some(comment) = &self.comment {
             format!(
-                "{}comment on {} \"{}\".\"{}\" is '{}';\n",
+                "{}comment on {} {}.{} is '{}';\n",
                 script,
                 keyword,
                 self.schema,
@@ -100,7 +100,7 @@ impl View {
     /// Returns a string to drop the view.
     pub fn get_drop_script(&self) -> String {
         format!(
-            "drop {} if exists \"{}\".\"{}\";\n",
+            "drop {} if exists {}.{};\n",
             self.view_keyword(),
             self.schema,
             self.name
@@ -113,11 +113,11 @@ impl View {
         }
 
         format!(
-            "alter {} \"{}\".\"{}\" owner to \"{}\";\n",
+            "alter {} {}.{} owner to {};\n",
             self.view_keyword(),
             self.schema,
             self.name,
-            self.owner.replace('"', "\"\"")
+            self.owner
         )
     }
 
@@ -153,7 +153,7 @@ impl View {
         }
 
         format!(
-            "CREATE OR REPLACE VIEW \"{}\".\"{}\" AS\n{}\n",
+            "CREATE OR REPLACE VIEW {}.{} AS\n{}\n",
             target.schema,
             target.name,
             target.definition.trim_end()
@@ -218,7 +218,7 @@ mod tests {
         let view = create_view("select id from public.users");
         assert_eq!(
             view.get_script(),
-            "create view \"analytics\".\"active_users\" as\nselect id from public.users\n"
+            "create view analytics.active_users as\nselect id from public.users\n"
         );
     }
 
@@ -227,7 +227,7 @@ mod tests {
         let view = create_materialized_view("select id from public.users");
         assert_eq!(
             view.get_script(),
-            "create materialized view \"analytics\".\"active_users\" as\nselect id from public.users\n"
+            "create materialized view analytics.active_users as\nselect id from public.users\n"
         );
     }
 
@@ -239,7 +239,7 @@ mod tests {
 
         assert_eq!(
             view.get_script(),
-            "create view \"analytics\".\"active_users\" as\nselect id from public.users\nalter view \"analytics\".\"active_users\" owner to \"pgc_owner\";\n"
+            "create view analytics.active_users as\nselect id from public.users\nalter view analytics.active_users owner to pgc_owner;\n"
         );
     }
 
@@ -251,7 +251,7 @@ mod tests {
 
         assert_eq!(
             view.get_script(),
-            "create materialized view \"analytics\".\"active_users\" as\nselect id from public.users\nalter materialized view \"analytics\".\"active_users\" owner to \"pgc_owner\";\n"
+            "create materialized view analytics.active_users as\nselect id from public.users\nalter materialized view analytics.active_users owner to pgc_owner;\n"
         );
     }
 
@@ -260,7 +260,7 @@ mod tests {
         let view = create_view("select id from public.users");
         assert_eq!(
             view.get_drop_script(),
-            "drop view if exists \"analytics\".\"active_users\";\n"
+            "drop view if exists analytics.active_users;\n"
         );
     }
 
@@ -269,7 +269,7 @@ mod tests {
         let view = create_materialized_view("select id from public.users");
         assert_eq!(
             view.get_drop_script(),
-            "drop materialized view if exists \"analytics\".\"active_users\";\n"
+            "drop materialized view if exists analytics.active_users;\n"
         );
     }
 
@@ -308,7 +308,7 @@ mod tests {
 
         assert_eq!(
             current.get_alter_script(&replacement),
-            "create view \"analytics\".\"active_users\" as\ncreate or replace view analytics.active_users as select 2\n"
+            "create view analytics.active_users as\ncreate or replace view analytics.active_users as select 2\n"
         );
     }
 
@@ -319,7 +319,7 @@ mod tests {
 
         assert_eq!(
             current.get_alter_script(&target),
-            "CREATE OR REPLACE VIEW \"analytics\".\"active_users\" AS\nselect id, active from public.users where active\n"
+            "CREATE OR REPLACE VIEW analytics.active_users AS\nselect id, active from public.users where active\n"
         );
     }
 
@@ -330,7 +330,7 @@ mod tests {
 
         assert_eq!(
             current.get_alter_script(&target),
-            "drop materialized view if exists \"analytics\".\"active_users\";\ncreate materialized view \"analytics\".\"active_users\" as\nselect id from public.users\n"
+            "drop materialized view if exists analytics.active_users;\ncreate materialized view analytics.active_users as\nselect id from public.users\n"
         );
     }
 }
