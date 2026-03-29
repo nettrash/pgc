@@ -14,6 +14,8 @@ pub struct Comparer {
     to: Dump,
     // Whether to use DROP statements in the output
     use_drop: bool,
+    // True - if explicit begin...commit statement has to be added; False - otherwise
+    use_single_transaction: bool,
 
     // The script that will be generated
     script: String,
@@ -30,11 +32,12 @@ pub struct Comparer {
 
 impl Comparer {
     // Creates a new Comparer with the given dumps
-    pub fn new(from: Dump, to: Dump, use_drop: bool) -> Self {
+    pub fn new(from: Dump, to: Dump, use_drop: bool, use_single_transaction: bool) -> Self {
         let mut comparer = Self {
             from,
             to,
             use_drop,
+            use_single_transaction,
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
@@ -64,6 +67,10 @@ impl Comparer {
 
     // Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
+        if self.use_single_transaction {
+            self.script.push_str("begin;\n\n");
+        }
+
         self.compare_schemas().await?;
         self.compare_extensions().await?;
         self.compare_enums().await?;
@@ -98,6 +105,10 @@ impl Comparer {
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
             self.trigger_post_script.clear();
+        }
+
+        if self.use_single_transaction {
+            self.script.push_str("\ncommit;");
         }
 
         Ok(())
@@ -2022,7 +2033,7 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2066,7 +2077,7 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2111,7 +2122,7 @@ mod tests {
         to_dump.routines.push(sql_routine);
         to_dump.routines.push(plpgsql_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2147,7 +2158,7 @@ mod tests {
         );
         from_dump.routines.push(dropped_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -2191,7 +2202,7 @@ mod tests {
         );
         from_dump.routines.push(dropped_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -2229,7 +2240,7 @@ mod tests {
             vec![("street", "varchar(255)"), ("city", "varchar(100)")],
         ));
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -2255,7 +2266,7 @@ mod tests {
         from_dump.schemas.push(from_schema);
         to_dump.schemas.push(to_schema);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_schemas().await.unwrap();
         let script = comparer.get_script();
 
@@ -2284,7 +2295,7 @@ mod tests {
         from_dump.extensions.push(from_ext);
         to_dump.extensions.push(to_ext);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_extensions().await.unwrap();
         let script = comparer.get_script();
 
@@ -2331,7 +2342,7 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2407,7 +2418,7 @@ mod tests {
         to_dump.routines.push(a_middle);
         to_dump.routines.push(r_base);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2493,7 +2504,7 @@ mod tests {
         from_dump.routines.push(x_step);
         from_dump.routines.push(a_middle);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2581,7 +2592,7 @@ mod tests {
         to_dump.routines.push(a_middle);
         to_dump.routines.push(r_base);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_routines_and_views().await.unwrap();
         let script = comparer.get_script();
 
@@ -2762,7 +2773,7 @@ mod tests {
         );
         to_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -2860,7 +2871,7 @@ mod tests {
         );
         to_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -2894,7 +2905,7 @@ mod tests {
         );
         to_dump.sequences.push(sequence);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -2944,7 +2955,7 @@ mod tests {
         from_dump.sequences.push(from_sequence);
         to_dump.sequences.push(to_sequence);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3039,7 +3050,7 @@ mod tests {
         );
         from_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3200,7 +3211,7 @@ mod tests {
         );
         to_dump.tables.push(to_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3275,7 +3286,7 @@ mod tests {
         to_dump.tables.push(part);
         to_dump.tables.push(orders);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3336,7 +3347,7 @@ mod tests {
         from_dump.tables.push(from_table);
         to_dump.tables.push(to_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare_tables().await.unwrap();
         let script = comparer.get_script();
 
@@ -3369,7 +3380,7 @@ mod tests {
         from_dump.views.push(from_view);
         to_dump.views.push(to_view);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.create_views().await.unwrap();
         let script = comparer.get_script();
 
@@ -3446,7 +3457,7 @@ mod tests {
         to_dump.routines.push(get_user_count);
         to_dump.views.push(v_user_stats);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3508,7 +3519,7 @@ mod tests {
         to_dump.routines.push(helper_fn);
         to_dump.views.push(mat_view);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3561,7 +3572,7 @@ mod tests {
         from_dump.routines.push(routine_b);
         from_dump.routines.push(routine_a);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3637,7 +3648,7 @@ mod tests {
         to_dump.tables.push(grandparent);
         to_dump.tables.push(sub_parent);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3715,7 +3726,7 @@ mod tests {
         from_dump.tables.push(sub_parent);
         from_dump.tables.push(leaf);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3915,7 +3926,7 @@ mod tests {
             None,
         ));
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3956,5 +3967,45 @@ mod tests {
             !script.contains("nextval('test_schema.test_bigserial_id_seq'"),
             "bigserial column should not have explicit nextval default"
         );
+    }
+
+    #[tokio::test]
+    async fn use_single_transaction_should_add_begin_commit() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut new_table = Table::new(
+            "public".to_string(),
+            "my-table".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "\"my-table\"", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        new_table.hash();
+
+        to_dump.tables.push(new_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, true);
+
+        comparer.compare().await.unwrap();
+
+        let script = comparer.get_script();
+
+        const SCRIPT_BODY_START_PATTERN: &str = "*/\n\n";
+
+        let script_body_start_index = script
+            .find(SCRIPT_BODY_START_PATTERN)
+            .map(|index| index + SCRIPT_BODY_START_PATTERN.len())
+            .expect("Script header was not found");
+
+        let script_body = &script[script_body_start_index..];
+
+        assert!(script_body.starts_with("begin;\n\n"));
+        assert!(script_body.ends_with("\ncommit;"));
     }
 }
