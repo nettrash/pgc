@@ -2,6 +2,7 @@
 
                 Features:
                     - Added --max-connections argument to set up a proper amount of connections.
+                    - string_extensions - to format statements in resulting diff file
 
 2026-04-02      v1.0.10
 

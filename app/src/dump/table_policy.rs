@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Error, Row, postgres::PgRow};
 
+use crate::utils::string_extensions::StringExt;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TablePolicy {
     pub schema: String,   // Schema name
@@ -123,7 +125,7 @@ impl TablePolicy {
             }
         }
 
-        script.push_str(";\n");
+        script.append_block(";");
         script
     }
 }
@@ -168,7 +170,7 @@ mod tests {
         assert!(script.contains("for select"));
         assert!(script.contains("to \"analyst\", \"auditor\""));
         assert!(script.contains("using (tenant_id = current_setting"));
-        assert!(script.ends_with(";\n"));
+        assert!(script.ends_with(";\n\n"));
     }
 
     #[test]
@@ -190,7 +192,7 @@ mod tests {
         assert!(script.contains("to public"));
         assert!(script.contains(" using (owner_id = current_user_id())"));
         assert!(script.contains(" with check (owner_id = current_user_id())"));
-        assert!(script.ends_with(";\n"));
+        assert!(script.ends_with(";\n\n"));
     }
 
     #[test]

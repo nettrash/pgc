@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::utils::string_extensions::StringExt;
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableColumn {
@@ -196,10 +198,13 @@ impl TableColumn {
         let old_generation =
             Self::normalized_identity_generation(existing.identity_generation.as_ref());
         if new_generation != old_generation {
-            statements.push(format!(
-                "alter table {}.{} alter column {} set generated {};\n",
-                self.schema, self.table, self.name, new_generation
-            ));
+            statements.push(
+                format!(
+                    "alter table {}.{} alter column {} set generated {};",
+                    self.schema, self.table, self.name, new_generation
+                )
+                .with_empty_lines(),
+            );
         }
 
         let mut options = Vec::new();
@@ -234,13 +239,16 @@ impl TableColumn {
         }
 
         for option in options {
-            statements.push(format!(
-                "alter table {}.{} alter column {} set {};\n",
-                self.schema,
-                self.table,
-                self.name,
-                option.to_uppercase()
-            ));
+            statements.push(
+                format!(
+                    "alter table {}.{} alter column {} set {};",
+                    self.schema,
+                    self.table,
+                    self.name,
+                    option.to_uppercase()
+                )
+                .with_empty_lines(),
+            );
         }
     }
 
@@ -280,12 +288,13 @@ impl TableColumn {
     pub fn get_comment_script(&self) -> Option<String> {
         self.comment.as_ref().map(|comment| {
             format!(
-                "comment on column {}.{}.{} is '{}';\n",
+                "comment on column {}.{}.{} is '{}';",
                 self.schema,
                 self.table,
                 self.name,
                 comment.replace('\'', "''")
             )
+            .with_empty_lines()
         })
     }
 
@@ -409,35 +418,47 @@ impl TableColumn {
         let old_generated = Self::normalized_generated(&existing.is_generated);
 
         if self.type_clause_differs(existing) {
-            statements.push(format!(
-                "alter table {}.{} alter column {} type {};\n",
-                self.schema,
-                self.table,
-                self.name,
-                self.render_type_clause()
-            ));
+            statements.push(
+                format!(
+                    "alter table {}.{} alter column {} type {};",
+                    self.schema,
+                    self.table,
+                    self.name,
+                    self.render_type_clause()
+                )
+                .with_empty_lines(),
+            );
         }
 
         if self.column_default != existing.column_default {
             match &self.column_default {
-                Some(default) => statements.push(format!(
-                    "alter table {}.{} alter column {} set default {};\n",
-                    self.schema, self.table, self.name, default
-                )),
-                None => statements.push(format!(
-                    "alter table {}.{} alter column {} drop default;\n",
-                    self.schema, self.table, self.name
-                )),
+                Some(default) => statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} set default {};",
+                        self.schema, self.table, self.name, default
+                    )
+                    .with_empty_lines(),
+                ),
+                None => statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} drop default;",
+                        self.schema, self.table, self.name
+                    )
+                    .with_empty_lines(),
+                ),
             }
         }
 
         if self.is_nullable != existing.is_nullable {
             if self.is_nullable {
                 if use_drop {
-                    statements.push(format!(
-                        "alter table {}.{} alter column {} drop not null;\n",
-                        self.schema, self.table, self.name
-                    ));
+                    statements.push(
+                        format!(
+                            "alter table {}.{} alter column {} drop not null;",
+                            self.schema, self.table, self.name
+                        )
+                        .with_empty_lines(),
+                    );
                 } else {
                     let commented = format!(
                         "-- use_drop=false: would drop NOT NULL\n-- alter table {}.{} alter column {} drop not null;\n",
@@ -446,10 +467,13 @@ impl TableColumn {
                     statements.push(commented);
                 }
             } else {
-                statements.push(format!(
-                    "alter table {}.{} alter column {} set not null;\n",
-                    self.schema, self.table, self.name
-                ));
+                statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} set not null;",
+                        self.schema, self.table, self.name
+                    )
+                    .with_empty_lines(),
+                );
             }
         }
 
@@ -457,10 +481,13 @@ impl TableColumn {
             if self.is_identity {
                 statements.push(self.build_identity_add_statement(existing));
             } else {
-                statements.push(format!(
-                    "alter table {}.{} alter column {} drop identity if exists;\n",
-                    self.schema, self.table, self.name
-                ));
+                statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} drop identity if exists;",
+                        self.schema, self.table, self.name
+                    )
+                    .with_empty_lines(),
+                );
             }
         } else if self.is_identity {
             self.build_identity_update_statements(existing, &mut statements);
@@ -495,19 +522,22 @@ impl TableColumn {
                 }
             } else {
                 if old_is_generated {
-                    statements.push(format!(
-                        "alter table {}.{} alter column {} drop expression;\n",
-                        self.schema, self.table, self.name
-                    ));
+                    statements.push(
+                        format!(
+                            "alter table {}.{} alter column {} drop expression;",
+                            self.schema, self.table, self.name
+                        )
+                        .with_empty_lines(),
+                    );
                 }
 
                 if new_is_generated && let Some(expr) = &self.generation_expression {
                     let norm_expr = Self::normalized_generation_expression(expr);
                     let wrapped = format!("({norm_expr})");
                     statements.push(format!(
-                        "alter table {}.{} alter column {} add generated always as {wrapped} stored;\n",
+                        "alter table {}.{} alter column {} add generated always as {wrapped} stored;",
                         self.schema, self.table, self.name
-                    ));
+                    ).with_empty_lines());
                 }
             }
         }
@@ -519,7 +549,7 @@ impl TableColumn {
             if self.comment != existing.comment {
                 let comment_stmt = if let Some(cmt) = &self.comment {
                     format!(
-                        "comment on column {}.{}.{} is '{}';\n",
+                        "comment on column {}.{}.{} is '{}';",
                         self.schema,
                         self.table,
                         self.name,
@@ -527,11 +557,11 @@ impl TableColumn {
                     )
                 } else {
                     format!(
-                        "comment on column {}.{}.{} is null;\n",
+                        "comment on column {}.{}.{} is null;",
                         self.schema, self.table, self.name
                     )
                 };
-                joined.push_str(&comment_stmt);
+                joined.append_block(&comment_stmt);
             }
             Some(joined)
         }
@@ -599,10 +629,11 @@ impl TableColumn {
             statement.push_str(" not null");
         }
 
-        statement.push_str(";\n");
+        statement.append_block(";");
+
         if let Some(comment) = &self.comment {
-            statement.push_str(&format!(
-                "comment on column {}.{}.{} is '{}';\n",
+            statement.append_block(&format!(
+                "comment on column {}.{}.{} is '{}';",
                 self.schema,
                 self.table,
                 self.name,
@@ -614,9 +645,10 @@ impl TableColumn {
 
     pub fn get_drop_script(&self) -> String {
         format!(
-            "alter table {}.{} drop column {};\n",
+            "alter table {}.{} drop column {};",
             self.schema, self.table, self.name
         )
+        .with_empty_lines()
     }
 }
 
@@ -1263,7 +1295,7 @@ mod tests {
             .expect("expected alter statement for type change");
         assert_eq!(
             script,
-            "alter table public.test_table alter column test_column type integer;\n"
+            "alter table public.test_table alter column test_column type integer;\n\n"
         );
     }
 
@@ -1280,7 +1312,7 @@ mod tests {
             .expect("expected alter statement for type change");
         assert_eq!(
             script,
-            "alter table app.users alter column test_column type integer;\n"
+            "alter table app.users alter column test_column type integer;\n\n"
         );
     }
 
@@ -1296,7 +1328,7 @@ mod tests {
             .expect("expected alter statement for default change");
         assert_eq!(
             script,
-            "alter table public.test_table alter column test_column set default 'default_value';\n"
+            "alter table public.test_table alter column test_column set default 'default_value';\n\n"
         );
     }
 
@@ -1312,7 +1344,7 @@ mod tests {
             .expect("expected alter statement for nullability change");
         assert_eq!(
             script,
-            "alter table public.test_table alter column test_column set not null;\n"
+            "alter table public.test_table alter column test_column set not null;\n\n"
         );
     }
 
@@ -1341,7 +1373,7 @@ mod tests {
     #[test]
     fn test_get_add_script_basic() {
         let column = create_test_column();
-        let expected = "alter table public.test_table add column test_column varchar(255);\n";
+        let expected = "alter table public.test_table add column test_column varchar(255);\n\n";
         assert_eq!(column.get_add_script(), expected);
     }
 
@@ -1352,7 +1384,7 @@ mod tests {
         column.column_default = Some("'default_value'".to_string());
         column.collation_name = Some("en_US.UTF-8".to_string());
 
-        let expected = "alter table public.test_table add column test_column varchar(255) collate \"en_US.UTF-8\" default 'default_value' not null;\n";
+        let expected = "alter table public.test_table add column test_column varchar(255) collate \"en_US.UTF-8\" default 'default_value' not null;\n\n";
         assert_eq!(column.get_add_script(), expected);
     }
 
@@ -1364,14 +1396,14 @@ mod tests {
         column.is_identity = true;
         column.identity_generation = Some("BY DEFAULT".to_string());
         // Remainder should include identity clause after type
-        let expected = "alter table public.test_table add column test_column integer generated BY DEFAULT as identity;\n";
+        let expected = "alter table public.test_table add column test_column integer generated BY DEFAULT as identity;\n\n";
         assert_eq!(column.get_add_script(), expected);
     }
 
     #[test]
     fn test_get_drop_script_basic() {
         let column = create_test_column();
-        let expected = "alter table public.test_table drop column test_column;\n";
+        let expected = "alter table public.test_table drop column test_column;\n\n";
         assert_eq!(column.get_drop_script(), expected);
     }
 
@@ -1379,7 +1411,7 @@ mod tests {
     fn test_get_drop_script_with_special_name() {
         let mut column = create_test_column();
         column.name = "\"weird name$\"".to_string();
-        let expected = "alter table public.test_table drop column \"weird name$\";\n";
+        let expected = "alter table public.test_table drop column \"weird name$\";\n\n";
         assert_eq!(column.get_drop_script(), expected);
     }
 
@@ -1401,7 +1433,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "alter table public.test_table alter column test_column set START WITH 100;\nalter table public.test_table alter column test_column set INCREMENT BY 5;\n"
+            "alter table public.test_table alter column test_column set START WITH 100;\n\nalter table public.test_table alter column test_column set INCREMENT BY 5;\n\n"
         );
     }
 
@@ -1418,8 +1450,8 @@ mod tests {
 
         assert_eq!(
             script,
-            "alter table public.test_table drop column test_column;\n".to_owned()
-                + "alter table public.test_table add column test_column varchar(255) generated always as (id * 2) stored;\n"
+            "alter table public.test_table drop column test_column;\n\n".to_owned()
+                + "alter table public.test_table add column test_column varchar(255) generated always as (id * 2) stored;\n\n"
         );
     }
 
@@ -1459,7 +1491,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "alter table public.test_table alter column test_column drop expression;\nalter table public.test_table alter column test_column add generated always as (id * 3) stored;\n"
+            "alter table public.test_table alter column test_column drop expression;\n\nalter table public.test_table alter column test_column add generated always as (id * 3) stored;\n\n"
         );
     }
 
@@ -1477,7 +1509,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "alter table public.test_table alter column test_column drop expression;\n"
+            "alter table public.test_table alter column test_column drop expression;\n\n"
         );
     }
 }

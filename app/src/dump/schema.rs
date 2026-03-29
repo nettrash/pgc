@@ -1,6 +1,8 @@
 use md5;
 use serde::{Deserialize, Serialize};
 
+use crate::utils::string_extensions::StringExt;
+
 // This is an information about a PostgreSQL schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
@@ -55,11 +57,12 @@ impl Schema {
 
     /// Returns a string to create the schema.
     pub fn get_script(&self) -> String {
-        let mut script = format!("create schema if not exists {};\n", self.name);
+        let mut script: String =
+            format!("create schema if not exists {};", self.name).with_empty_lines();
 
         if let Some(comment) = &self.comment {
-            script.push_str(&format!(
-                "comment on schema {} is '{}';\n",
+            script.append_block(&format!(
+                "comment on schema {} is '{}';",
                 self.name,
                 escape_single_quotes(comment)
             ));
@@ -75,7 +78,7 @@ impl Schema {
             return String::new();
         }
 
-        format!("alter schema {} owner to {};\n", self.name, self.owner)
+        format!("alter schema {} owner to {};", self.name, self.owner).with_empty_lines()
     }
 
     pub fn get_alter_script(&self, target: &Schema) -> String {
@@ -83,13 +86,13 @@ impl Schema {
 
         if self.comment != target.comment {
             if let Some(comment) = &target.comment {
-                script.push_str(&format!(
-                    "comment on schema {} is '{}';\n",
+                script.append_block(&format!(
+                    "comment on schema {} is '{}';",
                     target.name,
                     escape_single_quotes(comment)
                 ));
             } else {
-                script.push_str(&format!("comment on schema {} is null;\n", target.name));
+                script.append_block(&format!("comment on schema {} is null;", target.name));
             }
         }
 
@@ -102,7 +105,7 @@ impl Schema {
 
     /// Returns a string to drop the schema.
     pub fn get_drop_script(&self) -> String {
-        format!("drop schema if exists {};\n", self.name)
+        format!("drop schema if exists {};", self.name).with_empty_lines()
     }
 }
 
@@ -136,7 +139,7 @@ mod tests {
 
         assert_eq!(
             schema.get_script(),
-            "create schema if not exists analytics;\ncomment on schema analytics is 'reporting';\n"
+            "create schema if not exists analytics;\n\ncomment on schema analytics is 'reporting';\n\n"
         );
     }
 
@@ -151,7 +154,7 @@ mod tests {
 
         assert_eq!(
             schema.get_script(),
-            "create schema if not exists analytics;\nalter schema analytics owner to pgc_owner;\n"
+            "create schema if not exists analytics;\n\nalter schema analytics owner to pgc_owner;\n\n"
         );
     }
 
@@ -162,7 +165,10 @@ mod tests {
 
         let schema = Schema::new(name, raw_name, None);
 
-        assert_eq!(schema.get_drop_script(), "drop schema if exists archive;\n");
+        assert_eq!(
+            schema.get_drop_script(),
+            "drop schema if exists archive;\n\n"
+        );
     }
 
     #[test]
@@ -171,7 +177,7 @@ mod tests {
 
         assert_eq!(
             schema.get_script(),
-            "create schema if not exists \"my-schema\";\n"
+            "create schema if not exists \"my-schema\";\n\n"
         );
     }
 
@@ -185,7 +191,7 @@ mod tests {
 
         assert_eq!(
             schema.get_script(),
-            "create schema if not exists \"my-schema\";\ncomment on schema \"my-schema\" is 'my comment';\n"
+            "create schema if not exists \"my-schema\";\n\ncomment on schema \"my-schema\" is 'my comment';\n\n"
         );
     }
 
@@ -196,7 +202,7 @@ mod tests {
 
         assert_eq!(
             schema.get_owner_script(),
-            "alter schema \"my-schema\" owner to pgc_owner;\n"
+            "alter schema \"my-schema\" owner to pgc_owner;\n\n"
         );
     }
 
@@ -215,7 +221,7 @@ mod tests {
 
         assert_eq!(
             source.get_alter_script(&target),
-            "comment on schema \"my-schema\" is 'new comment';\n"
+            "comment on schema \"my-schema\" is 'new comment';\n\n"
         );
     }
 
@@ -230,7 +236,7 @@ mod tests {
 
         assert_eq!(
             source.get_alter_script(&target),
-            "comment on schema \"my-schema\" is null;\n"
+            "comment on schema \"my-schema\" is null;\n\n"
         );
     }
 
@@ -242,7 +248,7 @@ mod tests {
 
         assert_eq!(
             source.get_alter_script(&target),
-            "alter schema \"my-schema\" owner to new_owner;\n"
+            "alter schema \"my-schema\" owner to new_owner;\n\n"
         );
     }
 
@@ -252,7 +258,7 @@ mod tests {
 
         assert_eq!(
             schema.get_drop_script(),
-            "drop schema if exists \"my-schema\";\n"
+            "drop schema if exists \"my-schema\";\n\n"
         );
     }
 }

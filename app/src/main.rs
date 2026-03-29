@@ -10,6 +10,7 @@ use std::{io::Error, path::Path, time::Instant};
 pub mod comparer;
 pub mod config;
 pub mod dump;
+pub mod utils;
 
 // Command line arguments.
 #[derive(Parser, Debug)]
