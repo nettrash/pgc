@@ -4142,4 +4142,94 @@ mod tests {
         assert!(script_body.starts_with("begin;\n\n"));
         assert!(script_body.ends_with("\ncommit;"));
     }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_block_and_line_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script =
+            "/* header comment */\nCREATE TABLE t1 (id int); -- inline comment\n/* trailing */\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "CREATE TABLE t1 (id int);\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_dollar_quoted_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script = "CREATE FUNCTION f() RETURNS void AS $$\n-- inside body\n/* also inside */\n$$ LANGUAGE plpgsql;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE FUNCTION f() RETURNS void AS $$\n-- inside body\n/* also inside */\n$$ LANGUAGE plpgsql;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_named_dollar_tag_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script = "CREATE FUNCTION g() RETURNS void AS $body$\n-- comment inside\n$body$ LANGUAGE plpgsql;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE FUNCTION g() RETURNS void AS $body$\n-- comment inside\n$body$ LANGUAGE plpgsql;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_single_quoted_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script =
+            "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_returns_empty_for_comment_only_script() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script = "/* only a comment */\n-- another comment\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_collapses_excess_newlines() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script =
+            "CREATE TABLE t1 (id int);\n/* removed */\n\n\n\nCREATE TABLE t2 (id int);\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE TABLE t1 (id int);\n\nCREATE TABLE t2 (id int);\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_true_preserves_all_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        comparer.script = "/* header */\nCREATE TABLE t1 (id int); -- inline\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "/* header */\nCREATE TABLE t1 (id int); -- inline\n"
+        );
+    }
 }
