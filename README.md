@@ -16,7 +16,7 @@ We have multiple PostgreSQL database repositories and need to have a properly wo
 ## How to build
 
 ```bash
-cargo fmt -- -check
+cargo fmt --all
 cargo clippy --all-targets --all-featured
 cargo test  
 cargo build
@@ -66,6 +66,8 @@ Command line arguments can be used to execute just one function in one time.
 `--use-drop` - specify this argument if you want to use DROPs in output script, otherwise no DROPs will be used.
 
 `--use-single-transaction` - use this flag to wrap resulting diff file within explicit `begin;` and `commit;` statements (i.e. single transaction).
+
+`--use-comments {true|false}` - specify this argument if you don't want to use comments in output script with value false, otherwise comments will be used. Default value: `true`.
 
 ## Functionality
 
@@ -118,4 +120,5 @@ OUTPUT=delta.sql
 # ADDITIONAL PROPERTIES
 USE_DROP=true
 USE_SINGLE_TRANSACTION=true
+USE_COMMENTS=false
 ```
