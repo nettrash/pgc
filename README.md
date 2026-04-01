@@ -65,6 +65,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--use-drop` - specify this argument if you want to use DROPs in output script, otherwise no DROPs will be used.
 
+`--use-single-transaction` - use this flag to wrap resulting diff file within explicit `begin;` and `commit;` statements (i.e. single transaction).
+
 ## Functionality
 
 ### Create database schema dump
@@ -115,4 +117,5 @@ OUTPUT=delta.sql
 
 # ADDITIONAL PROPERTIES
 USE_DROP=true
+USE_SINGLE_TRANSACTION=true
 ```
