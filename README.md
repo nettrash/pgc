@@ -16,8 +16,8 @@ We have multiple PostgreSQL database repositories and need to have a properly wo
 ## How to build
 
 ```bash
-cargo fmt --all
-cargo clippy --all-targets --all-featured
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features
 cargo test  
 cargo build
 ```
