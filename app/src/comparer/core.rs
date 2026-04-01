@@ -228,28 +228,28 @@ impl Comparer {
             if src[i] == b'$'
                 && let Some(tag_len) = Self::dollar_tag_at(src, i)
             {
-                    let tag = &src[i..i + tag_len];
-                    // Copy opening tag
-                    result.push_str(std::str::from_utf8(tag).unwrap());
-                    i += tag_len;
-                    // Copy everything until closing tag
-                    loop {
-                        if i >= len {
-                            break;
-                        }
-                        if src[i] == b'$'
-                            && let Some(close_len) = Self::dollar_tag_at(src, i)
-                            && close_len == tag_len
-                            && &src[i..i + close_len] == tag
-                        {
-                            result.push_str(std::str::from_utf8(&src[i..i + close_len]).unwrap());
-                            i += close_len;
-                            break;
-                        }
-                        result.push(src[i] as char);
-                        i += 1;
+                let tag = &src[i..i + tag_len];
+                // Copy opening tag
+                result.push_str(std::str::from_utf8(tag).unwrap());
+                i += tag_len;
+                // Copy everything until closing tag
+                loop {
+                    if i >= len {
+                        break;
                     }
-                    continue;
+                    if src[i] == b'$'
+                        && let Some(close_len) = Self::dollar_tag_at(src, i)
+                        && close_len == tag_len
+                        && &src[i..i + close_len] == tag
+                    {
+                        result.push_str(std::str::from_utf8(&src[i..i + close_len]).unwrap());
+                        i += close_len;
+                        break;
+                    }
+                    result.push(src[i] as char);
+                    i += 1;
+                }
+                continue;
             }
             // Single-quoted string — pass through verbatim (handle '' escapes)
             if src[i] == b'\'' {
