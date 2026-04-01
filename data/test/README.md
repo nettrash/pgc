@@ -11,115 +11,212 @@ This folder contains two comprehensive PostgreSQL schemas designed to test all p
 
 These schemas are designed to test comparison capabilities for the following PostgreSQL objects:
 
-### 1. Extensions
-- **Added**: `hstore` extension in Schema B
-- **Removed**: `pgcrypto` extension in Schema B
-- **Unchanged**: `uuid-ossp`, `pg_trgm` extensions
-
-### 2. Schemas
+### 1. Schemas
 - **Added**: `new_reporting_schema` in Schema B
 - **Unchanged**: `test_schema`, `shared_schema`
+
+### 2. Extensions
+- **Added**: `hstore` extension in Schema B
+- **Removed**: `pgcrypto` extension in Schema B
+- **Unchanged**: `uuid-ossp`, `pg_trgm`
 
 ### 3. Custom Types
 
 #### Enums
-- **Modified**: `status_type` - added 'suspended' value in Schema B
-- **Removed**: `priority_type` in Schema B
-- **Added**: `contact_type` in Schema B
+- **Modified**: `test_schema.status_type` — added `'suspended'` value in Schema B
+- **Removed**: `test_schema.priority_type` in Schema B (including dependent routines)
+- **Added**: `test_schema.contact_type` in Schema B
 
 #### Composite Types
-- **Modified**: `address_type` - added 'region' field in Schema B
-- **Modified**: `user_profile` - added 'phone' field in Schema B
+- **Modified**: `shared_schema.address_type` — added `region` field in Schema B
+- **Modified**: `test_schema.user_profile` — added `phone` field in Schema B
+- **Removed**: `test_schema.test_type_A` in Schema B
+- **Added**: `test_schema.test_type_B` in Schema B
 
 #### Domain Types
-- **Modified**: `positive_integer` - added upper limit constraint in Schema B
+- **Modified**: `test_schema.positive_integer` — added upper limit constraint (`VALUE <= 1000000`) in Schema B
 
 ### 4. Sequences
-- **Modified**: `user_id_seq` - different start value in Schema B
-- **Modified**: `global_counter_seq` - different cache size in Schema B
-- **Removed**: `order_id_seq` in Schema B
-- **Added**: `report_id_seq` in Schema B
+- **Modified**: `test_schema.user_id_seq` — START changed from 1000 → 2000
+- **Modified**: `shared_schema.global_counter_seq` — CACHE changed from 1 → 5
+- **Removed**: `test_schema.order_id_seq` in Schema B
+- **Added**: `new_reporting_schema.report_id_seq` in Schema B
 
 ### 5. Tables
 
 #### Modified Tables
-- **users**: Added columns (`preferred_contact`, `timezone`, `two_factor_enabled`), modified column length (`username`)
-- **categories**: Added columns (`category_code`, `icon_url`)
-- **products**: Added columns (`barcode`, `manufacturer`, `warranty_months`, `is_featured`), removed columns (`weight`, `priority`), modified precision (`price`)
-- **audit_logs**: Added columns (`session_id`, `request_id`)
-- **identity_update_test**: Modified identity column options (`START WITH`, `INCREMENT BY`)
+- **users**: column `username` VARCHAR(50) → VARCHAR(60); added columns (`preferred_contact`, `timezone`, `two_factor_enabled`)
+- **categories**: added columns (`category_code`, `icon_url`)
+- **products**: column `name` VARCHAR(255) → VARCHAR(300); `price` DECIMAL(10,2) → DECIMAL(12,2); removed columns (`weight`); added columns (`barcode`, `manufacturer`, `warranty_months`, `is_featured`)
+- **audit_logs**: added columns (`session_id`, `request_id`)
+- **generated_pricing**: column `total` changed from plain NOT NULL to `GENERATED ALWAYS AS (quantity * unit_price) STORED`
+- **identity_update_test**: identity column parameters changed (START WITH 1 → 100, INCREMENT BY 1 → 5)
+- **trigger_order_test**: added column (`updated_at`)
+- **special$table**: added column (`"new#col" INT`)
+- **"table with spaces"**: column type changed (`TEXT` → `VARCHAR(255)`)
+- **composite_fk**: FK `fk_composite` gains `ON DELETE CASCADE`
+- **part_type_change_parent**: partition key type changed (`TEXT` → `UUID`; requires table recreation)
+- **partition_bound_test_active**: partition bound changed (`'active'` → `'inactive'`)
+- **events_2023**: changed from leaf partition to sub-partition parent (adds `PARTITION BY LIST (region)`)
 
 #### Removed Tables
-- **orders**: Completely removed in Schema B
-- **order_items**: Completely removed in Schema B
+- **orders**: completely removed
+- **order_items**: completely removed
+- **drop_parent**: partitioned table removed
+- **drop_child**: partition removed
+- **drop_orders**: table with FK and trigger removed
+- **sensor_data**: 3-level partition hierarchy removed (`sensor_data` → `sensor_data_eu` → `sensor_data_eu_1`)
 
 #### Added Tables
-- **reviews**: New table in Schema B
-- **daily_stats**: New table in new schema in Schema B
+- **reviews**: product reviews table with FK to products and users
+- **daily_stats**: reporting table in `new_reporting_schema`
+- **table1**: named primary key constraint (`pk_table1_id`)
+- **user_preferences**: uses `hstore` extension type
+- **data.test**: `BIGINT GENERATED ALWAYS AS IDENTITY` with explicit parameters
+- **test_serial**, **test_bigserial**, **test_identity**: serial/bigserial/identity column variants
+- **issue_serial_test**, **issue_identity_always_test**, **issue_identity_default_test**: auto-sequence column tests
+- **data.events_2023_us**, **data.events_2023_eu**: new leaf partitions under repartitioned events_2023
+- **data.metrics** hierarchy: new 3-level partitioned table (RANGE by year → LIST by type → leaf)
+- **data.partition_test** + **partition_test_default**: new partitioned table with DEFAULT partition
+- **data.logs_2025**: new partition added to existing `data.logs` parent
+- **data.tagged_items** + partitions (**alpha**, **beta**): new partitioned table with parent index
 
 ### 6. Indexes
-- **Modified**: Various indexes updated for new/changed columns
-- **Removed**: Indexes related to removed tables/columns
-- **Added**: Indexes for new tables and columns
+- **Added**: `idx_users_preferred_contact`, `idx_users_timezone`, `idx_products_manufacturer`, `idx_products_is_featured`, `idx_products_barcode`, `idx_reviews_*` (5 indexes), `idx_audit_logs_session_id`, `idx_audit_logs_request_id`, `idx_tagged_items_detail`, `idx_user_preferences_prefs`
+- **Modified**: `idx_audit_logs_table_op_changed_at` — unique index gains `record_id` column
+- **Removed**: all indexes on removed tables (`orders`, `order_items`)
+- **Unchanged**: existing indexes on `users`, `products`, `audit_logs`, `logs`
 
-### 7. Functions
+### 7. Foreign Keys
+- **Added**: FKs on `reviews` (to products, users), FK on `user_preferences` (to users)
+- **Modified**: `composite_fk.fk_composite` gains `ON DELETE CASCADE`
+- **Removed**: FKs on removed tables (`orders`, `order_items`, `drop_orders`)
+- **Unchanged**: FKs on `categories`, `products`
+
+### 8. Constraints
+- **Added**: `chk_products_warranty_reasonable`, `chk_reviews_content_not_empty`, `chk_reviews_helpful_count_positive`, inline `rating` check on reviews
+- **Removed**: `chk_products_weight_positive` (column removed), `chk_orders_dates`, `chk_orders_delivery_dates` (table removed)
+- **Unchanged**: `chk_users_email_format`, inline checks on `products`, `audit_logs`
+
+### 9. Functions
 
 #### Modified Functions
-- **generate_order_number**: Different prefix ('REF-' instead of 'ORD-') in Schema B
+- **generate_order_number()**: prefix changed `'ORD-'` → `'REF-'`
+- **fn_order_from()**: default text changed; added `updated_at` assignment
+- **get_users_by_status()**: return type adds `created_at` column
+- **fn_dollar_from()**: dollar quoting `$b$` → `$c$`, inner text changed, added `-v2` suffix
+- **lookup_username()**: flags `STABLE STRICT PARALLEL SAFE` → `VOLATILE PARALLEL UNSAFE`
+- **tax_label()**: flags `IMMUTABLE PARALLEL SAFE` → `STABLE PARALLEL RESTRICTED`
+- **calculate_tax()**: new parameter `currency varchar` added; logic updated
+- **generate_token()**: implementation changed from `gen_random_bytes` (pgcrypto) to `md5`-based
+- **get_active_usernames_sql()**: return type adds `preferred_contact` column
+- **product_price_with_tax_sql()**: new parameter `p_currency varchar DEFAULT 'USD'`
 
 #### Removed Functions
-- **calculate_order_total**: Removed in Schema B (related table removed)
-- **get_user_order_count**: Removed in Schema B (related table removed)
+- **calculate_order_total()**: depends on removed `orders` table
+- **get_user_order_count()**: depends on removed `orders` table
+- **drop_fn()**: trigger function for removed `drop_orders` table
+- **get_products_by_priority()**: depends on removed `priority_type` enum
+- **normalize_email_from()**: FROM-only function (IMMUTABLE LEAKPROOF PARALLEL SAFE)
+- **concat_agg_sfunc()**: support function for removed `concat_agg` aggregate
 
 #### Added Functions
-- **calculate_average_rating**: New function in Schema B
-- **get_user_review_count**: New function in Schema B
-- **update_daily_stats**: New function in Schema B
-- **SQL routines**: Added `get_active_usernames_sql` and `product_price_with_tax_sql` to cover SQL-language routines with and without dependencies on plpgsql functions (signature differs in Schema B)
+- **calculate_average_rating()**: average rating for a product
+- **get_user_review_count()**: review count for a user
+- **update_daily_stats()**: updates daily reporting stats (in `new_reporting_schema`)
+- **normalize_email_to()**: IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE
+- **get_user_count()**: returns user count
+- **report_user_stats()**: reads `v_user_stats` view
+- **r_base_value()**, **x_step_one()**, **a_middle_layer()**: routine dependency chain
+- **product_agg_sfunc()**: support function for `weighted_sum` aggregate
 
-### 8. Procedures
+#### Unchanged Functions
+- **update_timestamp()**, **audit_trigger()**, **get_secure_setting()**, **running_sum_sfunc()**, **new_entity_id()**
+
+### 10. Aggregate Functions
+- **Added**: `test_schema.weighted_sum(numeric, numeric)` — with support function and comment
+- **Removed**: `test_schema.concat_agg(text)` — with support function
+- **Unchanged**: `test_schema.running_sum(integer)`
+
+### 11. Procedures
+
+#### Modified Procedures
+- **admin_reset_counters()**: `SECURITY DEFINER` flag removed
 
 #### Removed Procedures
-- **cleanup_old_orders**: Removed in Schema B (related table removed)
+- **cleanup_old_orders()**: depends on removed `orders` table
 
 #### Added Procedures
-- **cleanup_old_reviews**: New procedure in Schema B
+- **cleanup_old_reviews()**: cleans old reviews (730-day threshold)
+- **print_user_stats()**: reads `v_user_stats` view
+- **z_final_report()**: calls `a_middle_layer()` (dependency chain)
 
-### 9. Triggers
+### 12. Triggers
+- **Added**: `trigger_reviews_update_timestamp`, `trigger_reviews_audit` on `reviews` table
+- **Removed**: `trigger_orders_audit` (orders table removed), `trg_drop_orders` (drop_orders table removed)
+- **Unchanged**: `trigger_users_update_timestamp`, `trigger_products_update_timestamp`, `trigger_users_audit`, `trg_order_from`
 
-#### Removed Triggers
-- **trigger_orders_audit**: Removed in Schema B (related table removed)
+### 13. Views
 
-#### Added Triggers
-- **trigger_reviews_update_timestamp**: New trigger in Schema B
-- **trigger_reviews_audit**: New trigger in Schema B
+#### Regular Views
+- **Modified**: `product_inventory` — added `manufacturer`, `is_featured` columns; 'Low Stock' threshold changed from 10 → 5
+- **Removed**: `user_order_summary` (orders table removed)
+- **Added**: `user_review_summary`, `product_review_stats`, `v_user_stats`
 
-### 10. Views
+#### Materialized Views
+- **Modified**: `active_users_mat` — added `status` column
+- **Removed**: `from_only_mat` (FROM-only)
+- **Added**: `product_stock_mat` (TO-only)
+- **Unchanged**: `user_count_mat`
 
-#### Modified Views
-- **product_inventory**: Added new columns, modified threshold logic in Schema B
+### 14. Row-Level Security Policies
+- **Modified**: `users_rls_select` — changed to `RESTRICTIVE`, role changed to `tenant_reader`, added `AND two_factor_enabled = TRUE` condition
+- **Added**: `users_rls_update` — FOR UPDATE, TO `tenant_editor`, with cross-check on `preferred_contact`
 
-#### Removed Views
-- **user_order_summary**: Removed in Schema B (related table removed)
+### 15. Owner Changes
+Objects change ownership from `pgc_owner_from` → `pgc_owner_to`:
+- Schema: `test_schema`
+- Type: `test_schema.status_type`
+- Domain: `test_schema.positive_integer`
+- Sequence: `test_schema.user_id_seq`
+- Table: `test_schema.users`
+- Function: `test_schema.update_timestamp()`
+- View: `test_schema.product_inventory`
+- Materialized view: `test_schema.active_users_mat`
 
-#### Added Views
-- **user_review_summary**: New view in Schema B
-- **product_review_stats**: New view in Schema B
+### 16. Comments
+- **Modified**: 9 comments updated (schemas, tables, types, domains, sequences, views, functions)
+- **Removed**: comments on `orders` table, `get_products_by_priority()`, `concat_agg()`
+- **Added**: comments on `new_reporting_schema`, `reviews` table, new columns, `weighted_sum` aggregate
+- **Unchanged**: comments on `users.metadata`, `products.dimensions`
 
-### 11. Constraints
+### 17. Special Test Scenarios
 
-#### Modified Constraints
-- Various check constraints updated for new business rules
+#### Dollar-Quoting
+- `fn_dollar_from()` uses nested `$$` inside custom delimiters (`$b$`/`$c$`) to test correct quoting
 
-#### Removed Constraints
-- Constraints related to removed columns
+#### Partition Scenarios
+- **Type change**: `part_type_change_parent` partition key TEXT → UUID (forces recreation)
+- **Leaf to sub-parent**: `events_2023` becomes sub-partition parent with new leaf partitions
+- **Hierarchy removal**: `sensor_data` 3-level hierarchy removed
+- **Hierarchy creation**: `metrics` new 3-level hierarchy created
+- **Bound change**: `partition_bound_test_active` value `'active'` → `'inactive'`
+- **New partition on existing parent**: `logs_2025` added to `data.logs`
+- **New partitioned table with index**: `tagged_items` (indexes on parent must not duplicate to partitions)
+- **Default partition**: `partition_test_default`
 
-#### Added Constraints
-- New constraints for new columns and tables
+#### Identity/Serial Columns
+- Tests `SERIAL`, `BIGSERIAL`, `GENERATED ALWAYS AS IDENTITY`, `GENERATED BY DEFAULT AS IDENTITY`
+- Identity parameter changes (START, INCREMENT)
+- Auto-created sequences must not be emitted separately
 
-### 12. Comments
-- **Modified**: Updated comments for existing objects
-- **Added**: Comments for new objects
+#### Extension Object Exclusion
+- Extension-owned objects (functions, types, operators) must not appear as individual creates/drops
+- User-defined objects referencing extension types (e.g., `user_preferences` using `hstore`) must still be compared
+
+#### Routine Dependency Ordering
+- View ↔ routine cross-dependencies: `get_user_count()` → `v_user_stats` → `report_user_stats()` / `print_user_stats()`
+- Routine chain: `r_base_value()` → `x_step_one()` → `a_middle_layer()` → `z_final_report()`
 
 ## Usage
 
@@ -132,11 +229,14 @@ To test the comparison tool with these schemas:
 
 ```bash
 # Create dumps
-pgc --command dump --database db_a --scheme test_schema --output schema_a.dump
-pgc --command dump --database db_b --scheme test_schema --output schema_b.dump
+pgc --command dump --database db_a --scheme "test_schema|shared_schema|new_reporting_schema|data" --output schema_a.dump
+pgc --command dump --database db_b --scheme "test_schema|shared_schema|new_reporting_schema|data" --output schema_b.dump
 
 # Compare
 pgc --command compare --from schema_a.dump --to schema_b.dump --output comparison_result.sql
+
+# Compare without comments
+pgc --command compare --from schema_a.dump --to schema_b.dump --output comparison_result.sql --use-comments false
 ```
 
 The resulting comparison script should contain SQL statements to transform the "FROM" database structure to match the "TO" database structure, including all the differences listed above.
@@ -144,10 +244,13 @@ The resulting comparison script should contain SQL statements to transform the "
 ## Expected Comparison Results
 
 The comparison should detect and generate SQL for:
-- Dropping removed extensions, types, tables, functions, etc.
-- Adding new extensions, types, tables, functions, etc.
-- Modifying existing structures (ALTER statements)
-- Updating constraints, indexes, triggers, and views
-- Handling dependencies correctly (drop in correct order, create in correct order)
-
-This comprehensive test suite ensures that the PGC tool can handle all major PostgreSQL schema differences that might occur in real-world database evolution scenarios.
+- Dropping removed extensions, types, tables, functions, aggregates, etc.
+- Adding new schemas, extensions, types, tables, functions, aggregates, etc.
+- Modifying existing structures (ALTER statements for columns, constraints, identity parameters, owner changes)
+- Updating constraints, indexes, triggers, views, materialized views, and RLS policies
+- Handling dependencies correctly (drop in reverse dependency order, create in dependency order)
+- Correctly handling partitioned tables (creation order: parent → mid → leaf; drop order: leaf → mid → parent)
+- Not emitting explicit CREATE INDEX for partitions (PostgreSQL propagates parent indexes automatically)
+- Not emitting extension-owned objects as individual creates/drops
+- Using serial/bigserial types instead of separate sequences where appropriate
+- Stripping SQL comments from output when `--use-comments false` is specified (preserving comments inside function bodies)

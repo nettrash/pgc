@@ -13,6 +13,8 @@ pub struct Config {
     pub use_drop: bool,
     // True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
     pub use_single_transaction: bool,
+    // Whether to include comments in the output script
+    pub use_comments: bool,
 }
 
 impl Config {
@@ -51,6 +53,7 @@ impl Config {
         let mut output = "data.out".to_string();
         let mut use_drop = false;
         let mut use_single_transaction = false;
+        let mut use_comments = true;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -82,6 +85,7 @@ impl Config {
                 && parts[0].trim() != "OUTPUT"
                 && parts[0].trim() != "USE_DROP"
                 && parts[0].trim() != "USE_SINGLE_TRANSACTION"
+                && parts[0].trim() != "USE_COMMENTS"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -120,6 +124,14 @@ impl Config {
                 "USE_SINGLE_TRANSACTION" => {
                     use_single_transaction = parts[1].trim().to_uppercase() == "TRUE"
                 }
+                "USE_COMMENTS" => {
+                    let value = parts[1].trim().to_uppercase();
+                    use_comments = match value.as_str() {
+                        "TRUE" => true,
+                        "FALSE" => false,
+                        _ => panic!("Invalid value for USE_COMMENTS: {}", parts[1].trim()),
+                    };
+                }
                 _ => {}
             }
         }
@@ -149,6 +161,7 @@ impl Config {
             output,
             use_drop,
             use_single_transaction,
+            use_comments,
         }
     }
 }

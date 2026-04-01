@@ -76,6 +76,10 @@ struct Args {
     /// True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
     #[arg(long, default_value = "false")]
     use_single_transaction: bool,
+
+    /// Include comments in the output script
+    #[arg(long, default_value = "true")]
+    use_comments: bool,
 }
 
 // Main entry point for the program.
@@ -115,6 +119,7 @@ pub async fn main() -> Result<(), Error> {
                     args.output.unwrap(),
                     args.use_drop,
                     args.use_single_transaction,
+                    args.use_comments,
                 )
                 .await;
             }
@@ -186,6 +191,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             output_file,
             cfg.use_drop,
             cfg.use_single_transaction,
+            cfg.use_comments,
         )
         .await;
 
@@ -220,6 +226,7 @@ async fn compare_dumps(
     output: String,
     use_drop: bool,
     use_single_transaction: bool,
+    use_comments: bool,
 ) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
@@ -227,7 +234,7 @@ async fn compare_dumps(
     println!("--> Dump from:\n{}\n", from.get_info());
     println!("--> Dump to:\n{}\n", to.get_info());
     println!("Comparing dumps...");
-    let mut comparer = Comparer::new(from, to, use_drop, use_single_transaction);
+    let mut comparer = Comparer::new(from, to, use_drop, use_single_transaction, use_comments);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");

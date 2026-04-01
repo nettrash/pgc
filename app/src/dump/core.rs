@@ -137,7 +137,7 @@ impl Dump {
     }
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let query = format!(
+        let result = sqlx::query(
             "select
                     quote_ident(n.nspname) as schema_name,
                     n.nspname as raw_schema_name,
@@ -149,12 +149,12 @@ impl Dump {
              left join pg_description d on d.objoid = n.oid
                  and d.classoid = 'pg_namespace'::regclass
                  and d.objsubid = 0
-             where n.nspname like '{}'
+             where n.nspname similar to $1
                and n.nspname not in ('pg_catalog', 'information_schema')",
-            self.configuration.scheme
-        );
-
-        let result = sqlx::query(query.as_str()).fetch_all(pool).await;
+        )
+        .bind(&self.configuration.scheme)
+        .fetch_all(pool)
+        .await;
         if let Err(e) = &result {
             return Err(Error::other(format!("Failed to fetch schemas: {}.", e)));
         }
