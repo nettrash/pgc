@@ -218,9 +218,10 @@ impl Comparer {
         }
         // Strip SQL comments from the script, but preserve comments inside
         // dollar-quoted strings ($$ ... $$, $tag$ ... $tag$) and single-quoted strings.
+        // Operates on bytes to avoid corrupting multi-byte UTF-8 sequences.
         let src = self.script.as_bytes();
         let len = src.len();
-        let mut result = String::with_capacity(len);
+        let mut result: Vec<u8> = Vec::with_capacity(len);
         let mut i = 0;
 
         while i < len {
@@ -230,7 +231,7 @@ impl Comparer {
             {
                 let tag = &src[i..i + tag_len];
                 // Copy opening tag
-                result.push_str(std::str::from_utf8(tag).unwrap());
+                result.extend_from_slice(tag);
                 i += tag_len;
                 // Copy everything until closing tag
                 loop {
@@ -242,31 +243,31 @@ impl Comparer {
                         && close_len == tag_len
                         && &src[i..i + close_len] == tag
                     {
-                        result.push_str(std::str::from_utf8(&src[i..i + close_len]).unwrap());
+                        result.extend_from_slice(&src[i..i + close_len]);
                         i += close_len;
                         break;
                     }
-                    result.push(src[i] as char);
+                    result.push(src[i]);
                     i += 1;
                 }
                 continue;
             }
             // Single-quoted string — pass through verbatim (handle '' escapes)
             if src[i] == b'\'' {
-                result.push('\'');
+                result.push(b'\'');
                 i += 1;
                 while i < len {
                     if src[i] == b'\'' {
-                        result.push('\'');
+                        result.push(b'\'');
                         i += 1;
                         if i < len && src[i] == b'\'' {
-                            result.push('\'');
+                            result.push(b'\'');
                             i += 1;
                         } else {
                             break;
                         }
                     } else {
-                        result.push(src[i] as char);
+                        result.push(src[i]);
                         i += 1;
                     }
                 }
@@ -296,9 +297,13 @@ impl Comparer {
                 }
                 continue;
             }
-            result.push(src[i] as char);
+            result.push(src[i]);
             i += 1;
         }
+
+        // Safety: result is built entirely from slices of self.script (valid UTF-8),
+        // so it is guaranteed to be valid UTF-8.
+        let result = String::from_utf8(result).expect("output must be valid UTF-8");
 
         // Collapse runs of 3+ newlines into 2
         let mut collapsed = String::with_capacity(result.len());
@@ -307,7 +312,7 @@ impl Comparer {
             if c == '\n' {
                 newline_count += 1;
                 if newline_count <= 2 {
-                    collapsed.push(c);
+                    collapsed.push('\n');
                 }
             } else {
                 newline_count = 0;
@@ -4230,6 +4235,21 @@ mod tests {
         assert_eq!(
             result,
             "/* header */\nCREATE TABLE t1 (id int); -- inline\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_utf8() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        comparer.script =
+            "/* comment */\nCOMMENT ON TABLE t IS '数据表 — 描述';\nSELECT $$函数体$$;\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "COMMENT ON TABLE t IS '数据表 — 描述';\nSELECT $$函数体$$;\n"
         );
     }
 }
