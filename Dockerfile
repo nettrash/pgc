@@ -67,9 +67,9 @@ CMD ["pgc", "--help"]
 # Metadata
 LABEL maintainer="nettrash" \
       description="PostgreSQL Database Comparer (PGC) - A tool for comparing PostgreSQL database schemas" \
-      version="1.0.9" \
+      version="1.0.10" \
       org.opencontainers.image.title="pgc" \
       org.opencontainers.image.description="PostgreSQL Database Comparer" \
-      org.opencontainers.image.version="1.0.9" \
+      org.opencontainers.image.version="1.0.10" \
       org.opencontainers.image.source="https://github.com/nettrash/pgc" \
       org.opencontainers.image.licenses="MIT"
