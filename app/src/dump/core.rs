@@ -147,7 +147,7 @@ impl Dump {
              left join pg_description d on d.objoid = n.oid
                  and d.classoid = 'pg_namespace'::regclass
                  and d.objsubid = 0
-             where n.nspname like '{}'
+             where n.nspname similar to '{}'
                and n.nspname not in ('pg_catalog', 'information_schema')",
             self.configuration.scheme
         );
