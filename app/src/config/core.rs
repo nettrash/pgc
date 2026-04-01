@@ -124,7 +124,14 @@ impl Config {
                 "USE_SINGLE_TRANSACTION" => {
                     use_single_transaction = parts[1].trim().to_uppercase() == "TRUE"
                 }
-                "USE_COMMENTS" => use_comments = parts[1].trim().to_uppercase() != "FALSE",
+                "USE_COMMENTS" => {
+                    let value = parts[1].trim().to_uppercase();
+                    use_comments = match value.as_str() {
+                        "TRUE" => true,
+                        "FALSE" => false,
+                        _ => panic!("Invalid value for USE_COMMENTS: {}", parts[1].trim()),
+                    };
+                }
                 _ => {}
             }
         }
