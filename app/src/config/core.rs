@@ -11,6 +11,8 @@ pub struct Config {
     pub output: String,
     // Whether to use DROP statements in the output
     pub use_drop: bool,
+    // True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
+    pub use_single_transaction: bool,
 }
 
 impl Config {
@@ -48,6 +50,7 @@ impl Config {
         let mut to_dump = "dump.to".to_string();
         let mut output = "data.out".to_string();
         let mut use_drop = false;
+        let mut use_single_transaction = false;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -78,6 +81,7 @@ impl Config {
                 && parts[0].trim() != "TO_DUMP"
                 && parts[0].trim() != "OUTPUT"
                 && parts[0].trim() != "USE_DROP"
+                && parts[0].trim() != "USE_SINGLE_TRANSACTION"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -113,6 +117,9 @@ impl Config {
                 "TO_DUMP" => to_dump = parts[1].trim().to_string(),
                 "OUTPUT" => output = parts[1].trim().to_string(),
                 "USE_DROP" => use_drop = parts[1].trim().to_uppercase() == "TRUE",
+                "USE_SINGLE_TRANSACTION" => {
+                    use_single_transaction = parts[1].trim().to_uppercase() == "TRUE"
+                }
                 _ => {}
             }
         }
@@ -141,6 +148,7 @@ impl Config {
             to,
             output,
             use_drop,
+            use_single_transaction,
         }
     }
 }
@@ -178,6 +186,7 @@ mod tests {
             TO_DUMP=to.dump
             OUTPUT=result.out
             USE_DROP=true
+            USE_SINGLE_TRANSACTION=true
         "#;
         let file = write_temp_config(config_content, "test_valid_config_parsing.cfg");
         let config = Config::new(file.clone());
@@ -193,6 +202,7 @@ mod tests {
         assert_eq!(config.to.file, "to.dump");
         assert_eq!(config.output, "result.out");
         assert!(config.use_drop);
+        assert!(config.use_single_transaction);
         let _ = std::fs::remove_file(file);
     }
 
@@ -244,6 +254,7 @@ mod tests {
             OUTPUT=result.out
             # Comment about USE_DROP
             USE_DROP=true
+            USE_SINGLE_TRANSACTION=true
         "#;
         let file = write_temp_config(
             config_content,
@@ -253,6 +264,7 @@ mod tests {
         assert_eq!(config.from.host, "localhost");
         assert_eq!(config.to.host, "remotehost");
         assert!(config.use_drop);
+        assert!(config.use_single_transaction);
         let _ = std::fs::remove_file(file);
     }
 
@@ -265,6 +277,7 @@ mod tests {
         assert_eq!(config.to.file, "dump.to");
         assert_eq!(config.output, "data.out");
         assert!(!config.use_drop);
+        assert!(!config.use_single_transaction);
         let _ = std::fs::remove_file(file);
     }
 
@@ -326,6 +339,57 @@ mod tests {
         let file = write_temp_config(config_content, "test_use_drop_case_insensitive.cfg");
         let config = Config::new(file.clone());
         assert!(config.use_drop);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_use_single_transaction_true_value() {
+        let config_content = r#"
+            USE_SINGLE_TRANSACTION=true
+        "#;
+
+        let file = write_temp_config(config_content, "test_use_single_transaction_true_value.cfg");
+
+        let config = Config::new(file.clone());
+
+        assert!(config.use_single_transaction);
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_use_single_transaction_false_value() {
+        let config_content = r#"
+            USE_SINGLE_TRANSACTION=false
+        "#;
+
+        let file = write_temp_config(
+            config_content,
+            "test_use_single_transaction_false_value.cfg",
+        );
+
+        let config = Config::new(file.clone());
+
+        assert!(!config.use_single_transaction);
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_use_single_transaction_case_insensitive() {
+        let config_content = r#"
+            USE_SINGLE_TRANSACTION=TRUE
+        "#;
+
+        let file = write_temp_config(
+            config_content,
+            "test_use_single_transaction_case_insensitive.cfg",
+        );
+
+        let config = Config::new(file.clone());
+
+        assert!(config.use_single_transaction);
+
         let _ = std::fs::remove_file(file);
     }
 }
