@@ -67,7 +67,7 @@ Command line arguments can be used to execute just one function in one time.
 
 `--use-single-transaction` - use this flag to wrap resulting diff file within explicit `begin;` and `commit;` statements (i.e. single transaction).
 
-`--use-comments {true|false}` - specify this argument if you don't want to use comments in output script with value false, otherwise comments will be used. Default value: `true`.
+`--use-comments {true|false}` - set to `false` to strip SQL comments from the generated script; set to `true` (default) to include comments.
 
 ## Functionality
 
