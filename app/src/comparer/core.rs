@@ -4009,6 +4009,8 @@ mod tests {
 
         let mut new_table = Table::new(
             "public".to_string(),
+            "\"my-table\"".to_string(),
+            "public".to_string(),
             "my-table".to_string(),
             "postgres".to_string(),
             None,
