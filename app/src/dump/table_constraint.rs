@@ -181,7 +181,7 @@ impl TableConstraint {
                     }
                 }
             } else {
-                // Outside a literal — lowercase only ASCII letters.
+                // Outside a literal — apply full Unicode lowercasing.
                 for lc in c.to_lowercase() {
                     out.push(lc);
                 }
