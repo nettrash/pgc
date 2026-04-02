@@ -1280,13 +1280,19 @@ impl Comparer {
 
         if !routines_to_drop.is_empty() {
             let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
-            let drop_names: Vec<(String, String)> = routines_to_drop
+            let drop_names: Vec<(String, String, String)> = routines_to_drop
                 .iter()
-                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|r| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
-                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1342,14 +1348,20 @@ impl Comparer {
 
         if !create_routines.is_empty() {
             let n = create_routines.len();
-            let names: Vec<(String, String)> = create_routines
+            let names: Vec<(String, String, String)> = create_routines
                 .iter()
-                .map(|(_, r)| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|(_, r)| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
             for (i, (_, routine)) in create_routines.iter().enumerate() {
-                for (j, (schema, name)) in names.iter().enumerate() {
+                for (j, (schema, name, _)) in names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1369,7 +1381,12 @@ impl Comparer {
                 } else {
                     0
                 };
-                (priority, r.schema.to_lowercase(), r.name.to_lowercase())
+                (
+                    priority,
+                    r.schema.to_lowercase(),
+                    r.name.to_lowercase(),
+                    r.arguments.to_lowercase(),
+                )
             });
 
             for idx in sorted {
@@ -1923,13 +1940,19 @@ impl Comparer {
             // reverse dependency order (dependents first).
             let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
 
-            let drop_names: Vec<(String, String)> = routines_to_drop
+            let drop_names: Vec<(String, String, String)> = routines_to_drop
                 .iter()
-                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|r| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
-                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
