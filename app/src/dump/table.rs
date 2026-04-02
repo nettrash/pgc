@@ -14,6 +14,68 @@ fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Extract column identifiers from a `pg_get_partkeydef` output string.
+///
+/// The input format is `method (ident1, ident2, ...)` where `method` is one of
+/// `range`, `list`, or `hash`.  Identifiers may be double-quoted (PostgreSQL
+/// style) and unquoted identifiers may contain `$` in addition to alphanumeric
+/// characters and underscores.
+///
+/// Returns lowercased identifier names (with quotes stripped for quoted idents).
+fn extract_partition_key_identifiers(pk: &str) -> Vec<String> {
+    // Find the content inside the outermost parentheses, skipping the method keyword.
+    let start = match pk.find('(') {
+        Some(i) => i + 1,
+        None => return Vec::new(),
+    };
+    let end = match pk.rfind(')') {
+        Some(i) => i,
+        None => pk.len(),
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let inner = &pk[start..end];
+
+    let mut identifiers = Vec::new();
+    for part in inner.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('"') {
+            // Quoted identifier: find matching close quote (doubled quotes "" are escapes).
+            let bytes = trimmed.as_bytes();
+            let mut i = 1; // skip opening quote
+            let mut ident = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        ident.push('"');
+                        i += 2;
+                    } else {
+                        break; // closing quote
+                    }
+                } else {
+                    ident.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            identifiers.push(ident.to_lowercase());
+        } else {
+            // Unquoted identifier: take leading identifier chars (alphanumeric, _, $).
+            let ident: String = trimmed
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !ident.is_empty() {
+                identifiers.push(ident.to_lowercase());
+            }
+        }
+    }
+    identifiers
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
@@ -1013,12 +1075,8 @@ impl Table {
 
                     let is_partition_child = self.partition_of.is_some();
                     let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
-                        let pk_norm: String = pk
-                            .chars()
-                            .filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '`'))
-                            .collect::<String>()
-                            .to_lowercase();
-                        pk_norm.contains(&new_col.name.to_lowercase())
+                        let col_lower = new_col.name.to_lowercase();
+                        extract_partition_key_identifiers(pk).contains(&col_lower)
                     });
 
                     if type_changed && (is_partition_child || in_partition_key) {
@@ -3206,5 +3264,268 @@ mod tests {
             script.contains("add constraint users_p1_local_chk"),
             "Local constraint must be emitted, got: {script}"
         );
+    }
+
+    // --- Partition key substring false-positive regression ---
+    #[test]
+    fn test_partitioned_parent_non_key_col_type_change_uses_alter() {
+        // Parent table partitioned by expense_date.
+        // Changing `amount` numeric(10,2) → numeric(15,4) must NOT trigger
+        // DROP+CREATE because `amount` is not in the partition key.
+        // This exercises the extract_partition_key_identifiers path
+        // (is_target_partition == false, in_partition_key must be false).
+        let schema = "pt_test";
+        let table_name = "s6_issue2_expenses";
+
+        let mut col_amount_old = create_dummy_column("amount", "numeric");
+        col_amount_old.schema = schema.to_string();
+        col_amount_old.table = table_name.to_string();
+        col_amount_old.numeric_precision = Some(10);
+        col_amount_old.numeric_scale = Some(2);
+        col_amount_old.ordinal_position = 3;
+
+        let mut col_amount_new = create_dummy_column("amount", "numeric");
+        col_amount_new.schema = schema.to_string();
+        col_amount_new.table = table_name.to_string();
+        col_amount_new.numeric_precision = Some(15);
+        col_amount_new.numeric_scale = Some(4);
+        col_amount_new.ordinal_position = 3;
+
+        let mut id_col = create_dummy_column("id", "bigint");
+        id_col.schema = schema.to_string();
+        id_col.table = table_name.to_string();
+        id_col.ordinal_position = 1;
+
+        let mut date_col_old = create_dummy_column("expense_date", "date");
+        date_col_old.schema = schema.to_string();
+        date_col_old.table = table_name.to_string();
+        date_col_old.ordinal_position = 2;
+        let date_col_new = date_col_old.clone();
+
+        let mut from = Table::new(
+            schema.to_string(),
+            table_name.to_string(),
+            schema.to_string(),
+            table_name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col.clone(), date_col_old, col_amount_old],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from.partition_key = Some("range (expense_date)".to_string());
+        from.hash();
+
+        let mut to = Table::new(
+            schema.to_string(),
+            table_name.to_string(),
+            schema.to_string(),
+            table_name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, date_col_new, col_amount_new],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to.partition_key = Some("range (expense_date)".to_string());
+        to.hash();
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop table"),
+            "Non-partition-key column type change must not trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "No data loss warning expected for non-partition-key column, got: {script}"
+        );
+        assert!(
+            script.contains("alter"),
+            "Should produce an ALTER statement for non-key column, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_non_partition_key_column_type_change_uses_alter() {
+        // Partition key references "category_id" but we change column "id".
+        // The old substring check matched "id" inside "category_id" and
+        // incorrectly triggered DROP + CREATE.
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "bigint"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, true);
+        assert!(
+            !script.contains("drop table"),
+            "Non-partition-key column type change must not trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "Non-partition-key column type change must not warn about data loss, got: {script}"
+        );
+        assert!(
+            script.contains("alter"),
+            "Should produce an ALTER statement, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_key_column_type_change_still_triggers_recreate() {
+        // When the actual partition key column type changes, DROP + CREATE is correct.
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "bigint"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, true);
+        assert!(
+            script.contains("drop table"),
+            "Partition key column type change must trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            script.contains("Data loss"),
+            "Partition key column type change must warn about data loss, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_key_single_unquoted() {
+        let ids = extract_partition_key_identifiers("range (created_at)");
+        assert_eq!(ids, vec!["created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_multiple_unquoted() {
+        let ids = extract_partition_key_identifiers("range (region, created_at)");
+        assert_eq!(ids, vec!["region", "created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_list_method() {
+        let ids = extract_partition_key_identifiers("LIST (flow_id)");
+        assert_eq!(ids, vec!["flow_id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_hash_method() {
+        let ids = extract_partition_key_identifiers("hash (id)");
+        assert_eq!(ids, vec!["id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_does_not_include_method() {
+        // Column named "range" should NOT match the method keyword
+        let ids = extract_partition_key_identifiers("range (created_at)");
+        assert!(!ids.contains(&"range".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_key_dollar_identifier() {
+        let ids = extract_partition_key_identifiers("range (my$col)");
+        assert_eq!(ids, vec!["my$col"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_quoted_identifier() {
+        let ids = extract_partition_key_identifiers("list (\"My Column\")");
+        assert_eq!(ids, vec!["my column"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_quoted_with_escaped_quote() {
+        let ids = extract_partition_key_identifiers("list (\"a\"\"b\")");
+        assert_eq!(ids, vec!["a\"b"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_mixed_quoted_and_unquoted() {
+        let ids = extract_partition_key_identifiers("range (\"Region\", created_at)");
+        assert_eq!(ids, vec!["region", "created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_empty_parens() {
+        let ids = extract_partition_key_identifiers("range ()");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_key_no_parens() {
+        let ids = extract_partition_key_identifiers("range");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_key_column_named_list() {
+        // A column actually named "list" inside the key should be extracted
+        let ids = extract_partition_key_identifiers("range (list)");
+        assert_eq!(ids, vec!["list"]);
     }
 }

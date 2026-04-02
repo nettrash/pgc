@@ -720,6 +720,23 @@ CREATE TABLE data.logs_2024
 
 CREATE INDEX idx_logs_message ON data.logs (message);
 
+-- =============================================================================
+-- Issue #118: non-partition-key column type change on a partitioned table
+-- Parent table partitioned by expense_date.  Changing column "amount" from
+-- numeric(10,2) to numeric(15,4) must produce only ALTER COLUMN on the parent.
+-- The partition must NOT be dropped+recreated.
+-- =============================================================================
+CREATE TABLE data.expenses (
+    id           BIGINT       NOT NULL,
+    expense_date DATE         NOT NULL,
+    amount       NUMERIC(10,2),
+    CONSTRAINT expenses_pkey PRIMARY KEY (id, expense_date)
+) PARTITION BY RANGE (expense_date);
+
+CREATE TABLE data.expenses_2024_01
+    PARTITION OF data.expenses
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
 -- SQL routines to test dependency handling
 CREATE OR REPLACE FUNCTION test_schema.get_active_usernames_sql()
 RETURNS TABLE(username varchar)
