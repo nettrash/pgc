@@ -31,7 +31,7 @@ impl GrantsMode {
             "ADDONLY" | "ADD_ONLY" => Self::AddOnly,
             "FULL" => Self::Full,
             _ => panic!(
-                "Invalid value for GRANTS_MODE: '{}'. Expected: ignore, addonly, full.",
+                "Invalid grants mode: '{}'. Expected: ignore, addonly, full.",
                 s
             ),
         }
