@@ -5584,4 +5584,520 @@ mod tests {
             "Must grant on new object with empty FROM acl, got: {script}"
         );
     }
+
+    #[tokio::test]
+    async fn compare_grants_table_addonly_no_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["reader=r/owner".to_string(), "old_app=rw/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec![
+            "reader=r/owner".to_string(),
+            "new_app=rwd/owner".to_string(),
+        ];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT DELETE, SELECT, UPDATE ON TABLE public.orders TO new_app;"),
+            "AddOnly must add new_app grant, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke old_app, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_sequence_full_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_seq = Sequence::new(
+            "public".to_string(),
+            "order_id_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec!["app=U/owner".to_string(), "old_svc=U/owner".to_string()];
+
+        let mut to_seq = Sequence::new(
+            "public".to_string(),
+            "order_id_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec!["app=U/owner".to_string()];
+
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE USAGE ON SEQUENCE public.order_id_seq FROM old_svc;"),
+            "Full must revoke removed sequence grant, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_sequence_addonly_no_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_seq = Sequence::new(
+            "public".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec!["old_svc=U/owner".to_string()];
+
+        let mut to_seq = Sequence::new(
+            "public".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec![];
+
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke sequence grants, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_view_full_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "report_v".to_string(),
+            "SELECT 1".to_string(),
+            "reports".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["analyst=r/owner".to_string(), "intern=r/owner".to_string()];
+
+        let mut to_view = View::new(
+            "report_v".to_string(),
+            "SELECT 1".to_string(),
+            "reports".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["analyst=r/owner".to_string()];
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE SELECT ON TABLE reports.report_v FROM intern;"),
+            "Full must revoke removed view grant, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_routine_function_full_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(10),
+            "calc".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "integer".to_string(),
+            "x integer".to_string(),
+            None,
+            None,
+            "BEGIN RETURN x; END".to_string(),
+        );
+        from_routine.acl = vec!["app=X/owner".to_string(), "old_svc=X/owner".to_string()];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(10),
+            "calc".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "integer".to_string(),
+            "x integer".to_string(),
+            None,
+            None,
+            "BEGIN RETURN x; END".to_string(),
+        );
+        to_routine.acl = vec!["app=X/owner".to_string()];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE EXECUTE ON FUNCTION public.calc(x integer) FROM old_svc;"),
+            "Full must revoke removed function grant, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_grantor_only_diff_produces_no_output() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Schema: same grantee + privileges, different grantor
+        let mut from_schema = Schema::new("app".to_string(), "app".to_string(), None);
+        from_schema.acl = vec!["reader=UC/old_owner".to_string()];
+        let mut to_schema = Schema::new("app".to_string(), "app".to_string(), None);
+        to_schema.acl = vec!["reader=UC/new_owner".to_string()];
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        // Table: same grantee + privileges, different grantor
+        let mut from_table = Table::new(
+            "app".to_string(),
+            "t1".to_string(),
+            "app".to_string(),
+            "t1".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["reader=rw/old_owner".to_string()];
+        let mut to_table = Table::new(
+            "app".to_string(),
+            "t1".to_string(),
+            "app".to_string(),
+            "t1".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["reader=rw/new_owner".to_string()];
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        // Sequence: same grantee + privileges, different grantor
+        let mut from_seq = Sequence::new(
+            "app".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec!["reader=U/old_owner".to_string()];
+        let mut to_seq = Sequence::new(
+            "app".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec!["reader=U/new_owner".to_string()];
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        // View: same grantee + privileges, different grantor
+        let mut from_view = View::new(
+            "v1".to_string(),
+            "SELECT 1".to_string(),
+            "app".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["reader=r/old_owner".to_string()];
+        let mut to_view = View::new(
+            "v1".to_string(),
+            "SELECT 1".to_string(),
+            "app".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["reader=r/new_owner".to_string()];
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        // Routine: same grantee + privileges, different grantor
+        let mut from_routine = Routine::new(
+            "app".to_string(),
+            Oid(99),
+            "do_it".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.acl = vec!["runner=X/old_owner".to_string()];
+        let mut to_routine = Routine::new(
+            "app".to_string(),
+            Oid(99),
+            "do_it".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.acl = vec!["runner=X/new_owner".to_string()];
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("GRANT"),
+            "Grantor-only diff must not emit GRANT, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "Grantor-only diff must not emit REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_full_grant_option_downgrade() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["admin=r*/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["admin=r/owner".to_string()];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE GRANT OPTION FOR SELECT ON TABLE public.items FROM admin;"),
+            "Full must revoke grant option when downgrading, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT SELECT"),
+            "No new grant expected for downgrade, got: {script}"
+        );
+        // Should only contain REVOKE GRANT OPTION FOR, not a bare REVOKE SELECT
+        assert!(
+            !script.contains("REVOKE SELECT ON TABLE"),
+            "Must not fully revoke the privilege on downgrade, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_addonly_ignores_grant_option_downgrade() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["admin=r*/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["admin=r/owner".to_string()];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke grant option, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grant expected, got: {script}"
+        );
+    }
 }
