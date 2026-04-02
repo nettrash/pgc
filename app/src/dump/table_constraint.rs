@@ -93,11 +93,63 @@ impl TableConstraint {
     /// created (e.g. via `IN(...)` in DDL versus applying a migration that
     /// reuses Form A verbatim).  Normalize by lowercasing outside literals
     /// and collapsing the redundant `::text` casts so both forms compare equal.
+    ///
+    /// Both the lowercasing and the cast replacements are applied only to
+    /// text **outside** single-quoted string literals, so literal contents
+    /// like `']::text[]'` are never altered.
     fn normalize_definition(s: &str) -> String {
-        let lower = Self::lowercase_outside_literals(s);
-        lower
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        // Accumulates non-literal text so we can apply replacements on it
+        // in one go before flushing.
+        let mut buf = String::new();
+
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                // Flush the non-literal buffer (lowercased + cast-normalized).
+                Self::flush_outside_buf(&mut buf, &mut out);
+
+                // Inside a single-quoted literal — copy verbatim.
+                out.push('\'');
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            out.push('\'');
+                            if chars.as_str().starts_with('\'') {
+                                out.push('\'');
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(ch) => out.push(ch),
+                        None => break,
+                    }
+                }
+            } else {
+                // Outside a literal — collect into buf for batch processing.
+                for lc in c.to_lowercase() {
+                    buf.push(lc);
+                }
+            }
+        }
+
+        // Flush any remaining non-literal text.
+        Self::flush_outside_buf(&mut buf, &mut out);
+        out
+    }
+
+    /// Applies cast-normalization replacements to `buf` (which contains only
+    /// non-literal text), appends the result to `out`, and clears `buf`.
+    fn flush_outside_buf(buf: &mut String, out: &mut String) {
+        if buf.is_empty() {
+            return;
+        }
+        let normalized = buf
             .replace("::character varying::text", "::character varying")
-            .replace("]::text[]", "]")
+            .replace("]::text[]", "]");
+        out.push_str(&normalized);
+        buf.clear();
     }
 
     /// Lowercases a SQL expression while preserving the original case of text
@@ -1188,6 +1240,35 @@ mod tests {
         assert_eq!(
             TableConstraint::lowercase_outside_literals("CHECK (label = '🚀Launch')"),
             "check (label = '🚀Launch')"
+        );
+    }
+
+    // --- normalize_definition must not alter replacement patterns inside literals ---
+
+    #[test]
+    fn test_normalize_definition_preserves_text_array_cast_inside_literal() {
+        // A literal containing "]::text[]" must NOT be rewritten.
+        let def = "CHECK (note = ']::text[]')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (note = ']::text[]')");
+    }
+
+    #[test]
+    fn test_normalize_definition_preserves_varying_text_cast_inside_literal() {
+        // A literal containing "::character varying::text" must NOT be rewritten.
+        let def = "CHECK (note = '::character varying::text')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (note = '::character varying::text')");
+    }
+
+    #[test]
+    fn test_normalize_definition_mixed_literal_and_outside_casts() {
+        // Cast outside the literal is normalized; identical text inside is preserved.
+        let def = "CHECK (x::character varying::text = ']::text[]' AND y::character varying::text = 'ok')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(
+            norm,
+            "check (x::character varying = ']::text[]' and y::character varying = 'ok')"
         );
     }
 }
