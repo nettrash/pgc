@@ -14,6 +14,68 @@ fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Extract column identifiers from a `pg_get_partkeydef` output string.
+///
+/// The input format is `method (ident1, ident2, ...)` where `method` is one of
+/// `range`, `list`, or `hash`.  Identifiers may be double-quoted (PostgreSQL
+/// style) and unquoted identifiers may contain `$` in addition to alphanumeric
+/// characters and underscores.
+///
+/// Returns lowercased identifier names (with quotes stripped for quoted idents).
+fn extract_partition_key_identifiers(pk: &str) -> Vec<String> {
+    // Find the content inside the outermost parentheses, skipping the method keyword.
+    let start = match pk.find('(') {
+        Some(i) => i + 1,
+        None => return Vec::new(),
+    };
+    let end = match pk.rfind(')') {
+        Some(i) => i,
+        None => pk.len(),
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let inner = &pk[start..end];
+
+    let mut identifiers = Vec::new();
+    for part in inner.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('"') {
+            // Quoted identifier: find matching close quote (doubled quotes "" are escapes).
+            let bytes = trimmed.as_bytes();
+            let mut i = 1; // skip opening quote
+            let mut ident = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        ident.push('"');
+                        i += 2;
+                    } else {
+                        break; // closing quote
+                    }
+                } else {
+                    ident.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            identifiers.push(ident.to_lowercase());
+        } else {
+            // Unquoted identifier: take leading identifier chars (alphanumeric, _, $).
+            let ident: String = trimmed
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !ident.is_empty() {
+                identifiers.push(ident.to_lowercase());
+            }
+        }
+    }
+    identifiers
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
@@ -1014,9 +1076,7 @@ impl Table {
                     let is_partition_child = self.partition_of.is_some();
                     let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
                         let col_lower = new_col.name.to_lowercase();
-                        pk.to_lowercase()
-                            .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .any(|token| token == col_lower)
+                        extract_partition_key_identifiers(pk).contains(&col_lower)
                     });
 
                     if type_changed && (is_partition_child || in_partition_key) {
@@ -3383,5 +3443,79 @@ mod tests {
             script.contains("Data loss"),
             "Partition key column type change must warn about data loss, got: {script}"
         );
+    }
+
+    #[test]
+    fn test_extract_partition_key_single_unquoted() {
+        let ids = extract_partition_key_identifiers("range (created_at)");
+        assert_eq!(ids, vec!["created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_multiple_unquoted() {
+        let ids = extract_partition_key_identifiers("range (region, created_at)");
+        assert_eq!(ids, vec!["region", "created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_list_method() {
+        let ids = extract_partition_key_identifiers("LIST (flow_id)");
+        assert_eq!(ids, vec!["flow_id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_hash_method() {
+        let ids = extract_partition_key_identifiers("hash (id)");
+        assert_eq!(ids, vec!["id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_does_not_include_method() {
+        // Column named "range" should NOT match the method keyword
+        let ids = extract_partition_key_identifiers("range (created_at)");
+        assert!(!ids.contains(&"range".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_key_dollar_identifier() {
+        let ids = extract_partition_key_identifiers("range (my$col)");
+        assert_eq!(ids, vec!["my$col"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_quoted_identifier() {
+        let ids = extract_partition_key_identifiers("list (\"My Column\")");
+        assert_eq!(ids, vec!["my column"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_quoted_with_escaped_quote() {
+        let ids = extract_partition_key_identifiers("list (\"a\"\"b\")");
+        assert_eq!(ids, vec!["a\"b"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_mixed_quoted_and_unquoted() {
+        let ids = extract_partition_key_identifiers("range (\"Region\", created_at)");
+        assert_eq!(ids, vec!["region", "created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_empty_parens() {
+        let ids = extract_partition_key_identifiers("range ()");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_key_no_parens() {
+        let ids = extract_partition_key_identifiers("range");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_key_column_named_list() {
+        // A column actually named "list" inside the key should be extracted
+        let ids = extract_partition_key_identifiers("range (list)");
+        assert_eq!(ids, vec!["list"]);
     }
 }
