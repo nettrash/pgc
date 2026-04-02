@@ -131,7 +131,10 @@ impl Config {
                     };
                 }
                 "GRANTS_MODE" => {
-                    grants_mode = GrantsMode::from_str_or_panic(parts[1].trim());
+                    grants_mode = parts[1]
+                        .trim()
+                        .parse::<GrantsMode>()
+                        .unwrap_or_else(|e| panic!("{e}"));
                 }
                 _ => {}
             }

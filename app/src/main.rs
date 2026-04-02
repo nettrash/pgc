@@ -87,14 +87,7 @@ struct Args {
 }
 
 fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
-    match src.to_ascii_lowercase().as_str() {
-        "ignore" => Ok(GrantsMode::Ignore),
-        "addonly" | "add_only" | "add-only" => Ok(GrantsMode::AddOnly),
-        "full" => Ok(GrantsMode::Full),
-        other => Err(format!(
-            "invalid value '{other}' for '--grants-mode'; valid values are: ignore, addonly, full"
-        )),
-    }
+    src.parse::<GrantsMode>()
 }
 // Main entry point for the program.
 #[tokio::main]
