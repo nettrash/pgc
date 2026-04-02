@@ -273,6 +273,27 @@ impl Comparer {
                 }
                 continue;
             }
+            // Double-quoted identifier — pass through verbatim (handle "" escapes)
+            if src[i] == b'"' {
+                result.push(b'"');
+                i += 1;
+                while i < len {
+                    if src[i] == b'"' {
+                        result.push(b'"');
+                        i += 1;
+                        if i < len && src[i] == b'"' {
+                            result.push(b'"');
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        result.push(src[i]);
+                        i += 1;
+                    }
+                }
+                continue;
+            }
             // Block comment /* ... */ — strip
             if i + 1 < len && src[i] == b'/' && src[i + 1] == b'*' {
                 i += 2;
@@ -4197,6 +4218,106 @@ mod tests {
         assert_eq!(
             result,
             "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_double_quoted_identifier_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Double-quoted identifiers containing sequences that look like comment
+        // starters must be passed through verbatim and must NOT be stripped.
+        comparer.script =
+            "SELECT 1 AS \"col--name\", 2 AS \"/*not a comment*/\"; -- real comment\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT 1 AS \"col--name\", 2 AS \"/*not a comment*/\";\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_double_quoted_identifier_with_escaped_quote() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // A doubled double-quote inside a quoted identifier is an escape sequence
+        // and must survive comment stripping intact.
+        comparer.script =
+            "ALTER TABLE t RENAME COLUMN \"col\"\"--name\" TO new_name; /* drop this */\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "ALTER TABLE t RENAME COLUMN \"col\"\"--name\" TO new_name;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_multiple_double_quoted_identifiers() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Several double-quoted identifiers in one statement, each containing
+        // comment-like sequences; only the trailing real comment should be stripped.
+        comparer.script =
+            "SELECT \"a--b\", \"c/*d*/e\", \"f--g\" FROM t; -- strip me\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT \"a--b\", \"c/*d*/e\", \"f--g\" FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_qualified_double_quoted_name() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Quoted schema + quoted table, both containing comment-like sequences.
+        comparer.script =
+            "CREATE TABLE \"my--schema\".\"my/*table*/\" (id int); /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE TABLE \"my--schema\".\"my/*table*/\" (id int);\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_empty_double_quoted_identifier() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // "" is a valid (if unusual) quoted identifier; must not confuse the state machine.
+        comparer.script = "ALTER INDEX \"\" RENAME TO x; /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "ALTER INDEX \"\" RENAME TO x;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_comment_after_double_quoted_identifier() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // The parser must exit the double-quote state correctly so the real block
+        // comment that follows is still stripped.
+        comparer.script = "SELECT \"col\" /* strip this */ FROM t;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT \"col\"  FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_mixed_double_and_single_quoted_with_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Double-quoted identifier and single-quoted string both containing
+        // comment-like bytes; trailing real comment must still be stripped.
+        comparer.script =
+            "INSERT INTO \"my--table\" (col) VALUES ('/* not */ a -- val'); -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "INSERT INTO \"my--table\" (col) VALUES ('/* not */ a -- val');\n"
         );
     }
 
