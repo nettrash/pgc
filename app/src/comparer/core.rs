@@ -216,8 +216,14 @@ impl Comparer {
         if self.use_comments {
             return self.script.clone();
         }
-        // Strip SQL comments from the script, but preserve comments inside
-        // dollar-quoted strings ($$ ... $$, $tag$ ... $tag$) and single-quoted strings.
+        // Strip SQL comments (-- line comments and /* block comments */) from the
+        // script, passing through all other content verbatim.  Four token types are
+        // recognised and copied byte-for-byte without interpretation so that
+        // comment-like sequences inside them are never stripped:
+        //   • dollar-quoted strings:      $$ … $$ or $tag$ … $tag$
+        //   • single-quoted literals:     ' … '   ('' is the escape for a literal quote)
+        //   • E-string literals:          E' … '  (backslash sequences and '' are handled)
+        //   • double-quoted identifiers:  " … "   ("" is the escape for a literal quote)
         // Operates on bytes to avoid corrupting multi-byte UTF-8 sequences.
         let src = self.script.as_bytes();
         let len = src.len();
@@ -252,46 +258,32 @@ impl Comparer {
                 }
                 continue;
             }
+            // E-string literal E'...' or e'...' — pass through verbatim.
+            // PostgreSQL escape strings allow both \' and '' to embed a single quote.
+            // This scanner does not interpret escape sequences; it copies every \X pair
+            // as two raw bytes so that the character following a backslash is never
+            // mistaken for a string terminator or a comment starter.
+            // Must be handled before the plain single-quote branch so that \'
+            // inside the literal does not terminate the scanner prematurely.
+            if (src[i] == b'E' || src[i] == b'e') && i + 1 < len && src[i + 1] == b'\'' {
+                result.push(src[i]); // E / e
+                result.push(b'\'');
+                i += 2;
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', true);
+                continue;
+            }
             // Single-quoted string — pass through verbatim (handle '' escapes)
             if src[i] == b'\'' {
                 result.push(b'\'');
                 i += 1;
-                while i < len {
-                    if src[i] == b'\'' {
-                        result.push(b'\'');
-                        i += 1;
-                        if i < len && src[i] == b'\'' {
-                            result.push(b'\'');
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        result.push(src[i]);
-                        i += 1;
-                    }
-                }
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', false);
                 continue;
             }
             // Double-quoted identifier — pass through verbatim (handle "" escapes)
             if src[i] == b'"' {
                 result.push(b'"');
                 i += 1;
-                while i < len {
-                    if src[i] == b'"' {
-                        result.push(b'"');
-                        i += 1;
-                        if i < len && src[i] == b'"' {
-                            result.push(b'"');
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        result.push(src[i]);
-                        i += 1;
-                    }
-                }
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'"', false);
                 continue;
             }
             // Block comment /* ... */ — strip
@@ -347,6 +339,54 @@ impl Comparer {
         let mut out = trimmed.to_string();
         out.push('\n');
         out
+    }
+
+    /// Copies a quoted literal body (everything after the opening delimiter has
+    /// already been pushed) into `result`, advancing `i` past the closing
+    /// delimiter.  Two quoting conventions are supported:
+    ///
+    /// * **Standard** (`backslash_escapes = false`): a doubled delimiter (`''`
+    ///   or `""`) is an escape sequence; any other occurrence of the delimiter
+    ///   ends the literal.
+    /// * **E-string** (`backslash_escapes = true`): additionally, a backslash
+    ///   followed by any byte is copied as a unit without re-inspecting the
+    ///   second byte, so `\'` never terminates the literal.
+    ///
+    /// In both modes every byte is copied verbatim — the scanner does not
+    /// interpret the content, only tracks enough structure to know when the
+    /// literal ends.
+    fn copy_quoted_literal(
+        src: &[u8],
+        result: &mut Vec<u8>,
+        i: &mut usize,
+        delimiter: u8,
+        backslash_escapes: bool,
+    ) {
+        let len = src.len();
+        while *i < len {
+            if backslash_escapes && src[*i] == b'\\' {
+                // Copy the backslash and the following byte as a unit.
+                result.push(b'\\');
+                *i += 1;
+                if *i < len {
+                    result.push(src[*i]);
+                    *i += 1;
+                }
+            } else if src[*i] == delimiter {
+                result.push(delimiter);
+                *i += 1;
+                if *i < len && src[*i] == delimiter {
+                    // Doubled-delimiter escape — copy the second one and keep scanning.
+                    result.push(delimiter);
+                    *i += 1;
+                } else {
+                    break; // closing delimiter
+                }
+            } else {
+                result.push(src[*i]);
+                *i += 1;
+            }
+        }
     }
 
     /// Checks if a dollar-quote tag starts at position `pos` in `src`.
@@ -4253,6 +4293,151 @@ mod tests {
         assert_eq!(
             result,
             "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_backslash_escaped_quote() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // \' inside E'...' is an escaped quote and must NOT terminate the string.
+        // The comment-like content after it must be preserved, not stripped.
+        comparer.script = "SELECT E'it\\'s fine -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'it\\'s fine -- not a comment' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_block_comment_lookalike() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // /* ... */ inside an E-string must not be treated as a block comment.
+        comparer.script = "SELECT E'/* not a comment */' AS val; /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'/* not a comment */' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_backslash_backslash_then_quote() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // \\\' is an escaped backslash (\\) followed by an escaped quote (\').
+        // The string should continue after that sequence.
+        comparer.script =
+            "SELECT E'backslash\\\\\\'quote -- still inside' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT E'backslash\\\\\\'quote -- still inside' AS val;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_doubled_quote_escape() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // '' inside E'...' is also a valid quote escape; must not terminate string early.
+        comparer.script = "SELECT E'it''s fine -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'it''s fine -- not a comment' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_lowercase_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Lowercase e'...' prefix must be handled identically to E'...'.
+        comparer.script = "SELECT e'it\\'s fine -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT e'it\\'s fine -- not a comment' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_does_not_treat_standalone_e_as_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // A bare column/alias named "e" followed immediately by a plain string
+        // literal must not be misidentified as an E-string prefix.
+        // Here "e" is a table alias and 'text' is a separate literal.
+        comparer.script = "SELECT e, 'text -- not a comment' FROM t; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT e, 'text -- not a comment' FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_does_not_treat_uppercase_e_identifier_as_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Uppercase E as a standalone identifier (column name), not followed by
+        // a quote, must not be confused with an E-string prefix.
+        comparer.script = "SELECT E FROM t; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_empty_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // An empty E-string E'' must not confuse the state machine.
+        comparer.script = "SELECT E'' AS val; /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_with_other_backslash_sequences() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // \n and \t are everyday escape sequences; the scanner must copy them
+        // verbatim and must not mistake the character after the backslash for
+        // anything other than the second byte of the pair.
+        comparer.script =
+            "SELECT E'line1\\nline2\\ttabbed -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT E'line1\\nline2\\ttabbed -- not a comment' AS val;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_multiple_e_strings_in_one_statement() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Multiple E-strings in one statement; real trailing comment stripped.
+        comparer.script =
+            "INSERT INTO t VALUES (E'val\\'1 -- x', E'val/*2*/'); -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "INSERT INTO t VALUES (E'val\\'1 -- x', E'val/*2*/');\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_adjacent_to_double_quoted_identifier() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // E-string and double-quoted identifier in the same statement; both
+        // preserved, real trailing comment stripped.
+        comparer.script =
+            "INSERT INTO \"my--table\" (col) VALUES (E'it\\'s -- ok'); -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "INSERT INTO \"my--table\" (col) VALUES (E'it\\'s -- ok');\n"
         );
     }
 
