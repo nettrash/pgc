@@ -12,6 +12,8 @@ pub struct TableConstraint {
     pub is_deferrable: bool,     // Whether the constraint is deferrable
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
+    #[serde(default)]
+    pub coninhcount: i16, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
 }
 
 impl TableConstraint {
@@ -290,6 +292,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -303,6 +306,7 @@ mod tests {
             is_deferrable: true,
             initially_deferred: true,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -316,6 +320,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -329,6 +334,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -536,6 +542,7 @@ mod tests {
             is_deferrable: true,
             initially_deferred: true,
             definition: Some("UNIQUE (id)".to_string()),
+            coninhcount: 0,
         };
 
         let script = constraint.get_script();
@@ -554,6 +561,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
         };
 
         let script = constraint.get_script();
@@ -572,6 +580,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         };
 
         let script = constraint.get_script();
@@ -709,6 +718,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("UNIQUE (column1, column2)".to_string()),
+            coninhcount: 0,
         };
 
         // Should handle special characters in all fields
@@ -736,6 +746,7 @@ mod tests {
                 is_deferrable: false,
                 initially_deferred: false,
                 definition: Some("PRIMARY KEY (id)".to_string()),
+                coninhcount: 0,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -746,6 +757,7 @@ mod tests {
                 is_deferrable: true,
                 initially_deferred: false,
                 definition: Some("FOREIGN KEY (user_id) REFERENCES users(id)".to_string()),
+                coninhcount: 0,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -756,6 +768,7 @@ mod tests {
                 is_deferrable: false,
                 initially_deferred: false,
                 definition: Some("UNIQUE (column1, column2)".to_string()),
+                coninhcount: 0,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -766,6 +779,7 @@ mod tests {
                 is_deferrable: false,
                 initially_deferred: false,
                 definition: Some("CHECK (age > 0)".to_string()),
+                coninhcount: 0,
             },
         ];
 
@@ -795,6 +809,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         };
 
         // Create the same hash as the implementation
@@ -826,6 +841,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         };
 
         // Create the same hash as the implementation (nulls_distinct=None means no update)
@@ -965,6 +981,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (status = 'Active')".to_string()),
+            coninhcount: 0,
         };
         let script = constraint.get_script();
         assert!(
@@ -986,6 +1003,7 @@ mod tests {
             definition: Some(
                 "CHECK (status IN ('Active', 'Inactive', 'PendingReview'))".to_string(),
             ),
+            coninhcount: 0,
         };
         let script = constraint.get_script();
         assert!(script.contains("'Active'"), "got: {script}");
@@ -1007,6 +1025,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (col <> 'It''s OK')".to_string()),
+            coninhcount: 0,
         };
         let script = constraint.get_script();
         assert!(
@@ -1026,6 +1045,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (AGE > 0 AND NAME IS NOT NULL)".to_string()),
+            coninhcount: 0,
         };
         let script = constraint.get_script();
         assert!(
@@ -1047,6 +1067,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (AMOUNT >= 0)".to_string()),
+            coninhcount: 0,
         };
         let script = constraint.get_script();
         assert!(script.contains("check (amount >= 0)"), "got: {script}");
@@ -1158,7 +1179,8 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))".to_string()),
-        };
+        coninhcount: 0,
+            };
         let constraint_b = TableConstraint {
             catalog: "db".to_string(),
             schema: "test_schema".to_string(),
@@ -1168,7 +1190,8 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))".to_string()),
-        };
+        coninhcount: 0,
+            };
         assert_eq!(constraint_a, constraint_b);
     }
 
@@ -1183,7 +1206,8 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))".to_string()),
-        };
+        coninhcount: 0,
+            };
         let constraint_b = TableConstraint {
             catalog: "db".to_string(),
             schema: "test_schema".to_string(),
@@ -1193,7 +1217,8 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))".to_string()),
-        };
+        coninhcount: 0,
+            };
 
         let mut hasher_a = Sha256::new();
         let mut hasher_b = Sha256::new();
