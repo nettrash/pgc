@@ -751,6 +751,22 @@ AS $$
     SELECT uuid_generate_v4();
 $$;
 
+-- =============================================================================
+-- CHECK constraint string literal case preservation test
+-- =============================================================================
+-- Verifies that mixed-case string literals inside CHECK constraints are
+-- not corrupted by lowercasing (lowercase_outside_literals bug fix).
+-- chk_category_values is identical in both FROM and TO → must NOT produce
+-- a false diff.
+-- chk_priority_label differs between FROM and TO → real diff expected.
+CREATE TABLE test_schema.check_literal_case_test (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50) NOT NULL,
+    priority VARCHAR(20) NOT NULL,
+    CONSTRAINT chk_category_values CHECK (category IN ('Electronics', 'Home & Garden', 'Books')),
+    CONSTRAINT chk_priority_label CHECK (priority IN ('P1-Critical', 'P2-High', 'P3-Medium', 'P4-Low'))
+);
+
 -- Owner change coverage (FROM side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
