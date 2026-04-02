@@ -978,7 +978,10 @@ impl Table {
         // non-FK constraints from their parent table.  Generating the same DDL
         // for both parent and partition causes errors (ADD/DROP COLUMN) or
         // redundant operations (SET NOT NULL, SET DEFAULT, constraint changes).
-        let is_target_partition = to_table.partition_of.is_some();
+        // Only suppress when the table is a partition child in both FROM and TO.
+        // If it is transitioning from standalone to partition (attach), structural
+        // changes may be required to make it compatible with the parent first.
+        let is_target_partition = self.partition_of.is_some() && to_table.partition_of.is_some();
 
         // Collect column additions or alterations
         for new_col in &to_table.columns {
