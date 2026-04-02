@@ -3268,81 +3268,84 @@ mod tests {
 
     // --- Partition key substring false-positive regression ---
     #[test]
-    fn test_partition_child_type_change_non_partition_key_col_skips_recreate() {
-        // Reproduces: parent partitioned by expense_date, child inherits.
-        // Changing `amount` numeric(10,2) → numeric(15,4) on the child must
-        // NOT trigger DROP+CREATE because `amount` is not in the partition key.
-        let schema = "\"pt_test\"";
-        let table_name = "\"s6_issue2_expenses_2024_01\"";
+    fn test_partitioned_parent_non_key_col_type_change_uses_alter() {
+        // Parent table partitioned by expense_date.
+        // Changing `amount` numeric(10,2) → numeric(15,4) must NOT trigger
+        // DROP+CREATE because `amount` is not in the partition key.
+        // This exercises the extract_partition_key_identifiers path
+        // (is_target_partition == false, in_partition_key must be false).
+        let schema = "pt_test";
+        let table_name = "s6_issue2_expenses";
 
-        let mut col_amount_old = partition_child_column("amount", 3);
-        col_amount_old.data_type = "numeric".to_string();
+        let mut col_amount_old = create_dummy_column("amount", "numeric");
+        col_amount_old.schema = schema.to_string();
+        col_amount_old.table = table_name.to_string();
         col_amount_old.numeric_precision = Some(10);
         col_amount_old.numeric_scale = Some(2);
+        col_amount_old.ordinal_position = 3;
 
-        let mut col_amount_new = partition_child_column("amount", 3);
-        col_amount_new.data_type = "numeric".to_string();
+        let mut col_amount_new = create_dummy_column("amount", "numeric");
+        col_amount_new.schema = schema.to_string();
+        col_amount_new.table = table_name.to_string();
         col_amount_new.numeric_precision = Some(15);
         col_amount_new.numeric_scale = Some(4);
+        col_amount_new.ordinal_position = 3;
 
-        let mut from = partition_child_table(
-            vec![
-                partition_child_identity_column("id", 1, "bigint"),
-                {
-                    let mut c = partition_child_column("expense_date", 2);
-                    c.data_type = "date".to_string();
-                    c
-                },
-                col_amount_old,
-            ],
+        let mut id_col = create_dummy_column("id", "bigint");
+        id_col.schema = schema.to_string();
+        id_col.table = table_name.to_string();
+        id_col.ordinal_position = 1;
+
+        let mut date_col_old = create_dummy_column("expense_date", "date");
+        date_col_old.schema = schema.to_string();
+        date_col_old.table = table_name.to_string();
+        date_col_old.ordinal_position = 2;
+        let date_col_new = date_col_old.clone();
+
+        let mut from = Table::new(
+            schema.to_string(),
+            table_name.to_string(),
+            schema.to_string(),
+            table_name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col.clone(), date_col_old, col_amount_old],
             vec![],
             vec![],
+            vec![],
+            None,
         );
-        from.schema = schema.to_string();
-        from.name = table_name.to_string();
-        from.partition_of = Some("\"pt_test\".\"s6_issue2_expenses\"".to_string());
-        from.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
-        for c in &mut from.columns {
-            c.schema = schema.to_string();
-            c.table = table_name.to_string();
-        }
+        from.partition_key = Some("range (expense_date)".to_string());
         from.hash();
 
-        let mut to = partition_child_table(
-            vec![
-                partition_child_identity_column("id", 1, "bigint"),
-                {
-                    let mut c = partition_child_column("expense_date", 2);
-                    c.data_type = "date".to_string();
-                    c
-                },
-                col_amount_new,
-            ],
+        let mut to = Table::new(
+            schema.to_string(),
+            table_name.to_string(),
+            schema.to_string(),
+            table_name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, date_col_new, col_amount_new],
             vec![],
             vec![],
+            vec![],
+            None,
         );
-        to.schema = schema.to_string();
-        to.name = table_name.to_string();
-        to.partition_of = Some("\"pt_test\".\"s6_issue2_expenses\"".to_string());
-        to.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
-        for c in &mut to.columns {
-            c.schema = schema.to_string();
-            c.table = table_name.to_string();
-        }
+        to.partition_key = Some("range (expense_date)".to_string());
         to.hash();
 
         let script = from.get_alter_script(&to, true);
         assert!(
             !script.contains("drop table"),
-            "Partition child must not be dropped when non-partition-key column type changes, got: {script}"
+            "Non-partition-key column type change must not trigger DROP TABLE, got: {script}"
         );
         assert!(
             !script.contains("Data loss"),
             "No data loss warning expected for non-partition-key column, got: {script}"
         );
         assert!(
-            !script.contains("create table"),
-            "Partition child must not be recreated for inherited column type change, got: {script}"
+            script.contains("alter"),
+            "Should produce an ALTER statement for non-key column, got: {script}"
         );
     }
 
