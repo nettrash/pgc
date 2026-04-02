@@ -961,6 +961,8 @@ impl Dump {
         for t in tables {
             result.push(t?);
         }
+        // Re-sort to ensure deterministic output regardless of completion order.
+        result.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
         Ok(result)
     }
 
