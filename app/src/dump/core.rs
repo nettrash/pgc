@@ -70,9 +70,14 @@ impl Dump {
 
     // Retrieve the dump from the configuration.
     pub async fn process(&mut self) -> Result<(), Error> {
+        const TABLE_FILL_CONCURRENCY: u32 = 6;
+        const POOL_CONNECTION_BUFFER: u32 = 2;
+        let max_connections = TABLE_FILL_CONCURRENCY + POOL_CONNECTION_BUFFER;
+
         let pool = PgPoolOptions::new()
-            //Looks like 3 is optimal
-            .max_connections(3)
+            // Match the pool size to the intended concurrent workload instead of hard-coding
+            // a lower value that would force tasks to block on connection acquisition.
+            .max_connections(max_connections)
             .connect(self.configuration.get_connection_string().as_str())
             .await
             .map_err(|e| {
