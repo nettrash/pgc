@@ -141,7 +141,6 @@ impl Dump {
         // We run them all in parallel to reduce total wall-clock time on
         // high-latency (remote) connections.
         let schema_filter = self.accessible_schema_filter();
-        let scheme = self.configuration.scheme.clone();
 
         let types_enums_fut = async {
             let mut types = Vec::new();
@@ -156,7 +155,7 @@ impl Dump {
         let extensions_fut = Self::fetch_extensions_standalone(pool, &schema_filter);
         let sequences_fut = Self::fetch_sequences_standalone(pool, &schema_filter);
         let routines_fut = Self::fetch_routines_standalone(pool, &schema_filter);
-        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter, &scheme);
+        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter);
         let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
 
         let (types_enums, extensions, sequences, routines, tables, views) = tokio::try_join!(
@@ -854,7 +853,6 @@ impl Dump {
     async fn fetch_tables_standalone(
         pool: &PgPool,
         schema_filter: &str,
-        _scheme: &str,
     ) -> Result<Vec<Table>, Error> {
         // Check once whether the pg_get_tabledef extension function exists.
         let has_tabledef_fn =
