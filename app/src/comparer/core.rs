@@ -286,19 +286,27 @@ impl Comparer {
                 Self::copy_quoted_literal(src, &mut result, &mut i, b'"', false);
                 continue;
             }
-            // Block comment /* ... */ — strip
+            // Block comment /* ... */ — strip.
+            // PostgreSQL allows arbitrarily nested block comments
+            // (/* outer /* inner */ still outer */); track a depth counter so
+            // every nesting level is consumed before resuming normal scanning.
             if i + 1 < len && src[i] == b'/' && src[i + 1] == b'*' {
                 i += 2;
-                loop {
-                    if i + 1 >= len {
-                        i = len;
-                        break;
-                    }
-                    if src[i] == b'*' && src[i + 1] == b'/' {
+                let mut depth: usize = 1;
+                while i + 1 < len && depth > 0 {
+                    if src[i] == b'/' && src[i + 1] == b'*' {
+                        depth += 1;
                         i += 2;
-                        break;
+                    } else if src[i] == b'*' && src[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
-                    i += 1;
+                }
+                if depth > 0 {
+                    // Unterminated comment — consumed to end of input.
+                    i = len;
                 }
                 continue;
             }
@@ -4254,6 +4262,131 @@ mod tests {
                 .to_string();
         let result = comparer.get_script();
         assert_eq!(result, "CREATE TABLE t1 (id int);\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_singly_nested_block_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // /* outer /* inner */ still outer */ must all be stripped.
+        comparer.script = "SELECT /* outer /* inner */ still outer */ 1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_deeply_nested_block_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Three levels of nesting.
+        comparer.script = "SELECT /* a /* b /* c */ b */ a */ 1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_adjacent_nested_block_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Two independent outer comments each with their own inner comment.
+        // The space between the first comment and SELECT is preserved.
+        comparer.script = "/* a /* b */ a */ SELECT /* c /* d */ c */ 1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_block_comment_before_statement() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Nested comment as a header; SQL that follows must be preserved intact.
+        comparer.script = "/* header /* nested */ end */\nCREATE TABLE t (id int);\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "CREATE TABLE t (id int);\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_only_script_returns_empty() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // A script consisting only of a nested block comment produces no output.
+        comparer.script = "/* outer /* inner */ outer */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_sql_between_levels() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Text that sits between the outer /* and its matching */ must be stripped
+        // even when inner comment pairs appear in the middle.
+        comparer.script = "SELECT /* before /* mid */ after */ 42;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  42;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_immediately_after_keyword() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // No space between the keyword and the nested comment; scanner must not
+        // be confused by the /* that immediately follows non-comment text.
+        comparer.script = "SELECT/* /* nested */ */1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_followed_by_line_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // After the nested block comment closes, a line comment on the same line
+        // must also be stripped.
+        comparer.script = "SELECT /* a /* b */ a */ 1; -- strip me\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_inside_single_quoted_string_not_stripped() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Nested-comment-like sequences inside a string literal must be preserved.
+        comparer.script = "SELECT '/* outer /* inner */ outer */' AS val;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT '/* outer /* inner */ outer */' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_inside_e_string_not_stripped() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Nested-comment-like sequences inside an E-string must also be preserved.
+        comparer.script = "SELECT E'/* outer /* inner */ outer */' AS val;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'/* outer /* inner */ outer */' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_inside_double_quoted_identifier_not_stripped() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        // Nested-comment-like sequences inside a double-quoted identifier must be preserved.
+        comparer.script = "SELECT 1 AS \"/* outer /* inner */ outer */\";\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT 1 AS \"/* outer /* inner */ outer */\";\n");
     }
 
     #[tokio::test]
