@@ -669,6 +669,39 @@ CREATE TABLE data.partition_bound_test (
 CREATE TABLE data.partition_bound_test_active PARTITION OF data.partition_bound_test FOR VALUES IN ('active');
 
 -- =============================================================================
+-- Partition DDL inheritance test: structural changes on a partitioned table
+-- must only be applied to the parent table. Partitions inherit column add/drop,
+-- alter (NOT NULL, DEFAULT), and non-FK constraint changes automatically.
+-- The comparer must NOT emit these DDL statements for partition children.
+--
+-- FROM state:
+--   parent: data.customers  (PARTITION BY RANGE (created_at))
+--     columns: id (PK, NOT NULL), name (NOT NULL), email (nullable), legacy (nullable)
+--     constraints: customers_pkey, chk_customers_name
+--   partition: data.customers_2024  (inherits structure)
+--   partition: data.customers_2025  (inherits structure)
+-- =============================================================================
+CREATE TABLE data.customers (
+    id         BIGINT       NOT NULL,
+    name       TEXT         NOT NULL,
+    email      TEXT,
+    legacy     TEXT,
+    created_at DATE         NOT NULL,
+    CONSTRAINT customers_pkey PRIMARY KEY (id, created_at),
+    CONSTRAINT chk_customers_name CHECK (name <> '')
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE data.customers_2024
+    PARTITION OF data.customers
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE data.customers_2025
+    PARTITION OF data.customers
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX idx_customers_email ON data.customers (email);
+
+-- =============================================================================
 -- Partition index test: existing partitioned table with index gains a new partition
 -- FROM has parent + index + one partition; TO adds a second partition.
 -- The comparer must NOT emit explicit CREATE INDEX for the new partition

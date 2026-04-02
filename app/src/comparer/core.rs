@@ -1540,6 +1540,26 @@ impl Comparer {
                     .push_str(table.get_trigger_script().as_str());
             }
         }
+        // Track parent tables that will be dropped + recreated (partition key
+        // changed, or a column in the partition key has a type change, etc.).
+        // Their children were implicitly dropped and must be re-created from
+        // scratch instead of altered.
+        // Seed with explicit partition_key differences; additional parents may
+        // be discovered during the alter loop when their generated script
+        // contains a DROP TABLE.
+        let mut recreated_parents: HashSet<String> = HashSet::new();
+        for table in ordered_from.iter() {
+            if let Some(to_table) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                && table.partition_key != to_table.partition_key
+            {
+                recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+            }
+        }
+
         // We will find all existing tables in both dumps with different hashes
         for table in ordered_from.iter() {
             if table.hash.is_none() {
@@ -1569,19 +1589,43 @@ impl Comparer {
                     continue;
                 }
                 if Self::hashes_differ(&to_table.hash, &table.hash) {
+                    // If this is a partition child whose parent was recreated
+                    // (dropped + recreated), the child was implicitly dropped.
+                    // Emit a CREATE TABLE instead of ALTER/DETACH/ATTACH.
+                    let parent_recreated = to_table.partition_of.as_ref().is_some_and(|pref| {
+                        let parent_key = Self::normalise_partition_of(pref);
+                        recreated_parents.contains(&parent_key)
+                    });
+
                     self.script.push_str(
                         format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
                     );
-                    self.script.push_str(
-                        table
-                            .get_alter_script_without_triggers(to_table, self.use_drop)
-                            .as_str(),
-                    );
-                    self.trigger_post_script.push_str(
-                        table
-                            .get_trigger_alter_script(to_table, self.use_drop)
-                            .as_str(),
-                    );
+
+                    if parent_recreated {
+                        self.script
+                            .push_str(to_table.get_script_without_triggers().as_str());
+                        self.trigger_post_script
+                            .push_str(to_table.get_trigger_script().as_str());
+                    } else {
+                        let alter_script =
+                            table.get_alter_script_without_triggers(to_table, self.use_drop);
+
+                        // If the generated alter script dropped + recreated this table
+                        // and the table is a partitioned parent, record it so its
+                        // children will be recreated instead of altered.
+                        if table.partition_key.is_some()
+                            && alter_script.to_lowercase().contains("drop table if exists")
+                        {
+                            recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+                        }
+
+                        self.script.push_str(alter_script.as_str());
+                        self.trigger_post_script.push_str(
+                            table
+                                .get_trigger_alter_script(to_table, self.use_drop)
+                                .as_str(),
+                        );
+                    }
                 }
             } else {
                 continue; // Table is present in both dumps, we already processed it
