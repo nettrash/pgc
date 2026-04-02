@@ -164,8 +164,8 @@ impl Comparer {
         if routine.hash.is_none() {
             self.script.push_str(
                 format!(
-                    "/* Skipping routine {}.{} due to missing hash. */\n",
-                    routine.schema, routine.name
+                    "/* Skipping routine {}.{}({}) due to missing hash. */\n",
+                    routine.schema, routine.name, routine.arguments
                 )
                 .as_str(),
             );
@@ -178,8 +178,8 @@ impl Comparer {
             if from_routine.hash.is_none() {
                 self.script.push_str(
                     format!(
-                        "/* Skipping routine {}.{} due to missing hash. */\n",
-                        from_routine.schema, from_routine.name
+                        "/* Skipping routine {}.{}({}) due to missing hash. */\n",
+                        from_routine.schema, from_routine.name, from_routine.arguments
                     )
                     .as_str(),
                 );
@@ -205,13 +205,13 @@ impl Comparer {
                     }
                 }
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str(),
                 );
                 self.script.push_str(routine.get_script().as_str());
             }
         } else {
             self.script
-                .push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+                .push_str(format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str());
             self.script.push_str(routine.get_script().as_str());
         }
     }
@@ -1298,7 +1298,7 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -1937,7 +1937,7 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
