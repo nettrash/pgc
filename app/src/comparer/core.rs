@@ -4771,4 +4771,164 @@ mod tests {
             "COMMENT ON TABLE t IS '数据表 — 描述';\nSELECT $$函数体$$;\n"
         );
     }
+
+    /// Partition child must not be dropped+recreated when a non-partition-key
+    /// column changes type on the parent.
+    #[tokio::test]
+    async fn partition_child_non_pk_col_type_change_no_recreate() {
+        fn numeric_column(
+            schema: &str,
+            table: &str,
+            name: &str,
+            ordinal: i32,
+            precision: i32,
+            scale: i32,
+        ) -> TableColumn {
+            let mut col = int_column(schema, table, name, ordinal);
+            col.data_type = "numeric".to_string();
+            col.numeric_precision = Some(precision);
+            col.numeric_scale = Some(scale);
+            col.numeric_precision_radix = Some(10);
+            col
+        }
+        fn date_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
+            let mut col = int_column(schema, table, name, ordinal);
+            col.data_type = "date".to_string();
+            col.numeric_precision = None;
+            col.numeric_precision_radix = None;
+            col.numeric_scale = None;
+            col
+        }
+        fn bigint_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
+            let mut col = int_column(schema, table, name, ordinal);
+            col.data_type = "bigint".to_string();
+            col.numeric_precision = Some(64);
+            col
+        }
+
+        let tbl = "s6_issue2_expenses";
+        let child_tbl = "s6_issue2_expenses_2024_01";
+        let schema = "\"pt_test\"";
+
+        // --- FROM dump ---
+        let mut from_parent = Table::new(
+            schema.to_string(),
+            tbl.to_string(),
+            "pt_test".to_string(),
+            tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, tbl, "id", 1),
+                date_column(schema, tbl, "expense_date", 2),
+                numeric_column(schema, tbl, "amount", 3, 10, 2),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_parent.partition_key = Some("RANGE (expense_date)".to_string());
+        from_parent.hash();
+
+        let mut from_child = Table::new(
+            schema.to_string(),
+            child_tbl.to_string(),
+            "pt_test".to_string(),
+            child_tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, child_tbl, "id", 1),
+                date_column(schema, child_tbl, "expense_date", 2),
+                numeric_column(schema, child_tbl, "amount", 3, 10, 2),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_child.partition_of = Some(format!("{}.{}", schema, tbl));
+        from_child.partition_bound =
+            Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        from_child.hash();
+
+        // --- TO dump ---
+        let mut to_parent = Table::new(
+            schema.to_string(),
+            tbl.to_string(),
+            "pt_test".to_string(),
+            tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, tbl, "id", 1),
+                date_column(schema, tbl, "expense_date", 2),
+                numeric_column(schema, tbl, "amount", 3, 15, 4),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_parent.partition_key = Some("RANGE (expense_date)".to_string());
+        to_parent.hash();
+
+        let mut to_child = Table::new(
+            schema.to_string(),
+            child_tbl.to_string(),
+            "pt_test".to_string(),
+            child_tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, child_tbl, "id", 1),
+                date_column(schema, child_tbl, "expense_date", 2),
+                numeric_column(schema, child_tbl, "amount", 3, 15, 4),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_child.partition_of = Some(format!("{}.{}", schema, tbl));
+        to_child.partition_bound =
+            Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        to_child.hash();
+
+        let mut from_dump = Dump::new(DumpConfig::default());
+        from_dump.tables.push(from_parent);
+        from_dump.tables.push(from_child);
+
+        let mut to_dump = Dump::new(DumpConfig::default());
+        to_dump.tables.push(to_parent);
+        to_dump.tables.push(to_child);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        comparer.compare_tables().await.unwrap();
+        let script = comparer.get_script();
+
+        // Parent should get ALTER COLUMN
+        assert!(
+            script.contains("alter column"),
+            "Parent must get ALTER COLUMN for amount, got: {script}"
+        );
+        // Child should NOT be dropped
+        assert!(
+            !script.contains("drop table"),
+            "Partition child must not be dropped for non-partition-key column type change, got: {script}"
+        );
+        // Child should NOT be recreated
+        assert!(
+            !script.to_lowercase().contains(&format!(
+                "create table {}.{} partition of",
+                schema, child_tbl
+            )),
+            "Partition child must not be recreated, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "No data loss warning expected, got: {script}"
+        );
+    }
 }

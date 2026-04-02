@@ -1013,12 +1013,10 @@ impl Table {
 
                     let is_partition_child = self.partition_of.is_some();
                     let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
-                        let pk_norm: String = pk
-                            .chars()
-                            .filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '`'))
-                            .collect::<String>()
-                            .to_lowercase();
-                        pk_norm.contains(&new_col.name.to_lowercase())
+                        let col_lower = new_col.name.to_lowercase();
+                        pk.to_lowercase()
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .any(|token| token == col_lower)
                     });
 
                     if type_changed && (is_partition_child || in_partition_key) {
@@ -3205,6 +3203,185 @@ mod tests {
         assert!(
             script.contains("add constraint users_p1_local_chk"),
             "Local constraint must be emitted, got: {script}"
+        );
+    }
+
+    // --- Partition key substring false-positive regression ---
+    #[test]
+    fn test_partition_child_type_change_non_partition_key_col_skips_recreate() {
+        // Reproduces: parent partitioned by expense_date, child inherits.
+        // Changing `amount` numeric(10,2) → numeric(15,4) on the child must
+        // NOT trigger DROP+CREATE because `amount` is not in the partition key.
+        let mut col_amount_old = partition_child_column("amount", 3);
+        col_amount_old.data_type = "numeric".to_string();
+        col_amount_old.numeric_precision = Some(10);
+        col_amount_old.numeric_scale = Some(2);
+        col_amount_old.table = "s6_issue2_expenses_2024_01".to_string();
+
+        let mut col_amount_new = partition_child_column("amount", 3);
+        col_amount_new.data_type = "numeric".to_string();
+        col_amount_new.numeric_precision = Some(15);
+        col_amount_new.numeric_scale = Some(4);
+        col_amount_new.table = "s6_issue2_expenses_2024_01".to_string();
+
+        let mut from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "bigint"),
+                {
+                    let mut c = partition_child_column("expense_date", 2);
+                    c.data_type = "date".to_string();
+                    c.table = "s6_issue2_expenses_2024_01".to_string();
+                    c
+                },
+                col_amount_old,
+            ],
+            vec![],
+            vec![],
+        );
+        from.schema = "\"pt_test\"".to_string();
+        from.name = "\"s6_issue2_expenses_2024_01\"".to_string();
+        from.partition_of = Some("\"pt_test\".\"s6_issue2_expenses\"".to_string());
+        from.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        from.hash();
+
+        let mut to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "bigint"),
+                {
+                    let mut c = partition_child_column("expense_date", 2);
+                    c.data_type = "date".to_string();
+                    c.table = "s6_issue2_expenses_2024_01".to_string();
+                    c
+                },
+                col_amount_new,
+            ],
+            vec![],
+            vec![],
+        );
+        to.schema = "\"pt_test\"".to_string();
+        to.name = "\"s6_issue2_expenses_2024_01\"".to_string();
+        to.partition_of = Some("\"pt_test\".\"s6_issue2_expenses\"".to_string());
+        to.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        to.hash();
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop table"),
+            "Partition child must not be dropped when non-partition-key column type changes, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "No data loss warning expected for non-partition-key column, got: {script}"
+        );
+        assert!(
+            !script.contains("create table"),
+            "Partition child must not be recreated for inherited column type change, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_non_partition_key_column_type_change_uses_alter() {
+        // Partition key references "category_id" but we change column "id".
+        // The old substring check matched "id" inside "category_id" and
+        // incorrectly triggered DROP + CREATE.
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "bigint"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, true);
+        assert!(
+            !script.contains("drop table"),
+            "Non-partition-key column type change must not trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "Non-partition-key column type change must not warn about data loss, got: {script}"
+        );
+        assert!(
+            script.contains("alter"),
+            "Should produce an ALTER statement, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_key_column_type_change_still_triggers_recreate() {
+        // When the actual partition key column type changes, DROP + CREATE is correct.
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "bigint"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, true);
+        assert!(
+            script.contains("drop table"),
+            "Partition key column type change must trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            script.contains("Data loss"),
+            "Partition key column type change must warn about data loss, got: {script}"
         );
     }
 }
