@@ -2,6 +2,7 @@
 
                 Features:
                     - Explicit begin...commit in resulting diff file.
+                    - Explicit quoting has been replaced with quote_ident
                     - Support schema selection using SIMILAR TO instead of LIKE.
                     - Added --use-comments parameter with default value `true`.
 

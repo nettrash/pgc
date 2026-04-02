@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 // This is an information about a PostgreSQL sequence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sequence {
@@ -117,13 +113,7 @@ impl Sequence {
             self.owned_by_column.as_deref(),
         ) {
             (Some(schema), Some(table), Some(column)) => {
-                let quote_ident = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
-                Some(format!(
-                    "owned by {}.{}.{}",
-                    quote_ident(schema),
-                    quote_ident(table),
-                    quote_ident(column)
-                ))
+                Some(format!("owned by {}.{}.{}", schema, table, column))
             }
             _ => None,
         }
@@ -134,10 +124,7 @@ impl Sequence {
         let mut script = String::new();
 
         // CREATE SEQUENCE statement
-        script.push_str(&format!(
-            "create sequence \"{}\".\"{}\"",
-            self.schema, self.name
-        ));
+        script.push_str(&format!("create sequence {}.{}", self.schema, self.name));
 
         // Add AS clause for data type if not default
         if !self.data_type.is_empty() && self.data_type != "bigint" {
@@ -190,7 +177,7 @@ impl Sequence {
 
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
-                "comment on sequence \"{}\".\"{}\" is '{}';\n",
+                "comment on sequence {}.{} is '{}';\n",
                 self.schema,
                 self.name,
                 comment.replace('\'', "''")
@@ -201,10 +188,7 @@ impl Sequence {
     }
 
     pub fn get_drop_script(&self) -> String {
-        format!(
-            "drop sequence if exists \"{}\".\"{}\";\n",
-            self.schema, self.name
-        )
+        format!("drop sequence if exists {}.{};\n", self.schema, self.name)
     }
 
     pub fn get_alter_script(&self) -> String {
@@ -240,7 +224,7 @@ impl Sequence {
             clauses.push(owned_by);
         }
 
-        let mut script = format!("alter sequence \"{}\".\"{}\"", self.schema, self.name);
+        let mut script = format!("alter sequence {}.{}", self.schema, self.name);
         if !clauses.is_empty() {
             script.push(' ');
             script.push_str(&clauses.join(" "));
@@ -251,7 +235,7 @@ impl Sequence {
 
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
-                "comment on sequence \"{}\".\"{}\" is '{}';\n",
+                "comment on sequence {}.{} is '{}';\n",
                 self.schema,
                 self.name,
                 comment.replace('\'', "''")
@@ -267,10 +251,8 @@ impl Sequence {
         }
 
         format!(
-            "alter sequence \"{}\".\"{}\" owner to {};\n",
-            self.schema,
-            self.name,
-            quote_ident(&self.owner)
+            "alter sequence {}.{} owner to {};\n",
+            self.schema, self.name, self.owner
         )
     }
 }
@@ -328,7 +310,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\nalter sequence \"public\".\"order_id_seq\" owner to \"postgres\";\n",
+            "create sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\nalter sequence public.order_id_seq owner to postgres;\n",
         );
     }
 
@@ -353,7 +335,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_script(),
-            "create sequence \"public\".\"minimal_seq\" no minvalue no maxvalue no cycle;\nalter sequence \"public\".\"minimal_seq\" owner to \"postgres\";\n",
+            "create sequence public.minimal_seq no minvalue no maxvalue no cycle;\nalter sequence public.minimal_seq owner to postgres;\n",
         );
     }
 
@@ -362,7 +344,7 @@ mod tests {
         let sequence = build_sequence();
         assert_eq!(
             sequence.get_drop_script(),
-            "drop sequence if exists \"public\".\"order_id_seq\";\n"
+            "drop sequence if exists public.order_id_seq;\n"
         );
     }
 
@@ -372,7 +354,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence \"public\".\"order_id_seq\" start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by \"public\".\"orders\".\"id\";\nalter sequence \"public\".\"order_id_seq\" owner to \"postgres\";\n",
+            "alter sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by public.orders.id;\nalter sequence public.order_id_seq owner to postgres;\n",
         );
     }
 
@@ -390,14 +372,14 @@ mod tests {
             false,
             None,
             None,
-            Some("my\"schema".to_string()),
-            Some("my.table".to_string()),
-            Some("\"column\"".to_string()),
+            Some("\"my\"\"schema\"".to_string()),
+            Some("\"my.table\"".to_string()),
+            Some("column".to_string()),
         );
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence \"audit\".\"event_seq\" start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".\"\"\"column\"\"\";\nalter sequence \"audit\".\"event_seq\" owner to \"postgres\";\n",
+            "alter sequence audit.event_seq start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".column;\nalter sequence audit.event_seq owner to postgres;\n",
         );
     }
 }
