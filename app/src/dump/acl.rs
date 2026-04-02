@@ -5,11 +5,19 @@
 ///   r = SELECT, a = INSERT, w = UPDATE, d = DELETE, D = TRUNCATE,
 ///   x = REFERENCES, t = TRIGGER, X = EXECUTE, U = USAGE, C = CREATE,
 ///   c = CONNECT, T = TEMPORARY
+/// A `*` after a privilege character indicates WITH GRANT OPTION.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AclEntry {
     pub grantee: String,
     pub privileges: String,
     pub grantor: String,
+}
+
+/// A single privilege with its grant-option flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrivilegeItem {
+    name: String,
+    grant_option: bool,
 }
 
 impl AclEntry {
@@ -33,30 +41,28 @@ impl AclEntry {
         })
     }
 
-    /// Returns the SQL object type keyword for GRANT/REVOKE based on the privilege characters.
-    fn privilege_descriptions(privs: &str, object_kind: &str) -> Vec<String> {
-        let mut result = Vec::new();
-        for ch in privs.chars() {
-            let desc = match ch {
-                'r' => "SELECT",
-                'a' => "INSERT",
-                'w' => "UPDATE",
-                'd' => "DELETE",
-                'D' => "TRUNCATE",
-                'x' => "REFERENCES",
-                't' => "TRIGGER",
-                'X' => "EXECUTE",
-                'U' => "USAGE",
-                'C' => "CREATE",
-                'c' => "CONNECT",
-                'T' => "TEMPORARY",
-                '*' => continue, // grant option marker, skip
-                _ => continue,
-            };
-            result.push(desc.to_string());
+    /// Map a single privilege character to its SQL keyword.
+    fn priv_char_to_name(ch: char) -> Option<&'static str> {
+        match ch {
+            'r' => Some("SELECT"),
+            'a' => Some("INSERT"),
+            'w' => Some("UPDATE"),
+            'd' => Some("DELETE"),
+            'D' => Some("TRUNCATE"),
+            'x' => Some("REFERENCES"),
+            't' => Some("TRIGGER"),
+            'X' => Some("EXECUTE"),
+            'U' => Some("USAGE"),
+            'C' => Some("CREATE"),
+            'c' => Some("CONNECT"),
+            'T' => Some("TEMPORARY"),
+            _ => None,
         }
-        // Filter to only valid privileges for this object kind
-        let valid: &[&str] = match object_kind {
+    }
+
+    /// Valid privilege names for a given object kind.
+    fn valid_privileges(object_kind: &str) -> &'static [&'static str] {
+        match object_kind {
             "TABLE" => &[
                 "SELECT",
                 "INSERT",
@@ -70,8 +76,31 @@ impl AclEntry {
             "FUNCTION" | "PROCEDURE" => &["EXECUTE"],
             "SCHEMA" => &["USAGE", "CREATE"],
             _ => &[],
-        };
-        result.retain(|p| valid.contains(&p.as_str()));
+        }
+    }
+
+    /// Parse privilege string into items, each with a grant-option flag.
+    /// E.g. `"r*wad"` → SELECT(grant_option), UPDATE, INSERT, DELETE.
+    fn parse_privileges(privs: &str, object_kind: &str) -> Vec<PrivilegeItem> {
+        let valid = Self::valid_privileges(object_kind);
+        let chars: Vec<char> = privs.chars().collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if let Some(name) = Self::priv_char_to_name(chars[i]) {
+                let grant_option = i + 1 < chars.len() && chars[i + 1] == '*';
+                if grant_option {
+                    i += 1; // skip the '*'
+                }
+                if valid.contains(&name) {
+                    result.push(PrivilegeItem {
+                        name: name.to_string(),
+                        grant_option,
+                    });
+                }
+            }
+            i += 1;
+        }
         result
     }
 
@@ -83,50 +112,97 @@ impl AclEntry {
         }
     }
 
-    /// Generate GRANT statement for this ACL entry on the given object.
+    /// Generate GRANT statement(s) for this ACL entry on the given object.
+    /// Privileges with and without GRANT OPTION are emitted as separate statements.
     pub fn get_grant_script(acl_item: &str, object_kind: &str, object_name: &str) -> String {
         let entry = match AclEntry::parse(acl_item) {
             Some(e) => e,
             None => return String::new(),
         };
-        let privs = Self::privilege_descriptions(&entry.privileges, object_kind);
-        if privs.is_empty() {
+        let items = Self::parse_privileges(&entry.privileges, object_kind);
+        if items.is_empty() {
             return String::new();
         }
-        let on_keyword = match object_kind {
-            "FUNCTION" | "PROCEDURE" => object_kind.to_string(),
-            _ => object_kind.to_string(),
-        };
-        format!(
-            "GRANT {} ON {} {} TO {};\n",
-            privs.join(", "),
-            on_keyword,
-            object_name,
-            Self::format_grantee(&entry.grantee)
-        )
+        let grantee = Self::format_grantee(&entry.grantee);
+        let mut script = String::new();
+
+        // Collect privileges without grant option
+        let plain: Vec<&str> = items
+            .iter()
+            .filter(|p| !p.grant_option)
+            .map(|p| p.name.as_str())
+            .collect();
+        if !plain.is_empty() {
+            script.push_str(&format!(
+                "GRANT {} ON {} {} TO {};\n",
+                plain.join(", "),
+                object_kind,
+                object_name,
+                grantee
+            ));
+        }
+
+        // Collect privileges with grant option
+        let with_go: Vec<&str> = items
+            .iter()
+            .filter(|p| p.grant_option)
+            .map(|p| p.name.as_str())
+            .collect();
+        if !with_go.is_empty() {
+            script.push_str(&format!(
+                "GRANT {} ON {} {} TO {} WITH GRANT OPTION;\n",
+                with_go.join(", "),
+                object_kind,
+                object_name,
+                grantee
+            ));
+        }
+
+        script
     }
 
-    /// Generate REVOKE statement for this ACL entry on the given object.
+    /// Generate REVOKE statement(s) for this ACL entry on the given object.
+    /// When revoking privileges that had GRANT OPTION, emits REVOKE GRANT OPTION FOR first,
+    /// then REVOKE for the privilege itself along with plain privileges.
     pub fn get_revoke_script(acl_item: &str, object_kind: &str, object_name: &str) -> String {
         let entry = match AclEntry::parse(acl_item) {
             Some(e) => e,
             None => return String::new(),
         };
-        let privs = Self::privilege_descriptions(&entry.privileges, object_kind);
-        if privs.is_empty() {
+        let items = Self::parse_privileges(&entry.privileges, object_kind);
+        if items.is_empty() {
             return String::new();
         }
-        let on_keyword = match object_kind {
-            "FUNCTION" | "PROCEDURE" => object_kind.to_string(),
-            _ => object_kind.to_string(),
-        };
-        format!(
+        let grantee = Self::format_grantee(&entry.grantee);
+        let mut script = String::new();
+
+        // For grant-option privileges, first revoke the grant option
+        let with_go: Vec<&str> = items
+            .iter()
+            .filter(|p| p.grant_option)
+            .map(|p| p.name.as_str())
+            .collect();
+        if !with_go.is_empty() {
+            script.push_str(&format!(
+                "REVOKE GRANT OPTION FOR {} ON {} {} FROM {};\n",
+                with_go.join(", "),
+                object_kind,
+                object_name,
+                grantee
+            ));
+        }
+
+        // Revoke all privileges (both plain and grant-option ones)
+        let all: Vec<&str> = items.iter().map(|p| p.name.as_str()).collect();
+        script.push_str(&format!(
             "REVOKE {} ON {} {} FROM {};\n",
-            privs.join(", "),
-            on_keyword,
+            all.join(", "),
+            object_kind,
             object_name,
-            Self::format_grantee(&entry.grantee)
-        )
+            grantee
+        ));
+
+        script
     }
 }
 
@@ -135,24 +211,28 @@ impl AclEntry {
 /// Returns `(grants_to_add, grants_to_revoke)` where each is a list of raw ACL item strings.
 /// `grants_to_revoke` is empty when not in full mode.
 pub fn diff_acls(from_acl: &[String], to_acl: &[String], full: bool) -> (Vec<String>, Vec<String>) {
-    let mut to_add = Vec::new();
-    let mut to_revoke = Vec::new();
+    use std::collections::HashSet;
+
+    let from_set: HashSet<&str> = from_acl.iter().map(|s| s.as_str()).collect();
+    let to_set: HashSet<&str> = to_acl.iter().map(|s| s.as_str()).collect();
 
     // ACL items to add: present in "to" but not in "from"
-    for item in to_acl {
-        if !from_acl.contains(item) {
-            to_add.push(item.clone());
-        }
-    }
+    let to_add: Vec<String> = to_acl
+        .iter()
+        .filter(|item| !from_set.contains(item.as_str()))
+        .cloned()
+        .collect();
 
     // ACL items to revoke (only in full mode): present in "from" but not in "to"
-    if full {
-        for item in from_acl {
-            if !to_acl.contains(item) {
-                to_revoke.push(item.clone());
-            }
-        }
-    }
+    let to_revoke: Vec<String> = if full {
+        from_acl
+            .iter()
+            .filter(|item| !to_set.contains(item.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     (to_add, to_revoke)
 }
@@ -227,12 +307,49 @@ mod tests {
     }
 
     #[test]
+    fn test_grant_script_with_grant_option() {
+        let script = AclEntry::get_grant_script("myuser=r*w/owner", "TABLE", "public.my_table");
+        assert_eq!(
+            script,
+            "GRANT UPDATE ON TABLE public.my_table TO myuser;\nGRANT SELECT ON TABLE public.my_table TO myuser WITH GRANT OPTION;\n"
+        );
+    }
+
+    #[test]
+    fn test_grant_script_all_grant_option() {
+        let script = AclEntry::get_grant_script("myuser=r*w*/owner", "TABLE", "public.my_table");
+        assert_eq!(
+            script,
+            "GRANT SELECT, UPDATE ON TABLE public.my_table TO myuser WITH GRANT OPTION;\n"
+        );
+    }
+
+    #[test]
     fn test_revoke_script() {
         let script = AclEntry::get_revoke_script("myuser=r/owner", "TABLE", "public.my_table");
         assert_eq!(
             script,
             "REVOKE SELECT ON TABLE public.my_table FROM myuser;\n"
         );
+    }
+
+    #[test]
+    fn test_revoke_script_with_grant_option() {
+        let script = AclEntry::get_revoke_script("myuser=r*w/owner", "TABLE", "public.my_table");
+        assert_eq!(
+            script,
+            "REVOKE GRANT OPTION FOR SELECT ON TABLE public.my_table FROM myuser;\nREVOKE SELECT, UPDATE ON TABLE public.my_table FROM myuser;\n"
+        );
+    }
+
+    #[test]
+    fn test_diff_acls_grant_option_change() {
+        // FROM: plain SELECT; TO: SELECT with grant option
+        let from = vec!["user1=r/owner".to_string()];
+        let to = vec!["user1=r*/owner".to_string()];
+        let (add, revoke) = diff_acls(&from, &to, true);
+        assert_eq!(add, vec!["user1=r*/owner"]);
+        assert_eq!(revoke, vec!["user1=r/owner"]);
     }
 
     #[test]
@@ -251,5 +368,26 @@ mod tests {
         let (add, revoke) = diff_acls(&from, &to, true);
         assert_eq!(add, vec!["user2=rw/owner"]);
         assert_eq!(revoke, vec!["user3=d/owner"]);
+    }
+
+    #[test]
+    fn test_parse_privileges_mixed() {
+        let items = AclEntry::parse_privileges("r*wadD", "TABLE");
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].name, "SELECT");
+        assert!(items[0].grant_option);
+        assert_eq!(items[1].name, "UPDATE");
+        assert!(!items[1].grant_option);
+        assert_eq!(items[2].name, "INSERT");
+        assert!(!items[2].grant_option);
+    }
+
+    #[test]
+    fn test_public_grant_with_grant_option() {
+        let script = AclEntry::get_grant_script("=r*/owner", "TABLE", "public.t");
+        assert_eq!(
+            script,
+            "GRANT SELECT ON TABLE public.t TO PUBLIC WITH GRANT OPTION;\n"
+        );
     }
 }

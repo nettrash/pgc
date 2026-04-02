@@ -5124,4 +5124,438 @@ mod tests {
             "No data loss warning expected, got: {script}"
         );
     }
+
+    // =========================================================================
+    // compare_grants tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn compare_grants_ignore_mode_produces_no_output() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("public".to_string(), "public".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string()];
+        let mut to_schema = Schema::new("public".to_string(), "public".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("GRANT"),
+            "Ignore mode must not emit GRANT, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "Ignore mode must not emit REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_addonly_adds_missing_schema_grant() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE, CREATE ON SCHEMA myschema TO writer;"),
+            "AddOnly must add missing grant, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not emit REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_addonly_does_not_revoke_removed_grant() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_full_revokes_removed_schema_grant() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE USAGE, CREATE ON SCHEMA myschema FROM writer;"),
+            "Full mode must revoke removed grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_full_table_add_and_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["reader=r/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["writer=rw/owner".to_string()];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT, UPDATE ON TABLE public.users TO writer;"),
+            "Full must add new grant, got: {script}"
+        );
+        assert!(
+            script.contains("REVOKE SELECT ON TABLE public.users FROM reader;"),
+            "Full must revoke removed grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_sequence() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_seq = Sequence::new(
+            "public".to_string(),
+            "my_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec![];
+
+        let mut to_seq = Sequence::new(
+            "public".to_string(),
+            "my_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE ON SEQUENCE public.my_seq TO reader;"),
+            "Must add sequence grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_view() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["reader=r/owner".to_string()];
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["reader=r/owner".to_string(), "writer=rw/owner".to_string()];
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT, UPDATE ON TABLE public.my_view TO writer;"),
+            "Must add view grant, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "No revoke expected when unchanged grant remains, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_routine_function() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "my_func".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.acl = vec![];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "my_func".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.acl = vec!["app=X/owner".to_string()];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT EXECUTE ON FUNCTION public.my_func() TO app;"),
+            "Must add function grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_routine_procedure() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "my_proc".to_string(),
+            "plpgsql".to_string(),
+            "procedure".to_string(),
+            "void".to_string(),
+            "days integer".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.acl = vec!["app=X/owner".to_string()];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "my_proc".to_string(),
+            "plpgsql".to_string(),
+            "procedure".to_string(),
+            "void".to_string(),
+            "days integer".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.acl = vec![];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE EXECUTE ON PROCEDURE public.my_proc(days integer) FROM app;"),
+            "Full must revoke removed procedure grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_with_grant_option() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U*/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE ON SCHEMA myschema TO reader WITH GRANT OPTION;"),
+            "Must add grant with grant option, got: {script}"
+        );
+        assert!(
+            script.contains("REVOKE USAGE ON SCHEMA myschema FROM reader;"),
+            "Must revoke old plain grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_no_comments_mode() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec![];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE ON SCHEMA myschema TO reader;"),
+            "Grant must still be emitted, got: {script}"
+        );
+        assert!(
+            !script.contains("/* Grants for schema"),
+            "Comments must be suppressed, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_new_object_no_from_acl() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Table exists only in TO
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "new_tbl".to_string(),
+            "public".to_string(),
+            "new_tbl".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["reader=r/owner".to_string()];
+
+        to_dump.tables.push(to_table);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT ON TABLE public.new_tbl TO reader;"),
+            "Must grant on new object with empty FROM acl, got: {script}"
+        );
+    }
 }
