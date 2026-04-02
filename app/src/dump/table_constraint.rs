@@ -102,37 +102,37 @@ impl TableConstraint {
 
     /// Lowercases a SQL expression while preserving the original case of text
     /// inside single-quoted string literals.  Handles the standard `''` escape
-    /// for embedded quotes.
+    /// for embedded quotes.  Iterates by `char` so multi-byte UTF-8 sequences
+    /// are never split.
     fn lowercase_outside_literals(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let len = bytes.len();
-        let mut out = String::with_capacity(len);
-        let mut i = 0;
-        while i < len {
-            if bytes[i] == b'\'' {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
                 // Inside a single-quoted literal — copy verbatim.
                 out.push('\'');
-                i += 1;
-                while i < len {
-                    if bytes[i] == b'\'' {
-                        out.push('\'');
-                        i += 1;
-                        if i < len && bytes[i] == b'\'' {
-                            // Doubled-quote escape — copy the second quote.
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
                             out.push('\'');
-                            i += 1;
-                        } else {
-                            break; // closing quote
+                            // Doubled-quote escape — copy the second quote
+                            // and stay inside the literal.
+                            if chars.as_str().starts_with('\'') {
+                                out.push('\'');
+                                chars.next();
+                            } else {
+                                break; // closing quote
+                            }
                         }
-                    } else {
-                        out.push(bytes[i] as char);
-                        i += 1;
+                        Some(ch) => out.push(ch),
+                        None => break, // unterminated literal
                     }
                 }
             } else {
-                // Outside a literal — lowercase.
-                out.push((bytes[i] as char).to_ascii_lowercase());
-                i += 1;
+                // Outside a literal — lowercase only ASCII letters.
+                for lc in c.to_lowercase() {
+                    out.push(lc);
+                }
             }
         }
         out
@@ -1150,6 +1150,44 @@ mod tests {
         assert_eq!(
             format!("{:x}", hasher_a.finalize()),
             format!("{:x}", hasher_b.finalize()),
+        );
+    }
+
+    // --- Unicode correctness ---
+
+    #[test]
+    fn test_lowercase_outside_literals_unicode_outside() {
+        // Non-ASCII identifier outside a literal must be lowercased properly.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (MÜLLER > 0)"),
+            "check (müller > 0)"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_unicode_inside_literal() {
+        // Non-ASCII characters inside a literal must be preserved verbatim.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (name = 'Ñoño')"),
+            "check (name = 'Ñoño')"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_multibyte_mixed() {
+        // Mix of multi-byte chars inside and outside literals.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (ГОРОД = 'Москва')"),
+            "check (город = 'Москва')"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_emoji_in_literal() {
+        // 4-byte UTF-8 sequences (emoji) inside a literal must survive.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (label = '🚀Launch')"),
+            "check (label = '🚀Launch')"
         );
     }
 }
