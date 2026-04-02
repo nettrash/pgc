@@ -2176,17 +2176,55 @@ impl Comparer {
 
         let full = self.grants_mode == GrantsMode::Full;
 
+        // Build O(1) lookup maps from the "from" dump
+        let from_schema_acl: HashMap<&str, &[String]> = self
+            .from
+            .schemas
+            .iter()
+            .map(|s| (s.name.as_str(), s.acl.as_slice()))
+            .collect();
+
+        let from_table_acl: HashMap<(&str, &str), &[String]> = self
+            .from
+            .tables
+            .iter()
+            .map(|t| ((t.schema.as_str(), t.name.as_str()), t.acl.as_slice()))
+            .collect();
+
+        let from_seq_acl: HashMap<(&str, &str), &[String]> = self
+            .from
+            .sequences
+            .iter()
+            .map(|s| ((s.schema.as_str(), s.name.as_str()), s.acl.as_slice()))
+            .collect();
+
+        let from_view_acl: HashMap<(&str, &str), &[String]> = self
+            .from
+            .views
+            .iter()
+            .map(|v| ((v.schema.as_str(), v.name.as_str()), v.acl.as_slice()))
+            .collect();
+
+        let from_routine_acl: HashMap<(&str, &str, &str), &[String]> = self
+            .from
+            .routines
+            .iter()
+            .map(|r| {
+                (
+                    (r.schema.as_str(), r.name.as_str(), r.arguments.as_str()),
+                    r.acl.as_slice(),
+                )
+            })
+            .collect();
+
         self.script
             .push_str("\n/* ---> Grants: Start section --------------- */\n\n");
 
         // --- Schemas ---
         for schema in &self.to.schemas {
-            let from_acl = self
-                .from
-                .schemas
-                .iter()
-                .find(|s| s.name == schema.name)
-                .map(|s| s.acl.as_slice())
+            let from_acl = from_schema_acl
+                .get(schema.name.as_str())
+                .copied()
                 .unwrap_or(&[]);
             let grants_script =
                 acl::generate_grants_script(from_acl, &schema.acl, full, "SCHEMA", &schema.name);
@@ -2201,12 +2239,9 @@ impl Comparer {
 
         // --- Tables ---
         for table in &self.to.tables {
-            let from_acl = self
-                .from
-                .tables
-                .iter()
-                .find(|t| t.schema == table.schema && t.name == table.name)
-                .map(|t| t.acl.as_slice())
+            let from_acl = from_table_acl
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .copied()
                 .unwrap_or(&[]);
             let object_name = format!("{}.{}", table.schema, table.name);
             let grants_script =
@@ -2222,12 +2257,9 @@ impl Comparer {
 
         // --- Sequences ---
         for seq in &self.to.sequences {
-            let from_acl = self
-                .from
-                .sequences
-                .iter()
-                .find(|s| s.schema == seq.schema && s.name == seq.name)
-                .map(|s| s.acl.as_slice())
+            let from_acl = from_seq_acl
+                .get(&(seq.schema.as_str(), seq.name.as_str()))
+                .copied()
                 .unwrap_or(&[]);
             let object_name = format!("{}.{}", seq.schema, seq.name);
             let grants_script =
@@ -2243,12 +2275,9 @@ impl Comparer {
 
         // --- Views ---
         for view in &self.to.views {
-            let from_acl = self
-                .from
-                .views
-                .iter()
-                .find(|v| v.schema == view.schema && v.name == view.name)
-                .map(|v| v.acl.as_slice())
+            let from_acl = from_view_acl
+                .get(&(view.schema.as_str(), view.name.as_str()))
+                .copied()
                 .unwrap_or(&[]);
             let object_name = format!("{}.{}", view.schema, view.name);
             let grants_script =
@@ -2264,16 +2293,13 @@ impl Comparer {
 
         // --- Routines ---
         for routine in &self.to.routines {
-            let from_acl = self
-                .from
-                .routines
-                .iter()
-                .find(|r| {
-                    r.schema == routine.schema
-                        && r.name == routine.name
-                        && r.arguments == routine.arguments
-                })
-                .map(|r| r.acl.as_slice())
+            let from_acl = from_routine_acl
+                .get(&(
+                    routine.schema.as_str(),
+                    routine.name.as_str(),
+                    routine.arguments.as_str(),
+                ))
+                .copied()
                 .unwrap_or(&[]);
             let object_kind = match routine.kind.as_str() {
                 "procedure" => "PROCEDURE",
