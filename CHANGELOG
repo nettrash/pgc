@@ -9,7 +9,7 @@
                     - Fixed incorrect detection of partition key column during type change.
                     - Support GRANTS management with different behaviors.
                     - Improved speed of execution.
-                    - Add time of execution to output in seconds.
+                    - Added execution time to output in seconds.
 
 2026-03-27      v1.0.9
 
