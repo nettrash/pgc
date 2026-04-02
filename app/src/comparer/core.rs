@@ -172,12 +172,9 @@ impl Comparer {
             return;
         }
 
-        if let Some(from_routine) = self
-            .from
-            .routines
-            .iter()
-            .find(|r| r.name == routine.name && r.schema == routine.schema)
-        {
+        if let Some(from_routine) = self.from.routines.iter().find(|r| {
+            r.name == routine.name && r.schema == routine.schema && r.arguments == routine.arguments
+        }) {
             if from_routine.hash.is_none() {
                 self.script.push_str(
                     format!(
@@ -1265,11 +1262,9 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self
-                    .to
-                    .routines
-                    .iter()
-                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+                !self.to.routines.iter().any(|tr| {
+                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
+                })
             })
             .cloned()
             .collect();
@@ -1903,11 +1898,9 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self
-                    .to
-                    .routines
-                    .iter()
-                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+                !self.to.routines.iter().any(|tr| {
+                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
+                })
             })
             .cloned()
             .collect();
@@ -1974,11 +1967,11 @@ impl Comparer {
             if routine.hash.is_none() {
                 continue;
             }
-            let from_routine = self
-                .from
-                .routines
-                .iter()
-                .find(|r| r.name == routine.name && r.schema == routine.schema);
+            let from_routine = self.from.routines.iter().find(|r| {
+                r.name == routine.name
+                    && r.schema == routine.schema
+                    && r.arguments == routine.arguments
+            });
             let needs_action = match from_routine {
                 None => true,
                 Some(fr) => fr.hash.is_some() && Self::hashes_differ(&fr.hash, &routine.hash),
