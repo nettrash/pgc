@@ -366,7 +366,8 @@ impl Table {
                 END AS constraint_type,
                 c.condeferrable AS is_deferrable,
                 c.condeferred AS initially_deferred,
-                pg_get_constraintdef(c.oid, true) AS definition
+                pg_get_constraintdef(c.oid, true) AS definition,
+                c.coninhcount
             FROM
                 pg_constraint c
                 JOIN pg_class t ON t.oid = c.conrelid
@@ -397,6 +398,7 @@ impl Table {
                 is_deferrable: row.get("is_deferrable"),
                 initially_deferred: row.get("initially_deferred"),
                 definition: row.get("definition"),
+                coninhcount: row.get("coninhcount"),
             });
         }
 
@@ -1067,8 +1069,10 @@ impl Table {
         // Collect constraint changes; drop statements run before column drops
         for new_constraint in &to_table.constraints {
             let is_fk = new_constraint.constraint_type.to_lowercase() == "foreign key";
-            // Skip non-FK constraints for partition children (inherited from parent).
-            if is_target_partition && !is_fk {
+            // Skip inherited non-FK constraints for partition children;
+            // these are managed by the parent table.  Truly-local partition
+            // constraints (coninhcount == 0) are still diffed.
+            if is_target_partition && !is_fk && new_constraint.coninhcount > 0 {
                 continue;
             }
             if let Some(old_constraint) = self
@@ -1105,11 +1109,13 @@ impl Table {
         }
 
         for old_constraint in &self.constraints {
-            // Skip non-FK constraint drops for partition children (inherited from parent).
+            // Skip inherited non-FK constraint drops for partition children;
+            // these are managed by the parent table.
             if is_target_partition
                 && !old_constraint
                     .constraint_type
                     .eq_ignore_ascii_case("foreign key")
+                && old_constraint.coninhcount > 0
             {
                 continue;
             }
@@ -1446,6 +1452,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -1459,6 +1466,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some(definition.to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -1472,6 +1480,7 @@ mod tests {
             is_deferrable,
             initially_deferred,
             definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -1485,6 +1494,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some(definition.to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -1920,6 +1930,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some(definition.to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -2650,6 +2661,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: definition.map(|d| d.to_string()),
+            coninhcount: 1,
         }
     }
 
@@ -2903,6 +2915,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
+            coninhcount: 0,
         };
         let to = partition_child_table(
             vec![partition_child_identity_column("id", 1, "integer")],
@@ -3048,6 +3061,150 @@ mod tests {
         assert!(
             !script.contains("drop constraint"),
             "DROP CONSTRAINT must not appear, got: {script}"
+        );
+    }
+
+    // Helper: local partition constraint (coninhcount = 0)
+    fn partition_child_local_constraint(
+        name: &str,
+        constraint_type: &str,
+        definition: Option<&str>,
+    ) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: name.to_string(),
+            table_name: "users_p1".to_string(),
+            constraint_type: constraint_type.to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: definition.map(|d| d.to_string()),
+            coninhcount: 0,
+        }
+    }
+
+    // --- Partition child: local (non-inherited) constraint add IS emitted ---
+    #[test]
+    fn test_partition_child_emits_add_local_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 0)"),
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("add constraint users_p1_local_chk"),
+            "Local CHECK constraint must be emitted for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: local constraint drop IS emitted ---
+    #[test]
+    fn test_partition_child_emits_drop_local_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 0)"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("drop constraint users_p1_local_chk"),
+            "Local CHECK constraint drop must be emitted for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: local constraint modification IS emitted ---
+    #[test]
+    fn test_partition_child_emits_alter_local_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 0)"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 100)"),
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("drop constraint users_p1_local_chk"),
+            "Local CHECK modification must emit drop, got: {script}"
+        );
+        assert!(
+            script.contains("add constraint users_p1_local_chk"),
+            "Local CHECK modification must emit add, got: {script}"
+        );
+    }
+
+    // --- Partition child: inherited constraint skipped, local constraint emitted in same table ---
+    #[test]
+    fn test_partition_child_mixed_inherited_and_local_constraints() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_constraint(
+                "users_p1_name_check",
+                "CHECK",
+                Some("CHECK (name <> '')"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![
+                partition_child_constraint(
+                    "users_p1_name_check",
+                    "CHECK",
+                    Some("CHECK (char_length(name) > 0)"),
+                ),
+                partition_child_local_constraint(
+                    "users_p1_local_chk",
+                    "CHECK",
+                    Some("CHECK (id > 0)"),
+                ),
+            ],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        // Inherited constraint change should be suppressed
+        assert!(
+            !script.contains("users_p1_name_check"),
+            "Inherited constraint must be suppressed, got: {script}"
+        );
+        // Local constraint addition should be emitted
+        assert!(
+            script.contains("add constraint users_p1_local_chk"),
+            "Local constraint must be emitted, got: {script}"
         );
     }
 }

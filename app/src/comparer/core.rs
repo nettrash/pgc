@@ -3539,6 +3539,7 @@ mod tests {
                 definition: Some(
                     "FOREIGN KEY (parent_id) REFERENCES public.parent(id)".to_string(),
                 ),
+                coninhcount: 0,
             }],
             vec![],
             vec![],
