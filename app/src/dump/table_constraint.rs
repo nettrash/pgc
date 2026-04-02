@@ -12,6 +12,8 @@ pub struct TableConstraint {
     pub is_deferrable: bool,     // Whether the constraint is deferrable
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
+    #[serde(default)]
+    pub coninhcount: i16, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
 }
 
 impl TableConstraint {
@@ -24,7 +26,7 @@ impl TableConstraint {
         hasher.update(self.is_deferrable.to_string().as_bytes());
         hasher.update(self.initially_deferred.to_string().as_bytes());
         if let Some(definition) = &self.definition {
-            hasher.update(definition.as_bytes());
+            hasher.update(Self::normalize_definition(definition).as_bytes());
         }
     }
 
@@ -33,14 +35,16 @@ impl TableConstraint {
     pub fn get_script(&self) -> String {
         let mut script = String::new();
         script.push_str(&format!(
-            "alter table \"{}\".\"{}\" add constraint \"{}\" ",
+            "alter table {}.{} add constraint {} ",
             self.schema, self.table_name, self.name
         ));
 
-        // If a definition is provided, start from that (lowercased) and optionally append flags.
+        // If a definition is provided, lowercase only the SQL keywords/identifiers,
+        // preserving the original case of string literal contents so that round-tripping
+        // through PGC does not produce a spurious diff.
         // Otherwise, build from constraint_type and attribute flags.
         let clause = if let Some(def) = &self.definition {
-            let mut base = def.to_lowercase();
+            let mut base = Self::lowercase_outside_literals(def);
             // Append deferrable flags for foreign key or unique if flags set
             if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
                 || self.constraint_type.eq_ignore_ascii_case("UNIQUE")
@@ -78,6 +82,116 @@ impl TableConstraint {
         script
     }
 
+    /// Normalizes a constraint definition for comparison purposes.
+    ///
+    /// `pg_get_constraintdef()` may produce two semantically identical but
+    /// textually different representations for CHECK constraints that use
+    /// `IN (...)` / `ANY (ARRAY[...])`:
+    ///
+    ///   Form A (array-level cast):   `ARRAY['v'::character varying, ...]::text[]`
+    ///   Form B (element-level cast):  `ARRAY['v'::character varying::text, ...]`
+    ///
+    /// Which form is returned depends on how the constraint was originally
+    /// created (e.g. via `IN(...)` in DDL versus applying a migration that
+    /// reuses Form A verbatim).  Normalize by lowercasing outside literals
+    /// and collapsing the redundant `::text` casts so both forms compare equal.
+    ///
+    /// Both the lowercasing and the cast replacements are applied only to
+    /// text **outside** single-quoted string literals, so literal contents
+    /// like `']::text[]'` are never altered.
+    fn normalize_definition(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        // Accumulates non-literal text so we can apply replacements on it
+        // in one go before flushing.
+        let mut buf = String::new();
+
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                // Flush the non-literal buffer (lowercased + cast-normalized).
+                Self::flush_outside_buf(&mut buf, &mut out);
+
+                // Inside a single-quoted literal — copy verbatim.
+                out.push('\'');
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            out.push('\'');
+                            if chars.as_str().starts_with('\'') {
+                                out.push('\'');
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(ch) => out.push(ch),
+                        None => break,
+                    }
+                }
+            } else {
+                // Outside a literal — collect into buf for batch processing.
+                for lc in c.to_lowercase() {
+                    buf.push(lc);
+                }
+            }
+        }
+
+        // Flush any remaining non-literal text.
+        Self::flush_outside_buf(&mut buf, &mut out);
+        out
+    }
+
+    /// Applies cast-normalization replacements to `buf` (which contains only
+    /// non-literal text), appends the result to `out`, and clears `buf`.
+    fn flush_outside_buf(buf: &mut String, out: &mut String) {
+        if buf.is_empty() {
+            return;
+        }
+        let normalized = buf
+            .replace("::character varying::text", "::character varying")
+            .replace("]::text[]", "]");
+        out.push_str(&normalized);
+        buf.clear();
+    }
+
+    /// Lowercases a SQL expression while preserving the original case of text
+    /// inside single-quoted string literals.  Handles the standard `''` escape
+    /// for embedded quotes.  Iterates by `char` so multi-byte UTF-8 sequences
+    /// are never split.
+    fn lowercase_outside_literals(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                // Inside a single-quoted literal — copy verbatim.
+                out.push('\'');
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            out.push('\'');
+                            // Doubled-quote escape — copy the second quote
+                            // and stay inside the literal.
+                            if chars.as_str().starts_with('\'') {
+                                out.push('\'');
+                                chars.next();
+                            } else {
+                                break; // closing quote
+                            }
+                        }
+                        Some(ch) => out.push(ch),
+                        None => break, // unterminated literal
+                    }
+                }
+            } else {
+                // Outside a literal — apply full Unicode lowercasing.
+                for lc in c.to_lowercase() {
+                    out.push(lc);
+                }
+            }
+        }
+        out
+    }
+
     /// Get alter script to change this constraint to match the target constraint
     /// Returns None if the constraint needs to be dropped and recreated
     pub fn get_alter_script(&self, target: &TableConstraint) -> Option<String> {
@@ -96,18 +210,18 @@ impl TableConstraint {
                 if target.is_deferrable {
                     if target.initially_deferred {
                         script.push_str(&format!(
-                            "alter table \"{}\".\"{}\" alter constraint \"{}\" deferrable initially deferred;\n",
+                            "alter table {}.{} alter constraint {} deferrable initially deferred;\n",
                             self.schema, self.table_name, target.name
                         ));
                     } else {
                         script.push_str(&format!(
-                            "alter table \"{}\".\"{}\" alter constraint \"{}\" deferrable initially immediate;\n",
+                            "alter table {}.{} alter constraint {} deferrable initially immediate;\n",
                             self.schema, self.table_name, target.name
                         ));
                     }
                 } else {
                     script.push_str(&format!(
-                        "alter table \"{}\".\"{}\" alter constraint \"{}\" not deferrable;\n",
+                        "alter table {}.{} alter constraint {} not deferrable;\n",
                         self.schema, self.table_name, target.name
                     ));
                 }
@@ -133,7 +247,8 @@ impl TableConstraint {
                 && self.name == target.name
                 && self.table_name == target.table_name
                 && self.constraint_type == target.constraint_type
-                && self.definition == target.definition
+                && self.definition.as_deref().map(Self::normalize_definition)
+                    == target.definition.as_deref().map(Self::normalize_definition)
             // Only is_deferrable and initially_deferred can differ
         } else {
             false
@@ -143,7 +258,7 @@ impl TableConstraint {
     /// Get drop script for this constraint
     pub fn get_drop_script(&self) -> String {
         format!(
-            "alter table \"{}\".\"{}\" drop constraint \"{}\";\n",
+            "alter table {}.{} drop constraint {};\n",
             self.schema, self.table_name, self.name
         )
     }
@@ -157,7 +272,8 @@ impl PartialEq for TableConstraint {
             && self.constraint_type == other.constraint_type
             && self.is_deferrable == other.is_deferrable
             && self.initially_deferred == other.initially_deferred
-            && self.definition == other.definition
+            && self.definition.as_deref().map(Self::normalize_definition)
+                == other.definition.as_deref().map(Self::normalize_definition)
     }
 }
 
@@ -176,6 +292,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -189,6 +306,7 @@ mod tests {
             is_deferrable: true,
             initially_deferred: true,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -202,6 +320,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -215,6 +334,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -380,8 +500,7 @@ mod tests {
         let constraint = create_primary_key_constraint();
         let script = constraint.get_script();
 
-        let expected =
-            "alter table \"public\".\"users\" add constraint \"pk_users_id\" primary key ;\n";
+        let expected = "alter table public.users add constraint pk_users_id primary key ;\n";
         assert_eq!(script, expected);
     }
 
@@ -390,7 +509,7 @@ mod tests {
         let constraint = create_foreign_key_constraint();
         let script = constraint.get_script();
 
-        let expected = "alter table \"app\".\"orders\" add constraint \"fk_orders_user_id\" foreign key deferrable initially deferred ;\n";
+        let expected = "alter table app.orders add constraint fk_orders_user_id foreign key deferrable initially deferred ;\n";
         assert_eq!(script, expected);
     }
 
@@ -399,8 +518,7 @@ mod tests {
         let constraint = create_unique_constraint();
         let script = constraint.get_script();
         // With reduced fields/behavior we no longer append null handling
-        let expected =
-            "alter table \"analytics\".\"products\" add constraint \"uk_products_sku\" unique ;\n";
+        let expected = "alter table analytics.products add constraint uk_products_sku unique ;\n";
         assert_eq!(script, expected);
     }
 
@@ -409,8 +527,7 @@ mod tests {
         let constraint = create_check_constraint();
         let script = constraint.get_script();
         // Simplified behavior: just the base type
-        let expected =
-            "alter table \"test\".\"persons\" add constraint \"chk_age_positive\" check ;\n";
+        let expected = "alter table test.persons add constraint chk_age_positive check ;\n";
         assert_eq!(script, expected);
     }
 
@@ -425,10 +542,11 @@ mod tests {
             is_deferrable: true,
             initially_deferred: true,
             definition: Some("UNIQUE (id)".to_string()),
+            coninhcount: 0,
         };
 
         let script = constraint.get_script();
-        let expected = "alter table \"test\".\"test_table\" add constraint \"test_constraint\" unique (id) deferrable initially deferred ;\n";
+        let expected = "alter table test.test_table add constraint test_constraint unique (id) deferrable initially deferred ;\n";
         assert_eq!(script, expected);
     }
 
@@ -436,13 +554,14 @@ mod tests {
     fn test_get_script_case_conversion() {
         let constraint = TableConstraint {
             catalog: "TEST".to_string(),
-            schema: "PUBLIC".to_string(),
-            name: "CONSTRAINT_NAME".to_string(),
-            table_name: "USERS".to_string(),
+            schema: "\"PUBLIC\"".to_string(),
+            name: "\"CONSTRAINT_NAME\"".to_string(),
+            table_name: "\"USERS\"".to_string(),
             constraint_type: "PRIMARY KEY".to_string(),
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
         };
 
         let script = constraint.get_script();
@@ -461,11 +580,12 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         };
 
         let script = constraint.get_script();
         // Note: constraint_type.to_lowercase() produces empty string, but format!("{} ", "") produces " "
-        let expected = "alter table \"\".\"\" add constraint \"\"  ;\n";
+        let expected = "alter table . add constraint   ;\n";
         assert_eq!(script, expected);
     }
 
@@ -590,14 +710,15 @@ mod tests {
     #[test]
     fn test_constraint_with_special_characters() {
         let constraint = TableConstraint {
-            catalog: "test-db".to_string(),
-            schema: "app$schema".to_string(),
-            name: "constraint@name".to_string(),
-            table_name: "table#name".to_string(),
+            catalog: "\"test-db\"".to_string(),
+            schema: "\"app$schema\"".to_string(),
+            name: "\"constraint@name\"".to_string(),
+            table_name: "\"table#name\"".to_string(),
             constraint_type: "UNIQUE".to_string(),
             is_deferrable: false,
             initially_deferred: false,
             definition: Some("UNIQUE (column1, column2)".to_string()),
+            coninhcount: 0,
         };
 
         // Should handle special characters in all fields
@@ -625,6 +746,7 @@ mod tests {
                 is_deferrable: false,
                 initially_deferred: false,
                 definition: Some("PRIMARY KEY (id)".to_string()),
+                coninhcount: 0,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -635,6 +757,7 @@ mod tests {
                 is_deferrable: true,
                 initially_deferred: false,
                 definition: Some("FOREIGN KEY (user_id) REFERENCES users(id)".to_string()),
+                coninhcount: 0,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -645,6 +768,7 @@ mod tests {
                 is_deferrable: false,
                 initially_deferred: false,
                 definition: Some("UNIQUE (column1, column2)".to_string()),
+                coninhcount: 0,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -655,13 +779,14 @@ mod tests {
                 is_deferrable: false,
                 initially_deferred: false,
                 definition: Some("CHECK (age > 0)".to_string()),
+                coninhcount: 0,
             },
         ];
 
         for constraint in constraints {
             // Each should produce a valid script
             let script = constraint.get_script();
-            assert!(script.contains(&format!("add constraint \"{}\"", constraint.name)));
+            assert!(script.contains(&format!("add constraint {}", constraint.name)));
             assert!(script.contains(&constraint.constraint_type.to_lowercase()));
             assert!(script.ends_with(";\n"));
 
@@ -684,6 +809,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         };
 
         // Create the same hash as the implementation
@@ -715,6 +841,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         };
 
         // Create the same hash as the implementation (nulls_distinct=None means no update)
@@ -784,7 +911,7 @@ mod tests {
         assert!(alter_script.is_some());
 
         let script = alter_script.unwrap();
-        assert!(script.contains("alter table \"app\".\"orders\" alter constraint \"fk_orders_user_id\" deferrable initially deferred"));
+        assert!(script.contains("alter table app.orders alter constraint fk_orders_user_id deferrable initially deferred"));
     }
 
     #[test]
@@ -799,9 +926,11 @@ mod tests {
         assert!(alter_script.is_some());
 
         let script = alter_script.unwrap();
-        assert!(script.contains(
-            "alter table \"app\".\"orders\" alter constraint \"fk_orders_user_id\" not deferrable"
-        ));
+        assert!(
+            script.contains(
+                "alter table app.orders alter constraint fk_orders_user_id not deferrable"
+            )
+        );
     }
 
     #[test]
@@ -833,7 +962,338 @@ mod tests {
 
         assert_eq!(
             drop_script,
-            "alter table \"app\".\"orders\" drop constraint \"fk_orders_user_id\";\n"
+            "alter table app.orders drop constraint fk_orders_user_id;\n"
+        );
+    }
+
+    // --- lowercase_outside_literals / string-literal preservation ---
+
+    #[test]
+    fn test_check_constraint_preserves_string_literal_case() {
+        // This is the core regression: CHECK (status = 'Active') must NOT become
+        // check (status = 'active'), or the next comparison produces a false diff.
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "chk_status".to_string(),
+            table_name: "orders".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (status = 'Active')".to_string()),
+            coninhcount: 0,
+        };
+        let script = constraint.get_script();
+        assert!(
+            script.contains("check (status = 'Active')"),
+            "string literal case must be preserved, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_check_constraint_preserves_multiple_literals() {
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "chk_multi".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(
+                "CHECK (status IN ('Active', 'Inactive', 'PendingReview'))".to_string(),
+            ),
+            coninhcount: 0,
+        };
+        let script = constraint.get_script();
+        assert!(script.contains("'Active'"), "got: {script}");
+        assert!(script.contains("'Inactive'"), "got: {script}");
+        assert!(script.contains("'PendingReview'"), "got: {script}");
+        // keywords outside literals must still be lower-cased
+        assert!(script.contains("check (status in ("), "got: {script}");
+    }
+
+    #[test]
+    fn test_check_constraint_preserves_escaped_quote_in_literal() {
+        // SQL-standard '' escape inside the literal
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "chk_esc".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (col <> 'It''s OK')".to_string()),
+            coninhcount: 0,
+        };
+        let script = constraint.get_script();
+        assert!(
+            script.contains("'It''s OK'"),
+            "escaped quote must survive, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_check_constraint_lowercases_keywords_outside_literals() {
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "chk_kw".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (AGE > 0 AND NAME IS NOT NULL)".to_string()),
+            coninhcount: 0,
+        };
+        let script = constraint.get_script();
+        assert!(
+            script.contains("check (age > 0 and name is not null)"),
+            "keywords must be lowered, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_definition_no_literals_fully_lowercased() {
+        // When there are no string literals the entire expression is lowered,
+        // matching the old behaviour.
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "chk_num".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (AMOUNT >= 0)".to_string()),
+            coninhcount: 0,
+        };
+        let script = constraint.get_script();
+        assert!(script.contains("check (amount >= 0)"), "got: {script}");
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_empty_string() {
+        assert_eq!(TableConstraint::lowercase_outside_literals(""), "");
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_no_quotes() {
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (X > 0)"),
+            "check (x > 0)"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_preserves_literal() {
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (status = 'Active')"),
+            "check (status = 'Active')"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_preserves_escaped_quotes() {
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (x = 'It''s A Test')"),
+            "check (x = 'It''s A Test')"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_adjacent_literals() {
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("'Foo' || 'Bar'"),
+            "'Foo' || 'Bar'"
+        );
+    }
+
+    // --- normalize_definition: array cast distribution equivalence ---
+
+    #[test]
+    fn test_normalize_definition_array_level_cast() {
+        // Form A from pg_get_constraintdef (created via IN (...))
+        let def_a = "CHECK (priority::text = ANY (ARRAY['P1-Critical'::character varying, 'P2-High'::character varying]::text[]))";
+        let norm = TableConstraint::normalize_definition(def_a);
+        assert_eq!(
+            norm,
+            "check (priority::text = any (array['P1-Critical'::character varying, 'P2-High'::character varying]))"
+        );
+    }
+
+    #[test]
+    fn test_normalize_definition_element_level_cast() {
+        // Form B from pg_get_constraintdef (created via migration applying Form A)
+        let def_b = "CHECK (priority::text = ANY (ARRAY['P1-Critical'::character varying::text, 'P2-High'::character varying::text]))";
+        let norm = TableConstraint::normalize_definition(def_b);
+        assert_eq!(
+            norm,
+            "check (priority::text = any (array['P1-Critical'::character varying, 'P2-High'::character varying]))"
+        );
+    }
+
+    #[test]
+    fn test_normalize_definition_both_forms_equal() {
+        // The two forms that pg_get_constraintdef actually produces
+        let form_a = "CHECK (priority::text = ANY (ARRAY['P1-Critical'::character varying, 'P2-High'::character varying, 'P3-Medium'::character varying, 'P4-Low'::character varying, 'P5-Informational'::character varying]::text[]))";
+        let form_b = "CHECK (priority::text = ANY (ARRAY['P1-Critical'::character varying::text, 'P2-High'::character varying::text, 'P3-Medium'::character varying::text, 'P4-Low'::character varying::text, 'P5-Informational'::character varying::text]))";
+
+        assert_eq!(
+            TableConstraint::normalize_definition(form_a),
+            TableConstraint::normalize_definition(form_b),
+        );
+    }
+
+    #[test]
+    fn test_normalize_definition_no_change_for_simple_check() {
+        let def = "CHECK (age > 0)";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (age > 0)");
+    }
+
+    #[test]
+    fn test_normalize_definition_preserves_standalone_text_cast() {
+        // priority::text should NOT be stripped — it's a standalone cast, not a chain
+        let def = "CHECK (priority::text = 'High')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (priority::text = 'High')");
+    }
+
+    #[test]
+    fn test_normalize_definition_preserves_string_literal_case() {
+        let def = "CHECK (status = 'Active')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (status = 'Active')");
+    }
+
+    #[test]
+    fn test_partial_eq_with_equivalent_array_cast_forms() {
+        let constraint_a = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "test_schema".to_string(),
+            name: "chk_priority".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))".to_string()),
+        coninhcount: 0,
+            };
+        let constraint_b = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "test_schema".to_string(),
+            name: "chk_priority".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))".to_string()),
+        coninhcount: 0,
+            };
+        assert_eq!(constraint_a, constraint_b);
+    }
+
+    #[test]
+    fn test_hasher_with_equivalent_array_cast_forms() {
+        let constraint_a = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "test_schema".to_string(),
+            name: "chk_priority".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))".to_string()),
+        coninhcount: 0,
+            };
+        let constraint_b = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "test_schema".to_string(),
+            name: "chk_priority".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))".to_string()),
+        coninhcount: 0,
+            };
+
+        let mut hasher_a = Sha256::new();
+        let mut hasher_b = Sha256::new();
+        constraint_a.add_to_hasher(&mut hasher_a);
+        constraint_b.add_to_hasher(&mut hasher_b);
+        assert_eq!(
+            format!("{:x}", hasher_a.finalize()),
+            format!("{:x}", hasher_b.finalize()),
+        );
+    }
+
+    // --- Unicode correctness ---
+
+    #[test]
+    fn test_lowercase_outside_literals_unicode_outside() {
+        // Non-ASCII identifier outside a literal must be lowercased properly.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (MÜLLER > 0)"),
+            "check (müller > 0)"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_unicode_inside_literal() {
+        // Non-ASCII characters inside a literal must be preserved verbatim.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (name = 'Ñoño')"),
+            "check (name = 'Ñoño')"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_multibyte_mixed() {
+        // Mix of multi-byte chars inside and outside literals.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (ГОРОД = 'Москва')"),
+            "check (город = 'Москва')"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_outside_literals_emoji_in_literal() {
+        // 4-byte UTF-8 sequences (emoji) inside a literal must survive.
+        assert_eq!(
+            TableConstraint::lowercase_outside_literals("CHECK (label = '🚀Launch')"),
+            "check (label = '🚀Launch')"
+        );
+    }
+
+    // --- normalize_definition must not alter replacement patterns inside literals ---
+
+    #[test]
+    fn test_normalize_definition_preserves_text_array_cast_inside_literal() {
+        // A literal containing "]::text[]" must NOT be rewritten.
+        let def = "CHECK (note = ']::text[]')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (note = ']::text[]')");
+    }
+
+    #[test]
+    fn test_normalize_definition_preserves_varying_text_cast_inside_literal() {
+        // A literal containing "::character varying::text" must NOT be rewritten.
+        let def = "CHECK (note = '::character varying::text')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(norm, "check (note = '::character varying::text')");
+    }
+
+    #[test]
+    fn test_normalize_definition_mixed_literal_and_outside_casts() {
+        // Cast outside the literal is normalized; identical text inside is preserved.
+        let def = "CHECK (x::character varying::text = ']::text[]' AND y::character varying::text = 'ok')";
+        let norm = TableConstraint::normalize_definition(def);
+        assert_eq!(
+            norm,
+            "check (x::character varying = ']::text[]' and y::character varying = 'ok')"
         );
     }
 }

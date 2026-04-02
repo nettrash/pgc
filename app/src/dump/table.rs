@@ -14,11 +14,75 @@ fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Extract column identifiers from a `pg_get_partkeydef` output string.
+///
+/// The input format is `method (ident1, ident2, ...)` where `method` is one of
+/// `range`, `list`, or `hash`.  Identifiers may be double-quoted (PostgreSQL
+/// style) and unquoted identifiers may contain `$` in addition to alphanumeric
+/// characters and underscores.
+///
+/// Returns lowercased identifier names (with quotes stripped for quoted idents).
+fn extract_partition_key_identifiers(pk: &str) -> Vec<String> {
+    // Find the content inside the outermost parentheses, skipping the method keyword.
+    let start = match pk.find('(') {
+        Some(i) => i + 1,
+        None => return Vec::new(),
+    };
+    let end = match pk.rfind(')') {
+        Some(i) => i,
+        None => pk.len(),
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let inner = &pk[start..end];
+
+    let mut identifiers = Vec::new();
+    for part in inner.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('"') {
+            // Quoted identifier: find matching close quote (doubled quotes "" are escapes).
+            let bytes = trimmed.as_bytes();
+            let mut i = 1; // skip opening quote
+            let mut ident = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        ident.push('"');
+                        i += 2;
+                    } else {
+                        break; // closing quote
+                    }
+                } else {
+                    ident.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            identifiers.push(ident.to_lowercase());
+        } else {
+            // Unquoted identifier: take leading identifier chars (alphanumeric, _, $).
+            let ident: String = trimmed
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !ident.is_empty() {
+                identifiers.push(ident.to_lowercase());
+            }
+        }
+    }
+    identifiers
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub schema: String,
     pub name: String,
+    pub raw_schema: String,
+    pub raw_name: String,
     pub owner: String,                     // Owner of the table
     pub space: Option<String>,             // Tablespace of the table
     pub has_indexes: bool,                 // Whether the table has indexes
@@ -38,6 +102,8 @@ pub struct Table {
     #[serde(default)]
     pub comment: Option<String>, // Table comment
     pub hash: Option<String>,              // Hash of the table
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>, // ACL (grant) entries for this table
 }
 
 impl Table {
@@ -46,6 +112,8 @@ impl Table {
     pub fn new(
         schema: String,
         name: String,
+        raw_schema: String,
+        raw_name: String,
         owner: String,
         space: Option<String>,
         columns: Vec<TableColumn>,
@@ -57,6 +125,8 @@ impl Table {
         let mut table = Self {
             schema,
             name,
+            raw_schema,
+            raw_name,
             owner,
             space,
             has_indexes: !indexes.is_empty(),
@@ -74,6 +144,7 @@ impl Table {
             partition_bound: None,
             comment: None,
             hash: None,
+            acl: Vec::new(),
         };
         table.hash();
         table
@@ -88,17 +159,17 @@ impl Table {
     /// `has_tabledef_fn` should be pre-checked once per dump run so we don't
     /// repeat the `pg_proc` lookup for every table.
     pub async fn fill(&mut self, pool: &PgPool, has_tabledef_fn: bool) -> Result<(), Error> {
-        let schema = self.schema.clone();
-        let name = self.name.clone();
+        let raw_schema = self.raw_schema.clone();
+        let raw_name = self.raw_name.clone();
 
         let (columns, indexes, constraints, triggers, policies_data, partition, definition) = tokio::try_join!(
-            Self::fetch_columns(pool, &schema, &name),
-            Self::fetch_indexes(pool, &schema, &name),
-            Self::fetch_constraints(pool, &schema, &name),
-            Self::fetch_triggers(pool, &schema, &name),
-            Self::fetch_policies(pool, &schema, &name),
-            Self::fetch_partition_info(pool, &schema, &name),
-            Self::fetch_definition(pool, &schema, &name, has_tabledef_fn),
+            Self::fetch_columns(pool, &raw_schema, &raw_name),
+            Self::fetch_indexes(pool, &raw_schema, &raw_name),
+            Self::fetch_constraints(pool, &raw_schema, &raw_name),
+            Self::fetch_triggers(pool, &raw_schema, &raw_name),
+            Self::fetch_policies(pool, &raw_schema, &raw_name),
+            Self::fetch_partition_info(pool, &raw_schema, &raw_name),
+            Self::fetch_definition(pool, &raw_schema, &raw_name, has_tabledef_fn),
         )?;
 
         self.columns = columns;
@@ -129,9 +200,9 @@ impl Table {
         let query = format!(
                         "SELECT
                                 c.table_catalog,
-                                c.table_schema,
-                                c.table_name,
-                                c.column_name,
+                                quote_ident(c.table_schema) as table_schema,
+                                quote_ident(c.table_name) as table_name,
+                                quote_ident(c.column_name) as column_name,
                                 c.ordinal_position,
                                 c.column_default,
                                 c.is_nullable,
@@ -297,12 +368,13 @@ impl Table {
         name: &str,
     ) -> Result<Vec<TableIndex>, Error> {
         let query = format!(
-                        "SELECT i.schemaname,
-                                        i.tablename,
-                                        i.indexname,
-                                        i.tablespace,
-                                        i.indexdef,
-                                        EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index
+                        "SELECT
+                                quote_ident(i.schemaname) as schemaname,
+                                quote_ident(i.tablename) as tablename,
+                                quote_ident(i.indexname) as indexname,
+                                i.tablespace,
+                                i.indexdef,
+                                EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index
                          FROM pg_indexes i
                          JOIN pg_class ic ON ic.relname = i.indexname
                          JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
@@ -345,7 +417,35 @@ impl Table {
         name: &str,
     ) -> Result<Vec<TableConstraint>, Error> {
         let query = format!(
-            "SELECT current_database() AS catalog, n.nspname AS schema, c.conname AS constraint_name, t.relname AS table_name, CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' ELSE c.contype::text END AS constraint_type, c.condeferrable AS is_deferrable, c.condeferred AS initially_deferred, pg_get_constraintdef(c.oid, true) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = '{}' AND t.relname = '{}' AND c.contype IN ('p','u','f','c') AND c.conislocal ORDER BY n.nspname, t.relname, c.conname;",
+            "SELECT
+                current_database() AS catalog,
+                quote_ident(n.nspname) AS schema,
+                quote_ident(c.conname) AS constraint_name,
+                quote_ident(t.relname) AS table_name,
+                CASE c.contype
+                    WHEN 'p' THEN 'PRIMARY KEY'
+                    WHEN 'f' THEN 'FOREIGN KEY'
+                    WHEN 'u' THEN 'UNIQUE'
+                    WHEN 'c' THEN 'CHECK'
+                    ELSE c.contype::text
+                END AS constraint_type,
+                c.condeferrable AS is_deferrable,
+                c.condeferred AS initially_deferred,
+                pg_get_constraintdef(c.oid, true) AS definition,
+                c.coninhcount
+            FROM
+                pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE
+                    n.nspname = '{}' AND
+                    t.relname = '{}' AND
+                    c.contype IN ('p','u','f','c') AND
+                    c.conislocal
+                ORDER BY
+                    n.nspname,
+                    t.relname,
+                    c.conname;",
             escape_single_quotes(schema),
             escape_single_quotes(name)
         );
@@ -363,6 +463,7 @@ impl Table {
                 is_deferrable: row.get("is_deferrable"),
                 initially_deferred: row.get("initially_deferred"),
                 definition: row.get("definition"),
+                coninhcount: row.get("coninhcount"),
             });
         }
 
@@ -376,9 +477,19 @@ impl Table {
         name: &str,
     ) -> Result<Vec<TableTrigger>, Error> {
         let query = format!(
-            "SELECT *, pg_get_triggerdef(oid) as tgdef FROM pg_trigger WHERE tgrelid = '\"{}\".\"{}\"'::regclass and tgisinternal = false ORDER BY tgname",
-            schema.replace('"', "\"\""),
-            name.replace('"', "\"\"")
+            "select
+                oid,
+                quote_ident(tgname) as tgname,
+                pg_get_triggerdef(oid) as tgdef
+            from
+                pg_trigger
+            where
+                tgrelid = format('%I.%I', '{}', '{}')::regclass and
+                tgisinternal = false
+            order by
+                tgname",
+            escape_single_quotes(schema),
+            escape_single_quotes(name)
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
@@ -402,9 +513,10 @@ impl Table {
         name: &str,
     ) -> Result<(Vec<TablePolicy>, bool), Error> {
         let query = format!(
-            "SELECT p.polname,
-                    n.nspname AS schemaname,
-                    c.relname AS tablename,
+            "SELECT
+                    quote_ident(p.polname) as polname,
+                    quote_ident(n.nspname) AS schemaname,
+                    quote_ident(c.relname) AS tablename,
                     p.polcmd::text AS polcmd,
                     p.polpermissive,
                     array(SELECT rolname::text FROM pg_roles r WHERE r.oid = ANY(p.polroles) ORDER BY rolname) AS roles,
@@ -462,8 +574,8 @@ impl Table {
                 c.relkind::text,
                 pg_get_partkeydef(c.oid) AS partition_key,
                 pg_get_expr(c.relpartbound, c.oid) AS partition_bound,
-                p.relname AS parent_table,
-                pn.nspname AS parent_schema
+                quote_ident(p.relname) AS parent_table,
+                quote_ident(pn.nspname) AS parent_schema
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             LEFT JOIN pg_inherits i ON i.inhrelid = c.oid
@@ -490,7 +602,7 @@ impl Table {
                 && let Some(parent_schema) = row.get::<Option<String>, _>("parent_schema")
             {
                 (
-                    Some(format!("\"{}\".\"{}\"", parent_schema, parent_table)),
+                    Some(format!("{}.{}", parent_schema, parent_table)),
                     row.get("partition_bound"),
                 )
             } else {
@@ -515,9 +627,15 @@ impl Table {
     ) -> Result<Option<String>, Error> {
         if has_tabledef_fn {
             let query = format!(
-                "select pg_get_tabledef(oid) AS definition from pg_class where relname = '{}' AND relnamespace = '\"{}\"'::regnamespace;",
+                "select
+                    pg_get_tabledef(oid) AS definition
+                from
+                    pg_class
+                where
+                    relname = '{}' and
+                    relnamespace = format('%I', '{}')::regnamespace;",
                 escape_single_quotes(name),
-                schema.replace('"', "\"\"")
+                escape_single_quotes(schema)
             );
             let row = sqlx::query(&query).fetch_one(pool).await?;
             Ok(row.get::<Option<String>, _>("definition"))
@@ -581,7 +699,7 @@ impl Table {
 
         if let Some(parent) = &self.partition_of {
             script.push_str(&format!(
-                "create table \"{}\".\"{}\" partition of {}",
+                "create table {}.{} partition of {}",
                 self.schema, self.name, parent
             ));
             if let Some(bound) = &self.partition_bound {
@@ -600,10 +718,7 @@ impl Table {
             script.push_str(";\n\n");
         } else {
             // 1. Build CREATE TABLE statement
-            script.push_str(&format!(
-                "create table \"{}\".\"{}\" (\n",
-                self.schema, self.name
-            ));
+            script.push_str(&format!("create table {}.{} (\n", self.schema, self.name));
 
             // 2. Add column definitions
             let mut column_definitions = Vec::new();
@@ -611,7 +726,7 @@ impl Table {
                 let mut col_def = String::new();
 
                 // Column name
-                col_def.push_str(&format!("    \"{}\" ", column.name));
+                col_def.push_str(&format!("    {} ", column.name));
 
                 // Use standard column definition
                 let col_script = column.get_script();
@@ -630,7 +745,7 @@ impl Table {
                 .find(|c| c.constraint_type.eq_ignore_ascii_case("primary key"));
             let has_pk_constraint = pk_constraint.is_some();
             let pk_constraint_name = pk_constraint
-                .map(|constraint| quote_ident(&constraint.name))
+                .map(|constraint| constraint.name.clone())
                 .unwrap_or_default();
 
             if has_pk_constraint {
@@ -757,7 +872,7 @@ impl Table {
         // 8. Enable row-level security before creating policies
         if self.has_rowsecurity {
             script.push_str(&format!(
-                "alter table \"{}\".\"{}\" enable row level security;\n",
+                "alter table {}.{} enable row level security;\n",
                 self.schema, self.name
             ));
         }
@@ -770,7 +885,7 @@ impl Table {
         // 10. Add table comment (if any) and column comments
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
-                "comment on table \"{}\".\"{}\" is '{}';\n",
+                "comment on table {}.{} is '{}';\n",
                 self.schema,
                 self.name,
                 escape_single_quotes(comment)
@@ -809,10 +924,7 @@ impl Table {
 
     /// Get drop script for the table
     pub fn get_drop_script(&self) -> String {
-        format!(
-            "drop table if exists \"{}\".\"{}\";\n",
-            self.schema, self.name
-        )
+        format!("drop table if exists {}.{};\n", self.schema, self.name)
     }
 
     pub fn get_owner_script(&self) -> String {
@@ -821,10 +933,8 @@ impl Table {
         }
 
         format!(
-            "alter table \"{}\".\"{}\" owner to {};\n",
-            self.schema,
-            self.name,
-            quote_ident(&self.owner)
+            "alter table {}.{} owner to {};\n",
+            self.schema, self.name, self.owner
         )
     }
 
@@ -910,7 +1020,7 @@ impl Table {
             // If it was a partition, detach it
             if let Some(old_parent) = &self.partition_of {
                 let detach_cmd = format!(
-                    "alter table {} detach partition \"{}\".\"{}\";\n",
+                    "alter table {} detach partition {}.{};\n",
                     old_parent, self.schema, self.name
                 );
                 if use_drop {
@@ -925,16 +1035,41 @@ impl Table {
                 && let Some(bound) = &to_table.partition_bound
             {
                 partition_script.push_str(&format!(
-                    "alter table {} attach partition \"{}\".\"{}\" {};\n",
+                    "alter table {} attach partition {}.{} {};\n",
                     new_parent, self.schema, self.name, bound
                 ));
             }
         }
 
+        // Partition children inherit column structure (add/drop/alter) and
+        // non-FK constraints from their parent table.  Generating the same DDL
+        // for both parent and partition causes errors (ADD/DROP COLUMN) or
+        // redundant operations (SET NOT NULL, SET DEFAULT, constraint changes).
+        // Only suppress when the table is a partition child in both FROM and TO.
+        // If it is transitioning from standalone to partition (attach), structural
+        // changes may be required to make it compatible with the parent first.
+        let is_target_partition = self.partition_of.is_some() && to_table.partition_of.is_some();
+
         // Collect column additions or alterations
         for new_col in &to_table.columns {
             if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name) {
                 if old_col != new_col {
+                    // Skip structural column changes for partition children;
+                    // only emit column comment changes (not inherited).
+                    if is_target_partition {
+                        if new_col.comment != old_col.comment {
+                            if let Some(comment_script) = new_col.get_comment_script() {
+                                column_alter_script.push_str(&comment_script);
+                            } else {
+                                column_alter_script.push_str(&format!(
+                                    "comment on column {}.{}.{} is null;\n",
+                                    new_col.schema, new_col.table, new_col.name
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
                     let type_changed = old_col.data_type != new_col.data_type
                         || old_col.udt_name != new_col.udt_name
                         || old_col.numeric_precision != new_col.numeric_precision
@@ -943,12 +1078,8 @@ impl Table {
 
                     let is_partition_child = self.partition_of.is_some();
                     let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
-                        let pk_norm: String = pk
-                            .chars()
-                            .filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '`'))
-                            .collect::<String>()
-                            .to_lowercase();
-                        pk_norm.contains(&new_col.name.to_lowercase())
+                        let col_lower = new_col.name.to_lowercase();
+                        extract_partition_key_identifiers(pk).contains(&col_lower)
                     });
 
                     if type_changed && (is_partition_child || in_partition_key) {
@@ -972,24 +1103,26 @@ impl Table {
                         column_alter_script.push_str(&alter_col_script);
                     }
                 }
-            } else {
+            } else if !is_target_partition {
                 column_alter_script.push_str(&new_col.get_add_script());
             }
         }
 
         // Collect column drops separately so they happen after constraint drops
-        for old_col in &self.columns {
-            if !to_table.columns.iter().any(|c| c.name == old_col.name) {
-                let drop_cmd = old_col.get_drop_script();
-                if use_drop {
-                    column_drop_script.push_str(&drop_cmd);
-                } else {
-                    column_drop_script.push_str(
-                        &drop_cmd
-                            .lines()
-                            .map(|l| format!("-- {}\n", l))
-                            .collect::<String>(),
-                    );
+        if !is_target_partition {
+            for old_col in &self.columns {
+                if !to_table.columns.iter().any(|c| c.name == old_col.name) {
+                    let drop_cmd = old_col.get_drop_script();
+                    if use_drop {
+                        column_drop_script.push_str(&drop_cmd);
+                    } else {
+                        column_drop_script.push_str(
+                            &drop_cmd
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect::<String>(),
+                        );
+                    }
                 }
             }
         }
@@ -997,6 +1130,12 @@ impl Table {
         // Collect constraint changes; drop statements run before column drops
         for new_constraint in &to_table.constraints {
             let is_fk = new_constraint.constraint_type.to_lowercase() == "foreign key";
+            // Skip inherited non-FK constraints for partition children;
+            // these are managed by the parent table.  Truly-local partition
+            // constraints (coninhcount == 0) are still diffed.
+            if is_target_partition && !is_fk && new_constraint.coninhcount > 0 {
+                continue;
+            }
             if let Some(old_constraint) = self
                 .constraints
                 .iter()
@@ -1031,6 +1170,16 @@ impl Table {
         }
 
         for old_constraint in &self.constraints {
+            // Skip inherited non-FK constraint drops for partition children;
+            // these are managed by the parent table.
+            if is_target_partition
+                && !old_constraint
+                    .constraint_type
+                    .eq_ignore_ascii_case("foreign key")
+                && old_constraint.coninhcount > 0
+            {
+                continue;
+            }
             if !to_table
                 .constraints
                 .iter()
@@ -1054,14 +1203,14 @@ impl Table {
         if self.comment != to_table.comment {
             let comment_stmt = if let Some(cmt) = &to_table.comment {
                 format!(
-                    "comment on table \"{}\".\"{}\" is '{}';\n",
+                    "comment on table {}.{} is '{}';\n",
                     to_table.schema,
                     to_table.name,
                     escape_single_quotes(cmt)
                 )
             } else {
                 format!(
-                    "comment on table \"{}\".\"{}\" is null;\n",
+                    "comment on table {}.{} is null;\n",
                     to_table.schema, to_table.name
                 )
             };
@@ -1076,7 +1225,7 @@ impl Table {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
                     let drop_cmd = format!(
-                        "drop index if exists \"{}\".\"{}\";\n",
+                        "drop index if exists {}.{};\n",
                         new_index.schema, new_index.name
                     );
                     if use_drop {
@@ -1096,10 +1245,8 @@ impl Table {
             if let Some(old_policy) = self.policies.iter().find(|p| p.name == new_policy.name) {
                 if old_policy != new_policy {
                     let drop_cmd = format!(
-                        "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
-                        old_policy.name.replace('"', "\"\""),
-                        self.schema,
-                        self.name
+                        "drop policy if exists {} on {}.{};\n",
+                        old_policy.name, self.schema, self.name
                     );
                     if use_drop {
                         policy_drop_script.push_str(&drop_cmd);
@@ -1119,7 +1266,7 @@ impl Table {
             }
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
                 let drop_cmd = format!(
-                    "drop index if exists \"{}\".\"{}\";\n",
+                    "drop index if exists {}.{};\n",
                     old_index.schema, old_index.name
                 );
                 if use_drop {
@@ -1133,7 +1280,7 @@ impl Table {
         for old_policy in &self.policies {
             if !to_table.policies.iter().any(|p| p.name == old_policy.name) {
                 let drop_cmd = format!(
-                    "drop policy if exists \"{}\" on \"{}\".\"{}\";\n",
+                    "drop policy if exists {} on {}.{};\n",
                     old_policy.name, self.schema, self.name
                 );
                 if use_drop {
@@ -1147,12 +1294,12 @@ impl Table {
         if self.has_rowsecurity != to_table.has_rowsecurity {
             let stmt = if to_table.has_rowsecurity {
                 format!(
-                    "alter table \"{}\".\"{}\" enable row level security;\n",
+                    "alter table {}.{} enable row level security;\n",
                     self.schema, self.name
                 )
             } else {
                 format!(
-                    "alter table \"{}\".\"{}\" disable row level security;\n",
+                    "alter table {}.{} disable row level security;\n",
                     self.schema, self.name
                 )
             };
@@ -1199,7 +1346,7 @@ impl Table {
             && let Some(new_space) = &to_table.space
         {
             script.push_str(&format!(
-                "alter table \"{}\".\"{}\" set tablespace {};\n",
+                "alter table {}.{} set tablespace {};\n",
                 to_table.schema,
                 to_table.name,
                 quote_ident(new_space)
@@ -1227,7 +1374,7 @@ impl Table {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
                     let drop_cmd = format!(
-                        "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                        "drop trigger if exists {} on {}.{};\n",
                         old_trigger.name, self.schema, self.name
                     );
                     if use_drop {
@@ -1245,7 +1392,7 @@ impl Table {
         for old_trigger in &self.triggers {
             if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
                 let drop_cmd = format!(
-                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                    "drop trigger if exists {} on {}.{};\n",
                     old_trigger.name, self.schema, self.name
                 );
                 if use_drop {
@@ -1366,6 +1513,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: None,
+            coninhcount: 0,
         }
     }
 
@@ -1379,6 +1527,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some(definition.to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -1392,6 +1541,7 @@ mod tests {
             is_deferrable,
             initially_deferred,
             definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -1405,6 +1555,7 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some(definition.to_string()),
+            coninhcount: 0,
         }
     }
 
@@ -1504,6 +1655,8 @@ mod tests {
         Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "postgres".to_string(),
             Some("pg_default".to_string()),
             vec![identity_column("id", 1, "integer"), name_column()],
@@ -1571,16 +1724,16 @@ mod tests {
         let script = table.get_script();
 
         let expected = concat!(
-            "create table \"public\".\"users\" (\n",
-            "    \"id\" integer generated BY DEFAULT as identity not null,\n",
-            "    \"name\" text not null,\n",
-            "    constraint \"users_pkey\" primary key (\"id\")\n",
+            "create table public.users (\n",
+            "    id integer generated BY DEFAULT as identity not null,\n",
+            "    name text not null,\n",
+            "    constraint users_pkey primary key (\"id\")\n",
             ")\n",
             "tablespace \"pg_default\";\n\n",
-            "alter table \"public\".\"users\" add constraint \"users_name_check\" check (name <> '') ;\n",
+            "alter table public.users add constraint users_name_check check (name <> '') ;\n",
             "create index idx_users_name on public.users using btree (name);\n",
             "create trigger audit_user before insert on public.users for each row execute function log_user();\n",
-            "alter table \"public\".\"users\" owner to \"postgres\";\n",
+            "alter table public.users owner to postgres;\n",
         );
 
         assert_eq!(script, expected);
@@ -1599,7 +1752,7 @@ mod tests {
 
         let script = table.get_script();
 
-        assert!(script.contains("create policy \"users_tenant_select\""));
+        assert!(script.contains("create policy users_tenant_select"));
         assert!(script.contains("for select"));
         assert!(script.contains("enable row level security"));
     }
@@ -1607,6 +1760,8 @@ mod tests {
     #[test]
     fn test_get_script_includes_unique_indexes() {
         let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1632,6 +1787,8 @@ mod tests {
         let table = Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "postgres".to_string(),
             Some("pg_default".to_string()),
             vec![identity_column("id", 1, "integer")],
@@ -1642,7 +1799,7 @@ mod tests {
         );
 
         let script = table.get_script();
-        assert!(script.contains("\"id\" integer generated BY DEFAULT as identity"));
+        assert!(script.contains("id integer generated BY DEFAULT as identity"));
         assert!(!script.contains("serial"));
     }
 
@@ -1651,13 +1808,15 @@ mod tests {
         let table = basic_table();
         assert_eq!(
             table.get_drop_script(),
-            "drop table if exists \"public\".\"users\";\n"
+            "drop table if exists public.users;\n"
         );
     }
 
     #[test]
     fn test_get_alter_script_handles_complex_differences() {
         let from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1694,6 +1853,8 @@ mod tests {
         );
 
         let to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1733,17 +1894,17 @@ mod tests {
         let fk_script = from_table.get_foreign_key_alter_script(&to_table);
 
         let expected_fragments = [
-            "alter table \"public\".\"users\" drop constraint \"users_name_check\";\n",
-            "alter table \"public\".\"users\" drop constraint \"users_legacy_check\";\n",
-            "alter table \"public\".\"users\" alter column \"name\" set default 'unknown'::text;\n",
-            "alter table \"public\".\"users\" add column \"email\" text;\n",
-            "drop index if exists \"public\".\"idx_users_name\";\n",
-            "drop index if exists \"public\".\"idx_users_old\";\n",
-            "drop trigger if exists \"audit_user\" on \"public\".\"users\";\n",
-            "drop trigger if exists \"cleanup_user\" on \"public\".\"users\";\n",
-            "alter table \"public\".\"users\" drop column \"legacy\";\n",
-            "alter table \"public\".\"users\" add constraint \"users_name_check\" check (char_length(name) > 0) ;\n",
-            "alter table \"public\".\"users\" add constraint \"users_email_unique\" unique (email) ;\n",
+            "alter table public.users drop constraint users_name_check;\n",
+            "alter table public.users drop constraint users_legacy_check;\n",
+            "alter table public.users alter column name set default 'unknown'::text;\n",
+            "alter table public.users add column email text;\n",
+            "drop index if exists public.idx_users_name;\n",
+            "drop index if exists public.idx_users_old;\n",
+            "drop trigger if exists audit_user on public.users;\n",
+            "drop trigger if exists cleanup_user on public.users;\n",
+            "alter table public.users drop column legacy;\n",
+            "alter table public.users add constraint users_name_check check (char_length(name) > 0) ;\n",
+            "alter table public.users add constraint users_email_unique unique (email) ;\n",
             "create index idx_users_name on public.users using btree (lower(name));\n",
             "create index idx_users_email on public.users using btree (email);\n",
             "create trigger audit_user after insert on public.users for each row execute function log_user_change();\n",
@@ -1766,7 +1927,7 @@ mod tests {
         assert!(script.contains("lower(name)"));
         assert!(script.contains("notify_user"));
 
-        assert!(fk_script.contains("alter table \"public\".\"users\" alter constraint \"users_account_fk\" deferrable initially deferred;\n"));
+        assert!(fk_script.contains("alter table public.users alter constraint users_account_fk deferrable initially deferred;\n"));
     }
 
     #[test]
@@ -1783,19 +1944,21 @@ mod tests {
         to_table.has_rowsecurity = true;
 
         let add_script = from_table.get_alter_script(&to_table, true);
-        assert!(add_script.contains("create policy \"users_tenant_insert\""));
+        assert!(add_script.contains("create policy users_tenant_insert"));
         assert!(add_script.contains("enable row level security"));
 
         from_table = to_table.clone();
         let to_table_no_policy = basic_table();
         let drop_script = from_table.get_alter_script(&to_table_no_policy, true);
-        assert!(drop_script.contains("drop policy if exists \"users_tenant_insert\""));
+        assert!(drop_script.contains("drop policy if exists users_tenant_insert"));
         assert!(drop_script.contains("disable row level security"));
     }
 
     #[test]
     fn test_get_foreign_key_script() {
         let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1813,7 +1976,7 @@ mod tests {
 
         let script = table.get_foreign_key_script();
 
-        assert!(script.contains("alter table \"public\".\"users\" add constraint \"users_account_fk\" foreign key (account_id) references public.accounts(id)"));
+        assert!(script.contains("alter table public.users add constraint users_account_fk foreign key (account_id) references public.accounts(id)"));
         assert!(!script.contains("users_name_check"));
         assert!(!script.contains("users_pkey"));
     }
@@ -1828,12 +1991,15 @@ mod tests {
             is_deferrable: false,
             initially_deferred: false,
             definition: Some(definition.to_string()),
+            coninhcount: 0,
         }
     }
 
     #[test]
     fn test_get_foreign_key_alter_script_add_new_fk() {
         let from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1846,6 +2012,8 @@ mod tests {
         );
 
         let to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1862,13 +2030,15 @@ mod tests {
 
         let script = from_table.get_foreign_key_alter_script(&to_table);
         assert!(script.contains(
-            "alter table \"public\".\"users\" add constraint \"fk_new\" foreign key (col) references other(id)"
+            "alter table public.users add constraint fk_new foreign key (col) references other(id)"
         ));
     }
 
     #[test]
     fn test_get_foreign_key_alter_script_drop_fk() {
         let from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1884,6 +2054,8 @@ mod tests {
         );
 
         let to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1904,6 +2076,8 @@ mod tests {
         let from_table = Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "postgres".to_string(),
             None,
             vec![],
@@ -1917,6 +2091,8 @@ mod tests {
         );
 
         let to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1933,7 +2109,7 @@ mod tests {
 
         let script = from_table.get_foreign_key_alter_script(&to_table);
         // Should contain the add constraint part. Drop is elsewhere.
-        assert!(script.contains("alter table \"public\".\"users\" add constraint \"fk_change\" foreign key (col) references table_b(id)"));
+        assert!(script.contains("alter table public.users add constraint fk_change foreign key (col) references table_b(id)"));
     }
 
     #[test]
@@ -1941,6 +2117,8 @@ mod tests {
         let fk = custom_foreign_key_constraint("fk_same", "FOREIGN KEY (col) REFERENCES other(id)");
 
         let from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1953,6 +2131,8 @@ mod tests {
         );
 
         let to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -1974,6 +2154,8 @@ mod tests {
         let fk_drop_from = Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "postgres".to_string(),
             None,
             vec![],
@@ -1988,6 +2170,8 @@ mod tests {
         let fk_drop_to = Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "postgres".to_string(),
             None,
             vec![],
@@ -2000,10 +2184,7 @@ mod tests {
         let drop_main_script = fk_drop_from.get_alter_script(&fk_drop_to, true);
         let drop_fk_script = fk_drop_from.get_foreign_key_alter_script(&fk_drop_to);
 
-        assert!(
-            drop_main_script
-                .contains("alter table \"public\".\"users\" drop constraint \"fk_drop\";")
-        );
+        assert!(drop_main_script.contains("alter table public.users drop constraint fk_drop;"));
         assert_eq!(drop_fk_script, "");
 
         // 2. Add FK (not in from, exists in to)
@@ -2015,11 +2196,13 @@ mod tests {
 
         assert!(!add_main_script.contains("fk_drop")); // Main script shouldn't touch new FKs
         assert!(add_fk_script.contains(
-            "alter table \"public\".\"users\" add constraint \"fk_drop\" foreign key (col) references other(id)"
+            "alter table public.users add constraint fk_drop foreign key (col) references other(id)"
         ));
 
         // 3. Recreate FK (definition change)
         let fk_change_from = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -2034,6 +2217,8 @@ mod tests {
             None,
         );
         let fk_change_to = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "postgres".to_string(),
@@ -2051,11 +2236,8 @@ mod tests {
         let change_main_script = fk_change_from.get_alter_script(&fk_change_to, true);
         let change_fk_script = fk_change_from.get_foreign_key_alter_script(&fk_change_to);
 
-        assert!(
-            change_main_script
-                .contains("alter table \"public\".\"users\" drop constraint \"fk_change\";")
-        );
-        assert!(change_fk_script.contains("alter table \"public\".\"users\" add constraint \"fk_change\" foreign key (col) references new_table(id)"));
+        assert!(change_main_script.contains("alter table public.users drop constraint fk_change;"));
+        assert!(change_fk_script.contains("alter table public.users add constraint fk_change foreign key (col) references new_table(id)"));
     }
 
     fn create_dummy_column(name: &str, data_type: &str) -> TableColumn {
@@ -2115,6 +2297,8 @@ mod tests {
         let mut table = Table::new(
             "data".to_string(),
             "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
             "owner".to_string(),
             None,
             vec![
@@ -2129,13 +2313,15 @@ mod tests {
         table.partition_key = Some("LIST (flow_id)".to_string());
 
         let script = table.get_script();
-        assert!(script.contains("create table \"data\".\"test\""));
+        assert!(script.contains("create table data.test"));
         assert!(script.contains("partition by LIST (flow_id)"));
     }
 
     #[test]
     fn test_partition_child_script() {
         let mut table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
             "data".to_string(),
             "test_default".to_string(),
             "owner".to_string(),
@@ -2146,14 +2332,11 @@ mod tests {
             vec![],
             None,
         );
-        table.partition_of = Some("\"data\".\"test\"".to_string());
+        table.partition_of = Some("data.test".to_string());
         table.partition_bound = Some("DEFAULT".to_string());
 
         let script = table.get_script();
-        assert!(
-            script
-                .contains("create table \"data\".\"test_default\" partition of \"data\".\"test\"")
-        );
+        assert!(script.contains("create table data.test_default partition of data.test"));
         assert!(script.contains("DEFAULT"));
     }
 
@@ -2161,6 +2344,8 @@ mod tests {
     fn test_sub_partition_script() {
         // A sub-partition is both a child of a partitioned table AND itself partitioned.
         let mut table = Table::new(
+            "data".to_string(),
+            "test_2023".to_string(),
             "data".to_string(),
             "test_2023".to_string(),
             "owner".to_string(),
@@ -2171,13 +2356,13 @@ mod tests {
             vec![],
             None,
         );
-        table.partition_of = Some("\"data\".\"test\"".to_string());
+        table.partition_of = Some("data.test".to_string());
         table.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
         table.partition_key = Some("LIST (id)".to_string());
 
         let script = table.get_script();
         assert!(
-            script.contains("create table \"data\".\"test_2023\" partition of \"data\".\"test\""),
+            script.contains("create table data.test_2023 partition of data.test"),
             "should reference parent table"
         );
         assert!(
@@ -2195,6 +2380,8 @@ mod tests {
         let mut table = Table::new(
             "data".to_string(),
             "test_default".to_string(),
+            "data".to_string(),
+            "test_default".to_string(),
             "owner".to_string(),
             Some("fast_ssd".to_string()),
             vec![],
@@ -2203,7 +2390,7 @@ mod tests {
             vec![],
             None,
         );
-        table.partition_of = Some("\"data\".\"test\"".to_string());
+        table.partition_of = Some("data.test".to_string());
         table.partition_bound = Some("DEFAULT".to_string());
 
         let script = table.get_script();
@@ -2216,6 +2403,8 @@ mod tests {
     #[test]
     fn test_regular_table_with_tablespace() {
         let table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
             "data".to_string(),
             "test".to_string(),
             "owner".to_string(),
@@ -2239,6 +2428,8 @@ mod tests {
         let from_table = Table::new(
             "data".to_string(),
             "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
             "owner".to_string(),
             Some("old_space".to_string()),
             vec![],
@@ -2249,6 +2440,8 @@ mod tests {
         );
 
         let to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
             "data".to_string(),
             "test".to_string(),
             "owner".to_string(),
@@ -2272,6 +2465,8 @@ mod tests {
         let mut from_table = Table::new(
             "data".to_string(),
             "test_default".to_string(),
+            "data".to_string(),
+            "test_default".to_string(),
             "owner".to_string(),
             None,
             vec![],
@@ -2284,6 +2479,8 @@ mod tests {
         from_table.partition_bound = Some("FOR VALUES IN (1)".to_string());
 
         let mut to_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
             "data".to_string(),
             "test_default".to_string(),
             "owner".to_string(),
@@ -2308,6 +2505,8 @@ mod tests {
         let mut from_table = Table::new(
             "data".to_string(),
             "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
             "owner".to_string(),
             None,
             vec![],
@@ -2319,6 +2518,8 @@ mod tests {
         from_table.partition_key = Some("LIST (id)".to_string());
 
         let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
             "data".to_string(),
             "test".to_string(),
             "owner".to_string(),
@@ -2343,6 +2544,8 @@ mod tests {
         let mut from_table = Table::new(
             "data".to_string(),
             "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
             "owner".to_string(),
             None,
             vec![],
@@ -2354,6 +2557,8 @@ mod tests {
         from_table.partition_key = Some("LIST (id)".to_string());
 
         let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
             "data".to_string(),
             "test".to_string(),
             "owner".to_string(),
@@ -2378,6 +2583,8 @@ mod tests {
         let mut from_table = Table::new(
             "data".to_string(),
             "test_default".to_string(),
+            "data".to_string(),
+            "test_default".to_string(),
             "owner".to_string(),
             None,
             vec![],
@@ -2386,10 +2593,12 @@ mod tests {
             vec![],
             None,
         );
-        from_table.partition_of = Some("\"data\".\"test\"".to_string());
+        from_table.partition_of = Some("data.test".to_string());
         from_table.partition_bound = Some("DEFAULT".to_string());
 
         let to_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
             "data".to_string(),
             "test_default".to_string(),
             "owner".to_string(),
@@ -2404,17 +2613,15 @@ mod tests {
 
         let script = from_table.get_alter_script(&to_table, true);
 
-        assert!(
-            script.contains(
-                "alter table \"data\".\"test\" detach partition \"data\".\"test_default\";"
-            )
-        );
+        assert!(script.contains("alter table data.test detach partition data.test_default;"));
         assert!(!script.contains("attach partition"));
     }
 
     #[test]
     fn test_get_alter_script_attach_partition() {
         let from_table = Table::new(
+            "data".to_string(),
+            "test_default".to_string(),
             "data".to_string(),
             "test_default".to_string(),
             "owner".to_string(),
@@ -2430,6 +2637,8 @@ mod tests {
         let mut to_table = Table::new(
             "data".to_string(),
             "test_default".to_string(),
+            "data".to_string(),
+            "test_default".to_string(),
             "owner".to_string(),
             None,
             vec![],
@@ -2438,14 +2647,888 @@ mod tests {
             vec![],
             None,
         );
-        to_table.partition_of = Some("\"data\".\"test\"".to_string());
+        to_table.partition_of = Some("data.test".to_string());
         to_table.partition_bound = Some("DEFAULT".to_string());
 
         let script = from_table.get_alter_script(&to_table, true);
 
         assert!(!script.contains("detach partition"));
-        assert!(script.contains(
-            "alter table \"data\".\"test\" attach partition \"data\".\"test_default\" DEFAULT;"
-        ));
+        assert!(
+            script.contains("alter table data.test attach partition data.test_default DEFAULT;")
+        );
+    }
+
+    // --- Helper for building a partition child table ---
+    fn partition_child_table(
+        columns: Vec<TableColumn>,
+        constraints: Vec<TableConstraint>,
+        indexes: Vec<TableIndex>,
+    ) -> Table {
+        let mut table = Table::new(
+            "public".to_string(),
+            "users_p1".to_string(),
+            "public".to_string(),
+            "users_p1".to_string(),
+            "postgres".to_string(),
+            None,
+            columns,
+            constraints,
+            indexes,
+            vec![],
+            None,
+        );
+        table.partition_of = Some("public.users".to_string());
+        table.partition_bound = Some("FOR VALUES FROM (1) TO (100)".to_string());
+        table.hash();
+        table
+    }
+
+    fn partition_child_column(name: &str, ordinal_position: i32) -> TableColumn {
+        let mut col = base_column(name, ordinal_position);
+        col.table = "users_p1".to_string();
+        col
+    }
+
+    fn partition_child_column_not_null(name: &str, ordinal_position: i32) -> TableColumn {
+        let mut col = partition_child_column(name, ordinal_position);
+        col.is_nullable = false;
+        col
+    }
+
+    fn partition_child_identity_column(
+        name: &str,
+        ordinal_position: i32,
+        data_type: &str,
+    ) -> TableColumn {
+        let mut col = partition_child_column(name, ordinal_position);
+        col.data_type = data_type.to_string();
+        col.is_identity = true;
+        col.is_nullable = false;
+        col.identity_generation = Some("BY DEFAULT".to_string());
+        col
+    }
+
+    fn partition_child_constraint(
+        name: &str,
+        constraint_type: &str,
+        definition: Option<&str>,
+    ) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: name.to_string(),
+            table_name: "users_p1".to_string(),
+            constraint_type: constraint_type.to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: definition.map(|d| d.to_string()),
+            coninhcount: 1,
+        }
+    }
+
+    // --- Partition child: column ADD is skipped ---
+    #[test]
+    fn test_partition_child_skips_add_column() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let mut to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("email", 2),
+            ],
+            vec![],
+            vec![],
+        );
+        to.hash();
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("add column"),
+            "ADD COLUMN must not appear for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: column DROP is skipped ---
+    #[test]
+    fn test_partition_child_skips_drop_column() {
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("legacy", 2),
+            ],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop column"),
+            "DROP COLUMN must not appear for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: SET NOT NULL / DROP NOT NULL is skipped ---
+    #[test]
+    fn test_partition_child_skips_set_not_null() {
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("name", 2), // nullable
+            ],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column_not_null("name", 2), // not null
+            ],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("set not null"),
+            "SET NOT NULL must not appear for partition child, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_child_skips_drop_not_null() {
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column_not_null("name", 2), // not null
+            ],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("name", 2), // nullable
+            ],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop not null"),
+            "DROP NOT NULL must not appear for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: SET DEFAULT / DROP DEFAULT is skipped ---
+    #[test]
+    fn test_partition_child_skips_set_default() {
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("name", 2),
+            ],
+            vec![],
+            vec![],
+        );
+
+        let mut name_with_default = partition_child_column("name", 2);
+        name_with_default.column_default = Some("'unknown'::text".to_string());
+        let to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                name_with_default,
+            ],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("set default"),
+            "SET DEFAULT must not appear for partition child, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_child_skips_drop_default() {
+        let mut name_with_default = partition_child_column("name", 2);
+        name_with_default.column_default = Some("'unknown'::text".to_string());
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                name_with_default,
+            ],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("name", 2),
+            ],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop default"),
+            "DROP DEFAULT must not appear for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: non-FK constraint add/drop/alter is skipped ---
+    #[test]
+    fn test_partition_child_skips_add_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_constraint(
+                "users_p1_name_check",
+                "CHECK",
+                Some("CHECK (name <> '')"),
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("add constraint"),
+            "ADD CONSTRAINT (CHECK) must not appear for partition child, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_child_skips_drop_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_constraint(
+                "users_p1_name_check",
+                "CHECK",
+                Some("CHECK (name <> '')"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop constraint"),
+            "DROP CONSTRAINT (CHECK) must not appear for partition child, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_child_skips_primary_key_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_constraint(
+                "users_p1_pkey",
+                "PRIMARY KEY",
+                None,
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("add constraint"),
+            "ADD CONSTRAINT (PK) must not appear for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: FK constraints are still emitted ---
+    #[test]
+    fn test_partition_child_still_emits_fk_changes() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let fk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: "users_p1_account_fk".to_string(),
+            table_name: "users_p1".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
+            coninhcount: 0,
+        };
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![fk],
+            vec![],
+        );
+
+        // FKs on partitions are handled by get_foreign_key_alter_script, not
+        // build_alter_script, so they should NOT appear in the alter script
+        // itself.  The key point is that the FK is not suppressed when the
+        // caller asks for it via the foreign-key path.
+        let fk_script = from.get_foreign_key_alter_script(&to);
+        assert!(
+            fk_script.contains("users_p1_account_fk"),
+            "FK constraint must still be emitted for partition child"
+        );
+    }
+
+    // --- Partition child: column comment changes ARE emitted ---
+    #[test]
+    fn test_partition_child_emits_column_comment_change() {
+        let mut col_from = partition_child_column("name", 2);
+        col_from.comment = Some("old comment".to_string());
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                col_from,
+            ],
+            vec![],
+            vec![],
+        );
+
+        let mut col_to = partition_child_column("name", 2);
+        col_to.comment = Some("new comment".to_string());
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer"), col_to],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("comment on column"),
+            "Column comment change must be emitted for partition child, got: {script}"
+        );
+        assert!(
+            script.contains("new comment"),
+            "New comment text must appear, got: {script}"
+        );
+    }
+
+    // --- Partition child: index changes ARE still emitted ---
+    #[test]
+    fn test_partition_child_still_emits_non_inherited_index_changes() {
+        let idx = TableIndex {
+            schema: "public".to_string(),
+            table: "users_p1".to_string(),
+            name: "idx_users_p1_name".to_string(),
+            catalog: None,
+            indexdef: "create index idx_users_p1_name on public.users_p1 using btree (name)"
+                .to_string(),
+            is_partition_index: false,
+        };
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![idx],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("create index idx_users_p1_name"),
+            "Non-inherited index on partition child must still be emitted, got: {script}"
+        );
+    }
+
+    // --- Non-partitioned table: all changes are still emitted ---
+    #[test]
+    fn test_non_partition_table_emits_all_column_changes() {
+        let from = basic_table();
+        let mut to = basic_table();
+        // Add a new column
+        to.columns.push(email_column());
+        to.hash();
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("add column email"),
+            "ADD COLUMN must appear for non-partitioned table, got: {script}"
+        );
+    }
+
+    // --- Partition child: combined add + alter + drop all skipped ---
+    #[test]
+    fn test_partition_child_skips_combined_column_changes() {
+        // From has: id, legacy (nullable)
+        // To has: id, name (not null), email (new)
+        // This means: legacy dropped, name added, no alter on id
+        let from = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column("legacy", 2),
+            ],
+            vec![partition_child_constraint(
+                "users_p1_check",
+                "CHECK",
+                Some("CHECK (legacy IS NOT NULL)"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![
+                partition_child_identity_column("id", 1, "integer"),
+                partition_child_column_not_null("name", 2),
+                partition_child_column("email", 3),
+            ],
+            vec![partition_child_constraint(
+                "users_p1_name_check",
+                "CHECK",
+                Some("CHECK (name <> '')"),
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("add column"),
+            "ADD COLUMN must not appear, got: {script}"
+        );
+        assert!(
+            !script.contains("drop column"),
+            "DROP COLUMN must not appear, got: {script}"
+        );
+        assert!(
+            !script.contains("add constraint"),
+            "ADD CONSTRAINT must not appear, got: {script}"
+        );
+        assert!(
+            !script.contains("drop constraint"),
+            "DROP CONSTRAINT must not appear, got: {script}"
+        );
+    }
+
+    // Helper: local partition constraint (coninhcount = 0)
+    fn partition_child_local_constraint(
+        name: &str,
+        constraint_type: &str,
+        definition: Option<&str>,
+    ) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: name.to_string(),
+            table_name: "users_p1".to_string(),
+            constraint_type: constraint_type.to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: definition.map(|d| d.to_string()),
+            coninhcount: 0,
+        }
+    }
+
+    // --- Partition child: local (non-inherited) constraint add IS emitted ---
+    #[test]
+    fn test_partition_child_emits_add_local_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 0)"),
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("add constraint users_p1_local_chk"),
+            "Local CHECK constraint must be emitted for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: local constraint drop IS emitted ---
+    #[test]
+    fn test_partition_child_emits_drop_local_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 0)"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("drop constraint users_p1_local_chk"),
+            "Local CHECK constraint drop must be emitted for partition child, got: {script}"
+        );
+    }
+
+    // --- Partition child: local constraint modification IS emitted ---
+    #[test]
+    fn test_partition_child_emits_alter_local_check_constraint() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 0)"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_local_constraint(
+                "users_p1_local_chk",
+                "CHECK",
+                Some("CHECK (id > 100)"),
+            )],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("drop constraint users_p1_local_chk"),
+            "Local CHECK modification must emit drop, got: {script}"
+        );
+        assert!(
+            script.contains("add constraint users_p1_local_chk"),
+            "Local CHECK modification must emit add, got: {script}"
+        );
+    }
+
+    // --- Partition child: inherited constraint skipped, local constraint emitted in same table ---
+    #[test]
+    fn test_partition_child_mixed_inherited_and_local_constraints() {
+        let from = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![partition_child_constraint(
+                "users_p1_name_check",
+                "CHECK",
+                Some("CHECK (name <> '')"),
+            )],
+            vec![],
+        );
+        let to = partition_child_table(
+            vec![partition_child_identity_column("id", 1, "integer")],
+            vec![
+                partition_child_constraint(
+                    "users_p1_name_check",
+                    "CHECK",
+                    Some("CHECK (char_length(name) > 0)"),
+                ),
+                partition_child_local_constraint(
+                    "users_p1_local_chk",
+                    "CHECK",
+                    Some("CHECK (id > 0)"),
+                ),
+            ],
+            vec![],
+        );
+
+        let script = from.get_alter_script(&to, true);
+        // Inherited constraint change should be suppressed
+        assert!(
+            !script.contains("users_p1_name_check"),
+            "Inherited constraint must be suppressed, got: {script}"
+        );
+        // Local constraint addition should be emitted
+        assert!(
+            script.contains("add constraint users_p1_local_chk"),
+            "Local constraint must be emitted, got: {script}"
+        );
+    }
+
+    // --- Partition key substring false-positive regression ---
+    #[test]
+    fn test_partitioned_parent_non_key_col_type_change_uses_alter() {
+        // Parent table partitioned by expense_date.
+        // Changing `amount` numeric(10,2) → numeric(15,4) must NOT trigger
+        // DROP+CREATE because `amount` is not in the partition key.
+        // This exercises the extract_partition_key_identifiers path
+        // (is_target_partition == false, in_partition_key must be false).
+        let schema = "pt_test";
+        let table_name = "s6_issue2_expenses";
+
+        let mut col_amount_old = create_dummy_column("amount", "numeric");
+        col_amount_old.schema = schema.to_string();
+        col_amount_old.table = table_name.to_string();
+        col_amount_old.numeric_precision = Some(10);
+        col_amount_old.numeric_scale = Some(2);
+        col_amount_old.ordinal_position = 3;
+
+        let mut col_amount_new = create_dummy_column("amount", "numeric");
+        col_amount_new.schema = schema.to_string();
+        col_amount_new.table = table_name.to_string();
+        col_amount_new.numeric_precision = Some(15);
+        col_amount_new.numeric_scale = Some(4);
+        col_amount_new.ordinal_position = 3;
+
+        let mut id_col = create_dummy_column("id", "bigint");
+        id_col.schema = schema.to_string();
+        id_col.table = table_name.to_string();
+        id_col.ordinal_position = 1;
+
+        let mut date_col_old = create_dummy_column("expense_date", "date");
+        date_col_old.schema = schema.to_string();
+        date_col_old.table = table_name.to_string();
+        date_col_old.ordinal_position = 2;
+        let date_col_new = date_col_old.clone();
+
+        let mut from = Table::new(
+            schema.to_string(),
+            table_name.to_string(),
+            schema.to_string(),
+            table_name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col.clone(), date_col_old, col_amount_old],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from.partition_key = Some("range (expense_date)".to_string());
+        from.hash();
+
+        let mut to = Table::new(
+            schema.to_string(),
+            table_name.to_string(),
+            schema.to_string(),
+            table_name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, date_col_new, col_amount_new],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to.partition_key = Some("range (expense_date)".to_string());
+        to.hash();
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop table"),
+            "Non-partition-key column type change must not trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "No data loss warning expected for non-partition-key column, got: {script}"
+        );
+        assert!(
+            script.contains("alter"),
+            "Should produce an ALTER statement for non-key column, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_non_partition_key_column_type_change_uses_alter() {
+        // Partition key references "category_id" but we change column "id".
+        // The old substring check matched "id" inside "category_id" and
+        // incorrectly triggered DROP + CREATE.
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "bigint"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, true);
+        assert!(
+            !script.contains("drop table"),
+            "Non-partition-key column type change must not trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "Non-partition-key column type change must not warn about data loss, got: {script}"
+        );
+        assert!(
+            script.contains("alter"),
+            "Should produce an ALTER statement, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partition_key_column_type_change_still_triggers_recreate() {
+        // When the actual partition key column type changes, DROP + CREATE is correct.
+        let mut from_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "integer"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let mut to_table = Table::new(
+            "data".to_string(),
+            "test".to_string(),
+            "data".to_string(),
+            "test".to_string(),
+            "owner".to_string(),
+            None,
+            vec![
+                create_dummy_column("id", "integer"),
+                create_dummy_column("category_id", "bigint"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_table.partition_key = Some("LIST (category_id)".to_string());
+
+        let script = from_table.get_alter_script(&to_table, true);
+        assert!(
+            script.contains("drop table"),
+            "Partition key column type change must trigger DROP TABLE, got: {script}"
+        );
+        assert!(
+            script.contains("Data loss"),
+            "Partition key column type change must warn about data loss, got: {script}"
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_key_single_unquoted() {
+        let ids = extract_partition_key_identifiers("range (created_at)");
+        assert_eq!(ids, vec!["created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_multiple_unquoted() {
+        let ids = extract_partition_key_identifiers("range (region, created_at)");
+        assert_eq!(ids, vec!["region", "created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_list_method() {
+        let ids = extract_partition_key_identifiers("LIST (flow_id)");
+        assert_eq!(ids, vec!["flow_id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_hash_method() {
+        let ids = extract_partition_key_identifiers("hash (id)");
+        assert_eq!(ids, vec!["id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_does_not_include_method() {
+        // Column named "range" should NOT match the method keyword
+        let ids = extract_partition_key_identifiers("range (created_at)");
+        assert!(!ids.contains(&"range".to_string()));
+    }
+
+    #[test]
+    fn test_extract_partition_key_dollar_identifier() {
+        let ids = extract_partition_key_identifiers("range (my$col)");
+        assert_eq!(ids, vec!["my$col"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_quoted_identifier() {
+        let ids = extract_partition_key_identifiers("list (\"My Column\")");
+        assert_eq!(ids, vec!["my column"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_quoted_with_escaped_quote() {
+        let ids = extract_partition_key_identifiers("list (\"a\"\"b\")");
+        assert_eq!(ids, vec!["a\"b"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_mixed_quoted_and_unquoted() {
+        let ids = extract_partition_key_identifiers("range (\"Region\", created_at)");
+        assert_eq!(ids, vec!["region", "created_at"]);
+    }
+
+    #[test]
+    fn test_extract_partition_key_empty_parens() {
+        let ids = extract_partition_key_identifiers("range ()");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_key_no_parens() {
+        let ids = extract_partition_key_identifiers("range");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_key_column_named_list() {
+        // A column actually named "list" inside the key should be extracted
+        let ids = extract_partition_key_identifiers("range (list)");
+        assert_eq!(ids, vec!["list"]);
     }
 }

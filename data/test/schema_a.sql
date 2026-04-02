@@ -15,6 +15,18 @@ BEGIN
      END IF;
 END;
 $$;
+
+-- Roles used for grant comparison cases
+DO $$
+BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_grant_reader') THEN
+          CREATE ROLE pgc_grant_reader;
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_grant_writer') THEN
+          CREATE ROLE pgc_grant_writer;
+     END IF;
+END;
+$$;
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
@@ -370,6 +382,26 @@ BEGIN
 END;
 $$;
 
+-- =============================================================================
+-- Overloaded routine test: identical overloads in FROM and TO
+-- Two procedures with the same name but different argument signatures.
+-- Both overloads are identical in FROM and TO, so no diff should be emitted.
+-- =============================================================================
+CREATE OR REPLACE PROCEDURE test_schema.notify_event(pJobId uuid, pEventType varchar, pAttributes jsonb)
+LANGUAGE plpgsql AS $$
+BEGIN
+    CALL test_schema.notify_event(pJobId, pEventType, null, pAttributes, null);
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE test_schema.notify_event(pJobId uuid, pEventType varchar, pUserId varchar, pAttributes jsonb, pSessionSeed jsonb DEFAULT NULL)
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- full implementation placeholder
+    RAISE NOTICE 'notify_event: job=%, type=%, user=%, attrs=%, seed=%', pJobId, pEventType, pUserId, pAttributes, pSessionSeed;
+END;
+$$;
+
 -- Triggers
 CREATE TRIGGER trigger_users_update_timestamp
     BEFORE UPDATE ON test_schema.users
@@ -669,6 +701,39 @@ CREATE TABLE data.partition_bound_test (
 CREATE TABLE data.partition_bound_test_active PARTITION OF data.partition_bound_test FOR VALUES IN ('active');
 
 -- =============================================================================
+-- Partition DDL inheritance test: structural changes on a partitioned table
+-- must only be applied to the parent table. Partitions inherit column add/drop,
+-- alter (NOT NULL, DEFAULT), and non-FK constraint changes automatically.
+-- The comparer must NOT emit these DDL statements for partition children.
+--
+-- FROM state:
+--   parent: data.customers  (PARTITION BY RANGE (created_at))
+--     columns: id (PK, NOT NULL), name (NOT NULL), email (nullable), legacy (nullable)
+--     constraints: customers_pkey, chk_customers_name
+--   partition: data.customers_2024  (inherits structure)
+--   partition: data.customers_2025  (inherits structure)
+-- =============================================================================
+CREATE TABLE data.customers (
+    id         BIGINT       NOT NULL,
+    name       TEXT         NOT NULL,
+    email      TEXT,
+    legacy     TEXT,
+    created_at DATE         NOT NULL,
+    CONSTRAINT customers_pkey PRIMARY KEY (id, created_at),
+    CONSTRAINT chk_customers_name CHECK (name <> '')
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE data.customers_2024
+    PARTITION OF data.customers
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE data.customers_2025
+    PARTITION OF data.customers
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX idx_customers_email ON data.customers (email);
+
+-- =============================================================================
 -- Partition index test: existing partitioned table with index gains a new partition
 -- FROM has parent + index + one partition; TO adds a second partition.
 -- The comparer must NOT emit explicit CREATE INDEX for the new partition
@@ -686,6 +751,23 @@ CREATE TABLE data.logs_2024
     FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 
 CREATE INDEX idx_logs_message ON data.logs (message);
+
+-- =============================================================================
+-- Issue #118: non-partition-key column type change on a partitioned table
+-- Parent table partitioned by expense_date.  Changing column "amount" from
+-- numeric(10,2) to numeric(15,4) must produce only ALTER COLUMN on the parent.
+-- The partition must NOT be dropped+recreated.
+-- =============================================================================
+CREATE TABLE data.expenses (
+    id           BIGINT       NOT NULL,
+    expense_date DATE         NOT NULL,
+    amount       NUMERIC(10,2),
+    CONSTRAINT expenses_pkey PRIMARY KEY (id, expense_date)
+) PARTITION BY RANGE (expense_date);
+
+CREATE TABLE data.expenses_2024_01
+    PARTITION OF data.expenses
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
 
 -- SQL routines to test dependency handling
 CREATE OR REPLACE FUNCTION test_schema.get_active_usernames_sql()
@@ -751,6 +833,22 @@ AS $$
     SELECT uuid_generate_v4();
 $$;
 
+-- =============================================================================
+-- CHECK constraint string literal case preservation test
+-- =============================================================================
+-- Verifies that mixed-case string literals inside CHECK constraints are
+-- not corrupted by lowercasing (lowercase_outside_literals bug fix).
+-- chk_category_values is identical in both FROM and TO → must NOT produce
+-- a false diff.
+-- chk_priority_label differs between FROM and TO → real diff expected.
+CREATE TABLE test_schema.check_literal_case_test (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50) NOT NULL,
+    priority VARCHAR(20) NOT NULL,
+    CONSTRAINT chk_category_values CHECK (category IN ('Electronics', 'Home & Garden', 'Books')),
+    CONSTRAINT chk_priority_label CHECK (priority IN ('P1-Critical', 'P2-High', 'P3-Medium', 'P4-Low'))
+);
+
 -- Owner change coverage (FROM side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_from;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_from;
@@ -777,4 +875,28 @@ ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_from;
 --   1. Skip creating separate sequences for serial/bigserial columns
 --   2. Use serial/bigserial types in the CREATE TABLE statement
 --   3. Correctly handle identity columns (skip sequence as well)
+
+-- =============================================================================
+-- Grants comparison test (FROM side)
+-- =============================================================================
+-- These GRANT statements establish the FROM baseline for grant comparison.
+-- Schema B (TO) has different grants to exercise all diff scenarios:
+--   unchanged, modified, added, and removed grants.
+
+-- Schema grants
+GRANT USAGE ON SCHEMA test_schema TO pgc_grant_reader;
+
+-- Table grants
+GRANT SELECT ON test_schema.users TO pgc_grant_reader;
+GRANT SELECT, INSERT, UPDATE ON test_schema.users TO pgc_grant_writer;
+GRANT SELECT ON test_schema.products TO pgc_grant_reader;
+
+-- Sequence grants
+GRANT USAGE ON SEQUENCE test_schema.user_id_seq TO pgc_grant_reader;
+
+-- View grants
+GRANT SELECT ON test_schema.product_inventory TO pgc_grant_reader;
+
+-- Function grants
+GRANT EXECUTE ON FUNCTION test_schema.update_timestamp() TO pgc_grant_reader;
 

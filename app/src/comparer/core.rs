@@ -1,3 +1,5 @@
+use crate::config::grants_mode::GrantsMode;
+use crate::dump::acl;
 use crate::dump::{core::Dump, routine::Routine, table::Table, view::View};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -14,6 +16,12 @@ pub struct Comparer {
     to: Dump,
     // Whether to use DROP statements in the output
     use_drop: bool,
+    // True - if explicit begin...commit statement has to be added; False - otherwise
+    use_single_transaction: bool,
+    // Whether to include comments in the output script
+    use_comments: bool,
+    // How to handle grants (privileges) during comparison
+    grants_mode: GrantsMode,
 
     // The script that will be generated
     script: String,
@@ -30,11 +38,21 @@ pub struct Comparer {
 
 impl Comparer {
     // Creates a new Comparer with the given dumps
-    pub fn new(from: Dump, to: Dump, use_drop: bool) -> Self {
+    pub fn new(
+        from: Dump,
+        to: Dump,
+        use_drop: bool,
+        use_single_transaction: bool,
+        use_comments: bool,
+        grants_mode: GrantsMode,
+    ) -> Self {
         let mut comparer = Self {
             from,
             to,
             use_drop,
+            use_single_transaction,
+            use_comments,
+            grants_mode,
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
@@ -54,8 +72,8 @@ impl Comparer {
         comparer.script.push_str("\n\n To dump:\n");
         comparer.script.push_str(&comparer.to.get_info());
         comparer.script.push_str(&format!(
-            "\n\n Comparison results (use_drop: {}):\n",
-            comparer.use_drop
+            "\n\n Comparison results (use_drop: {}, grants_mode: {}):\n",
+            comparer.use_drop, comparer.grants_mode
         ));
         comparer.script.push_str("*/\n\n");
 
@@ -64,6 +82,10 @@ impl Comparer {
 
     // Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
+        if self.use_single_transaction {
+            self.script.push_str("begin;\n\n");
+        }
+
         self.compare_schemas().await?;
         self.compare_extensions().await?;
         self.compare_enums().await?;
@@ -98,6 +120,12 @@ impl Comparer {
         if !self.trigger_post_script.is_empty() {
             self.script.push_str(&self.trigger_post_script);
             self.trigger_post_script.clear();
+        }
+
+        self.compare_grants().await?;
+
+        if self.use_single_transaction {
+            self.script.push_str("\ncommit;");
         }
 
         Ok(())
@@ -136,25 +164,22 @@ impl Comparer {
         if routine.hash.is_none() {
             self.script.push_str(
                 format!(
-                    "/* Skipping routine {}.{} due to missing hash. */\n",
-                    routine.schema, routine.name
+                    "/* Skipping routine {}.{}({}) due to missing hash. */\n",
+                    routine.schema, routine.name, routine.arguments
                 )
                 .as_str(),
             );
             return;
         }
 
-        if let Some(from_routine) = self
-            .from
-            .routines
-            .iter()
-            .find(|r| r.name == routine.name && r.schema == routine.schema)
-        {
+        if let Some(from_routine) = self.from.routines.iter().find(|r| {
+            r.name == routine.name && r.schema == routine.schema && r.arguments == routine.arguments
+        }) {
             if from_routine.hash.is_none() {
                 self.script.push_str(
                     format!(
-                        "/* Skipping routine {}.{} due to missing hash. */\n",
-                        from_routine.schema, from_routine.name
+                        "/* Skipping routine {}.{}({}) due to missing hash. */\n",
+                        from_routine.schema, from_routine.name, from_routine.arguments
                     )
                     .as_str(),
                 );
@@ -180,20 +205,228 @@ impl Comparer {
                     }
                 }
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script.push_str(routine.get_script().as_str());
             }
         } else {
-            self.script
-                .push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+            self.script.push_str(
+                format!(
+                    "/* Routine: {}.{}({})*/\n",
+                    routine.schema, routine.name, routine.arguments
+                )
+                .as_str(),
+            );
             self.script.push_str(routine.get_script().as_str());
         }
     }
 
     // Returns the script generated by the comparer
     fn get_script(&self) -> String {
-        self.script.clone()
+        if self.use_comments {
+            return self.script.clone();
+        }
+        // Strip SQL comments (-- line comments and /* block comments */) from the
+        // script, passing through all other content verbatim.  Four token types are
+        // recognised and copied byte-for-byte without interpretation so that
+        // comment-like sequences inside them are never stripped:
+        //   • dollar-quoted strings:      $$ … $$ or $tag$ … $tag$
+        //   • single-quoted literals:     ' … '   ('' is the escape for a literal quote)
+        //   • E-string literals:          E' … '  (backslash sequences and '' are handled)
+        //   • double-quoted identifiers:  " … "   ("" is the escape for a literal quote)
+        // Operates on bytes to avoid corrupting multi-byte UTF-8 sequences.
+        let src = self.script.as_bytes();
+        let len = src.len();
+        let mut result: Vec<u8> = Vec::with_capacity(len);
+        let mut i = 0;
+
+        while i < len {
+            // Dollar-quoting: $$ or $tag$ — pass through verbatim until matching closer
+            if src[i] == b'$'
+                && let Some(tag_len) = Self::dollar_tag_at(src, i)
+            {
+                let tag = &src[i..i + tag_len];
+                // Copy opening tag
+                result.extend_from_slice(tag);
+                i += tag_len;
+                // Copy everything until closing tag
+                loop {
+                    if i >= len {
+                        break;
+                    }
+                    if src[i] == b'$'
+                        && let Some(close_len) = Self::dollar_tag_at(src, i)
+                        && close_len == tag_len
+                        && &src[i..i + close_len] == tag
+                    {
+                        result.extend_from_slice(&src[i..i + close_len]);
+                        i += close_len;
+                        break;
+                    }
+                    result.push(src[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            // E-string literal E'...' or e'...' — pass through verbatim.
+            // PostgreSQL escape strings allow both \' and '' to embed a single quote.
+            // This scanner does not interpret escape sequences; it copies every \X pair
+            // as two raw bytes so that the character following a backslash is never
+            // mistaken for a string terminator or a comment starter.
+            // Must be handled before the plain single-quote branch so that \'
+            // inside the literal does not terminate the scanner prematurely.
+            if (src[i] == b'E' || src[i] == b'e') && i + 1 < len && src[i + 1] == b'\'' {
+                result.push(src[i]); // E / e
+                result.push(b'\'');
+                i += 2;
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', true);
+                continue;
+            }
+            // Single-quoted string — pass through verbatim (handle '' escapes)
+            if src[i] == b'\'' {
+                result.push(b'\'');
+                i += 1;
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', false);
+                continue;
+            }
+            // Double-quoted identifier — pass through verbatim (handle "" escapes)
+            if src[i] == b'"' {
+                result.push(b'"');
+                i += 1;
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'"', false);
+                continue;
+            }
+            // Block comment /* ... */ — strip.
+            // PostgreSQL allows arbitrarily nested block comments
+            // (/* outer /* inner */ still outer */); track a depth counter so
+            // every nesting level is consumed before resuming normal scanning.
+            if i + 1 < len && src[i] == b'/' && src[i + 1] == b'*' {
+                i += 2;
+                let mut depth: usize = 1;
+                while i + 1 < len && depth > 0 {
+                    if src[i] == b'/' && src[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if src[i] == b'*' && src[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if depth > 0 {
+                    // Unterminated comment — consumed to end of input.
+                    i = len;
+                }
+                continue;
+            }
+            // Line comment -- ... — strip
+            if i + 1 < len && src[i] == b'-' && src[i + 1] == b'-' {
+                i += 2;
+                while i < len && src[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            result.push(src[i]);
+            i += 1;
+        }
+
+        // Safety: result is built entirely from slices of self.script (valid UTF-8),
+        // so it is guaranteed to be valid UTF-8.
+        let result = String::from_utf8(result).expect("output must be valid UTF-8");
+
+        // Collapse runs of 3+ newlines into 2
+        let mut collapsed = String::with_capacity(result.len());
+        let mut newline_count = 0u32;
+        for c in result.chars() {
+            if c == '\n' {
+                newline_count += 1;
+                if newline_count <= 2 {
+                    collapsed.push('\n');
+                }
+            } else {
+                newline_count = 0;
+                collapsed.push(c);
+            }
+        }
+        let trimmed = collapsed.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let mut out = trimmed.to_string();
+        out.push('\n');
+        out
+    }
+
+    /// Copies a quoted literal body (everything after the opening delimiter has
+    /// already been pushed) into `result`, advancing `i` past the closing
+    /// delimiter.  Two quoting conventions are supported:
+    ///
+    /// * **Standard** (`backslash_escapes = false`): a doubled delimiter (`''`
+    ///   or `""`) is an escape sequence; any other occurrence of the delimiter
+    ///   ends the literal.
+    /// * **E-string** (`backslash_escapes = true`): additionally, a backslash
+    ///   followed by any byte is copied as a unit without re-inspecting the
+    ///   second byte, so `\'` never terminates the literal.
+    ///
+    /// In both modes every byte is copied verbatim — the scanner does not
+    /// interpret the content, only tracks enough structure to know when the
+    /// literal ends.
+    fn copy_quoted_literal(
+        src: &[u8],
+        result: &mut Vec<u8>,
+        i: &mut usize,
+        delimiter: u8,
+        backslash_escapes: bool,
+    ) {
+        let len = src.len();
+        while *i < len {
+            if backslash_escapes && src[*i] == b'\\' {
+                // Copy the backslash and the following byte as a unit.
+                result.push(b'\\');
+                *i += 1;
+                if *i < len {
+                    result.push(src[*i]);
+                    *i += 1;
+                }
+            } else if src[*i] == delimiter {
+                result.push(delimiter);
+                *i += 1;
+                if *i < len && src[*i] == delimiter {
+                    // Doubled-delimiter escape — copy the second one and keep scanning.
+                    result.push(delimiter);
+                    *i += 1;
+                } else {
+                    break; // closing delimiter
+                }
+            } else {
+                result.push(src[*i]);
+                *i += 1;
+            }
+        }
+    }
+
+    /// Checks if a dollar-quote tag starts at position `pos` in `src`.
+    /// A tag is `$` followed by zero or more alphanumeric/underscore chars, followed by `$`.
+    /// Returns the total length of the tag (including both `$` signs) or None.
+    fn dollar_tag_at(src: &[u8], pos: usize) -> Option<usize> {
+        if pos >= src.len() || src[pos] != b'$' {
+            return None;
+        }
+        let mut j = pos + 1;
+        while j < src.len() && (src[j].is_ascii_alphanumeric() || src[j] == b'_') {
+            j += 1;
+        }
+        if j < src.len() && src[j] == b'$' {
+            Some(j - pos + 1) // include closing $
+        } else {
+            None
+        }
     }
 
     fn normalized_view_reference(reference: &str) -> String {
@@ -1038,24 +1271,28 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self
-                    .to
-                    .routines
-                    .iter()
-                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+                !self.to.routines.iter().any(|tr| {
+                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
+                })
             })
             .cloned()
             .collect();
 
         if !routines_to_drop.is_empty() {
             let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
-            let drop_names: Vec<(String, String)> = routines_to_drop
+            let drop_names: Vec<(String, String, String)> = routines_to_drop
                 .iter()
-                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|r| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
-                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1076,7 +1313,11 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -1107,14 +1348,20 @@ impl Comparer {
 
         if !create_routines.is_empty() {
             let n = create_routines.len();
-            let names: Vec<(String, String)> = create_routines
+            let names: Vec<(String, String, String)> = create_routines
                 .iter()
-                .map(|(_, r)| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|(_, r)| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
             for (i, (_, routine)) in create_routines.iter().enumerate() {
-                for (j, (schema, name)) in names.iter().enumerate() {
+                for (j, (schema, name, _)) in names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1134,7 +1381,12 @@ impl Comparer {
                 } else {
                     0
                 };
-                (priority, r.schema.to_lowercase(), r.name.to_lowercase())
+                (
+                    priority,
+                    r.schema.to_lowercase(),
+                    r.name.to_lowercase(),
+                    r.arguments.to_lowercase(),
+                )
             });
 
             for idx in sorted {
@@ -1252,7 +1504,7 @@ impl Comparer {
             // Drop triggers on the table
             for trigger in &table.triggers {
                 pre_drop.push_str(&format!(
-                    "drop trigger if exists \"{}\" on \"{}\".\"{}\";\n",
+                    "drop trigger if exists {} on {}.{};\n",
                     trigger.name, table.schema, table.name
                 ));
             }
@@ -1321,6 +1573,26 @@ impl Comparer {
                     .push_str(table.get_trigger_script().as_str());
             }
         }
+        // Track parent tables that will be dropped + recreated (partition key
+        // changed, or a column in the partition key has a type change, etc.).
+        // Their children were implicitly dropped and must be re-created from
+        // scratch instead of altered.
+        // Seed with explicit partition_key differences; additional parents may
+        // be discovered during the alter loop when their generated script
+        // contains a DROP TABLE.
+        let mut recreated_parents: HashSet<String> = HashSet::new();
+        for table in ordered_from.iter() {
+            if let Some(to_table) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                && table.partition_key != to_table.partition_key
+            {
+                recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+            }
+        }
+
         // We will find all existing tables in both dumps with different hashes
         for table in ordered_from.iter() {
             if table.hash.is_none() {
@@ -1350,19 +1622,43 @@ impl Comparer {
                     continue;
                 }
                 if Self::hashes_differ(&to_table.hash, &table.hash) {
+                    // If this is a partition child whose parent was recreated
+                    // (dropped + recreated), the child was implicitly dropped.
+                    // Emit a CREATE TABLE instead of ALTER/DETACH/ATTACH.
+                    let parent_recreated = to_table.partition_of.as_ref().is_some_and(|pref| {
+                        let parent_key = Self::normalise_partition_of(pref);
+                        recreated_parents.contains(&parent_key)
+                    });
+
                     self.script.push_str(
                         format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str(),
                     );
-                    self.script.push_str(
-                        table
-                            .get_alter_script_without_triggers(to_table, self.use_drop)
-                            .as_str(),
-                    );
-                    self.trigger_post_script.push_str(
-                        table
-                            .get_trigger_alter_script(to_table, self.use_drop)
-                            .as_str(),
-                    );
+
+                    if parent_recreated {
+                        self.script
+                            .push_str(to_table.get_script_without_triggers().as_str());
+                        self.trigger_post_script
+                            .push_str(to_table.get_trigger_script().as_str());
+                    } else {
+                        let alter_script =
+                            table.get_alter_script_without_triggers(to_table, self.use_drop);
+
+                        // If the generated alter script dropped + recreated this table
+                        // and the table is a partitioned parent, record it so its
+                        // children will be recreated instead of altered.
+                        if table.partition_key.is_some()
+                            && alter_script.to_lowercase().contains("drop table if exists")
+                        {
+                            recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+                        }
+
+                        self.script.push_str(alter_script.as_str());
+                        self.trigger_post_script.push_str(
+                            table
+                                .get_trigger_alter_script(to_table, self.use_drop)
+                                .as_str(),
+                        );
+                    }
                 }
             } else {
                 continue; // Table is present in both dumps, we already processed it
@@ -1632,11 +1928,9 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self
-                    .to
-                    .routines
-                    .iter()
-                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+                !self.to.routines.iter().any(|tr| {
+                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
+                })
             })
             .cloned()
             .collect();
@@ -1646,13 +1940,19 @@ impl Comparer {
             // reverse dependency order (dependents first).
             let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
 
-            let drop_names: Vec<(String, String)> = routines_to_drop
+            let drop_names: Vec<(String, String, String)> = routines_to_drop
                 .iter()
-                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|r| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
-                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1673,7 +1973,11 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -1703,11 +2007,11 @@ impl Comparer {
             if routine.hash.is_none() {
                 continue;
             }
-            let from_routine = self
-                .from
-                .routines
-                .iter()
-                .find(|r| r.name == routine.name && r.schema == routine.schema);
+            let from_routine = self.from.routines.iter().find(|r| {
+                r.name == routine.name
+                    && r.schema == routine.schema
+                    && r.arguments == routine.arguments
+            });
             let needs_action = match from_routine {
                 None => true,
                 Some(fr) => fr.hash.is_some() && Self::hashes_differ(&fr.hash, &routine.hash),
@@ -1896,12 +2200,233 @@ impl Comparer {
             .push_str("\n/* ---> Routines & Views: End section --------------- */\n\n");
         Ok(())
     }
+
+    // Compare grants (privileges) for all objects
+    async fn compare_grants(&mut self) -> Result<(), Error> {
+        if self.grants_mode == GrantsMode::Ignore {
+            return Ok(());
+        }
+
+        let full = self.grants_mode == GrantsMode::Full;
+
+        // Build O(1) lookup maps from the "from" dump
+        let from_schema_map: HashMap<&str, (&[String], &str)> = self
+            .from
+            .schemas
+            .iter()
+            .map(|s| (s.name.as_str(), (s.acl.as_slice(), s.owner.as_str())))
+            .collect();
+
+        let from_table_map: HashMap<(&str, &str), (&[String], &str)> = self
+            .from
+            .tables
+            .iter()
+            .map(|t| {
+                (
+                    (t.schema.as_str(), t.name.as_str()),
+                    (t.acl.as_slice(), t.owner.as_str()),
+                )
+            })
+            .collect();
+
+        let from_seq_map: HashMap<(&str, &str), (&[String], &str)> = self
+            .from
+            .sequences
+            .iter()
+            .map(|s| {
+                (
+                    (s.schema.as_str(), s.name.as_str()),
+                    (s.acl.as_slice(), s.owner.as_str()),
+                )
+            })
+            .collect();
+
+        let from_view_map: HashMap<(&str, &str), (&[String], &str)> = self
+            .from
+            .views
+            .iter()
+            .map(|v| {
+                (
+                    (v.schema.as_str(), v.name.as_str()),
+                    (v.acl.as_slice(), v.owner.as_str()),
+                )
+            })
+            .collect();
+
+        let from_routine_map: HashMap<(&str, &str, &str), (&[String], &str)> = self
+            .from
+            .routines
+            .iter()
+            .map(|r| {
+                (
+                    (r.schema.as_str(), r.name.as_str(), r.arguments.as_str()),
+                    (r.acl.as_slice(), r.owner.as_str()),
+                )
+            })
+            .collect();
+
+        self.script
+            .push_str("\n/* ---> Grants: Start section --------------- */\n\n");
+
+        // --- Schemas ---
+        for schema in &self.to.schemas {
+            let (from_acl, from_owner) = from_schema_map
+                .get(schema.name.as_str())
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, schema.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &schema.acl,
+                full,
+                "SCHEMA",
+                &schema.name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for schema: {} */\n", schema.name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Tables ---
+        for table in &self.to.tables {
+            let (from_acl, from_owner) = from_table_map
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, table.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_name = format!("{}.{}", table.schema, table.name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &table.acl,
+                full,
+                "TABLE",
+                &object_name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for table: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Sequences ---
+        for seq in &self.to.sequences {
+            let (from_acl, from_owner) = from_seq_map
+                .get(&(seq.schema.as_str(), seq.name.as_str()))
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, seq.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_name = format!("{}.{}", seq.schema, seq.name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &seq.acl,
+                full,
+                "SEQUENCE",
+                &object_name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for sequence: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Views ---
+        for view in &self.to.views {
+            let (from_acl, from_owner) = from_view_map
+                .get(&(view.schema.as_str(), view.name.as_str()))
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, view.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_name = format!("{}.{}", view.schema, view.name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &view.acl,
+                full,
+                "TABLE",
+                &object_name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for view: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Routines ---
+        for routine in &self.to.routines {
+            let (from_acl, from_owner) = from_routine_map
+                .get(&(
+                    routine.schema.as_str(),
+                    routine.name.as_str(),
+                    routine.arguments.as_str(),
+                ))
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, routine.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_kind = match routine.kind.as_str() {
+                "procedure" => "PROCEDURE",
+                _ => "FUNCTION",
+            };
+            let object_name = format!("{}.{}({})", routine.schema, routine.name, routine.arguments);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &routine.acl,
+                full,
+                object_kind,
+                &object_name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script.push_str(
+                        format!("/* Grants for {}: {} */\n", routine.kind, object_name).as_str(),
+                    );
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> Grants: End section --------------- */\n\n");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::dump_config::DumpConfig;
+    use crate::config::grants_mode::GrantsMode;
     use crate::dump::extension::Extension;
     use crate::dump::pg_type::{CompositeAttribute, PgType};
     use crate::dump::routine::Routine;
@@ -2022,14 +2547,13 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("drop function if exists \"public\".\"test_func\" ();"));
-        assert!(
-            script.contains("create or replace function \"public\".\"test_func\"() returns text")
-        );
+        assert!(script.contains("drop function if exists public.test_func ();"));
+        assert!(script.contains("create or replace function public.test_func() returns text"));
     }
 
     #[tokio::test]
@@ -2066,14 +2590,15 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("drop function if exists \"public\".\"test_func\" (a integer);"));
-        assert!(script.contains(
-            "create or replace function \"public\".\"test_func\"(a text) returns integer"
-        ));
+        assert!(script.contains("drop function if exists public.test_func (a integer);"));
+        assert!(
+            script.contains("create or replace function public.test_func(a text) returns integer")
+        );
     }
 
     #[tokio::test]
@@ -2111,15 +2636,16 @@ mod tests {
         to_dump.routines.push(sql_routine);
         to_dump.routines.push(plpgsql_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
         let pos_plpgsql = script
-            .find("create or replace function \"public\".\"fn_plpgsql\"")
+            .find("create or replace function public.fn_plpgsql")
             .expect("plpgsql routine script not found");
         let pos_sql = script
-            .find("create or replace function \"public\".\"fn_sql\"")
+            .find("create or replace function public.fn_sql")
             .expect("sql routine script not found");
 
         assert!(pos_plpgsql < pos_sql, "SQL routines should be applied last");
@@ -2147,15 +2673,15 @@ mod tests {
         );
         from_dump.routines.push(dropped_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let routine_drop_pos = script
-            .find("drop function if exists \"test_schema\".\"get_users_by_status\"")
+            .find("drop function if exists test_schema.get_users_by_status")
             .expect("routine drop script not found");
         let type_drop_pos = script
-            .find("drop type if exists \"test_schema\".\"status_type\";")
+            .find("drop type if exists test_schema.status_type;")
             .expect("type drop script not found");
 
         assert!(
@@ -2191,15 +2717,15 @@ mod tests {
         );
         from_dump.routines.push(dropped_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let routine_drop_pos = script
-            .find("drop function if exists \"test_schema\".\"get_users_by_status_enum\"")
+            .find("drop function if exists test_schema.get_users_by_status_enum")
             .expect("routine drop script not found");
         let enum_drop_pos = script
-            .find("drop type if exists \"test_schema\".\"status_enum\";")
+            .find("drop type if exists test_schema.status_enum;")
             .expect("enum drop script not found");
 
         assert!(
@@ -2229,14 +2755,14 @@ mod tests {
             vec![("street", "varchar(255)"), ("city", "varchar(100)")],
         ));
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("create type \"test_schema\".\"test_type_B\" as ("));
+        assert!(script.contains("create type test_schema.test_type_B as ("));
         assert!(script.contains("\"street\" varchar(255)"));
         assert!(script.contains("\"city\" varchar(100)"));
-        assert!(script.contains("drop type if exists \"test_schema\".\"test_type_A\";"));
+        assert!(script.contains("drop type if exists test_schema.test_type_A;"));
     }
 
     #[tokio::test]
@@ -2244,22 +2770,22 @@ mod tests {
         let mut from_dump = Dump::new(DumpConfig::default());
         let mut to_dump = Dump::new(DumpConfig::default());
 
-        let mut from_schema = Schema::new("public".to_string(), None);
+        let mut from_schema = Schema::new("public".to_string(), "public".to_string(), None);
         from_schema.owner = "old_owner".to_string();
         from_schema.hash();
 
-        let mut to_schema = Schema::new("public".to_string(), None);
+        let mut to_schema = Schema::new("public".to_string(), "public".to_string(), None);
         to_schema.owner = "new_owner".to_string();
         to_schema.hash();
 
         from_dump.schemas.push(from_schema);
         to_dump.schemas.push(to_schema);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_schemas().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter schema \"public\" owner to \"new_owner\";"));
+        assert!(script.contains("alter schema public owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -2284,7 +2810,7 @@ mod tests {
         from_dump.extensions.push(from_ext);
         to_dump.extensions.push(to_ext);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_extensions().await.unwrap();
         let script = comparer.get_script();
 
@@ -2331,13 +2857,11 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(
-            script.contains("alter function \"public\".\"test_func\"() owner to \"new_owner\";")
-        );
+        assert!(script.contains("alter function public.test_func() owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -2407,21 +2931,22 @@ mod tests {
         to_dump.routines.push(a_middle);
         to_dump.routines.push(r_base);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
         let pos_base = script
-            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .find("create or replace function test_schema.r_base_value")
             .expect("r_base_value not found");
         let pos_step = script
-            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .find("create or replace function test_schema.x_step_one")
             .expect("x_step_one not found");
         let pos_middle = script
-            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .find("create or replace function test_schema.a_middle_layer")
             .expect("a_middle_layer not found");
         let pos_final = script
-            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .find("create or replace procedure test_schema.z_final_report")
             .expect("z_final_report not found");
 
         assert!(
@@ -2493,18 +3018,18 @@ mod tests {
         from_dump.routines.push(x_step);
         from_dump.routines.push(a_middle);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
         let pos_base = script
-            .find("drop function if exists \"test_schema\".\"r_base_value\"")
+            .find("drop function if exists test_schema.r_base_value")
             .expect("r_base_value drop not found");
         let pos_step = script
-            .find("drop function if exists \"test_schema\".\"x_step_one\"")
+            .find("drop function if exists test_schema.x_step_one")
             .expect("x_step_one drop not found");
         let pos_middle = script
-            .find("drop function if exists \"test_schema\".\"a_middle_layer\"")
+            .find("drop function if exists test_schema.a_middle_layer")
             .expect("a_middle_layer drop not found");
 
         // Drops should go in reverse dependency order: dependents first.
@@ -2581,21 +3106,22 @@ mod tests {
         to_dump.routines.push(a_middle);
         to_dump.routines.push(r_base);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines_and_views().await.unwrap();
         let script = comparer.get_script();
 
         let pos_base = script
-            .find("create or replace function \"test_schema\".\"r_base_value\"")
+            .find("create or replace function test_schema.r_base_value")
             .expect("r_base_value not found");
         let pos_step = script
-            .find("create or replace function \"test_schema\".\"x_step_one\"")
+            .find("create or replace function test_schema.x_step_one")
             .expect("x_step_one not found");
         let pos_middle = script
-            .find("create or replace function \"test_schema\".\"a_middle_layer\"")
+            .find("create or replace function test_schema.a_middle_layer")
             .expect("a_middle_layer not found");
         let pos_final = script
-            .find("create or replace procedure \"test_schema\".\"z_final_report\"")
+            .find("create or replace procedure test_schema.z_final_report")
             .expect("z_final_report not found");
 
         assert!(
@@ -2752,6 +3278,8 @@ mod tests {
         let table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![column],
@@ -2762,7 +3290,8 @@ mod tests {
         );
         to_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -2850,6 +3379,8 @@ mod tests {
         let table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![column],
@@ -2860,7 +3391,8 @@ mod tests {
         );
         to_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -2894,12 +3426,13 @@ mod tests {
         );
         to_dump.sequences.push(sequence);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
         assert!(!script.contains("Skipping sequence"));
-        assert!(script.contains("create sequence \"public\".\"test_seq\""));
+        assert!(script.contains("create sequence public.test_seq"));
     }
 
     #[tokio::test]
@@ -2944,11 +3477,11 @@ mod tests {
         from_dump.sequences.push(from_sequence);
         to_dump.sequences.push(to_sequence);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter sequence \"public\".\"test_seq\" owner to \"new_owner\";"));
+        assert!(script.contains("alter sequence public.test_seq owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -3029,6 +3562,8 @@ mod tests {
         let table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![column],
@@ -3039,7 +3574,7 @@ mod tests {
         );
         from_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3124,6 +3659,8 @@ mod tests {
         let from_table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![from_column],
@@ -3190,6 +3727,8 @@ mod tests {
         let to_table = Table::new(
             "public".to_string(),
             "test".to_string(),
+            "public".to_string(),
+            "test".to_string(),
             "postgres".to_string(),
             None,
             vec![to_column],
@@ -3200,7 +3739,7 @@ mod tests {
         );
         to_dump.tables.push(to_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3214,6 +3753,8 @@ mod tests {
 
         // Parent partitioned table
         let mut parent = Table::new(
+            "public".to_string(),
+            "parent".to_string(),
             "public".to_string(),
             "parent".to_string(),
             "postgres".to_string(),
@@ -3231,6 +3772,8 @@ mod tests {
         let mut part = Table::new(
             "public".to_string(),
             "child".to_string(),
+            "public".to_string(),
+            "child".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "child", "id", 1)],
@@ -3245,6 +3788,8 @@ mod tests {
 
         // Referencing table with FK to parent
         let mut orders = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
             "public".to_string(),
             "orders".to_string(),
             "postgres".to_string(),
@@ -3264,6 +3809,7 @@ mod tests {
                 definition: Some(
                     "FOREIGN KEY (parent_id) REFERENCES public.parent(id)".to_string(),
                 ),
+                coninhcount: 0,
             }],
             vec![],
             vec![],
@@ -3275,21 +3821,22 @@ mod tests {
         to_dump.tables.push(part);
         to_dump.tables.push(orders);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let pos_parent = script
-            .find("create table \"public\".\"parent\"")
+            .find("create table public.parent")
             .expect("parent table not created");
         let pos_child = script
-            .find("create table \"public\".\"child\" partition of public.parent")
+            .find("create table public.child partition of public.parent")
             .expect("partition table not created");
         let pos_orders = script
-            .find("create table \"public\".\"orders\"")
+            .find("create table public.orders")
             .expect("orders table not created");
         let pos_fk = script
-            .find("alter table \"public\".\"orders\" add constraint \"orders_parent_fk\"")
+            .find("alter table public.orders add constraint orders_parent_fk")
             .expect("fk not emitted");
 
         assert!(
@@ -3310,6 +3857,8 @@ mod tests {
         let mut from_table = Table::new(
             "public".to_string(),
             "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
             "old_owner".to_string(),
             None,
             vec![int_column("public", "users", "id", 1)],
@@ -3321,6 +3870,8 @@ mod tests {
         from_table.hash();
 
         let mut to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
             "public".to_string(),
             "users".to_string(),
             "new_owner".to_string(),
@@ -3336,11 +3887,11 @@ mod tests {
         from_dump.tables.push(from_table);
         to_dump.tables.push(to_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_tables().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter table \"public\".\"users\" owner to \"new_owner\";"));
+        assert!(script.contains("alter table public.users owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -3369,11 +3920,11 @@ mod tests {
         from_dump.views.push(from_view);
         to_dump.views.push(to_view);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.create_views().await.unwrap();
         let script = comparer.get_script();
 
-        assert!(script.contains("alter view \"public\".\"active_users\" owner to \"new_owner\";"));
+        assert!(script.contains("alter view public.active_users owner to new_owner;"));
     }
 
     #[tokio::test]
@@ -3388,9 +3939,11 @@ mod tests {
         let from_dump = Dump::new(DumpConfig::default());
         let mut to_dump = Dump::new(DumpConfig::default());
 
-        to_dump
-            .schemas
-            .push(Schema::new("test_schema".to_string(), None));
+        to_dump.schemas.push(Schema::new(
+            "test_schema".to_string(),
+            "test_schema".to_string(),
+            None,
+        ));
 
         let get_user_count = Routine::new(
             "test_schema".to_string(),
@@ -3446,21 +3999,22 @@ mod tests {
         to_dump.routines.push(get_user_count);
         to_dump.views.push(v_user_stats);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let pos_get_user_count = script
-            .find("create or replace function \"test_schema\".\"get_user_count\"")
+            .find("create or replace function test_schema.get_user_count")
             .expect("get_user_count not found in script");
         let pos_view = script
-            .find("\"test_schema\".\"v_user_stats\"")
+            .find("test_schema.v_user_stats")
             .expect("v_user_stats not found in script");
         let pos_report = script
-            .find("create or replace function \"test_schema\".\"report_user_stats\"")
+            .find("create or replace function test_schema.report_user_stats")
             .expect("report_user_stats not found in script");
         let pos_print = script
-            .find("create or replace procedure \"test_schema\".\"print_user_stats\"")
+            .find("create or replace procedure test_schema.print_user_stats")
             .expect("print_user_stats not found in script");
 
         assert!(
@@ -3508,16 +4062,15 @@ mod tests {
         to_dump.routines.push(helper_fn);
         to_dump.views.push(mat_view);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let pos_fn = script
-            .find("create or replace function \"public\".\"helper\"")
+            .find("create or replace function public.helper")
             .expect("helper function not found");
-        let pos_mv = script
-            .find("\"public\".\"mv_data\"")
-            .expect("mv_data not found");
+        let pos_mv = script.find("public.mv_data").expect("mv_data not found");
 
         assert!(
             pos_fn < pos_mv,
@@ -3561,15 +4114,15 @@ mod tests {
         from_dump.routines.push(routine_b);
         from_dump.routines.push(routine_a);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let pos_caller = script
-            .find("drop function if exists \"public\".\"caller_fn\"")
+            .find("drop function if exists public.caller_fn")
             .expect("caller_fn drop not found");
         let pos_base = script
-            .find("drop function if exists \"public\".\"base_fn\"")
+            .find("drop function if exists public.base_fn")
             .expect("base_fn drop not found");
 
         assert!(
@@ -3588,6 +4141,8 @@ mod tests {
         let mut grandparent = Table::new(
             "public".to_string(),
             "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events", "id", 1)],
@@ -3601,6 +4156,8 @@ mod tests {
 
         // Level 1: sub-partition parent (is both a partition child AND partitioned by LIST)
         let mut sub_parent = Table::new(
+            "public".to_string(),
+            "events_2023".to_string(),
             "public".to_string(),
             "events_2023".to_string(),
             "postgres".to_string(),
@@ -3620,6 +4177,8 @@ mod tests {
         let mut leaf = Table::new(
             "public".to_string(),
             "events_2023_a".to_string(),
+            "public".to_string(),
+            "events_2023_a".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events_2023_a", "id", 1)],
@@ -3637,18 +4196,19 @@ mod tests {
         to_dump.tables.push(grandparent);
         to_dump.tables.push(sub_parent);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let pos_gp = script
-            .find("create table \"public\".\"events\"")
+            .find("create table public.events")
             .expect("grandparent not created");
         let pos_sp = script
-            .find("create table \"public\".\"events_2023\" partition of")
+            .find("create table public.events_2023 partition of")
             .expect("sub-partition parent not created");
         let pos_leaf = script
-            .find("create table \"public\".\"events_2023_a\" partition of")
+            .find("create table public.events_2023_a partition of")
             .expect("leaf partition not created");
 
         assert!(
@@ -3669,6 +4229,8 @@ mod tests {
         let mut grandparent = Table::new(
             "public".to_string(),
             "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events", "id", 1)],
@@ -3683,6 +4245,8 @@ mod tests {
         let mut sub_parent = Table::new(
             "public".to_string(),
             "events_2023".to_string(),
+            "public".to_string(),
+            "events_2023".to_string(),
             "postgres".to_string(),
             None,
             vec![int_column("public", "events_2023", "id", 1)],
@@ -3691,12 +4255,14 @@ mod tests {
             vec![],
             None,
         );
-        sub_parent.partition_of = Some("\"public\".\"events\"".to_string());
+        sub_parent.partition_of = Some("public.events".to_string());
         sub_parent.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
         sub_parent.partition_key = Some("LIST (id)".to_string());
         sub_parent.hash();
 
         let mut leaf = Table::new(
+            "public".to_string(),
+            "events_2023_a".to_string(),
             "public".to_string(),
             "events_2023_a".to_string(),
             "postgres".to_string(),
@@ -3707,7 +4273,7 @@ mod tests {
             vec![],
             None,
         );
-        leaf.partition_of = Some("\"public\".\"events_2023\"".to_string());
+        leaf.partition_of = Some("public.events_2023".to_string());
         leaf.partition_bound = Some("FOR VALUES IN (1)".to_string());
         leaf.hash();
 
@@ -3715,18 +4281,18 @@ mod tests {
         from_dump.tables.push(sub_parent);
         from_dump.tables.push(leaf);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
         let pos_gp = script
-            .find("drop table if exists \"public\".\"events\";")
+            .find("drop table if exists public.events;")
             .expect("grandparent drop not found");
         let pos_sp = script
-            .find("drop table if exists \"public\".\"events_2023\";")
+            .find("drop table if exists public.events_2023;")
             .expect("sub-partition parent drop not found");
         let pos_leaf = script
-            .find("drop table if exists \"public\".\"events_2023_a\";")
+            .find("drop table if exists public.events_2023_a;")
             .expect("leaf partition drop not found");
 
         assert!(
@@ -3817,6 +4383,8 @@ mod tests {
         let serial_table = Table::new(
             "test_schema".to_string(),
             "test_serial".to_string(),
+            "test_schema".to_string(),
+            "test_serial".to_string(),
             "postgres".to_string(),
             None,
             vec![serial_col],
@@ -3900,6 +4468,8 @@ mod tests {
         let bigserial_table = Table::new(
             "test_schema".to_string(),
             "test_bigserial".to_string(),
+            "test_schema".to_string(),
+            "test_bigserial".to_string(),
             "postgres".to_string(),
             None,
             vec![bigserial_col],
@@ -3912,10 +4482,12 @@ mod tests {
 
         to_dump.schemas.push(crate::dump::schema::Schema::new(
             "test_schema".to_string(),
+            "test_schema".to_string(),
             None,
         ));
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3929,21 +4501,21 @@ mod tests {
             "bigserial sequence should be skipped"
         );
         assert!(
-            !script.contains("create sequence \"test_schema\".\"test_serial_id_seq\""),
+            !script.contains("create sequence test_schema.test_serial_id_seq"),
             "serial sequence should not be created separately"
         );
         assert!(
-            !script.contains("create sequence \"test_schema\".\"test_bigserial_id_seq\""),
+            !script.contains("create sequence test_schema.test_bigserial_id_seq"),
             "bigserial sequence should not be created separately"
         );
 
         // Table columns should use serial/bigserial types
         assert!(
-            script.contains("\"id\" serial"),
+            script.contains("id serial"),
             "serial column should use 'serial' type, got:\n{script}"
         );
         assert!(
-            script.contains("\"id\" bigserial"),
+            script.contains("id bigserial"),
             "bigserial column should use 'bigserial' type, got:\n{script}"
         );
 
@@ -3955,6 +4527,2007 @@ mod tests {
         assert!(
             !script.contains("nextval('test_schema.test_bigserial_id_seq'"),
             "bigserial column should not have explicit nextval default"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_single_transaction_should_add_begin_commit() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut new_table = Table::new(
+            "public".to_string(),
+            "\"my-table\"".to_string(),
+            "public".to_string(),
+            "my-table".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "\"my-table\"", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        new_table.hash();
+
+        to_dump.tables.push(new_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, true, true, GrantsMode::Ignore);
+
+        comparer.compare().await.unwrap();
+
+        let script = comparer.get_script();
+
+        const SCRIPT_BODY_START_PATTERN: &str = "*/\n\n";
+
+        let script_body_start_index = script
+            .find(SCRIPT_BODY_START_PATTERN)
+            .map(|index| index + SCRIPT_BODY_START_PATTERN.len())
+            .expect("Script header was not found");
+
+        let script_body = &script[script_body_start_index..];
+
+        assert!(script_body.starts_with("begin;\n\n"));
+        assert!(script_body.ends_with("\ncommit;"));
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_block_and_line_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script =
+            "/* header comment */\nCREATE TABLE t1 (id int); -- inline comment\n/* trailing */\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "CREATE TABLE t1 (id int);\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_singly_nested_block_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // /* outer /* inner */ still outer */ must all be stripped.
+        comparer.script = "SELECT /* outer /* inner */ still outer */ 1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_deeply_nested_block_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Three levels of nesting.
+        comparer.script = "SELECT /* a /* b /* c */ b */ a */ 1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_adjacent_nested_block_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Two independent outer comments each with their own inner comment.
+        // Any space left before SELECT after stripping the first comment is removed by get_script()'s trim().
+        comparer.script = "/* a /* b */ a */ SELECT /* c /* d */ c */ 1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_block_comment_before_statement() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Nested comment as a header; SQL that follows must be preserved intact.
+        comparer.script = "/* header /* nested */ end */\nCREATE TABLE t (id int);\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "CREATE TABLE t (id int);\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_only_script_returns_empty() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // A script consisting only of a nested block comment produces no output.
+        comparer.script = "/* outer /* inner */ outer */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_sql_between_levels() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Text that sits between the outer /* and its matching */ must be stripped
+        // even when inner comment pairs appear in the middle.
+        comparer.script = "SELECT /* before /* mid */ after */ 42;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  42;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_immediately_after_keyword() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // No space between the keyword and the nested comment; scanner must not
+        // be confused by the /* that immediately follows non-comment text.
+        comparer.script = "SELECT/* /* nested */ */1;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_followed_by_line_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // After the nested block comment closes, a line comment on the same line
+        // must also be stripped.
+        comparer.script = "SELECT /* a /* b */ a */ 1; -- strip me\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT  1;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_inside_single_quoted_string_not_stripped() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Nested-comment-like sequences inside a string literal must be preserved.
+        comparer.script = "SELECT '/* outer /* inner */ outer */' AS val;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT '/* outer /* inner */ outer */' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_inside_e_string_not_stripped() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Nested-comment-like sequences inside an E-string must also be preserved.
+        comparer.script = "SELECT E'/* outer /* inner */ outer */' AS val;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'/* outer /* inner */ outer */' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_nested_comment_inside_double_quoted_identifier_not_stripped() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Nested-comment-like sequences inside a double-quoted identifier must be preserved.
+        comparer.script = "SELECT 1 AS \"/* outer /* inner */ outer */\";\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT 1 AS \"/* outer /* inner */ outer */\";\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_dollar_quoted_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script = "CREATE FUNCTION f() RETURNS void AS $$\n-- inside body\n/* also inside */\n$$ LANGUAGE plpgsql;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE FUNCTION f() RETURNS void AS $$\n-- inside body\n/* also inside */\n$$ LANGUAGE plpgsql;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_named_dollar_tag_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script = "CREATE FUNCTION g() RETURNS void AS $body$\n-- comment inside\n$body$ LANGUAGE plpgsql;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE FUNCTION g() RETURNS void AS $body$\n-- comment inside\n$body$ LANGUAGE plpgsql;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_single_quoted_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script =
+            "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_backslash_escaped_quote() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // \' inside E'...' is an escaped quote and must NOT terminate the string.
+        // The comment-like content after it must be preserved, not stripped.
+        comparer.script = "SELECT E'it\\'s fine -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'it\\'s fine -- not a comment' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_block_comment_lookalike() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // /* ... */ inside an E-string must not be treated as a block comment.
+        comparer.script = "SELECT E'/* not a comment */' AS val; /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'/* not a comment */' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_backslash_backslash_then_quote() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // \\\' is an escaped backslash (\\) followed by an escaped quote (\').
+        // The string should continue after that sequence.
+        comparer.script =
+            "SELECT E'backslash\\\\\\'quote -- still inside' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT E'backslash\\\\\\'quote -- still inside' AS val;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_doubled_quote_escape() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // '' inside E'...' is also a valid quote escape; must not terminate string early.
+        comparer.script = "SELECT E'it''s fine -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'it''s fine -- not a comment' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_lowercase_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Lowercase e'...' prefix must be handled identically to E'...'.
+        comparer.script = "SELECT e'it\\'s fine -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT e'it\\'s fine -- not a comment' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_does_not_treat_standalone_e_as_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // A bare column/alias named "e" followed immediately by a plain string
+        // literal must not be misidentified as an E-string prefix.
+        // Here "e" is a table alias and 'text' is a separate literal.
+        comparer.script = "SELECT e, 'text -- not a comment' FROM t; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT e, 'text -- not a comment' FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_does_not_treat_uppercase_e_identifier_as_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Uppercase E as a standalone identifier (column name), not followed by
+        // a quote, must not be confused with an E-string prefix.
+        comparer.script = "SELECT E FROM t; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_empty_e_string() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // An empty E-string E'' must not confuse the state machine.
+        comparer.script = "SELECT E'' AS val; /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT E'' AS val;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_with_other_backslash_sequences() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // \n and \t are everyday escape sequences; the scanner must copy them
+        // verbatim and must not mistake the character after the backslash for
+        // anything other than the second byte of the pair.
+        comparer.script =
+            "SELECT E'line1\\nline2\\ttabbed -- not a comment' AS val; -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT E'line1\\nline2\\ttabbed -- not a comment' AS val;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_multiple_e_strings_in_one_statement() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Multiple E-strings in one statement; real trailing comment stripped.
+        comparer.script =
+            "INSERT INTO t VALUES (E'val\\'1 -- x', E'val/*2*/'); -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "INSERT INTO t VALUES (E'val\\'1 -- x', E'val/*2*/');\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_e_string_adjacent_to_double_quoted_identifier() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // E-string and double-quoted identifier in the same statement; both
+        // preserved, real trailing comment stripped.
+        comparer.script =
+            "INSERT INTO \"my--table\" (col) VALUES (E'it\\'s -- ok'); -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "INSERT INTO \"my--table\" (col) VALUES (E'it\\'s -- ok');\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_double_quoted_identifier_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Double-quoted identifiers containing sequences that look like comment
+        // starters must be passed through verbatim and must NOT be stripped.
+        comparer.script =
+            "SELECT 1 AS \"col--name\", 2 AS \"/*not a comment*/\"; -- real comment\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "SELECT 1 AS \"col--name\", 2 AS \"/*not a comment*/\";\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_double_quoted_identifier_with_escaped_quote() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // A doubled double-quote inside a quoted identifier is an escape sequence
+        // and must survive comment stripping intact.
+        comparer.script =
+            "ALTER TABLE t RENAME COLUMN \"col\"\"--name\" TO new_name; /* drop this */\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "ALTER TABLE t RENAME COLUMN \"col\"\"--name\" TO new_name;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_multiple_double_quoted_identifiers() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Several double-quoted identifiers in one statement, each containing
+        // comment-like sequences; only the trailing real comment should be stripped.
+        comparer.script =
+            "SELECT \"a--b\", \"c/*d*/e\", \"f--g\" FROM t; -- strip me\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT \"a--b\", \"c/*d*/e\", \"f--g\" FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_qualified_double_quoted_name() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Quoted schema + quoted table, both containing comment-like sequences.
+        comparer.script =
+            "CREATE TABLE \"my--schema\".\"my/*table*/\" (id int); /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE TABLE \"my--schema\".\"my/*table*/\" (id int);\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_empty_double_quoted_identifier() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // "" is a valid (if unusual) quoted identifier; must not confuse the state machine.
+        comparer.script = "ALTER INDEX \"\" RENAME TO x; /* strip */\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "ALTER INDEX \"\" RENAME TO x;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_strips_comment_after_double_quoted_identifier() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // The parser must exit the double-quote state correctly so the real block
+        // comment that follows is still stripped.
+        comparer.script = "SELECT \"col\" /* strip this */ FROM t;\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "SELECT \"col\"  FROM t;\n");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_mixed_double_and_single_quoted_with_comment() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        // Double-quoted identifier and single-quoted string both containing
+        // comment-like bytes; trailing real comment must still be stripped.
+        comparer.script =
+            "INSERT INTO \"my--table\" (col) VALUES ('/* not */ a -- val'); -- strip\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "INSERT INTO \"my--table\" (col) VALUES ('/* not */ a -- val');\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_returns_empty_for_comment_only_script() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script = "/* only a comment */\n-- another comment\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_collapses_excess_newlines() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script =
+            "CREATE TABLE t1 (id int);\n/* removed */\n\n\n\nCREATE TABLE t2 (id int);\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "CREATE TABLE t1 (id int);\n\nCREATE TABLE t2 (id int);\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_true_preserves_all_comments() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.script = "/* header */\nCREATE TABLE t1 (id int); -- inline\n".to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "/* header */\nCREATE TABLE t1 (id int); -- inline\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_comments_false_preserves_utf8() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        comparer.script =
+            "/* comment */\nCOMMENT ON TABLE t IS '数据表 — 描述';\nSELECT $$函数体$$;\n"
+                .to_string();
+        let result = comparer.get_script();
+        assert_eq!(
+            result,
+            "COMMENT ON TABLE t IS '数据表 — 描述';\nSELECT $$函数体$$;\n"
+        );
+    }
+
+    /// Partition child must not be dropped+recreated when a non-partition-key
+    /// column changes type on the parent.
+    #[tokio::test]
+    async fn partition_child_non_pk_col_type_change_no_recreate() {
+        fn numeric_column(
+            schema: &str,
+            table: &str,
+            name: &str,
+            ordinal: i32,
+            precision: i32,
+            scale: i32,
+        ) -> TableColumn {
+            let mut col = int_column(schema, table, name, ordinal);
+            col.data_type = "numeric".to_string();
+            col.numeric_precision = Some(precision);
+            col.numeric_scale = Some(scale);
+            col.numeric_precision_radix = Some(10);
+            col
+        }
+        fn date_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
+            let mut col = int_column(schema, table, name, ordinal);
+            col.data_type = "date".to_string();
+            col.numeric_precision = None;
+            col.numeric_precision_radix = None;
+            col.numeric_scale = None;
+            col
+        }
+        fn bigint_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
+            let mut col = int_column(schema, table, name, ordinal);
+            col.data_type = "bigint".to_string();
+            col.numeric_precision = Some(64);
+            col
+        }
+
+        let tbl = "s6_issue2_expenses";
+        let child_tbl = "s6_issue2_expenses_2024_01";
+        let schema = "\"pt_test\"";
+
+        // --- FROM dump ---
+        let mut from_parent = Table::new(
+            schema.to_string(),
+            tbl.to_string(),
+            "pt_test".to_string(),
+            tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, tbl, "id", 1),
+                date_column(schema, tbl, "expense_date", 2),
+                numeric_column(schema, tbl, "amount", 3, 10, 2),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_parent.partition_key = Some("RANGE (expense_date)".to_string());
+        from_parent.hash();
+
+        let mut from_child = Table::new(
+            schema.to_string(),
+            child_tbl.to_string(),
+            "pt_test".to_string(),
+            child_tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, child_tbl, "id", 1),
+                date_column(schema, child_tbl, "expense_date", 2),
+                numeric_column(schema, child_tbl, "amount", 3, 10, 2),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_child.partition_of = Some(format!("{}.{}", schema, tbl));
+        from_child.partition_bound =
+            Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        from_child.hash();
+
+        // --- TO dump ---
+        let mut to_parent = Table::new(
+            schema.to_string(),
+            tbl.to_string(),
+            "pt_test".to_string(),
+            tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, tbl, "id", 1),
+                date_column(schema, tbl, "expense_date", 2),
+                numeric_column(schema, tbl, "amount", 3, 15, 4),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_parent.partition_key = Some("RANGE (expense_date)".to_string());
+        to_parent.hash();
+
+        let mut to_child = Table::new(
+            schema.to_string(),
+            child_tbl.to_string(),
+            "pt_test".to_string(),
+            child_tbl.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                bigint_column(schema, child_tbl, "id", 1),
+                date_column(schema, child_tbl, "expense_date", 2),
+                numeric_column(schema, child_tbl, "amount", 3, 15, 4),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_child.partition_of = Some(format!("{}.{}", schema, tbl));
+        to_child.partition_bound =
+            Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        to_child.hash();
+
+        let mut from_dump = Dump::new(DumpConfig::default());
+        from_dump.tables.push(from_parent);
+        from_dump.tables.push(from_child);
+
+        let mut to_dump = Dump::new(DumpConfig::default());
+        to_dump.tables.push(to_parent);
+        to_dump.tables.push(to_child);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_tables().await.unwrap();
+        let script = comparer.get_script();
+
+        // Parent should get ALTER COLUMN
+        assert!(
+            script.contains("alter column"),
+            "Parent must get ALTER COLUMN for amount, got: {script}"
+        );
+        // Child should NOT be dropped
+        assert!(
+            !script.contains("drop table"),
+            "Partition child must not be dropped for non-partition-key column type change, got: {script}"
+        );
+        // Child should NOT be recreated
+        assert!(
+            !script.to_lowercase().contains(&format!(
+                "create table {}.{} partition of",
+                schema, child_tbl
+            )),
+            "Partition child must not be recreated, got: {script}"
+        );
+        assert!(
+            !script.contains("Data loss"),
+            "No data loss warning expected, got: {script}"
+        );
+    }
+
+    // =========================================================================
+    // compare_grants tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn compare_grants_ignore_mode_produces_no_output() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("public".to_string(), "public".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string()];
+        let mut to_schema = Schema::new("public".to_string(), "public".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("GRANT"),
+            "Ignore mode must not emit GRANT, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "Ignore mode must not emit REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_addonly_adds_missing_schema_grant() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT CREATE, USAGE ON SCHEMA myschema TO writer;"),
+            "AddOnly must add missing grant, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not emit REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_addonly_does_not_revoke_removed_grant() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_full_revokes_removed_schema_grant() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string(), "writer=UC/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE CREATE, USAGE ON SCHEMA myschema FROM writer;"),
+            "Full mode must revoke removed grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_full_table_add_and_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["reader=r/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["writer=rw/owner".to_string()];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT, UPDATE ON TABLE public.users TO writer;"),
+            "Full must add new grant, got: {script}"
+        );
+        assert!(
+            script.contains("REVOKE SELECT ON TABLE public.users FROM reader;"),
+            "Full must revoke removed grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_sequence() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_seq = Sequence::new(
+            "public".to_string(),
+            "my_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec![];
+
+        let mut to_seq = Sequence::new(
+            "public".to_string(),
+            "my_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE ON SEQUENCE public.my_seq TO reader;"),
+            "Must add sequence grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_view() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["reader=r/owner".to_string()];
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["reader=r/owner".to_string(), "writer=rw/owner".to_string()];
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT, UPDATE ON TABLE public.my_view TO writer;"),
+            "Must add view grant, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "No revoke expected when unchanged grant remains, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_routine_function() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "my_func".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.acl = vec![];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(1),
+            "my_func".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.acl = vec!["app=X/owner".to_string()];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT EXECUTE ON FUNCTION public.my_func() TO app;"),
+            "Must add function grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_routine_procedure() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "my_proc".to_string(),
+            "plpgsql".to_string(),
+            "procedure".to_string(),
+            "void".to_string(),
+            "days integer".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.acl = vec!["app=X/owner".to_string()];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(2),
+            "my_proc".to_string(),
+            "plpgsql".to_string(),
+            "procedure".to_string(),
+            "void".to_string(),
+            "days integer".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.acl = vec![];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE EXECUTE ON PROCEDURE public.my_proc(days integer) FROM app;"),
+            "Full must revoke removed procedure grant, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_with_grant_option() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec!["reader=U/owner".to_string()];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U*/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE ON SCHEMA myschema TO reader WITH GRANT OPTION;"),
+            "Must add grant with grant option, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "Upgrading to WITH GRANT OPTION must not REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_no_comments_mode() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        from_schema.acl = vec![];
+        let mut to_schema = Schema::new("myschema".to_string(), "myschema".to_string(), None);
+        to_schema.acl = vec!["reader=U/owner".to_string()];
+
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT USAGE ON SCHEMA myschema TO reader;"),
+            "Grant must still be emitted, got: {script}"
+        );
+        assert!(
+            !script.contains("/* Grants for schema"),
+            "Comments must be suppressed, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_new_object_no_from_acl() {
+        let from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Table exists only in TO
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "new_tbl".to_string(),
+            "public".to_string(),
+            "new_tbl".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["reader=r/owner".to_string()];
+
+        to_dump.tables.push(to_table);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT ON TABLE public.new_tbl TO reader;"),
+            "Must grant on new object with empty FROM acl, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_table_addonly_no_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["reader=r/owner".to_string(), "old_app=rw/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec![
+            "reader=r/owner".to_string(),
+            "new_app=rwd/owner".to_string(),
+        ];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT DELETE, SELECT, UPDATE ON TABLE public.orders TO new_app;"),
+            "AddOnly must add new_app grant, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke old_app, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_sequence_full_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_seq = Sequence::new(
+            "public".to_string(),
+            "order_id_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec!["app=U/owner".to_string(), "old_svc=U/owner".to_string()];
+
+        let mut to_seq = Sequence::new(
+            "public".to_string(),
+            "order_id_seq".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec!["app=U/owner".to_string()];
+
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE USAGE ON SEQUENCE public.order_id_seq FROM old_svc;"),
+            "Full must revoke removed sequence grant, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_sequence_addonly_no_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_seq = Sequence::new(
+            "public".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec!["old_svc=U/owner".to_string()];
+
+        let mut to_seq = Sequence::new(
+            "public".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec![];
+
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke sequence grants, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_view_full_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "report_v".to_string(),
+            "SELECT 1".to_string(),
+            "reports".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["analyst=r/owner".to_string(), "intern=r/owner".to_string()];
+
+        let mut to_view = View::new(
+            "report_v".to_string(),
+            "SELECT 1".to_string(),
+            "reports".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["analyst=r/owner".to_string()];
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE SELECT ON TABLE reports.report_v FROM intern;"),
+            "Full must revoke removed view grant, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_routine_function_full_revoke() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(10),
+            "calc".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "integer".to_string(),
+            "x integer".to_string(),
+            None,
+            None,
+            "BEGIN RETURN x; END".to_string(),
+        );
+        from_routine.acl = vec!["app=X/owner".to_string(), "old_svc=X/owner".to_string()];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(10),
+            "calc".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "integer".to_string(),
+            "x integer".to_string(),
+            None,
+            None,
+            "BEGIN RETURN x; END".to_string(),
+        );
+        to_routine.acl = vec!["app=X/owner".to_string()];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE EXECUTE ON FUNCTION public.calc(x integer) FROM old_svc;"),
+            "Full must revoke removed function grant, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grants expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_grantor_only_diff_produces_no_output() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Schema: same grantee + privileges, different grantor
+        let mut from_schema = Schema::new("app".to_string(), "app".to_string(), None);
+        from_schema.acl = vec!["reader=UC/old_owner".to_string()];
+        let mut to_schema = Schema::new("app".to_string(), "app".to_string(), None);
+        to_schema.acl = vec!["reader=UC/new_owner".to_string()];
+        from_dump.schemas.push(from_schema);
+        to_dump.schemas.push(to_schema);
+
+        // Table: same grantee + privileges, different grantor
+        let mut from_table = Table::new(
+            "app".to_string(),
+            "t1".to_string(),
+            "app".to_string(),
+            "t1".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["reader=rw/old_owner".to_string()];
+        let mut to_table = Table::new(
+            "app".to_string(),
+            "t1".to_string(),
+            "app".to_string(),
+            "t1".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["reader=rw/new_owner".to_string()];
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        // Sequence: same grantee + privileges, different grantor
+        let mut from_seq = Sequence::new(
+            "app".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        from_seq.acl = vec!["reader=U/old_owner".to_string()];
+        let mut to_seq = Sequence::new(
+            "app".to_string(),
+            "s1".to_string(),
+            "owner".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9223372036854775807),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        to_seq.acl = vec!["reader=U/new_owner".to_string()];
+        from_dump.sequences.push(from_seq);
+        to_dump.sequences.push(to_seq);
+
+        // View: same grantee + privileges, different grantor
+        let mut from_view = View::new(
+            "v1".to_string(),
+            "SELECT 1".to_string(),
+            "app".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["reader=r/old_owner".to_string()];
+        let mut to_view = View::new(
+            "v1".to_string(),
+            "SELECT 1".to_string(),
+            "app".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["reader=r/new_owner".to_string()];
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        // Routine: same grantee + privileges, different grantor
+        let mut from_routine = Routine::new(
+            "app".to_string(),
+            Oid(99),
+            "do_it".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.acl = vec!["runner=X/old_owner".to_string()];
+        let mut to_routine = Routine::new(
+            "app".to_string(),
+            Oid(99),
+            "do_it".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.acl = vec!["runner=X/new_owner".to_string()];
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("GRANT"),
+            "Grantor-only diff must not emit GRANT, got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "Grantor-only diff must not emit REVOKE, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_full_grant_option_downgrade() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["admin=r*/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["admin=r/owner".to_string()];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("REVOKE GRANT OPTION FOR SELECT ON TABLE public.items FROM admin;"),
+            "Full must revoke grant option when downgrading, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT SELECT"),
+            "No new grant expected for downgrade, got: {script}"
+        );
+        // Should only contain REVOKE GRANT OPTION FOR, not a bare REVOKE SELECT
+        assert!(
+            !script.contains("REVOKE SELECT ON TABLE"),
+            "Must not fully revoke the privilege on downgrade, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_addonly_ignores_grant_option_downgrade() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec!["admin=r*/owner".to_string()];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "items".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+            "owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec!["admin=r/owner".to_string()];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("REVOKE"),
+            "AddOnly must not revoke grant option, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No new grant expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_excludes_owner_acl_entries() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Table with ownership change: old_owner → new_owner
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "data".to_string(),
+            "public".to_string(),
+            "data".to_string(),
+            "old_owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec![
+            "old_owner=arwdDxt/old_owner".to_string(),
+            "reader=r/old_owner".to_string(),
+        ];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "data".to_string(),
+            "public".to_string(),
+            "data".to_string(),
+            "new_owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec![
+            "new_owner=arwdDxt/new_owner".to_string(),
+            "reader=r/new_owner".to_string(),
+        ];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("old_owner"),
+            "Must not REVOKE from old owner, got: {script}"
+        );
+        assert!(
+            !script.contains("new_owner"),
+            "Must not GRANT to new owner, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No grants expected (reader unchanged), got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "No revokes expected (reader unchanged), got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_owner_excluded_nonowner_still_diffed() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(50),
+            "process".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.owner = "the_owner".to_string();
+        from_routine.acl = vec![
+            "the_owner=X/the_owner".to_string(),
+            "old_app=X/the_owner".to_string(),
+        ];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(50),
+            "process".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.owner = "the_owner".to_string();
+        to_routine.acl = vec![
+            "the_owner=X/the_owner".to_string(),
+            "new_app=X/the_owner".to_string(),
+        ];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT EXECUTE ON FUNCTION public.process() TO new_app;"),
+            "Must grant to non-owner, got: {script}"
+        );
+        assert!(
+            script.contains("REVOKE EXECUTE ON FUNCTION public.process() FROM old_app;"),
+            "Must revoke from non-owner, got: {script}"
+        );
+        assert!(
+            !script.contains("the_owner"),
+            "Must not reference owner in grants/revokes, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_identical_no_diff() {
+        // Two routines with the same (schema, name) but different arguments.
+        // Both overloads are identical in FROM and TO → no output expected.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short_from = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_from = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'notify';\nEND;".to_string(),
+        );
+
+        let overload_short_to = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_to = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'notify';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short_from);
+        from_dump.routines.push(overload_long_from);
+        to_dump.routines.push(overload_short_to);
+        to_dump.routines.push(overload_long_to);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("create or replace"),
+            "Identical overloads must not produce CREATE, got: {script}"
+        );
+        assert!(
+            !script.contains("drop procedure"),
+            "Identical overloads must not produce DROP, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_one_changed() {
+        // Two overloads with the same (schema, name). Only the long overload
+        // changes its body between FROM and TO. The short overload must remain
+        // untouched while the long one is recreated.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short_from = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_from = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'old body';\nEND;".to_string(),
+        );
+
+        // Short overload is identical to FROM
+        let overload_short_to = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        // Long overload has a different body → should be recreated
+        let overload_long_to = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'new body';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short_from);
+        from_dump.routines.push(overload_long_from);
+        to_dump.routines.push(overload_short_to);
+        to_dump.routines.push(overload_long_to);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        // The changed (long) overload must be recreated
+        assert!(
+            script.contains("create or replace procedure myschema.notify_event(pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb)"),
+            "Changed overload must be recreated, got: {script}"
+        );
+        // The short overload's signature must NOT appear in any CREATE statement
+        let short_create = "create or replace procedure myschema.notify_event(pjobid uuid, peventtype character varying, pattributes jsonb)";
+        assert!(
+            !script.contains(short_create),
+            "Unchanged overload must not be recreated, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_drop_only_removed_overload() {
+        // FROM has two overloads; TO has only the short one.
+        // Only the long overload must be dropped; the short one must stay.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'short';\nEND;".to_string(),
+        );
+        let overload_long = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, pattributes jsonb, pseed jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'long';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short.clone());
+        from_dump.routines.push(overload_long);
+        to_dump.routines.push(overload_short);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb);"),
+            "Removed overload must be dropped, got: {script}"
+        );
+        assert!(
+            !script.contains("create or replace"),
+            "Unchanged overload must not be recreated, got: {script}"
         );
     }
 }

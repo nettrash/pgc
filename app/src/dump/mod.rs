@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod core;
 pub mod extension;
 pub mod pg_enum;

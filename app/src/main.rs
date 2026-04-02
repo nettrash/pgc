@@ -1,11 +1,11 @@
 use crate::{
     comparer::core::Comparer,
-    config::{core::Config, dump_config::DumpConfig},
+    config::{core::Config, dump_config::DumpConfig, grants_mode::GrantsMode},
     dump::core::Dump,
 };
 use chrono::Datelike;
 use clap::{CommandFactory, Parser};
-use std::{io::Error, path::Path};
+use std::{io::Error, path::Path, time::Instant};
 
 pub mod comparer;
 pub mod config;
@@ -72,12 +72,35 @@ struct Args {
     /// Use DROP statements in the output
     #[arg(long, default_value = "false")]
     use_drop: bool,
+
+    /// True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
+    #[arg(long, default_value = "false")]
+    use_single_transaction: bool,
+
+    /// Include comments in the output script
+    #[arg(long, default_value = "true")]
+    use_comments: bool,
+
+    /// Grants handling mode: ignore, addonly, full
+    #[arg(long, value_parser = parse_grants_mode, default_value = "ignore")]
+    grants_mode: GrantsMode,
 }
 
+fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
+    src.parse::<GrantsMode>()
+}
 // Main entry point for the program.
 #[tokio::main]
 pub async fn main() -> Result<(), Error> {
+    let start = Instant::now();
     pgc_version();
+    let result = run_main().await;
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("\nExecution time: {elapsed:.2} seconds");
+    result
+}
+
+async fn run_main() -> Result<(), Error> {
     let args = Args::parse();
     if args.command.is_none() && args.config.is_none() {
         let mut cmd = Args::command();
@@ -110,6 +133,9 @@ pub async fn main() -> Result<(), Error> {
                     args.to.unwrap(),
                     args.output.unwrap(),
                     args.use_drop,
+                    args.use_single_transaction,
+                    args.use_comments,
+                    args.grants_mode,
                 )
                 .await;
             }
@@ -142,7 +168,6 @@ async fn run_by_config(config: String) -> Result<(), Error> {
         let from_file = cfg.from.file.clone();
         let to_file = cfg.to.file.clone();
         let output_file = cfg.output.clone();
-        let use_drop = cfg.use_drop;
 
         let result = create_dump(DumpConfig {
             host: cfg.from.host,
@@ -175,7 +200,18 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             return Err(e);
         }
         println!("Dumps created successfully. Now comparing...");
-        let compare_result = compare_dumps(from_file, to_file, output_file, use_drop).await;
+
+        let compare_result = compare_dumps(
+            from_file,
+            to_file,
+            output_file,
+            cfg.use_drop,
+            cfg.use_single_transaction,
+            cfg.use_comments,
+            cfg.grants_mode,
+        )
+        .await;
+
         if let Err(e) = compare_result {
             eprintln!("Error comparing dumps: {e}");
             return Err(e);
@@ -206,6 +242,9 @@ async fn compare_dumps(
     to: String,
     output: String,
     use_drop: bool,
+    use_single_transaction: bool,
+    use_comments: bool,
+    grants_mode: GrantsMode,
 ) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
@@ -213,7 +252,14 @@ async fn compare_dumps(
     println!("--> Dump from:\n{}\n", from.get_info());
     println!("--> Dump to:\n{}\n", to.get_info());
     println!("Comparing dumps...");
-    let mut comparer = Comparer::new(from, to, use_drop);
+    let mut comparer = Comparer::new(
+        from,
+        to,
+        use_drop,
+        use_single_transaction,
+        use_comments,
+        grants_mode,
+    );
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");

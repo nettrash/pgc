@@ -6,9 +6,11 @@ use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::postgres::types::Oid;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -68,7 +70,15 @@ impl Dump {
 
     // Retrieve the dump from the configuration.
     pub async fn process(&mut self) -> Result<(), Error> {
-        let pool = PgPool::connect(self.configuration.get_connection_string().as_str())
+        const TABLE_FILL_CONCURRENCY: u32 = 6;
+        const POOL_CONNECTION_BUFFER: u32 = 2;
+        let max_connections = TABLE_FILL_CONCURRENCY + POOL_CONNECTION_BUFFER;
+
+        let pool = PgPoolOptions::new()
+            // Match the pool size to the intended concurrent workload instead of hard-coding
+            // a lower value that would force tasks to block on connection acquisition.
+            .max_connections(max_connections)
+            .connect(self.configuration.get_connection_string().as_str())
             .await
             .map_err(|e| {
                 Error::other(format!(
@@ -114,7 +124,7 @@ impl Dump {
         let names: Vec<String> = self
             .schemas
             .iter()
-            .map(|s| format!("'{}'", s.name.replace('\'', "''")))
+            .map(|s| format!("'{}'", s.raw_name.replace('\'', "''")))
             .collect();
         format!("({})", names.join(", "))
     }
@@ -125,34 +135,70 @@ impl Dump {
             println!("No accessible schemas to dump.");
             return Ok(());
         }
-        self.get_extensions(pool).await?;
-        self.get_types(pool).await?;
-        self.get_domain_constraints(pool).await?;
-        self.get_enums(pool).await?;
-        self.get_sequences(pool).await?;
-        self.get_routines(pool).await?;
-        self.get_tables(pool).await?;
-        self.get_views(pool).await?;
+
+        // Types, domain constraints and enums must run sequentially (they
+        // depend on each other), but the rest of the queries are independent.
+        // We run them all in parallel to reduce total wall-clock time on
+        // high-latency (remote) connections.
+        let schema_filter = self.accessible_schema_filter();
+
+        let types_enums_fut = async {
+            let mut types = Vec::new();
+            let mut enums = Vec::new();
+            // get_types logic (inlined to avoid &mut self borrow conflicts)
+            Self::fetch_types_standalone(pool, &schema_filter, &mut types).await?;
+            Self::fetch_domain_constraints_standalone(pool, &schema_filter, &mut types).await?;
+            Self::fetch_enums_standalone(pool, &mut types, &mut enums).await?;
+            Ok::<(Vec<PgType>, Vec<PgEnum>), Error>((types, enums))
+        };
+
+        let extensions_fut = Self::fetch_extensions_standalone(pool, &schema_filter);
+        let sequences_fut = Self::fetch_sequences_standalone(pool, &schema_filter);
+        let routines_fut = Self::fetch_routines_standalone(pool, &schema_filter);
+        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter);
+        let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
+
+        let (types_enums, extensions, sequences, routines, tables, views) = tokio::try_join!(
+            types_enums_fut,
+            extensions_fut,
+            sequences_fut,
+            routines_fut,
+            tables_fut,
+            views_fut,
+        )?;
+
+        let (types, enums) = types_enums;
+        self.types = types;
+        self.enums = enums;
+        self.extensions = extensions;
+        self.sequences = sequences;
+        self.routines = routines;
+        self.tables = tables;
+        self.views = views;
+
         Ok(())
     }
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let query = format!(
-            "select n.nspname as schema_name,
-                    r.rolname as schema_owner,
+        let result = sqlx::query(
+            "select
+                    quote_ident(n.nspname) as schema_name,
+                    n.nspname as raw_schema_name,
+                    quote_ident(r.rolname) as schema_owner,
                     d.description as schema_comment,
-                    has_schema_privilege(n.nspname, 'USAGE') as has_usage
+                    has_schema_privilege(n.nspname, 'USAGE') as has_usage,
+                    n.nspacl::text[] as schema_acl
              from pg_namespace n
              left join pg_roles r on r.oid = n.nspowner
              left join pg_description d on d.objoid = n.oid
                  and d.classoid = 'pg_namespace'::regclass
                  and d.objsubid = 0
-             where n.nspname like '{}'
+             where n.nspname similar to $1
                and n.nspname not in ('pg_catalog', 'information_schema')",
-            self.configuration.scheme
-        );
-
-        let result = sqlx::query(query.as_str()).fetch_all(pool).await;
+        )
+        .bind(&self.configuration.scheme)
+        .fetch_all(pool)
+        .await;
         if let Err(e) = &result {
             return Err(Error::other(format!("Failed to fetch schemas: {}.", e)));
         }
@@ -164,6 +210,7 @@ impl Dump {
             println!("Schemas found:");
             for row in rows {
                 let schema_name: String = row.get("schema_name");
+                let raw_schema_name: String = row.get("raw_schema_name");
                 let has_usage: bool = row.get("has_usage");
 
                 if !has_usage {
@@ -173,8 +220,10 @@ impl Dump {
 
                 let owner: Option<String> = row.get("schema_owner");
                 let comment: Option<String> = row.get("schema_comment");
-                let mut sch = Schema::new(schema_name, comment);
+                let acl: Option<Vec<String>> = row.get("schema_acl");
+                let mut sch = Schema::new(schema_name, raw_schema_name, comment);
                 sch.owner = owner.unwrap_or_default();
+                sch.acl = acl.unwrap_or_default();
                 sch.hash();
                 println!(" - {}", sch.name);
                 self.schemas.push(sch);
@@ -183,20 +232,36 @@ impl Dump {
         Ok(())
     }
 
-    // Fetch extensions from the database and populate the dump.
-    async fn get_extensions(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let schema_filter = self.accessible_schema_filter();
-        let result = sqlx::query(format!("select n.nspname, e.*, r.rolname as extowner from pg_extension e join pg_namespace n on e.extnamespace = n.oid left join pg_roles r on r.oid = e.extowner where (n.nspname in {} or n.nspname = 'public')", schema_filter).as_str())
-            .fetch_all(pool)
-            .await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch extensions: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
+    // ---------------------------------------------------------------
+    // Standalone (static) fetch helpers used by the parallelised fill
+    // ---------------------------------------------------------------
 
+    async fn fetch_extensions_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Extension>, Error> {
+        let query = format!(
+            "
+            select
+                quote_ident(n.nspname) as nspname,
+                quote_ident(e.extname) as extname,
+                e.extversion,
+                quote_ident(r.rolname) as extowner
+            from
+                pg_extension e
+                join pg_namespace n on e.extnamespace = n.oid
+                left join pg_roles r on r.oid = e.extowner
+            where
+                (n.nspname in {} or n.nspname = 'public')",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch extensions: {e}.")))?;
+
+        let mut extensions = Vec::new();
         if rows.is_empty() {
             println!("No extensions found.");
         } else {
@@ -208,18 +273,21 @@ impl Dump {
                     schema: row.get("nspname"),
                     owner: row.get::<Option<String>, _>("extowner").unwrap_or_default(),
                 };
-                self.extensions.push(ext.clone());
                 println!(
                     " - {} (version: {}, namespace: {})",
                     ext.name, ext.version, ext.schema
                 );
+                extensions.push(ext);
             }
         }
-        Ok(())
+        Ok(extensions)
     }
 
-    // Fetch types from the database and populate the dump.
-    async fn get_types(&mut self, pool: &PgPool) -> Result<(), Error> {
+    async fn fetch_types_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+        types: &mut Vec<PgType>,
+    ) -> Result<(), Error> {
         let composite_attributes_rows = sqlx::query(
             format!(
                 "select
@@ -243,13 +311,13 @@ impl Dump {
                         and ext_dep.deptype = 'e'
                     )
                  order by t.oid, a.attnum",
-                self.accessible_schema_filter()
+                schema_filter
             )
             .as_str(),
         )
         .fetch_all(pool)
         .await
-        .map_err(|e| Error::other(format!("Failed to fetch composite type attributes: {}.", e)))?;
+        .map_err(|e| Error::other(format!("Failed to fetch composite type attributes: {e}.")))?;
 
         let mut composite_attributes_map: HashMap<Oid, Vec<CompositeAttribute>> = HashMap::new();
         for row in composite_attributes_rows {
@@ -264,15 +332,15 @@ impl Dump {
                 .push(attribute);
         }
 
-        let result = sqlx::query(
+        let rows = sqlx::query(
             format!(
                 "select 
-                n.nspname, 
+                quote_ident(n.nspname) as nspname,
                 t.oid as type_oid,
-                t.typname,
+                quote_ident(t.typname) as typname,
                 t.typnamespace,
                 t.typowner,
-                owner_role.rolname as typowner_name,
+                quote_ident(owner_role.rolname) as typowner_name,
                 t.typlen,
                 t.typbyval,
                 t.typtype,
@@ -321,19 +389,13 @@ impl Dump {
                     where ext_dep.objid = t.oid
                     and ext_dep.deptype = 'e'
                 )",
-                self.accessible_schema_filter()
+                schema_filter
             )
             .as_str(),
         )
         .fetch_all(pool)
-        .await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch user-defined types: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch user-defined types: {e}.")))?;
 
         if rows.is_empty() {
             println!("No user-defined types found.");
@@ -385,67 +447,23 @@ impl Dump {
                     hash: None,
                 };
                 pgtype.hash();
-                self.types.push(pgtype.clone());
                 println!(
                     " - {} (namespace: {}, hash: {})",
                     pgtype.typname,
                     pgtype.schema,
                     pgtype.hash.as_deref().unwrap_or("None")
                 );
+                types.push(pgtype);
             }
         }
         Ok(())
     }
 
-    // Fetch enums from the database and populate the dump.
-    async fn get_enums(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query("select e.* from pg_enum e where not exists (select 1 from pg_depend ext_dep where ext_dep.objid = e.enumtypid and ext_dep.deptype = 'e')").fetch_all(pool).await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch enums: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
-
-        if rows.is_empty() {
-            println!("No enums found.");
-        } else {
-            println!("Enums found:");
-            for row in rows {
-                let pgenum = PgEnum {
-                    oid: row.get("oid"),
-                    enumtypid: row.get("enumtypid"),
-                    enumsortorder: row.get("enumsortorder"),
-                    enumlabel: row.get("enumlabel"),
-                };
-                self.enums.push(pgenum.clone());
-                println!(
-                    " - enumtypid {} (label: {})",
-                    pgenum.enumtypid.0, pgenum.enumlabel
-                );
-            }
-
-            let mut labels_by_type: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
-            for enum_value in &self.enums {
-                labels_by_type
-                    .entry(enum_value.enumtypid.0)
-                    .or_default()
-                    .push((enum_value.enumsortorder, enum_value.enumlabel.clone()));
-            }
-
-            for (type_oid, mut labels) in labels_by_type {
-                labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-
-                if let Some(pg_type) = self.types.iter_mut().find(|t| t.oid.0 == type_oid) {
-                    pg_type.enum_labels = labels.into_iter().map(|(_, label)| label).collect();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn get_domain_constraints(&mut self, pool: &PgPool) -> Result<(), Error> {
+    async fn fetch_domain_constraints_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+        types: &mut [PgType],
+    ) -> Result<(), Error> {
         let query = format!(
             "select
                 c.contypid as domain_oid,
@@ -463,17 +481,13 @@ impl Dump {
                   and ext_dep.deptype = 'e'
               )
             order by c.contypid, c.conname",
-            self.accessible_schema_filter()
+            schema_filter
         );
 
-        let result = sqlx::query(query.as_str()).fetch_all(pool).await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch domain constraints: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch domain constraints: {e}.")))?;
 
         if rows.is_empty() {
             println!("No domain constraints found.");
@@ -488,14 +502,14 @@ impl Dump {
                 name: row.get("conname"),
                 definition: row.get("definition"),
             };
+            println!(" - {} on type {}", constraint.name, type_oid.0);
             constraints_by_type
                 .entry(type_oid.0)
                 .or_default()
-                .push(constraint.clone());
-            println!(" - {} on type {}", constraint.name, type_oid.0);
+                .push(constraint);
         }
 
-        for pg_type in &mut self.types {
+        for pg_type in types.iter_mut() {
             if let Some(mut constraints) = constraints_by_type.remove(&pg_type.oid.0) {
                 constraints.sort_by(|a, b| a.name.cmp(&b.name));
                 pg_type.domain_constraints = constraints;
@@ -505,62 +519,105 @@ impl Dump {
         Ok(())
     }
 
-    // Fetch sequences from the database and populate the dump.
-    async fn get_sequences(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(
-            format!(
-                "
-                select
-                    seq.schemaname,
-                    seq.sequencename,
-                    seq.sequenceowner,
-                    seq.data_type::varchar as sequencedatatype,
-                    seq.start_value,
-                    seq.min_value,
-                    seq.max_value,
-                    seq.increment_by,
-                    seq.cycle,
-                    seq.cache_size,
-                    seq.last_value,
-                    owner_ns.nspname as owned_by_schema,
-                    owner_table.relname as owned_by_table,
-                    owner_attr.attname as owned_by_column,
-                    dep.deptype::text as dependency_type,
-                    seq_desc.description as seq_comment
-                from
-                    pg_sequences seq
-                    left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
-                    left join pg_class seq_class on seq_class.relname = seq.sequencename
-                        and seq_class.relnamespace = seq_ns.oid
-                    left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and seq_desc.objsubid = 0
-                    left join pg_depend dep on dep.objid = seq_class.oid
-                        and dep.deptype in ('a', 'i')
-                    left join pg_class owner_table on owner_table.oid = dep.refobjid
-                    left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
-                    left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
-                        and owner_attr.attnum = dep.refobjsubid
-                where
-                    seq.schemaname in {}
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = seq_class.oid
-                        and ext_dep.deptype = 'e'
-                    )",
-                self.accessible_schema_filter()
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await;
+    async fn fetch_enums_standalone(
+        pool: &PgPool,
+        types: &mut [PgType],
+        enums: &mut Vec<PgEnum>,
+    ) -> Result<(), Error> {
+        let rows = sqlx::query("select e.* from pg_enum e where not exists (select 1 from pg_depend ext_dep where ext_dep.objid = e.enumtypid and ext_dep.deptype = 'e')")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch enums: {e}.")))?;
 
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch sequences: {}.",
-                result.err().unwrap()
-            )));
+        if rows.is_empty() {
+            println!("No enums found.");
+        } else {
+            println!("Enums found:");
+            for row in &rows {
+                let pgenum = PgEnum {
+                    oid: row.get("oid"),
+                    enumtypid: row.get("enumtypid"),
+                    enumsortorder: row.get("enumsortorder"),
+                    enumlabel: row.get("enumlabel"),
+                };
+                println!(
+                    " - enumtypid {} (label: {})",
+                    pgenum.enumtypid.0, pgenum.enumlabel
+                );
+                enums.push(pgenum);
+            }
+
+            let mut labels_by_type: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
+            for enum_value in enums.iter() {
+                labels_by_type
+                    .entry(enum_value.enumtypid.0)
+                    .or_default()
+                    .push((enum_value.enumsortorder, enum_value.enumlabel.clone()));
+            }
+
+            for (type_oid, mut labels) in labels_by_type {
+                labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
+                if let Some(pg_type) = types.iter_mut().find(|t| t.oid.0 == type_oid) {
+                    pg_type.enum_labels = labels.into_iter().map(|(_, label)| label).collect();
+                }
+            }
         }
-        let rows = result.unwrap();
+        Ok(())
+    }
 
+    async fn fetch_sequences_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Sequence>, Error> {
+        let query = format!(
+            "
+            select
+                quote_ident(seq.schemaname) as schemaname,
+                quote_ident(seq.sequencename) as sequencename,
+                quote_ident(seq.sequenceowner) as sequenceowner,
+                seq.data_type::varchar as sequencedatatype,
+                seq.start_value,
+                seq.min_value,
+                seq.max_value,
+                seq.increment_by,
+                seq.cycle,
+                seq.cache_size,
+                seq.last_value,
+                quote_ident(owner_ns.nspname) as owned_by_schema,
+                quote_ident(owner_table.relname) as owned_by_table,
+                quote_ident(owner_attr.attname) as owned_by_column,
+                dep.deptype::text as dependency_type,
+                seq_desc.description as seq_comment,
+                seq_class.relacl::text[] as seq_acl
+            from
+                pg_sequences seq
+                left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
+                left join pg_class seq_class on seq_class.relname = seq.sequencename
+                    and seq_class.relnamespace = seq_ns.oid
+                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and seq_desc.objsubid = 0
+                left join pg_depend dep on dep.objid = seq_class.oid
+                    and dep.deptype in ('a', 'i')
+                left join pg_class owner_table on owner_table.oid = dep.refobjid
+                left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
+                left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
+                    and owner_attr.attnum = dep.refobjsubid
+            where
+                seq.schemaname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = seq_class.oid
+                    and ext_dep.deptype = 'e'
+                )",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch sequences: {e}.")))?;
+
+        let mut sequences = Vec::new();
         if rows.is_empty() {
             println!("No sequences found.");
         } else {
@@ -584,6 +641,9 @@ impl Dump {
                     is_identity: false,
                     comment: row.get("seq_comment"),
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("seq_acl")
+                        .unwrap_or_default(),
                 };
                 if let Some(deptype) = row.get::<Option<String>, _>("dependency_type")
                     && deptype == "i"
@@ -591,99 +651,93 @@ impl Dump {
                     seq.is_identity = true;
                 }
                 seq.hash();
-                self.sequences.push(seq.clone());
                 println!(
                     " - name {} (type: {}, hash: {})",
                     seq.name,
                     seq.data_type,
                     seq.hash.as_deref().unwrap_or("None")
                 );
+                sequences.push(seq);
             }
         }
-
-        Ok(())
+        Ok(sequences)
     }
 
-    // Fetch routines from the database and populate the dump.
-    async fn get_routines(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(
-            format!(
-                "select
-                    n.nspname,
-                    r.oid,
-                    r.proname,
-                    l.lanname as prolang,
-                    case r.prokind
-                        when 'f' then 'function'
-                        when 'p' then 'procedure'
-                        when 'a' then 'aggregate'
-                        when 'w' then 'window'
-                    end as prokind,
-                    pg_get_function_result(r.oid) as prorettype,
-                    pg_get_function_identity_arguments(r.oid) as proarguments,
-                    pg_get_expr(r.proargdefaults, 0) as proargdefaults,
-                    owner_role.rolname as owner_name,
-                    r.prosrc,
-                    d.description as routine_comment,
-                    r.provolatile::text as provolatile,
-                    r.proisstrict,
-                    r.proleakproof,
-                    r.proparallel::text as proparallel,
-                    r.prosecdef,
-                    -- aggregate details (NULL for non-aggregates)
-                    agg.aggtransfn::regproc::text as agg_sfunc,
-                    format_type(agg.aggtranstype, null) as agg_stype,
-                    agg.aggtransspace as agg_sspace,
-                    case when agg.aggfinalfn != 0 then agg.aggfinalfn::regproc::text end as agg_finalfunc,
-                    agg.aggfinalextra as agg_finalfunc_extra,
-                    agg.aggfinalmodify::text as agg_finalfunc_modify,
-                    case when agg.aggcombinefn != 0 then agg.aggcombinefn::regproc::text end as agg_combinefunc,
-                    case when agg.aggserialfn != 0 then agg.aggserialfn::regproc::text end as agg_serialfunc,
-                    case when agg.aggdeserialfn != 0 then agg.aggdeserialfn::regproc::text end as agg_deserialfunc,
-                    agg.agginitval as agg_initcond,
-                    case when agg.aggmtransfn != 0 then agg.aggmtransfn::regproc::text end as agg_msfunc,
-                    case when agg.aggminvtransfn != 0 then agg.aggminvtransfn::regproc::text end as agg_minvfunc,
-                    case when agg.aggmtransfn != 0 then format_type(agg.aggmtranstype, null) end as agg_mstype,
-                    agg.aggmtransspace as agg_msspace,
-                    case when agg.aggmfinalfn != 0 then agg.aggmfinalfn::regproc::text end as agg_mfinalfunc,
-                    agg.aggmfinalextra as agg_mfinalfunc_extra,
-                    agg.aggmfinalmodify::text as agg_mfinalfunc_modify,
-                    agg.aggminitval as agg_minitcond,
-                    case when agg.aggsortop != 0 then agg.aggsortop::regoper::text end as agg_sortop,
-                    agg.aggkind::text as agg_kind,
-                    agg.aggnumdirectargs as agg_numdirectargs
-                from
-                    pg_proc r
-                    join pg_namespace n on r.pronamespace = n.oid
-                    join pg_language l on r.prolang = l.oid
-                    left join pg_roles owner_role on owner_role.oid = r.proowner
-                    left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
-                    left join pg_aggregate agg on agg.aggfnoid = r.oid
-                where
-                    n.nspname in {}
-                    and n.nspname not in ('pg_catalog', 'information_schema')
-                    and (l.lanname not in ('c', 'internal') or r.prokind in ('a', 'w'))
-                    and r.prokind in ('f', 'p', 'a', 'w')
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = r.oid
-                        and ext_dep.deptype = 'e'
-                    );
-                ",
-                self.accessible_schema_filter()
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch routines: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
+    async fn fetch_routines_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Routine>, Error> {
+        let query = format!(
+            "select
+                quote_ident(n.nspname) as nspname,
+                r.oid,
+                quote_ident(r.proname) as proname,
+                l.lanname as prolang,
+                case r.prokind
+                    when 'f' then 'function'
+                    when 'p' then 'procedure'
+                    when 'a' then 'aggregate'
+                    when 'w' then 'window'
+                end as prokind,
+                pg_get_function_result(r.oid) as prorettype,
+                pg_get_function_identity_arguments(r.oid) as proarguments,
+                pg_get_expr(r.proargdefaults, 0) as proargdefaults,
+                quote_ident(owner_role.rolname) as owner_name,
+                r.prosrc,
+                d.description as routine_comment,
+                r.provolatile::text as provolatile,
+                r.proisstrict,
+                r.proleakproof,
+                r.proparallel::text as proparallel,
+                r.prosecdef,
+                r.proacl::text[] as routine_acl,
+                agg.aggtransfn::regproc::text as agg_sfunc,
+                format_type(agg.aggtranstype, null) as agg_stype,
+                agg.aggtransspace as agg_sspace,
+                case when agg.aggfinalfn != 0 then agg.aggfinalfn::regproc::text end as agg_finalfunc,
+                agg.aggfinalextra as agg_finalfunc_extra,
+                agg.aggfinalmodify::text as agg_finalfunc_modify,
+                case when agg.aggcombinefn != 0 then agg.aggcombinefn::regproc::text end as agg_combinefunc,
+                case when agg.aggserialfn != 0 then agg.aggserialfn::regproc::text end as agg_serialfunc,
+                case when agg.aggdeserialfn != 0 then agg.aggdeserialfn::regproc::text end as agg_deserialfunc,
+                agg.agginitval as agg_initcond,
+                case when agg.aggmtransfn != 0 then agg.aggmtransfn::regproc::text end as agg_msfunc,
+                case when agg.aggminvtransfn != 0 then agg.aggminvtransfn::regproc::text end as agg_minvfunc,
+                case when agg.aggmtransfn != 0 then format_type(agg.aggmtranstype, null) end as agg_mstype,
+                agg.aggmtransspace as agg_msspace,
+                case when agg.aggmfinalfn != 0 then agg.aggmfinalfn::regproc::text end as agg_mfinalfunc,
+                agg.aggmfinalextra as agg_mfinalfunc_extra,
+                agg.aggmfinalmodify::text as agg_mfinalfunc_modify,
+                agg.aggminitval as agg_minitcond,
+                case when agg.aggsortop != 0 then agg.aggsortop::regoper::text end as agg_sortop,
+                agg.aggkind::text as agg_kind,
+                agg.aggnumdirectargs as agg_numdirectargs
+            from
+                pg_proc r
+                join pg_namespace n on r.pronamespace = n.oid
+                join pg_language l on r.prolang = l.oid
+                left join pg_roles owner_role on owner_role.oid = r.proowner
+                left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
+                left join pg_aggregate agg on agg.aggfnoid = r.oid
+            where
+                n.nspname in {}
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and (l.lanname not in ('c', 'internal') or r.prokind in ('a', 'w'))
+                and r.prokind in ('f', 'p', 'a', 'w')
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = r.oid
+                    and ext_dep.deptype = 'e'
+                );",
+            schema_filter
+        );
 
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch routines: {e}.")))?;
+
+        let mut routines = Vec::new();
         if rows.is_empty() {
             println!("No routines found.");
         } else {
@@ -772,9 +826,11 @@ impl Dump {
                     security_definer: row.get("prosecdef"),
                     aggregate_info,
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("routine_acl")
+                        .unwrap_or_default(),
                 };
                 routine.hash();
-                self.routines.push(routine.clone());
                 println!(
                     " - {} {}.{} (lang: {}, arguments: {}, hash: {})",
                     routine.kind,
@@ -784,13 +840,20 @@ impl Dump {
                     routine.arguments,
                     routine.hash.as_deref().unwrap_or("None")
                 );
+                routines.push(routine);
             }
         }
-        Ok(())
+        Ok(routines)
     }
 
-    // Fetch tables from the database and populate the dump.
-    async fn get_tables(&mut self, pool: &PgPool) -> Result<(), Error> {
+    /// Fetch all tables with bounded-parallel fills.
+    ///
+    /// Up to 6 tables are filled concurrently so that per-table sub-queries
+    /// overlap, drastically reducing wall-clock time on remote connections.
+    async fn fetch_tables_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Table>, Error> {
         // Check once whether the pg_get_tabledef extension function exists.
         let has_tabledef_fn =
             sqlx::query("select proname from pg_proc where proname = 'pg_get_tabledef';")
@@ -799,125 +862,194 @@ impl Dump {
                 .unwrap_or(None)
                 .is_some();
 
-        let result = sqlx::query(
-            format!(
-                "
-                    select t.*, d.description as table_comment
-                    from pg_tables t
-                    left join pg_class c on c.relname = t.tablename
-                        and c.relkind in ('r','p')
-                        and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
-                    left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-                    where 
-                        t.schemaname not in ('pg_catalog', 'information_schema') 
-                        and t.schemaname in {} 
-                        and t.tablename not like 'pg_%'
-                        and not exists (
-                            select 1 from pg_depend ext_dep
-                            where ext_dep.objid = c.oid
-                            and ext_dep.deptype = 'e'
-                        );",
-                self.accessible_schema_filter()
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch tables: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
+        let query = format!(
+            "
+                select
+                    quote_ident(t.schemaname) as schemaname,
+                    quote_ident(t.tablename) as tablename,
+                    quote_ident(t.tableowner) as tableowner,
+                    t.schemaname as raw_schema_name,
+                    t.tablename as raw_table_name,
+                    t.tablespace,
+                    t.hasindexes,
+                    t.hastriggers,
+                    t.hasrules,
+                    t.rowsecurity,
+                    d.description as table_comment,
+                    c.relacl::text[] as table_acl
+                from pg_tables t
+                left join pg_class c on c.relname = t.tablename
+                    and c.relkind in ('r','p')
+                    and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
+                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+                where 
+                    t.schemaname not in ('pg_catalog', 'information_schema') 
+                    and t.schemaname in {} 
+                    and t.tablename not like 'pg_%'
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = c.oid
+                        and ext_dep.deptype = 'e'
+                    );",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch tables: {e}.")))?;
 
         if rows.is_empty() {
             println!("No tables found.");
-        } else {
-            println!("Tables found:");
-            for row in rows {
-                let mut table = Table {
-                    schema: row.get("schemaname"),
-                    name: row.get("tablename"),
-                    owner: row.get("tableowner"),
-                    space: row.get("tablespace"),
-                    has_indexes: row.get("hasindexes"),
-                    has_triggers: row.get("hastriggers"),
-                    has_rules: row.get("hasrules"),
-                    has_rowsecurity: row.get("rowsecurity"),
-                    columns: Vec::new(),
-                    constraints: Vec::new(),
-                    indexes: Vec::new(),
-                    triggers: Vec::new(),
-                    policies: Vec::new(),
-                    definition: None,
-                    partition_key: None,
-                    partition_of: None,
-                    partition_bound: None,
-                    comment: row.get("table_comment"),
-                    hash: None,
-                };
-                table.fill(pool, has_tabledef_fn).await.map_err(|e| {
+            return Ok(Vec::new());
+        }
+
+        println!("Tables found:");
+
+        // Build lightweight table structs from the catalog rows.
+        let mut shell_tables: Vec<Table> = Vec::with_capacity(rows.len());
+        for row in rows {
+            shell_tables.push(Table {
+                schema: row.get("schemaname"),
+                name: row.get("tablename"),
+                raw_schema: row.get("raw_schema_name"),
+                raw_name: row.get("raw_table_name"),
+                owner: row.get("tableowner"),
+                space: row.get("tablespace"),
+                has_indexes: row.get("hasindexes"),
+                has_triggers: row.get("hastriggers"),
+                has_rules: row.get("hasrules"),
+                has_rowsecurity: row.get("rowsecurity"),
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                indexes: Vec::new(),
+                triggers: Vec::new(),
+                policies: Vec::new(),
+                definition: None,
+                partition_key: None,
+                partition_of: None,
+                partition_bound: None,
+                comment: row.get("table_comment"),
+                hash: None,
+                acl: row
+                    .get::<Option<Vec<String>>, _>("table_acl")
+                    .unwrap_or_default(),
+            });
+        }
+
+        // Fill all tables concurrently (up to 6 at a time to stay within pool limits).
+        let pool_ref = pool;
+        let tables: Vec<Result<Table, Error>> = stream::iter(shell_tables)
+            .map(|mut table| async move {
+                table.fill(pool_ref, has_tabledef_fn).await.map_err(|e| {
                     Error::other(format!("Failed to fill table {}: {}.", table.name, e))
                 })?;
-
                 table.hash();
-                self.tables.push(table.clone());
-
                 println!(
                     " - {}.{} (hash: {})",
                     table.schema,
                     table.name,
                     table.hash.as_deref().unwrap_or("None")
                 );
-            }
+                Ok(table)
+            })
+            .buffer_unordered(6)
+            .collect()
+            .await;
+
+        let mut result = Vec::with_capacity(tables.len());
+        for t in tables {
+            result.push(t?);
         }
-        Ok(())
+        // Re-sort to ensure deterministic output regardless of completion order.
+        result.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+        Ok(result)
     }
 
-    async fn get_views(&mut self, pool: &PgPool) -> Result<(), Error> {
-        // Fetch regular (non-materialized) views.
-        let result = sqlx::query(
-            format!(
-                "select v.table_schema,
-                        v.table_name,
-                        v.view_definition,
-                        pv.viewowner as view_owner,
-                        array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
-                        d.description as view_comment
-                from information_schema.views v
-                join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
-                left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
-                left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
-                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-                where
-                    v.table_schema not in ('pg_catalog', 'information_schema')
-                    and v.table_schema in {}
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = c.oid
-                        and ext_dep.deptype = 'e'
-                    )
-                group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description;",
-                self.accessible_schema_filter()
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await;
-        if result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch views: {}.",
-                result.err().unwrap()
-            )));
-        }
-        let rows = result.unwrap();
+    async fn fetch_views_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<View>, Error> {
+        // Fetch regular and materialized views concurrently.
+        let regular_query = format!(
+            "select 
+                    quote_ident(v.table_schema) as table_schema,
+                    quote_ident(v.table_name) as table_name,
+                    v.view_definition,
+                    quote_ident(pv.viewowner) as view_owner,
+                    array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
+                    d.description as view_comment,
+                    (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl
+            from information_schema.views v
+            join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
+            left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
+            left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
+            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+            where
+                v.table_schema not in ('pg_catalog', 'information_schema')
+                and v.table_schema in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = c.oid
+                    and ext_dep.deptype = 'e'
+                )
+            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid;",
+            schema_filter
+        );
 
-        if rows.is_empty() {
+        let mat_query = format!(
+            "select
+                    mv.schemaname as table_schema,
+                    mv.matviewname as table_name,
+                    mv.definition as view_definition,
+                    mv.matviewowner as view_owner,
+                    array(
+                        select distinct n.nspname || '.' || dc.relname
+                        from pg_depend dep
+                        join pg_class dc on dc.oid = dep.refobjid
+                        join pg_namespace n on n.oid = dc.relnamespace
+                        where dep.objid = c.oid
+                          and dep.deptype = 'n'
+                          and dc.relkind in ('r', 'v', 'm')
+                    ) as table_relation,
+                    d.description as view_comment,
+                    c.relacl::text[] as view_acl
+            from pg_matviews mv
+            join pg_class c on c.relname = mv.matviewname
+                and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
+            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+            where mv.schemaname not in ('pg_catalog', 'information_schema')
+                and mv.schemaname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = c.oid
+                    and ext_dep.deptype = 'e'
+                );",
+            schema_filter
+        );
+
+        let (regular_rows, mat_rows) = tokio::try_join!(
+            async {
+                sqlx::query(regular_query.as_str())
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to fetch views: {e}.")))
+            },
+            async {
+                sqlx::query(mat_query.as_str())
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to fetch materialized views: {e}.")))
+            },
+        )?;
+
+        let mut views = Vec::new();
+
+        if regular_rows.is_empty() {
             println!("No views found.");
         } else {
             println!("Views found:");
-            for row in rows {
+            for row in regular_rows {
                 let mut view = View {
                     schema: row.get("table_schema"),
                     name: row.get("table_name"),
@@ -929,61 +1061,20 @@ impl Dump {
                     comment: row.get("view_comment"),
                     is_materialized: false,
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("view_acl")
+                        .unwrap_or_default(),
                 };
                 view.hash();
-                self.views.push(view.clone());
-
                 println!(
                     " - {}.{} (hash: {})",
                     view.schema,
                     view.name,
                     view.hash.as_deref().unwrap_or("None")
                 );
+                views.push(view);
             }
         }
-
-        // Fetch materialized views.
-        let mat_result = sqlx::query(
-            format!(
-                "select
-                        mv.schemaname as table_schema,
-                        mv.matviewname as table_name,
-                        mv.definition as view_definition,
-                        mv.matviewowner as view_owner,
-                        array(
-                            select distinct n.nspname || '.' || dc.relname
-                            from pg_depend dep
-                            join pg_class dc on dc.oid = dep.refobjid
-                            join pg_namespace n on n.oid = dc.relnamespace
-                            where dep.objid = c.oid
-                              and dep.deptype = 'n'
-                              and dc.relkind in ('r', 'v', 'm')
-                        ) as table_relation,
-                        d.description as view_comment
-                from pg_matviews mv
-                join pg_class c on c.relname = mv.matviewname
-                    and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
-                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-                where mv.schemaname not in ('pg_catalog', 'information_schema')
-                    and mv.schemaname in {}
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = c.oid
-                        and ext_dep.deptype = 'e'
-                    );",
-                self.accessible_schema_filter()
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await;
-        if mat_result.is_err() {
-            return Err(Error::other(format!(
-                "Failed to fetch materialized views: {}.",
-                mat_result.err().unwrap()
-            )));
-        }
-        let mat_rows = mat_result.unwrap();
 
         if mat_rows.is_empty() {
             println!("No materialized views found.");
@@ -1001,20 +1092,22 @@ impl Dump {
                     comment: row.get("view_comment"),
                     is_materialized: true,
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("view_acl")
+                        .unwrap_or_default(),
                 };
                 view.hash();
-                self.views.push(view.clone());
-
                 println!(
                     " - {}.{} (materialized, hash: {})",
                     view.schema,
                     view.name,
                     view.hash.as_deref().unwrap_or("None")
                 );
+                views.push(view);
             }
         }
 
-        Ok(())
+        Ok(views)
     }
 
     // Read a dump from a file and deserialize it.

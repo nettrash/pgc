@@ -197,6 +197,9 @@ pub struct Routine {
     pub aggregate_info: Option<AggregateInfo>,
     /// The hash of the routine.
     pub hash: Option<String>,
+    /// ACL (grant) entries for this routine
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
 }
 
 impl Routine {
@@ -241,6 +244,7 @@ impl Routine {
             security_definer: false,
             aggregate_info: None,
             hash: None,
+            acl: Vec::new(),
         };
         routine.hash();
         routine
@@ -351,7 +355,7 @@ impl Routine {
 
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure \"{}\".\"{}\"({}) language {}{flags} as {d}{body}{d};\n",
+                "create or replace procedure {}.{}({}) language {}{flags} as {d}{body}{d};\n",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
@@ -361,7 +365,7 @@ impl Routine {
                 body = self.source_code
             ),
             _ => format!(
-                "create or replace {create_kind} \"{}\".\"{}\"({}) returns {} language {}{flags} as {d}{body}{d};\n",
+                "create or replace {create_kind} {}.{}({}) returns {} language {}{flags} as {d}{body}{d};\n",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
@@ -382,7 +386,7 @@ impl Routine {
                 _ => "function",
             };
             script.push_str(&format!(
-                "comment on {object_kind} \"{}\".\"{}\"({}) is '{}';\n",
+                "comment on {object_kind} {}.{}({}) is '{}';\n",
                 self.schema,
                 self.name,
                 self.arguments,
@@ -521,7 +525,7 @@ impl Routine {
             };
 
             script.push_str(&format!(
-                "create aggregate \"{}\".\"{}\"({}) (\n{}\n);\n",
+                "create aggregate {}.{}({}) (\n{}\n);\n",
                 self.schema,
                 self.name,
                 args,
@@ -530,14 +534,14 @@ impl Routine {
         } else {
             // Fallback: no aggregate_info available, emit a comment
             script.push_str(&format!(
-                "/* aggregate \"{}\".\"{}\"({}) — aggregate details unavailable */\n",
+                "/* aggregate {}.{}({}) — aggregate details unavailable */\n",
                 self.schema, self.name, self.arguments
             ));
         }
 
         if let Some(comment) = &self.comment {
             script.push_str(&format!(
-                "comment on aggregate \"{}\".\"{}\"({}) is '{}';\n",
+                "comment on aggregate {}.{}({}) is '{}';\n",
                 self.schema,
                 self.name,
                 self.signature_args(),
@@ -568,7 +572,7 @@ impl Routine {
             other => other.to_string(),
         };
         format!(
-            "drop {} if exists \"{}\".\"{}\" ({});\n",
+            "drop {} if exists {}.{} ({});\n",
             drop_kind,
             self.schema,
             self.name,
@@ -588,12 +592,12 @@ impl Routine {
         };
 
         format!(
-            "alter {} \"{}\".\"{}\"({}) owner to \"{}\";\n",
+            "alter {} {}.{}({}) owner to {};\n",
             object_kind,
             self.schema,
             self.name,
             self.signature_args(),
-            self.owner.replace('"', "\"\"")
+            self.owner
         )
     }
 
@@ -781,7 +785,7 @@ mod tests {
         let routine = build_function_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace function \"public\".\"add\"(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\n";
+        let expected = "create or replace function public.add(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -791,7 +795,7 @@ mod tests {
         routine.owner = "pgc_owner".to_string();
         routine.hash();
 
-        let expected = "create or replace function \"public\".\"add\"(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\nalter function \"public\".\"add\"(a integer) owner to \"pgc_owner\";\n";
+        let expected = "create or replace function public.add(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\nalter function public.add(a integer) owner to pgc_owner;\n";
         assert_eq!(routine.get_script(), expected);
     }
 
@@ -800,7 +804,7 @@ mod tests {
         let routine = build_procedure_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace procedure \"public\".\"do_something\"(a integer) language sql as $$SELECT a;$$;\n";
+        let expected = "create or replace procedure public.do_something(a integer) language sql as $$SELECT a;$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -809,7 +813,7 @@ mod tests {
         let routine = build_function_routine();
         let drop_script = routine.get_drop_script();
 
-        let expected = "drop function if exists \"public\".\"add\" (a integer);\n";
+        let expected = "drop function if exists public.add (a integer);\n";
         assert_eq!(drop_script, expected);
     }
 
@@ -829,7 +833,7 @@ mod tests {
         );
         let script = routine.get_script();
 
-        let expected = "create or replace function \"data\".\"test\"(fetching_id bigint, fetching_event_id character varying) returns TABLE(row_to_json json) language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END$$;\n";
+        let expected = "create or replace function data.test(fetching_id bigint, fetching_event_id character varying) returns TABLE(row_to_json json) language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END$$;\n";
         assert_eq!(script, expected);
     }
 
@@ -911,7 +915,7 @@ mod tests {
         routine.hash();
 
         let script = routine.get_script();
-        assert!(script.contains("create aggregate \"public\".\"my_sum\"(integer)"));
+        assert!(script.contains("create aggregate public.my_sum(integer)"));
         assert!(script.contains("SFUNC = int4_sum"));
         assert!(script.contains("STYPE = bigint"));
         assert!(script.contains("INITCOND = '0'"));
@@ -988,7 +992,9 @@ mod tests {
 
         let script = routine.get_script();
         assert!(
-            script.contains("create aggregate \"public\".\"my_percentile\"(double precision ORDER BY double precision)"),
+            script.contains(
+                "create aggregate public.my_percentile(double precision ORDER BY double precision)"
+            ),
             "Expected ordered-set syntax with ORDER BY, got: {}",
             script
         );
@@ -1038,7 +1044,7 @@ mod tests {
 
         let script = routine.get_script();
         assert!(
-            script.contains("create aggregate \"public\".\"my_rank\"(\"any\" ORDER BY \"any\")"),
+            script.contains("create aggregate public.my_rank(\"any\" ORDER BY \"any\")"),
             "Expected hypothetical-set syntax with ORDER BY, got: {}",
             script
         );
@@ -1086,7 +1092,7 @@ mod tests {
 
         let script = routine.get_script();
         assert!(
-            script.contains("create aggregate \"public\".\"my_mode\"(ORDER BY anyelement)"),
+            script.contains("create aggregate public.my_mode(ORDER BY anyelement)"),
             "Expected ordered-set syntax with no direct args, got: {}",
             script
         );
