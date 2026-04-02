@@ -16,6 +16,9 @@ pub struct Schema {
     pub comment: Option<String>,
     /// Hash of the schema
     pub hash: Option<String>,
+    /// ACL (grant) entries for this schema
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
 }
 
 fn escape_single_quotes(value: &str) -> String {
@@ -31,6 +34,7 @@ impl Schema {
             owner: String::new(),
             comment,
             hash: None,
+            acl: Vec::new(),
         };
         schema.hash();
         schema

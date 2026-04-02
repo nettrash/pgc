@@ -23,6 +23,9 @@ pub struct View {
     /// Hash of the view
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// ACL (grant) entries for this view
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
 }
 
 impl View {
@@ -42,6 +45,7 @@ impl View {
             comment: None,
             is_materialized: false,
             hash: None,
+            acl: Vec::new(),
         };
         view.hash();
         view

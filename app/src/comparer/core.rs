@@ -1,3 +1,5 @@
+use crate::config::grants_mode::GrantsMode;
+use crate::dump::acl;
 use crate::dump::{core::Dump, routine::Routine, table::Table, view::View};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -18,6 +20,8 @@ pub struct Comparer {
     use_single_transaction: bool,
     // Whether to include comments in the output script
     use_comments: bool,
+    // How to handle grants (privileges) during comparison
+    grants_mode: GrantsMode,
 
     // The script that will be generated
     script: String,
@@ -40,6 +44,7 @@ impl Comparer {
         use_drop: bool,
         use_single_transaction: bool,
         use_comments: bool,
+        grants_mode: GrantsMode,
     ) -> Self {
         let mut comparer = Self {
             from,
@@ -47,6 +52,7 @@ impl Comparer {
             use_drop,
             use_single_transaction,
             use_comments,
+            grants_mode,
             script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
@@ -66,8 +72,8 @@ impl Comparer {
         comparer.script.push_str("\n\n To dump:\n");
         comparer.script.push_str(&comparer.to.get_info());
         comparer.script.push_str(&format!(
-            "\n\n Comparison results (use_drop: {}):\n",
-            comparer.use_drop
+            "\n\n Comparison results (use_drop: {}, grants_mode: {}):\n",
+            comparer.use_drop, comparer.grants_mode
         ));
         comparer.script.push_str("*/\n\n");
 
@@ -115,6 +121,8 @@ impl Comparer {
             self.script.push_str(&self.trigger_post_script);
             self.trigger_post_script.clear();
         }
+
+        self.compare_grants().await?;
 
         if self.use_single_transaction {
             self.script.push_str("\ncommit;");
@@ -2159,12 +2167,147 @@ impl Comparer {
             .push_str("\n/* ---> Routines & Views: End section --------------- */\n\n");
         Ok(())
     }
+
+    // Compare grants (privileges) for all objects
+    async fn compare_grants(&mut self) -> Result<(), Error> {
+        if self.grants_mode == GrantsMode::Ignore {
+            return Ok(());
+        }
+
+        let full = self.grants_mode == GrantsMode::Full;
+
+        self.script
+            .push_str("\n/* ---> Grants: Start section --------------- */\n\n");
+
+        // --- Schemas ---
+        for schema in &self.to.schemas {
+            let from_acl = self
+                .from
+                .schemas
+                .iter()
+                .find(|s| s.name == schema.name)
+                .map(|s| s.acl.as_slice())
+                .unwrap_or(&[]);
+            let grants_script =
+                acl::generate_grants_script(from_acl, &schema.acl, full, "SCHEMA", &schema.name);
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for schema: {} */\n", schema.name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Tables ---
+        for table in &self.to.tables {
+            let from_acl = self
+                .from
+                .tables
+                .iter()
+                .find(|t| t.schema == table.schema && t.name == table.name)
+                .map(|t| t.acl.as_slice())
+                .unwrap_or(&[]);
+            let object_name = format!("{}.{}", table.schema, table.name);
+            let grants_script =
+                acl::generate_grants_script(from_acl, &table.acl, full, "TABLE", &object_name);
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for table: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Sequences ---
+        for seq in &self.to.sequences {
+            let from_acl = self
+                .from
+                .sequences
+                .iter()
+                .find(|s| s.schema == seq.schema && s.name == seq.name)
+                .map(|s| s.acl.as_slice())
+                .unwrap_or(&[]);
+            let object_name = format!("{}.{}", seq.schema, seq.name);
+            let grants_script =
+                acl::generate_grants_script(from_acl, &seq.acl, full, "SEQUENCE", &object_name);
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for sequence: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Views ---
+        for view in &self.to.views {
+            let from_acl = self
+                .from
+                .views
+                .iter()
+                .find(|v| v.schema == view.schema && v.name == view.name)
+                .map(|v| v.acl.as_slice())
+                .unwrap_or(&[]);
+            let object_name = format!("{}.{}", view.schema, view.name);
+            let grants_script =
+                acl::generate_grants_script(from_acl, &view.acl, full, "TABLE", &object_name);
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for view: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Routines ---
+        for routine in &self.to.routines {
+            let from_acl = self
+                .from
+                .routines
+                .iter()
+                .find(|r| {
+                    r.schema == routine.schema
+                        && r.name == routine.name
+                        && r.arguments == routine.arguments
+                })
+                .map(|r| r.acl.as_slice())
+                .unwrap_or(&[]);
+            let object_kind = match routine.kind.as_str() {
+                "procedure" => "PROCEDURE",
+                _ => "FUNCTION",
+            };
+            let object_name = format!("{}.{}({})", routine.schema, routine.name, routine.arguments);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &routine.acl,
+                full,
+                object_kind,
+                &object_name,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script.push_str(
+                        format!("/* Grants for {}: {} */\n", routine.kind, object_name).as_str(),
+                    );
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        self.script
+            .push_str("\n/* ---> Grants: End section --------------- */\n\n");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::dump_config::DumpConfig;
+    use crate::config::grants_mode::GrantsMode;
     use crate::dump::extension::Extension;
     use crate::dump::pg_type::{CompositeAttribute, PgType};
     use crate::dump::routine::Routine;
@@ -2285,7 +2428,8 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2327,7 +2471,8 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2372,7 +2517,8 @@ mod tests {
         to_dump.routines.push(sql_routine);
         to_dump.routines.push(plpgsql_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2408,7 +2554,7 @@ mod tests {
         );
         from_dump.routines.push(dropped_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -2452,7 +2598,7 @@ mod tests {
         );
         from_dump.routines.push(dropped_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -2490,7 +2636,7 @@ mod tests {
             vec![("street", "varchar(255)"), ("city", "varchar(100)")],
         ));
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -2516,7 +2662,7 @@ mod tests {
         from_dump.schemas.push(from_schema);
         to_dump.schemas.push(to_schema);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_schemas().await.unwrap();
         let script = comparer.get_script();
 
@@ -2545,7 +2691,7 @@ mod tests {
         from_dump.extensions.push(from_ext);
         to_dump.extensions.push(to_ext);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_extensions().await.unwrap();
         let script = comparer.get_script();
 
@@ -2592,7 +2738,7 @@ mod tests {
         from_dump.routines.push(from_routine);
         to_dump.routines.push(to_routine);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2666,7 +2812,8 @@ mod tests {
         to_dump.routines.push(a_middle);
         to_dump.routines.push(r_base);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2752,7 +2899,7 @@ mod tests {
         from_dump.routines.push(x_step);
         from_dump.routines.push(a_middle);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_routines().await.unwrap();
         let script = comparer.get_script();
 
@@ -2840,7 +2987,8 @@ mod tests {
         to_dump.routines.push(a_middle);
         to_dump.routines.push(r_base);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_routines_and_views().await.unwrap();
         let script = comparer.get_script();
 
@@ -3023,7 +3171,8 @@ mod tests {
         );
         to_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3123,7 +3272,8 @@ mod tests {
         );
         to_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3157,7 +3307,8 @@ mod tests {
         );
         to_dump.sequences.push(sequence);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3207,7 +3358,7 @@ mod tests {
         from_dump.sequences.push(from_sequence);
         to_dump.sequences.push(to_sequence);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3304,7 +3455,7 @@ mod tests {
         );
         from_dump.tables.push(table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3469,7 +3620,7 @@ mod tests {
         );
         to_dump.tables.push(to_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_sequences().await.unwrap();
         let script = comparer.get_script();
 
@@ -3551,7 +3702,8 @@ mod tests {
         to_dump.tables.push(part);
         to_dump.tables.push(orders);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3616,7 +3768,7 @@ mod tests {
         from_dump.tables.push(from_table);
         to_dump.tables.push(to_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_tables().await.unwrap();
         let script = comparer.get_script();
 
@@ -3649,7 +3801,7 @@ mod tests {
         from_dump.views.push(from_view);
         to_dump.views.push(to_view);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.create_views().await.unwrap();
         let script = comparer.get_script();
 
@@ -3728,7 +3880,8 @@ mod tests {
         to_dump.routines.push(get_user_count);
         to_dump.views.push(v_user_stats);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3790,7 +3943,8 @@ mod tests {
         to_dump.routines.push(helper_fn);
         to_dump.views.push(mat_view);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3841,7 +3995,7 @@ mod tests {
         from_dump.routines.push(routine_b);
         from_dump.routines.push(routine_a);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -3923,7 +4077,8 @@ mod tests {
         to_dump.tables.push(grandparent);
         to_dump.tables.push(sub_parent);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -4007,7 +4162,7 @@ mod tests {
         from_dump.tables.push(sub_parent);
         from_dump.tables.push(leaf);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -4212,7 +4367,8 @@ mod tests {
             None,
         ));
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.compare().await.unwrap();
         let script = comparer.get_script();
 
@@ -4278,7 +4434,7 @@ mod tests {
 
         to_dump.tables.push(new_table);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, false, true, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, false, true, true, GrantsMode::Ignore);
 
         comparer.compare().await.unwrap();
 
@@ -4301,7 +4457,8 @@ mod tests {
     async fn use_comments_false_strips_block_and_line_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script =
             "/* header comment */\nCREATE TABLE t1 (id int); -- inline comment\n/* trailing */\n"
                 .to_string();
@@ -4313,7 +4470,8 @@ mod tests {
     async fn use_comments_false_strips_singly_nested_block_comment() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // /* outer /* inner */ still outer */ must all be stripped.
         comparer.script = "SELECT /* outer /* inner */ still outer */ 1;\n".to_string();
         let result = comparer.get_script();
@@ -4324,7 +4482,8 @@ mod tests {
     async fn use_comments_false_strips_deeply_nested_block_comment() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Three levels of nesting.
         comparer.script = "SELECT /* a /* b /* c */ b */ a */ 1;\n".to_string();
         let result = comparer.get_script();
@@ -4335,7 +4494,8 @@ mod tests {
     async fn use_comments_false_strips_adjacent_nested_block_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Two independent outer comments each with their own inner comment.
         // Any space left before SELECT after stripping the first comment is removed by get_script()'s trim().
         comparer.script = "/* a /* b */ a */ SELECT /* c /* d */ c */ 1;\n".to_string();
@@ -4347,7 +4507,8 @@ mod tests {
     async fn use_comments_false_nested_block_comment_before_statement() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Nested comment as a header; SQL that follows must be preserved intact.
         comparer.script = "/* header /* nested */ end */\nCREATE TABLE t (id int);\n".to_string();
         let result = comparer.get_script();
@@ -4358,7 +4519,8 @@ mod tests {
     async fn use_comments_false_nested_comment_only_script_returns_empty() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // A script consisting only of a nested block comment produces no output.
         comparer.script = "/* outer /* inner */ outer */\n".to_string();
         let result = comparer.get_script();
@@ -4369,7 +4531,8 @@ mod tests {
     async fn use_comments_false_nested_comment_sql_between_levels() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Text that sits between the outer /* and its matching */ must be stripped
         // even when inner comment pairs appear in the middle.
         comparer.script = "SELECT /* before /* mid */ after */ 42;\n".to_string();
@@ -4381,7 +4544,8 @@ mod tests {
     async fn use_comments_false_nested_comment_immediately_after_keyword() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // No space between the keyword and the nested comment; scanner must not
         // be confused by the /* that immediately follows non-comment text.
         comparer.script = "SELECT/* /* nested */ */1;\n".to_string();
@@ -4393,7 +4557,8 @@ mod tests {
     async fn use_comments_false_nested_comment_followed_by_line_comment() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // After the nested block comment closes, a line comment on the same line
         // must also be stripped.
         comparer.script = "SELECT /* a /* b */ a */ 1; -- strip me\n".to_string();
@@ -4405,7 +4570,8 @@ mod tests {
     async fn use_comments_false_nested_comment_inside_single_quoted_string_not_stripped() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Nested-comment-like sequences inside a string literal must be preserved.
         comparer.script = "SELECT '/* outer /* inner */ outer */' AS val;\n".to_string();
         let result = comparer.get_script();
@@ -4416,7 +4582,8 @@ mod tests {
     async fn use_comments_false_nested_comment_inside_e_string_not_stripped() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Nested-comment-like sequences inside an E-string must also be preserved.
         comparer.script = "SELECT E'/* outer /* inner */ outer */' AS val;\n".to_string();
         let result = comparer.get_script();
@@ -4427,7 +4594,8 @@ mod tests {
     async fn use_comments_false_nested_comment_inside_double_quoted_identifier_not_stripped() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Nested-comment-like sequences inside a double-quoted identifier must be preserved.
         comparer.script = "SELECT 1 AS \"/* outer /* inner */ outer */\";\n".to_string();
         let result = comparer.get_script();
@@ -4438,7 +4606,8 @@ mod tests {
     async fn use_comments_false_preserves_dollar_quoted_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script = "CREATE FUNCTION f() RETURNS void AS $$\n-- inside body\n/* also inside */\n$$ LANGUAGE plpgsql;\n".to_string();
         let result = comparer.get_script();
         assert_eq!(
@@ -4451,7 +4620,8 @@ mod tests {
     async fn use_comments_false_preserves_named_dollar_tag_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script = "CREATE FUNCTION g() RETURNS void AS $body$\n-- comment inside\n$body$ LANGUAGE plpgsql;\n".to_string();
         let result = comparer.get_script();
         assert_eq!(
@@ -4464,7 +4634,8 @@ mod tests {
     async fn use_comments_false_preserves_single_quoted_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script =
             "SELECT '-- not a comment' AS val, '/* also not */' AS val2;\n".to_string();
         let result = comparer.get_script();
@@ -4478,7 +4649,8 @@ mod tests {
     async fn use_comments_false_preserves_e_string_backslash_escaped_quote() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // \' inside E'...' is an escaped quote and must NOT terminate the string.
         // The comment-like content after it must be preserved, not stripped.
         comparer.script = "SELECT E'it\\'s fine -- not a comment' AS val; -- strip\n".to_string();
@@ -4490,7 +4662,8 @@ mod tests {
     async fn use_comments_false_preserves_e_string_block_comment_lookalike() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // /* ... */ inside an E-string must not be treated as a block comment.
         comparer.script = "SELECT E'/* not a comment */' AS val; /* strip */\n".to_string();
         let result = comparer.get_script();
@@ -4501,7 +4674,8 @@ mod tests {
     async fn use_comments_false_preserves_e_string_backslash_backslash_then_quote() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // \\\' is an escaped backslash (\\) followed by an escaped quote (\').
         // The string should continue after that sequence.
         comparer.script =
@@ -4517,7 +4691,8 @@ mod tests {
     async fn use_comments_false_preserves_e_string_doubled_quote_escape() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // '' inside E'...' is also a valid quote escape; must not terminate string early.
         comparer.script = "SELECT E'it''s fine -- not a comment' AS val; -- strip\n".to_string();
         let result = comparer.get_script();
@@ -4528,7 +4703,8 @@ mod tests {
     async fn use_comments_false_preserves_lowercase_e_string() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Lowercase e'...' prefix must be handled identically to E'...'.
         comparer.script = "SELECT e'it\\'s fine -- not a comment' AS val; -- strip\n".to_string();
         let result = comparer.get_script();
@@ -4539,7 +4715,8 @@ mod tests {
     async fn use_comments_false_does_not_treat_standalone_e_as_e_string() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // A bare column/alias named "e" followed immediately by a plain string
         // literal must not be misidentified as an E-string prefix.
         // Here "e" is a table alias and 'text' is a separate literal.
@@ -4552,7 +4729,8 @@ mod tests {
     async fn use_comments_false_does_not_treat_uppercase_e_identifier_as_e_string() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Uppercase E as a standalone identifier (column name), not followed by
         // a quote, must not be confused with an E-string prefix.
         comparer.script = "SELECT E FROM t; -- strip\n".to_string();
@@ -4564,7 +4742,8 @@ mod tests {
     async fn use_comments_false_preserves_empty_e_string() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // An empty E-string E'' must not confuse the state machine.
         comparer.script = "SELECT E'' AS val; /* strip */\n".to_string();
         let result = comparer.get_script();
@@ -4575,7 +4754,8 @@ mod tests {
     async fn use_comments_false_preserves_e_string_with_other_backslash_sequences() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // \n and \t are everyday escape sequences; the scanner must copy them
         // verbatim and must not mistake the character after the backslash for
         // anything other than the second byte of the pair.
@@ -4592,7 +4772,8 @@ mod tests {
     async fn use_comments_false_preserves_multiple_e_strings_in_one_statement() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Multiple E-strings in one statement; real trailing comment stripped.
         comparer.script =
             "INSERT INTO t VALUES (E'val\\'1 -- x', E'val/*2*/'); -- strip\n".to_string();
@@ -4607,7 +4788,8 @@ mod tests {
     async fn use_comments_false_preserves_e_string_adjacent_to_double_quoted_identifier() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // E-string and double-quoted identifier in the same statement; both
         // preserved, real trailing comment stripped.
         comparer.script =
@@ -4623,7 +4805,8 @@ mod tests {
     async fn use_comments_false_preserves_double_quoted_identifier_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Double-quoted identifiers containing sequences that look like comment
         // starters must be passed through verbatim and must NOT be stripped.
         comparer.script =
@@ -4639,7 +4822,8 @@ mod tests {
     async fn use_comments_false_preserves_double_quoted_identifier_with_escaped_quote() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // A doubled double-quote inside a quoted identifier is an escape sequence
         // and must survive comment stripping intact.
         comparer.script =
@@ -4656,7 +4840,8 @@ mod tests {
     async fn use_comments_false_preserves_multiple_double_quoted_identifiers() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Several double-quoted identifiers in one statement, each containing
         // comment-like sequences; only the trailing real comment should be stripped.
         comparer.script =
@@ -4669,7 +4854,8 @@ mod tests {
     async fn use_comments_false_preserves_qualified_double_quoted_name() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Quoted schema + quoted table, both containing comment-like sequences.
         comparer.script =
             "CREATE TABLE \"my--schema\".\"my/*table*/\" (id int); /* strip */\n".to_string();
@@ -4684,7 +4870,8 @@ mod tests {
     async fn use_comments_false_preserves_empty_double_quoted_identifier() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // "" is a valid (if unusual) quoted identifier; must not confuse the state machine.
         comparer.script = "ALTER INDEX \"\" RENAME TO x; /* strip */\n".to_string();
         let result = comparer.get_script();
@@ -4695,7 +4882,8 @@ mod tests {
     async fn use_comments_false_strips_comment_after_double_quoted_identifier() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // The parser must exit the double-quote state correctly so the real block
         // comment that follows is still stripped.
         comparer.script = "SELECT \"col\" /* strip this */ FROM t;\n".to_string();
@@ -4707,7 +4895,8 @@ mod tests {
     async fn use_comments_false_mixed_double_and_single_quoted_with_comment() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         // Double-quoted identifier and single-quoted string both containing
         // comment-like bytes; trailing real comment must still be stripped.
         comparer.script =
@@ -4723,7 +4912,8 @@ mod tests {
     async fn use_comments_false_returns_empty_for_comment_only_script() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script = "/* only a comment */\n-- another comment\n".to_string();
         let result = comparer.get_script();
         assert_eq!(result, "");
@@ -4733,7 +4923,8 @@ mod tests {
     async fn use_comments_false_collapses_excess_newlines() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script =
             "CREATE TABLE t1 (id int);\n/* removed */\n\n\n\nCREATE TABLE t2 (id int);\n"
                 .to_string();
@@ -4748,7 +4939,8 @@ mod tests {
     async fn use_comments_true_preserves_all_comments() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
         comparer.script = "/* header */\nCREATE TABLE t1 (id int); -- inline\n".to_string();
         let result = comparer.get_script();
         assert_eq!(
@@ -4761,7 +4953,8 @@ mod tests {
     async fn use_comments_false_preserves_utf8() {
         let from_dump = Dump::new(DumpConfig::default());
         let to_dump = Dump::new(DumpConfig::default());
-        let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
         comparer.script =
             "/* comment */\nCOMMENT ON TABLE t IS '数据表 — 描述';\nSELECT $$函数体$$;\n"
                 .to_string();
@@ -4904,7 +5097,7 @@ mod tests {
         to_dump.tables.push(to_parent);
         to_dump.tables.push(to_child);
 
-        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.compare_tables().await.unwrap();
         let script = comparer.get_script();
 

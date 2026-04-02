@@ -15,6 +15,18 @@ BEGIN
      END IF;
 END;
 $$;
+
+-- Roles used for grant comparison cases
+DO $$
+BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_grant_reader') THEN
+          CREATE ROLE pgc_grant_reader;
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_grant_writer') THEN
+          CREATE ROLE pgc_grant_writer;
+     END IF;
+END;
+$$;
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
@@ -843,4 +855,28 @@ ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_from;
 --   1. Skip creating separate sequences for serial/bigserial columns
 --   2. Use serial/bigserial types in the CREATE TABLE statement
 --   3. Correctly handle identity columns (skip sequence as well)
+
+-- =============================================================================
+-- Grants comparison test (FROM side)
+-- =============================================================================
+-- These GRANT statements establish the FROM baseline for grant comparison.
+-- Schema B (TO) has different grants to exercise all diff scenarios:
+--   unchanged, modified, added, and removed grants.
+
+-- Schema grants
+GRANT USAGE ON SCHEMA test_schema TO pgc_grant_reader;
+
+-- Table grants
+GRANT SELECT ON test_schema.users TO pgc_grant_reader;
+GRANT SELECT, INSERT, UPDATE ON test_schema.users TO pgc_grant_writer;
+GRANT SELECT ON test_schema.products TO pgc_grant_reader;
+
+-- Sequence grants
+GRANT USAGE ON SEQUENCE test_schema.user_id_seq TO pgc_grant_reader;
+
+-- View grants
+GRANT SELECT ON test_schema.product_inventory TO pgc_grant_reader;
+
+-- Function grants
+GRANT EXECUTE ON FUNCTION test_schema.update_timestamp() TO pgc_grant_reader;
 

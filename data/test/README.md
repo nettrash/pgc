@@ -196,7 +196,29 @@ Objects change ownership from `pgc_owner_from` → `pgc_owner_to`:
 - **Added**: comments on `new_reporting_schema`, `reviews` table, new columns, `weighted_sum` aggregate
 - **Unchanged**: comments on `users.metadata`, `products.dimensions`
 
-### 17. Special Test Scenarios
+### 17. Grants (ACL)
+Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
+
+#### Unchanged Grants
+- `SELECT` on `test_schema.users` → `pgc_grant_reader`
+- `SELECT` on `test_schema.product_inventory` (view) → `pgc_grant_reader`
+- `USAGE` on `test_schema` (schema) → `pgc_grant_reader`
+
+#### Modified Grants
+- `test_schema.users` → `pgc_grant_writer`: FROM has `SELECT, INSERT, UPDATE`; TO has `SELECT, INSERT` (UPDATE revoked)
+- `test_schema.products` → `pgc_grant_reader`: FROM has `SELECT`; TO has `SELECT, INSERT` (INSERT added)
+
+#### Added Grants
+- `SELECT, UPDATE` on `test_schema.products` → `pgc_grant_writer` (new grantee)
+- `SELECT` on `test_schema.product_inventory` (view) → `pgc_grant_writer` (new grantee)
+- `USAGE, CREATE` on `test_schema` (schema) → `pgc_grant_writer` (new grantee)
+- `EXECUTE` on `test_schema.calculate_average_rating(UUID)` → `pgc_grant_reader` (new function)
+
+#### Removed Grants
+- `USAGE` on `test_schema.user_id_seq` (sequence) → `pgc_grant_reader` (no grant in TO)
+- `EXECUTE` on `test_schema.update_timestamp()` (function) → `pgc_grant_reader` (no grant in TO)
+
+### 18. Special Test Scenarios
 
 #### CHECK Constraint String Literal Case Preservation
 - `chk_category_values` contains mixed-case string literals (`'Electronics'`, `'Home & Garden'`, `'Books'`) identical in both schemas

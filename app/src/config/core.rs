@@ -1,4 +1,5 @@
 use crate::config::dump_config::DumpConfig;
+use crate::config::grants_mode::GrantsMode;
 
 // Configuration file representation.
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct Config {
     pub use_single_transaction: bool,
     // Whether to include comments in the output script
     pub use_comments: bool,
+    // How to handle grants (privileges) during comparison
+    pub grants_mode: GrantsMode,
 }
 
 impl Config {
@@ -54,6 +57,7 @@ impl Config {
         let mut use_drop = false;
         let mut use_single_transaction = false;
         let mut use_comments = true;
+        let mut grants_mode = GrantsMode::Ignore;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -88,6 +92,7 @@ impl Config {
                 && key != "USE_DROP"
                 && key != "USE_SINGLE_TRANSACTION"
                 && key != "USE_COMMENTS"
+                && key != "GRANTS_MODE"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -125,6 +130,9 @@ impl Config {
                         _ => panic!("Invalid value for USE_COMMENTS: {}", parts[1].trim()),
                     };
                 }
+                "GRANTS_MODE" => {
+                    grants_mode = GrantsMode::from_str_or_panic(parts[1].trim());
+                }
                 _ => {}
             }
         }
@@ -155,6 +163,7 @@ impl Config {
             use_drop,
             use_single_transaction,
             use_comments,
+            grants_mode,
         }
     }
 }

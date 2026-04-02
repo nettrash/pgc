@@ -143,7 +143,8 @@ impl Dump {
                     n.nspname as raw_schema_name,
                     quote_ident(r.rolname) as schema_owner,
                     d.description as schema_comment,
-                    has_schema_privilege(n.nspname, 'USAGE') as has_usage
+                    has_schema_privilege(n.nspname, 'USAGE') as has_usage,
+                    n.nspacl::text[] as schema_acl
              from pg_namespace n
              left join pg_roles r on r.oid = n.nspowner
              left join pg_description d on d.objoid = n.oid
@@ -176,8 +177,10 @@ impl Dump {
 
                 let owner: Option<String> = row.get("schema_owner");
                 let comment: Option<String> = row.get("schema_comment");
+                let acl: Option<Vec<String>> = row.get("schema_acl");
                 let mut sch = Schema::new(schema_name, raw_schema_name, comment);
                 sch.owner = owner.unwrap_or_default();
+                sch.acl = acl.unwrap_or_default();
                 sch.hash();
                 println!(" - {}", sch.name);
                 self.schemas.push(sch);
@@ -544,7 +547,8 @@ impl Dump {
                     quote_ident(owner_table.relname) as owned_by_table,
                     quote_ident(owner_attr.attname) as owned_by_column,
                     dep.deptype::text as dependency_type,
-                    seq_desc.description as seq_comment
+                    seq_desc.description as seq_comment,
+                    seq_class.relacl::text[] as seq_acl
                 from
                     pg_sequences seq
                     left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
@@ -602,6 +606,9 @@ impl Dump {
                     is_identity: false,
                     comment: row.get("seq_comment"),
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("seq_acl")
+                        .unwrap_or_default(),
                 };
                 if let Some(deptype) = row.get::<Option<String>, _>("dependency_type")
                     && deptype == "i"
@@ -648,6 +655,7 @@ impl Dump {
                     r.proleakproof,
                     r.proparallel::text as proparallel,
                     r.prosecdef,
+                    r.proacl::text[] as routine_acl,
                     -- aggregate details (NULL for non-aggregates)
                     agg.aggtransfn::regproc::text as agg_sfunc,
                     format_type(agg.aggtranstype, null) as agg_stype,
@@ -790,6 +798,9 @@ impl Dump {
                     security_definer: row.get("prosecdef"),
                     aggregate_info,
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("routine_acl")
+                        .unwrap_or_default(),
                 };
                 routine.hash();
                 self.routines.push(routine.clone());
@@ -831,7 +842,8 @@ impl Dump {
                         t.hastriggers,
                         t.hasrules,
                         t.rowsecurity,
-                        d.description as table_comment
+                        d.description as table_comment,
+                        c.relacl::text[] as table_acl
                     from pg_tables t
                     left join pg_class c on c.relname = t.tablename
                         and c.relkind in ('r','p')
@@ -887,6 +899,9 @@ impl Dump {
                     partition_bound: None,
                     comment: row.get("table_comment"),
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("table_acl")
+                        .unwrap_or_default(),
                 };
                 table.fill(pool, has_tabledef_fn).await.map_err(|e| {
                     Error::other(format!("Failed to fill table {}: {}.", table.name, e))
@@ -916,7 +931,8 @@ impl Dump {
                         v.view_definition,
                         quote_ident(pv.viewowner) as view_owner,
                         array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
-                        d.description as view_comment
+                        d.description as view_comment,
+                        (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl
                 from information_schema.views v
                 join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
                 left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
@@ -930,7 +946,7 @@ impl Dump {
                         where ext_dep.objid = c.oid
                         and ext_dep.deptype = 'e'
                     )
-                group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description;",
+                group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid;",
                 self.accessible_schema_filter()
             )
             .as_str(),
@@ -961,6 +977,9 @@ impl Dump {
                     comment: row.get("view_comment"),
                     is_materialized: false,
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("view_acl")
+                        .unwrap_or_default(),
                 };
                 view.hash();
                 self.views.push(view.clone());
@@ -991,7 +1010,8 @@ impl Dump {
                               and dep.deptype = 'n'
                               and dc.relkind in ('r', 'v', 'm')
                         ) as table_relation,
-                        d.description as view_comment
+                        d.description as view_comment,
+                        c.relacl::text[] as view_acl
                 from pg_matviews mv
                 join pg_class c on c.relname = mv.matviewname
                     and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
@@ -1033,6 +1053,9 @@ impl Dump {
                     comment: row.get("view_comment"),
                     is_materialized: true,
                     hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("view_acl")
+                        .unwrap_or_default(),
                 };
                 view.hash();
                 self.views.push(view.clone());
