@@ -157,6 +157,10 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **print_user_stats()**: reads `v_user_stats` view
 - **z_final_report()**: calls `a_middle_layer()` (dependency chain)
 
+#### Unchanged Procedures
+- **notify_event(uuid, varchar, jsonb)**: 3-param overload, identical in both schemas
+- **notify_event(uuid, varchar, varchar, jsonb, jsonb)**: 5-param overload, identical in both schemas (tests overloaded routine matching by argument signature)
+
 ### 12. Triggers
 - **Added**: `trigger_reviews_update_timestamp`, `trigger_reviews_audit` on `reviews` table
 - **Removed**: `trigger_orders_audit` (orders table removed), `trg_drop_orders` (drop_orders table removed)
@@ -248,6 +252,11 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 #### Extension Object Exclusion
 - Extension-owned objects (functions, types, operators) must not appear as individual creates/drops
 - User-defined objects referencing extension types (e.g., `user_preferences` using `hstore`) must still be compared
+
+#### Overloaded Routines
+- `test_schema.notify_event` has two overloads (3-param and 5-param) identical in both schemas
+- Verifies that overloads are matched by `(schema, name, arguments)` — not just `(schema, name)`
+- No diff should be emitted for either overload
 
 #### Routine Dependency Ordering
 - View ↔ routine cross-dependencies: `get_user_count()` → `v_user_stats` → `report_user_stats()` / `print_user_stats()`
