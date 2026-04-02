@@ -4292,7 +4292,7 @@ mod tests {
         let to_dump = Dump::new(DumpConfig::default());
         let mut comparer = Comparer::new(from_dump, to_dump, false, false, false);
         // Two independent outer comments each with their own inner comment.
-        // The space between the first comment and SELECT is preserved.
+        // Any space left before SELECT after stripping the first comment is removed by get_script()'s trim().
         comparer.script = "/* a /* b */ a */ SELECT /* c /* d */ c */ 1;\n".to_string();
         let result = comparer.get_script();
         assert_eq!(result, "SELECT  1;\n");
