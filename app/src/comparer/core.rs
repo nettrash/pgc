@@ -164,25 +164,22 @@ impl Comparer {
         if routine.hash.is_none() {
             self.script.push_str(
                 format!(
-                    "/* Skipping routine {}.{} due to missing hash. */\n",
-                    routine.schema, routine.name
+                    "/* Skipping routine {}.{}({}) due to missing hash. */\n",
+                    routine.schema, routine.name, routine.arguments
                 )
                 .as_str(),
             );
             return;
         }
 
-        if let Some(from_routine) = self
-            .from
-            .routines
-            .iter()
-            .find(|r| r.name == routine.name && r.schema == routine.schema)
-        {
+        if let Some(from_routine) = self.from.routines.iter().find(|r| {
+            r.name == routine.name && r.schema == routine.schema && r.arguments == routine.arguments
+        }) {
             if from_routine.hash.is_none() {
                 self.script.push_str(
                     format!(
-                        "/* Skipping routine {}.{} due to missing hash. */\n",
-                        from_routine.schema, from_routine.name
+                        "/* Skipping routine {}.{}({}) due to missing hash. */\n",
+                        from_routine.schema, from_routine.name, from_routine.arguments
                     )
                     .as_str(),
                 );
@@ -208,13 +205,22 @@ impl Comparer {
                     }
                 }
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script.push_str(routine.get_script().as_str());
             }
         } else {
-            self.script
-                .push_str(format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str());
+            self.script.push_str(
+                format!(
+                    "/* Routine: {}.{}({})*/\n",
+                    routine.schema, routine.name, routine.arguments
+                )
+                .as_str(),
+            );
             self.script.push_str(routine.get_script().as_str());
         }
     }
@@ -1265,24 +1271,28 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self
-                    .to
-                    .routines
-                    .iter()
-                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+                !self.to.routines.iter().any(|tr| {
+                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
+                })
             })
             .cloned()
             .collect();
 
         if !routines_to_drop.is_empty() {
             let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
-            let drop_names: Vec<(String, String)> = routines_to_drop
+            let drop_names: Vec<(String, String, String)> = routines_to_drop
                 .iter()
-                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|r| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
-                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1303,7 +1313,11 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -1334,14 +1348,20 @@ impl Comparer {
 
         if !create_routines.is_empty() {
             let n = create_routines.len();
-            let names: Vec<(String, String)> = create_routines
+            let names: Vec<(String, String, String)> = create_routines
                 .iter()
-                .map(|(_, r)| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|(_, r)| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
             for (i, (_, routine)) in create_routines.iter().enumerate() {
-                for (j, (schema, name)) in names.iter().enumerate() {
+                for (j, (schema, name, _)) in names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1361,7 +1381,12 @@ impl Comparer {
                 } else {
                     0
                 };
-                (priority, r.schema.to_lowercase(), r.name.to_lowercase())
+                (
+                    priority,
+                    r.schema.to_lowercase(),
+                    r.name.to_lowercase(),
+                    r.arguments.to_lowercase(),
+                )
             });
 
             for idx in sorted {
@@ -1903,11 +1928,9 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self
-                    .to
-                    .routines
-                    .iter()
-                    .any(|tr| tr.name == r.name && tr.schema == r.schema)
+                !self.to.routines.iter().any(|tr| {
+                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
+                })
             })
             .cloned()
             .collect();
@@ -1917,13 +1940,19 @@ impl Comparer {
             // reverse dependency order (dependents first).
             let mut drop_deps: Vec<HashSet<usize>> = vec![HashSet::new(); routines_to_drop.len()];
 
-            let drop_names: Vec<(String, String)> = routines_to_drop
+            let drop_names: Vec<(String, String, String)> = routines_to_drop
                 .iter()
-                .map(|r| (r.schema.to_lowercase(), r.name.to_lowercase()))
+                .map(|r| {
+                    (
+                        r.schema.to_lowercase(),
+                        r.name.to_lowercase(),
+                        r.arguments.to_lowercase(),
+                    )
+                })
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
-                for (j, (schema, name)) in drop_names.iter().enumerate() {
+                for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
                         && (Self::text_references_qualified_name(
                             &routine.source_code,
@@ -1944,7 +1973,11 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}*/\n", routine.schema, routine.name).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -1974,11 +2007,11 @@ impl Comparer {
             if routine.hash.is_none() {
                 continue;
             }
-            let from_routine = self
-                .from
-                .routines
-                .iter()
-                .find(|r| r.name == routine.name && r.schema == routine.schema);
+            let from_routine = self.from.routines.iter().find(|r| {
+                r.name == routine.name
+                    && r.schema == routine.schema
+                    && r.arguments == routine.arguments
+            });
             let needs_action = match from_routine {
                 None => true,
                 Some(fr) => fr.hash.is_some() && Self::hashes_differ(&fr.hash, &routine.hash),
@@ -6287,6 +6320,214 @@ mod tests {
         assert!(
             !script.contains("the_owner"),
             "Must not reference owner in grants/revokes, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_identical_no_diff() {
+        // Two routines with the same (schema, name) but different arguments.
+        // Both overloads are identical in FROM and TO → no output expected.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short_from = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_from = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'notify';\nEND;".to_string(),
+        );
+
+        let overload_short_to = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_to = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'notify';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short_from);
+        from_dump.routines.push(overload_long_from);
+        to_dump.routines.push(overload_short_to);
+        to_dump.routines.push(overload_long_to);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("create or replace"),
+            "Identical overloads must not produce CREATE, got: {script}"
+        );
+        assert!(
+            !script.contains("drop procedure"),
+            "Identical overloads must not produce DROP, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_one_changed() {
+        // Two overloads with the same (schema, name). Only the long overload
+        // changes its body between FROM and TO. The short overload must remain
+        // untouched while the long one is recreated.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short_from = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_from = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'old body';\nEND;".to_string(),
+        );
+
+        // Short overload is identical to FROM
+        let overload_short_to = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        // Long overload has a different body → should be recreated
+        let overload_long_to = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'new body';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short_from);
+        from_dump.routines.push(overload_long_from);
+        to_dump.routines.push(overload_short_to);
+        to_dump.routines.push(overload_long_to);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        // The changed (long) overload must be recreated
+        assert!(
+            script.contains("create or replace procedure myschema.notify_event(pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb)"),
+            "Changed overload must be recreated, got: {script}"
+        );
+        // The short overload's signature must NOT appear in any CREATE statement
+        let short_create = "create or replace procedure myschema.notify_event(pjobid uuid, peventtype character varying, pattributes jsonb)";
+        assert!(
+            !script.contains(short_create),
+            "Unchanged overload must not be recreated, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_drop_only_removed_overload() {
+        // FROM has two overloads; TO has only the short one.
+        // Only the long overload must be dropped; the short one must stay.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'short';\nEND;".to_string(),
+        );
+        let overload_long = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, pattributes jsonb, pseed jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'long';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short.clone());
+        from_dump.routines.push(overload_long);
+        to_dump.routines.push(overload_short);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb);"),
+            "Removed overload must be dropped, got: {script}"
+        );
+        assert!(
+            !script.contains("create or replace"),
+            "Unchanged overload must not be recreated, got: {script}"
         );
     }
 }

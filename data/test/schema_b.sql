@@ -420,6 +420,26 @@ BEGIN
 END;
 $$;
 
+-- =============================================================================
+-- Overloaded routine test: identical overloads in FROM and TO
+-- Two procedures with the same name but different argument signatures.
+-- Both overloads are identical in FROM and TO, so no diff should be emitted.
+-- =============================================================================
+CREATE OR REPLACE PROCEDURE test_schema.notify_event(pJobId uuid, pEventType varchar, pAttributes jsonb)
+LANGUAGE plpgsql AS $$
+BEGIN
+    CALL test_schema.notify_event(pJobId, pEventType, null, pAttributes, null);
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE test_schema.notify_event(pJobId uuid, pEventType varchar, pUserId varchar, pAttributes jsonb, pSessionSeed jsonb DEFAULT NULL)
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- full implementation placeholder
+    RAISE NOTICE 'notify_event: job=%, type=%, user=%, attrs=%, seed=%', pJobId, pEventType, pUserId, pAttributes, pSessionSeed;
+END;
+$$;
+
 -- Triggers (some modified, some removed, some added)
 CREATE TRIGGER trigger_users_update_timestamp
     BEFORE UPDATE ON test_schema.users
