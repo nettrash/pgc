@@ -216,8 +216,14 @@ impl Comparer {
         if self.use_comments {
             return self.script.clone();
         }
-        // Strip SQL comments from the script, but preserve comments inside
-        // dollar-quoted strings ($$ ... $$, $tag$ ... $tag$) and single-quoted strings.
+        // Strip SQL comments (-- line comments and /* block comments */) from the
+        // script, passing through all other content verbatim.  Four token types are
+        // recognised and copied byte-for-byte without interpretation so that
+        // comment-like sequences inside them are never stripped:
+        //   • dollar-quoted strings:      $$ … $$ or $tag$ … $tag$
+        //   • single-quoted literals:     ' … '   ('' is the escape for a literal quote)
+        //   • E-string literals:          E' … '  (backslash sequences and '' are handled)
+        //   • double-quoted identifiers:  " … "   ("" is the escape for a literal quote)
         // Operates on bytes to avoid corrupting multi-byte UTF-8 sequences.
         let src = self.script.as_bytes();
         let len = src.len();
@@ -253,81 +259,31 @@ impl Comparer {
                 continue;
             }
             // E-string literal E'...' or e'...' — pass through verbatim.
-            // PostgreSQL escape strings allow both \' and '' to embed a quote, and
-            // any \X sequence is a backslash escape (the backslash is consumed).
+            // PostgreSQL escape strings allow both \' and '' to embed a single quote.
+            // This scanner does not interpret escape sequences; it copies every \X pair
+            // as two raw bytes so that the character following a backslash is never
+            // mistaken for a string terminator or a comment starter.
             // Must be handled before the plain single-quote branch so that \'
             // inside the literal does not terminate the scanner prematurely.
             if (src[i] == b'E' || src[i] == b'e') && i + 1 < len && src[i + 1] == b'\'' {
                 result.push(src[i]); // E / e
                 result.push(b'\'');
                 i += 2;
-                while i < len {
-                    if src[i] == b'\\' {
-                        // Backslash escape: copy the backslash and the next byte
-                        // (whatever it is) as a unit, then keep scanning.
-                        result.push(b'\\');
-                        i += 1;
-                        if i < len {
-                            result.push(src[i]);
-                            i += 1;
-                        }
-                    } else if src[i] == b'\'' {
-                        result.push(b'\'');
-                        i += 1;
-                        if i < len && src[i] == b'\'' {
-                            // Doubled-quote escape inside E-string
-                            result.push(b'\'');
-                            i += 1;
-                        } else {
-                            break; // closing quote
-                        }
-                    } else {
-                        result.push(src[i]);
-                        i += 1;
-                    }
-                }
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', true);
                 continue;
             }
             // Single-quoted string — pass through verbatim (handle '' escapes)
             if src[i] == b'\'' {
                 result.push(b'\'');
                 i += 1;
-                while i < len {
-                    if src[i] == b'\'' {
-                        result.push(b'\'');
-                        i += 1;
-                        if i < len && src[i] == b'\'' {
-                            result.push(b'\'');
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        result.push(src[i]);
-                        i += 1;
-                    }
-                }
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', false);
                 continue;
             }
             // Double-quoted identifier — pass through verbatim (handle "" escapes)
             if src[i] == b'"' {
                 result.push(b'"');
                 i += 1;
-                while i < len {
-                    if src[i] == b'"' {
-                        result.push(b'"');
-                        i += 1;
-                        if i < len && src[i] == b'"' {
-                            result.push(b'"');
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        result.push(src[i]);
-                        i += 1;
-                    }
-                }
+                Self::copy_quoted_literal(src, &mut result, &mut i, b'"', false);
                 continue;
             }
             // Block comment /* ... */ — strip
@@ -383,6 +339,54 @@ impl Comparer {
         let mut out = trimmed.to_string();
         out.push('\n');
         out
+    }
+
+    /// Copies a quoted literal body (everything after the opening delimiter has
+    /// already been pushed) into `result`, advancing `i` past the closing
+    /// delimiter.  Two quoting conventions are supported:
+    ///
+    /// * **Standard** (`backslash_escapes = false`): a doubled delimiter (`''`
+    ///   or `""`) is an escape sequence; any other occurrence of the delimiter
+    ///   ends the literal.
+    /// * **E-string** (`backslash_escapes = true`): additionally, a backslash
+    ///   followed by any byte is copied as a unit without re-inspecting the
+    ///   second byte, so `\'` never terminates the literal.
+    ///
+    /// In both modes every byte is copied verbatim — the scanner does not
+    /// interpret the content, only tracks enough structure to know when the
+    /// literal ends.
+    fn copy_quoted_literal(
+        src: &[u8],
+        result: &mut Vec<u8>,
+        i: &mut usize,
+        delimiter: u8,
+        backslash_escapes: bool,
+    ) {
+        let len = src.len();
+        while *i < len {
+            if backslash_escapes && src[*i] == b'\\' {
+                // Copy the backslash and the following byte as a unit.
+                result.push(b'\\');
+                *i += 1;
+                if *i < len {
+                    result.push(src[*i]);
+                    *i += 1;
+                }
+            } else if src[*i] == delimiter {
+                result.push(delimiter);
+                *i += 1;
+                if *i < len && src[*i] == delimiter {
+                    // Doubled-delimiter escape — copy the second one and keep scanning.
+                    result.push(delimiter);
+                    *i += 1;
+                } else {
+                    break; // closing delimiter
+                }
+            } else {
+                result.push(src[*i]);
+                *i += 1;
+            }
+        }
     }
 
     /// Checks if a dollar-quote tag starts at position `pos` in `src`.
