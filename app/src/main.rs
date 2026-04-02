@@ -92,7 +92,7 @@ fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
         "addonly" | "add_only" | "add-only" => Ok(GrantsMode::AddOnly),
         "full" => Ok(GrantsMode::Full),
         other => Err(format!(
-            "invalid value '{other}' for '--grants_mode'; valid values are: ignore, addonly, full"
+            "invalid value '{other}' for '--grants-mode'; valid values are: ignore, addonly, full"
         )),
     }
 }
@@ -134,7 +134,7 @@ pub async fn main() -> Result<(), Error> {
                     args.use_drop,
                     args.use_single_transaction,
                     args.use_comments,
-                    GrantsMode::from_str_or_panic(&args.grants_mode),
+                    args.grants_mode,
                 )
                 .await;
             }
