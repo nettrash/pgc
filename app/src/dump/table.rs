@@ -3272,17 +3272,18 @@ mod tests {
         // Reproduces: parent partitioned by expense_date, child inherits.
         // Changing `amount` numeric(10,2) → numeric(15,4) on the child must
         // NOT trigger DROP+CREATE because `amount` is not in the partition key.
+        let schema = "\"pt_test\"";
+        let table_name = "\"s6_issue2_expenses_2024_01\"";
+
         let mut col_amount_old = partition_child_column("amount", 3);
         col_amount_old.data_type = "numeric".to_string();
         col_amount_old.numeric_precision = Some(10);
         col_amount_old.numeric_scale = Some(2);
-        col_amount_old.table = "s6_issue2_expenses_2024_01".to_string();
 
         let mut col_amount_new = partition_child_column("amount", 3);
         col_amount_new.data_type = "numeric".to_string();
         col_amount_new.numeric_precision = Some(15);
         col_amount_new.numeric_scale = Some(4);
-        col_amount_new.table = "s6_issue2_expenses_2024_01".to_string();
 
         let mut from = partition_child_table(
             vec![
@@ -3290,7 +3291,6 @@ mod tests {
                 {
                     let mut c = partition_child_column("expense_date", 2);
                     c.data_type = "date".to_string();
-                    c.table = "s6_issue2_expenses_2024_01".to_string();
                     c
                 },
                 col_amount_old,
@@ -3298,10 +3298,14 @@ mod tests {
             vec![],
             vec![],
         );
-        from.schema = "\"pt_test\"".to_string();
-        from.name = "\"s6_issue2_expenses_2024_01\"".to_string();
+        from.schema = schema.to_string();
+        from.name = table_name.to_string();
         from.partition_of = Some("\"pt_test\".\"s6_issue2_expenses\"".to_string());
         from.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        for c in &mut from.columns {
+            c.schema = schema.to_string();
+            c.table = table_name.to_string();
+        }
         from.hash();
 
         let mut to = partition_child_table(
@@ -3310,7 +3314,6 @@ mod tests {
                 {
                     let mut c = partition_child_column("expense_date", 2);
                     c.data_type = "date".to_string();
-                    c.table = "s6_issue2_expenses_2024_01".to_string();
                     c
                 },
                 col_amount_new,
@@ -3318,10 +3321,14 @@ mod tests {
             vec![],
             vec![],
         );
-        to.schema = "\"pt_test\"".to_string();
-        to.name = "\"s6_issue2_expenses_2024_01\"".to_string();
+        to.schema = schema.to_string();
+        to.name = table_name.to_string();
         to.partition_of = Some("\"pt_test\".\"s6_issue2_expenses\"".to_string());
         to.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
+        for c in &mut to.columns {
+            c.schema = schema.to_string();
+            c.table = table_name.to_string();
+        }
         to.hash();
 
         let script = from.get_alter_script(&to, true);
