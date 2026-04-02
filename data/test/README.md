@@ -81,8 +81,8 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **data.logs_2025**: new partition added to existing `data.logs` parent
 - **data.tagged_items** + partitions (**alpha**, **beta**): new partitioned table with parent index
 
-#### Unchanged Tables
-- **check_literal_case_test**: identical structure; tests CHECK constraint string literal case preservation
+#### Modified Tables (constraint diff only)
+- **check_literal_case_test**: `chk_priority_label` modified (added `'P5-Informational'`); `chk_category_values` unchanged (tests mixed-case string literal case preservation)
 
 ### 6. Indexes
 - **Added**: `idx_users_preferred_contact`, `idx_users_timezone`, `idx_products_manufacturer`, `idx_products_is_featured`, `idx_products_barcode`, `idx_reviews_*` (5 indexes), `idx_audit_logs_session_id`, `idx_audit_logs_request_id`, `idx_tagged_items_detail`, `idx_user_preferences_prefs`
