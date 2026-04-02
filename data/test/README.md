@@ -81,6 +81,9 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **data.logs_2025**: new partition added to existing `data.logs` parent
 - **data.tagged_items** + partitions (**alpha**, **beta**): new partitioned table with parent index
 
+#### Modified Tables (constraint diff only)
+- **check_literal_case_test**: `chk_priority_label` modified (added `'P5-Informational'`); `chk_category_values` unchanged (tests mixed-case string literal case preservation)
+
 ### 6. Indexes
 - **Added**: `idx_users_preferred_contact`, `idx_users_timezone`, `idx_products_manufacturer`, `idx_products_is_featured`, `idx_products_barcode`, `idx_reviews_*` (5 indexes), `idx_audit_logs_session_id`, `idx_audit_logs_request_id`, `idx_tagged_items_detail`, `idx_user_preferences_prefs`
 - **Modified**: `idx_audit_logs_table_op_changed_at` — unique index gains `record_id` column
@@ -95,8 +98,9 @@ These schemas are designed to test comparison capabilities for the following Pos
 
 ### 8. Constraints
 - **Added**: `chk_products_warranty_reasonable`, `chk_reviews_content_not_empty`, `chk_reviews_helpful_count_positive`, inline `rating` check on reviews
+- **Modified**: `chk_priority_label` — added `'P5-Informational'` value in Schema B
 - **Removed**: `chk_products_weight_positive` (column removed), `chk_orders_dates`, `chk_orders_delivery_dates` (table removed)
-- **Unchanged**: `chk_users_email_format`, inline checks on `products`, `audit_logs`
+- **Unchanged**: `chk_users_email_format`, `chk_category_values` (mixed-case string literals preserved), inline checks on `products`, `audit_logs`
 
 ### 9. Functions
 
@@ -191,6 +195,11 @@ Objects change ownership from `pgc_owner_from` → `pgc_owner_to`:
 - **Unchanged**: comments on `users.metadata`, `products.dimensions`
 
 ### 17. Special Test Scenarios
+
+#### CHECK Constraint String Literal Case Preservation
+- `chk_category_values` contains mixed-case string literals (`'Electronics'`, `'Home & Garden'`, `'Books'`) identical in both schemas
+- Verifies that `lowercase_outside_literals()` preserves literal case so no false diff is generated
+- `chk_priority_label` contains mixed-case literals and is intentionally modified in Schema B to verify real diffs are still detected
 
 #### Dollar-Quoting
 - `fn_dollar_from()` uses nested `$$` inside custom delimiters (`$b$`/`$c$`) to test correct quoting

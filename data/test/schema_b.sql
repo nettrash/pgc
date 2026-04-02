@@ -1028,6 +1028,19 @@ CREATE TABLE test_schema.user_preferences (
 
 CREATE INDEX idx_user_preferences_prefs ON test_schema.user_preferences USING GIN(preferences);
 
+-- =============================================================================
+-- CHECK constraint string literal case preservation test
+-- =============================================================================
+-- chk_category_values is UNCHANGED → must NOT produce a false diff
+-- chk_priority_label is MODIFIED → added 'P5-Informational' value
+CREATE TABLE test_schema.check_literal_case_test (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50) NOT NULL,
+    priority VARCHAR(20) NOT NULL,
+    CONSTRAINT chk_category_values CHECK (category IN ('Electronics', 'Home & Garden', 'Books')),
+    CONSTRAINT chk_priority_label CHECK (priority IN ('P1-Critical', 'P2-High', 'P3-Medium', 'P4-Low', 'P5-Informational'))  -- MODIFIED: added P5-Informational
+);
+
 -- Owner change coverage (TO side)
 ALTER SCHEMA test_schema OWNER TO pgc_owner_to;
 ALTER TYPE test_schema.status_type OWNER TO pgc_owner_to;
