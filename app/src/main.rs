@@ -82,10 +82,20 @@ struct Args {
     use_comments: bool,
 
     /// Grants handling mode: ignore, addonly, full
-    #[arg(long, default_value = "ignore")]
-    grants_mode: String,
+    #[arg(long, value_parser = parse_grants_mode, default_value = "ignore")]
+    grants_mode: GrantsMode,
 }
 
+fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
+    match src.to_ascii_lowercase().as_str() {
+        "ignore" => Ok(GrantsMode::Ignore),
+        "addonly" | "add_only" | "add-only" => Ok(GrantsMode::AddOnly),
+        "full" => Ok(GrantsMode::Full),
+        other => Err(format!(
+            "invalid value '{other}' for '--grants_mode'; valid values are: ignore, addonly, full"
+        )),
+    }
+}
 // Main entry point for the program.
 #[tokio::main]
 pub async fn main() -> Result<(), Error> {
