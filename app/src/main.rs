@@ -5,7 +5,7 @@ use crate::{
 };
 use chrono::Datelike;
 use clap::{CommandFactory, Parser};
-use std::{io::Error, path::Path};
+use std::{io::Error, path::Path, time::Instant};
 
 pub mod comparer;
 pub mod config;
@@ -92,7 +92,15 @@ fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
 // Main entry point for the program.
 #[tokio::main]
 pub async fn main() -> Result<(), Error> {
+    let start = Instant::now();
     pgc_version();
+    let result = run_main().await;
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("\nExecution time: {elapsed:.2} seconds");
+    result
+}
+
+async fn run_main() -> Result<(), Error> {
     let args = Args::parse();
     if args.command.is_none() && args.config.is_none() {
         let mut cmd = Args::command();
