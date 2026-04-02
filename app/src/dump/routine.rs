@@ -197,6 +197,9 @@ pub struct Routine {
     pub aggregate_info: Option<AggregateInfo>,
     /// The hash of the routine.
     pub hash: Option<String>,
+    /// ACL (grant) entries for this routine
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
 }
 
 impl Routine {
@@ -241,6 +244,7 @@ impl Routine {
             security_definer: false,
             aggregate_info: None,
             hash: None,
+            acl: Vec::new(),
         };
         routine.hash();
         routine

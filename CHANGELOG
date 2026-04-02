@@ -7,6 +7,7 @@
                     - Added --use-comments parameter with default value `true`.
                     - Fixed DDL inheritance logic.
                     - Fixed incorrect detection of partition key column during type change.
+                    - Support GRANTS management with different behaviors.
 
 2026-03-27      v1.0.9
 

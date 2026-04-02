@@ -22,6 +22,8 @@ pub struct Sequence {
     #[serde(default)]
     pub comment: Option<String>, // Optional sequence comment
     pub hash: Option<String>,            // Hash of the sequence
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>, // ACL (grant) entries for this sequence
 }
 
 impl Sequence {
@@ -61,6 +63,7 @@ impl Sequence {
             is_identity: false,
             comment: None,
             hash: None,
+            acl: Vec::new(),
         };
         sequence.hash();
         sequence

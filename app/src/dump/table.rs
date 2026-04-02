@@ -102,6 +102,8 @@ pub struct Table {
     #[serde(default)]
     pub comment: Option<String>, // Table comment
     pub hash: Option<String>,              // Hash of the table
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>, // ACL (grant) entries for this table
 }
 
 impl Table {
@@ -142,6 +144,7 @@ impl Table {
             partition_bound: None,
             comment: None,
             hash: None,
+            acl: Vec::new(),
         };
         table.hash();
         table

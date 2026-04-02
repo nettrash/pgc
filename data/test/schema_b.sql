@@ -19,6 +19,18 @@ BEGIN
 END;
 $$;
 
+-- Roles used for grant comparison cases
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_grant_reader') THEN
+        CREATE ROLE pgc_grant_reader;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_grant_writer') THEN
+        CREATE ROLE pgc_grant_writer;
+    END IF;
+END;
+$$;
+
 -- Extensions (modified list)
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 -- pgcrypto removed
@@ -1123,3 +1135,37 @@ CREATE TABLE test_schema.test_bigserial (
 CREATE TABLE test_schema.test_identity (
     id integer GENERATED ALWAYS AS IDENTITY
 );
+
+-- =============================================================================
+-- Grants comparison test (TO side)
+-- =============================================================================
+-- These GRANT statements establish the TO target for grant comparison.
+-- Differences from Schema A (FROM):
+--   Unchanged: users SELECT→reader, view SELECT→reader, schema USAGE→reader
+--   Modified:  users writer loses UPDATE (was SELECT,INSERT,UPDATE → SELECT,INSERT)
+--              products reader gains INSERT (was SELECT → SELECT,INSERT)
+--   Added:     products writer (SELECT,UPDATE) — new grantee
+--              view writer (SELECT) — new grantee
+--              schema writer (USAGE,CREATE) — new grantee
+--              new function calculate_average_rating EXECUTE→reader
+--   Removed:   sequence user_id_seq USAGE→reader (no grant in TO)
+--              function update_timestamp EXECUTE→reader (no grant in TO)
+
+-- Schema grants
+GRANT USAGE ON SCHEMA test_schema TO pgc_grant_reader;
+GRANT USAGE, CREATE ON SCHEMA test_schema TO pgc_grant_writer;
+
+-- Table grants
+GRANT SELECT ON test_schema.users TO pgc_grant_reader;
+GRANT SELECT, INSERT ON test_schema.users TO pgc_grant_writer;
+GRANT SELECT, INSERT ON test_schema.products TO pgc_grant_reader;
+GRANT SELECT, UPDATE ON test_schema.products TO pgc_grant_writer;
+
+-- Sequence grants (user_id_seq grant removed compared to FROM)
+
+-- View grants
+GRANT SELECT ON test_schema.product_inventory TO pgc_grant_reader;
+GRANT SELECT ON test_schema.product_inventory TO pgc_grant_writer;
+
+-- Function grants (update_timestamp grant removed; new function grant added)
+GRANT EXECUTE ON FUNCTION test_schema.calculate_average_rating(UUID) TO pgc_grant_reader;

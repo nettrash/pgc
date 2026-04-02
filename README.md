@@ -69,6 +69,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--use-comments {true|false}` - set to `false` to strip SQL comments from the generated script; set to `true` (default) to include comments.
 
+`--grants-mode {ignore|addonly|full}` - controls how grants (privileges) are handled during comparison. `ignore` (default) skips grants entirely; `addonly` adds grants that exist in TO but not in FROM; `full` makes grants identical by adding missing and revoking extra.
+
 ## Functionality
 
 ### Create database schema dump
@@ -121,4 +123,5 @@ OUTPUT=delta.sql
 USE_DROP=true
 USE_SINGLE_TRANSACTION=true
 USE_COMMENTS=false
+GRANTS_MODE=ignore
 ```

@@ -1,6 +1,6 @@
 use crate::{
     comparer::core::Comparer,
-    config::{core::Config, dump_config::DumpConfig},
+    config::{core::Config, dump_config::DumpConfig, grants_mode::GrantsMode},
     dump::core::Dump,
 };
 use chrono::Datelike;
@@ -80,8 +80,15 @@ struct Args {
     /// Include comments in the output script
     #[arg(long, default_value = "true")]
     use_comments: bool,
+
+    /// Grants handling mode: ignore, addonly, full
+    #[arg(long, value_parser = parse_grants_mode, default_value = "ignore")]
+    grants_mode: GrantsMode,
 }
 
+fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
+    src.parse::<GrantsMode>()
+}
 // Main entry point for the program.
 #[tokio::main]
 pub async fn main() -> Result<(), Error> {
@@ -120,6 +127,7 @@ pub async fn main() -> Result<(), Error> {
                     args.use_drop,
                     args.use_single_transaction,
                     args.use_comments,
+                    args.grants_mode,
                 )
                 .await;
             }
@@ -192,6 +200,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             cfg.use_drop,
             cfg.use_single_transaction,
             cfg.use_comments,
+            cfg.grants_mode,
         )
         .await;
 
@@ -227,6 +236,7 @@ async fn compare_dumps(
     use_drop: bool,
     use_single_transaction: bool,
     use_comments: bool,
+    grants_mode: GrantsMode,
 ) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
@@ -234,7 +244,14 @@ async fn compare_dumps(
     println!("--> Dump from:\n{}\n", from.get_info());
     println!("--> Dump to:\n{}\n", to.get_info());
     println!("Comparing dumps...");
-    let mut comparer = Comparer::new(from, to, use_drop, use_single_transaction, use_comments);
+    let mut comparer = Comparer::new(
+        from,
+        to,
+        use_drop,
+        use_single_transaction,
+        use_comments,
+        grants_mode,
+    );
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");
