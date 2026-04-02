@@ -66,50 +66,46 @@ impl Config {
             if parts[0].trim().is_empty() || parts[1].trim().is_empty() {
                 panic!("Invalid configuration line: {line}");
             }
-            if parts[0].trim().to_uppercase() != "FROM_HOST"
-                && parts[0].trim() != "FROM_PORT"
-                && parts[0].trim().to_uppercase() != "FROM_USER"
-                && parts[0].trim() != "FROM_PASSWORD"
-                && parts[0].trim() != "FROM_DATABASE"
-                && parts[0].trim() != "FROM_SCHEME"
-                && parts[0].trim() != "FROM_SSL"
-                && parts[0].trim() != "FROM_DUMP"
-                && parts[0].trim().to_uppercase() != "TO_HOST"
-                && parts[0].trim() != "TO_PORT"
-                && parts[0].trim().to_uppercase() != "TO_USER"
-                && parts[0].trim() != "TO_PASSWORD"
-                && parts[0].trim() != "TO_DATABASE"
-                && parts[0].trim() != "TO_SCHEME"
-                && parts[0].trim() != "TO_SSL"
-                && parts[0].trim() != "TO_DUMP"
-                && parts[0].trim() != "OUTPUT"
-                && parts[0].trim() != "USE_DROP"
-                && parts[0].trim() != "USE_SINGLE_TRANSACTION"
-                && parts[0].trim() != "USE_COMMENTS"
+            let key = parts[0].trim().to_uppercase();
+            let value = parts[1].trim().to_uppercase();
+            if key != "FROM_HOST"
+                && key != "FROM_PORT"
+                && key != "FROM_USER"
+                && key != "FROM_PASSWORD"
+                && key != "FROM_DATABASE"
+                && key != "FROM_SCHEME"
+                && key != "FROM_SSL"
+                && key != "FROM_DUMP"
+                && key != "TO_HOST"
+                && key != "TO_PORT"
+                && key != "TO_USER"
+                && key != "TO_PASSWORD"
+                && key != "TO_DATABASE"
+                && key != "TO_SCHEME"
+                && key != "TO_SSL"
+                && key != "TO_DUMP"
+                && key != "OUTPUT"
+                && key != "USE_DROP"
+                && key != "USE_SINGLE_TRANSACTION"
+                && key != "USE_COMMENTS"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
-            if parts[0].trim().to_uppercase() == "FROM_SSL"
-                && parts[1].trim().to_uppercase() != "TRUE"
-                && parts[1].trim().to_uppercase() != "FALSE"
-            {
+            if key == "FROM_SSL" && value != "TRUE" && value != "FALSE" {
                 panic!("Invalid value for FROM_SSL: {}", parts[1]);
             }
-            if parts[0].trim().to_uppercase() == "TO_SSL"
-                && parts[1].trim().to_uppercase() != "TRUE"
-                && parts[1].trim().to_uppercase() != "FALSE"
-            {
+            if key == "TO_SSL" && value != "TRUE" && value != "FALSE" {
                 panic!("Invalid value for TO_SSL: {}", parts[1]);
             }
 
-            match parts[0].trim().to_uppercase().as_str() {
+            match key.as_str() {
                 "FROM_HOST" => from_host = parts[1].trim().to_string(),
                 "FROM_PORT" => from_port = parts[1].trim().to_string(),
                 "FROM_USER" => from_user = parts[1].trim().to_string(),
                 "FROM_PASSWORD" => from_password = parts[1].trim().to_string(),
                 "FROM_DATABASE" => from_database = parts[1].trim().to_string(),
                 "FROM_SCHEME" => from_scheme = parts[1].trim().to_string(),
-                "FROM_SSL" => from_ssl = parts[1].trim().to_uppercase() == "TRUE",
+                "FROM_SSL" => from_ssl = value == "TRUE",
                 "FROM_DUMP" => from_dump = parts[1].trim().to_string(),
                 "TO_HOST" => to_host = parts[1].trim().to_string(),
                 "TO_PORT" => to_port = parts[1].trim().to_string(),
@@ -117,15 +113,12 @@ impl Config {
                 "TO_PASSWORD" => to_password = parts[1].trim().to_string(),
                 "TO_DATABASE" => to_database = parts[1].trim().to_string(),
                 "TO_SCHEME" => to_scheme = parts[1].trim().to_string(),
-                "TO_SSL" => to_ssl = parts[1].trim().to_uppercase() == "TRUE",
+                "TO_SSL" => to_ssl = value == "TRUE",
                 "TO_DUMP" => to_dump = parts[1].trim().to_string(),
                 "OUTPUT" => output = parts[1].trim().to_string(),
-                "USE_DROP" => use_drop = parts[1].trim().to_uppercase() == "TRUE",
-                "USE_SINGLE_TRANSACTION" => {
-                    use_single_transaction = parts[1].trim().to_uppercase() == "TRUE"
-                }
+                "USE_DROP" => use_drop = value == "TRUE",
+                "USE_SINGLE_TRANSACTION" => use_single_transaction = value == "TRUE",
                 "USE_COMMENTS" => {
-                    let value = parts[1].trim().to_uppercase();
                     use_comments = match value.as_str() {
                         "TRUE" => true,
                         "FALSE" => false,
@@ -403,6 +396,134 @@ mod tests {
 
         assert!(config.use_single_transaction);
 
+        let _ = std::fs::remove_file(file);
+    }
+
+    // --- Key normalisation (case-insensitive key names) ---
+
+    #[test]
+    fn test_lowercase_key_use_comments_accepted() {
+        // Previously `use_comments=false` was rejected by the allowlist even though
+        // the match branch would have accepted it after to_uppercase(); now both use
+        // the same normalised string so lowercase keys must work.
+        let config_content = "use_comments=false\n";
+        let file = write_temp_config(config_content, "test_lowercase_key_use_comments.cfg");
+        let config = Config::new(file.clone());
+        assert!(!config.use_comments);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_mixed_case_key_use_comments_accepted() {
+        let config_content = "Use_Comments=true\n";
+        let file = write_temp_config(config_content, "test_mixed_case_key_use_comments.cfg");
+        let config = Config::new(file.clone());
+        assert!(config.use_comments);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_lowercase_key_use_drop_accepted() {
+        let config_content = "use_drop=true\n";
+        let file = write_temp_config(config_content, "test_lowercase_key_use_drop.cfg");
+        let config = Config::new(file.clone());
+        assert!(config.use_drop);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_lowercase_key_use_single_transaction_accepted() {
+        let config_content = "use_single_transaction=true\n";
+        let file = write_temp_config(
+            config_content,
+            "test_lowercase_key_use_single_transaction.cfg",
+        );
+        let config = Config::new(file.clone());
+        assert!(config.use_single_transaction);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_lowercase_key_from_host_accepted() {
+        let config_content = "from_host=myhost\n";
+        let file = write_temp_config(config_content, "test_lowercase_key_from_host.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.from.host, "myhost");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_mixed_case_key_to_database_accepted() {
+        let config_content = "To_Database=mydb\n";
+        let file = write_temp_config(config_content, "test_mixed_case_key_to_database.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.to.database, "mydb");
+        let _ = std::fs::remove_file(file);
+    }
+
+    // --- Value normalisation (case-insensitive boolean values) ---
+
+    #[test]
+    fn test_use_comments_false_lowercase_value() {
+        let config_content = "USE_COMMENTS=false\n";
+        let file = write_temp_config(
+            config_content,
+            "test_use_comments_false_lowercase_value.cfg",
+        );
+        let config = Config::new(file.clone());
+        assert!(!config.use_comments);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_use_comments_true_mixed_case_value() {
+        let config_content = "USE_COMMENTS=True\n";
+        let file = write_temp_config(
+            config_content,
+            "test_use_comments_true_mixed_case_value.cfg",
+        );
+        let config = Config::new(file.clone());
+        assert!(config.use_comments);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_use_comments_invalid_value_panics() {
+        let config_content = "USE_COMMENTS=yes\n";
+        let file = write_temp_config(config_content, "test_use_comments_invalid_value_panics.cfg");
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_from_ssl_lowercase_true_value() {
+        let config_content = "FROM_SSL=true\n";
+        let file = write_temp_config(config_content, "test_from_ssl_lowercase_true_value.cfg");
+        let config = Config::new(file.clone());
+        assert!(config.from.ssl);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_to_ssl_mixed_case_false_value() {
+        let config_content = "TO_SSL=False\n";
+        let file = write_temp_config(config_content, "test_to_ssl_mixed_case_false_value.cfg");
+        let config = Config::new(file.clone());
+        assert!(!config.to.ssl);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_from_ssl_invalid_value_still_panics() {
+        // Ensure the value guard still fires after normalisation.
+        let config_content = "FROM_SSL=yes\n";
+        let file = write_temp_config(
+            config_content,
+            "test_from_ssl_invalid_value_still_panics.cfg",
+        );
+        let _ = Config::new(file.clone());
         let _ = std::fs::remove_file(file);
     }
 }
