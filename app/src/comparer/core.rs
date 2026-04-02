@@ -205,13 +205,22 @@ impl Comparer {
                     }
                 }
                 self.script.push_str(
-                    format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script.push_str(routine.get_script().as_str());
             }
         } else {
-            self.script
-                .push_str(format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str());
+            self.script.push_str(
+                format!(
+                    "/* Routine: {}.{}({})*/\n",
+                    routine.schema, routine.name, routine.arguments
+                )
+                .as_str(),
+            );
             self.script.push_str(routine.get_script().as_str());
         }
     }
@@ -1298,7 +1307,11 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -1937,7 +1950,11 @@ impl Comparer {
             for idx in drop_order {
                 let routine = &routines_to_drop[idx];
                 self.script.push_str(
-                    format!("/* Routine: {}.{}({})*/\n", routine.schema, routine.name, routine.arguments).as_str(),
+                    format!(
+                        "/* Routine: {}.{}({})*/\n",
+                        routine.schema, routine.name, routine.arguments
+                    )
+                    .as_str(),
                 );
                 self.script
                     .push_str("/* Routine is not present in 'to' dump and should be dropped. */\n");
@@ -6280,6 +6297,214 @@ mod tests {
         assert!(
             !script.contains("the_owner"),
             "Must not reference owner in grants/revokes, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_identical_no_diff() {
+        // Two routines with the same (schema, name) but different arguments.
+        // Both overloads are identical in FROM and TO → no output expected.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short_from = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_from = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'notify';\nEND;".to_string(),
+        );
+
+        let overload_short_to = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_to = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'notify';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short_from);
+        from_dump.routines.push(overload_long_from);
+        to_dump.routines.push(overload_short_to);
+        to_dump.routines.push(overload_long_to);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("create or replace"),
+            "Identical overloads must not produce CREATE, got: {script}"
+        );
+        assert!(
+            !script.contains("drop procedure"),
+            "Identical overloads must not produce DROP, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_one_changed() {
+        // Two overloads with the same (schema, name). Only the long overload
+        // changes its body between FROM and TO. The short overload must remain
+        // untouched while the long one is recreated.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short_from = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        let overload_long_from = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'old body';\nEND;".to_string(),
+        );
+
+        // Short overload is identical to FROM
+        let overload_short_to = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    CALL myschema.notify_event(pjobid, peventtype, null, pattributes, null);\nEND;".to_string(),
+        );
+        // Long overload has a different body → should be recreated
+        let overload_long_to = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'new body';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short_from);
+        from_dump.routines.push(overload_long_from);
+        to_dump.routines.push(overload_short_to);
+        to_dump.routines.push(overload_long_to);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        // The changed (long) overload must be recreated
+        assert!(
+            script.contains("create or replace procedure myschema.notify_event(pjobid uuid, peventtype character varying, puserid character varying, pattributes jsonb, psessionseed jsonb DEFAULT NULL::jsonb)"),
+            "Changed overload must be recreated, got: {script}"
+        );
+        // The short overload's signature must NOT appear in any CREATE statement
+        let short_create = "create or replace procedure myschema.notify_event(pjobid uuid, peventtype character varying, pattributes jsonb)";
+        assert!(
+            !script.contains(short_create),
+            "Unchanged overload must not be recreated, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_routines_overloaded_drop_only_removed_overload() {
+        // FROM has two overloads; TO has only the short one.
+        // Only the long overload must be dropped; the short one must stay.
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let overload_short = Routine::new(
+            "myschema".to_string(),
+            Oid(1),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, pattributes jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'short';\nEND;".to_string(),
+        );
+        let overload_long = Routine::new(
+            "myschema".to_string(),
+            Oid(2),
+            "notify_event".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "pjobid uuid, pattributes jsonb, pseed jsonb".to_string(),
+            None,
+            None,
+            "BEGIN\n    RAISE NOTICE 'long';\nEND;".to_string(),
+        );
+
+        from_dump.routines.push(overload_short.clone());
+        from_dump.routines.push(overload_long);
+        to_dump.routines.push(overload_short);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare_routines().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb);"),
+            "Removed overload must be dropped, got: {script}"
+        );
+        assert!(
+            !script.contains("create or replace"),
+            "Unchanged overload must not be recreated, got: {script}"
         );
     }
 }

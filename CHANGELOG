@@ -10,7 +10,7 @@
                     - Support GRANTS management with different behaviors.
                     - Improved speed of execution.
                     - Added execution time to output in seconds.
-                    - Fixed overloaded routines support.
+                    - Fixed comparison of overloaded routines by matching functions/procedures using their argument signatures.
 
 2026-03-27      v1.0.9
 
