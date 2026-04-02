@@ -5176,7 +5176,7 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(
-            script.contains("GRANT USAGE, CREATE ON SCHEMA myschema TO writer;"),
+            script.contains("GRANT CREATE, USAGE ON SCHEMA myschema TO writer;"),
             "AddOnly must add missing grant, got: {script}"
         );
         assert!(
@@ -5227,7 +5227,7 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(
-            script.contains("REVOKE USAGE, CREATE ON SCHEMA myschema FROM writer;"),
+            script.contains("REVOKE CREATE, USAGE ON SCHEMA myschema FROM writer;"),
             "Full mode must revoke removed grant, got: {script}"
         );
     }
@@ -5492,8 +5492,8 @@ mod tests {
             "Must add grant with grant option, got: {script}"
         );
         assert!(
-            script.contains("REVOKE USAGE ON SCHEMA myschema FROM reader;"),
-            "Must revoke old plain grant, got: {script}"
+            !script.contains("REVOKE"),
+            "Upgrading to WITH GRANT OPTION must not REVOKE, got: {script}"
         );
     }
 
