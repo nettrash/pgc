@@ -2177,42 +2177,57 @@ impl Comparer {
         let full = self.grants_mode == GrantsMode::Full;
 
         // Build O(1) lookup maps from the "from" dump
-        let from_schema_acl: HashMap<&str, &[String]> = self
+        let from_schema_map: HashMap<&str, (&[String], &str)> = self
             .from
             .schemas
             .iter()
-            .map(|s| (s.name.as_str(), s.acl.as_slice()))
+            .map(|s| (s.name.as_str(), (s.acl.as_slice(), s.owner.as_str())))
             .collect();
 
-        let from_table_acl: HashMap<(&str, &str), &[String]> = self
+        let from_table_map: HashMap<(&str, &str), (&[String], &str)> = self
             .from
             .tables
             .iter()
-            .map(|t| ((t.schema.as_str(), t.name.as_str()), t.acl.as_slice()))
+            .map(|t| {
+                (
+                    (t.schema.as_str(), t.name.as_str()),
+                    (t.acl.as_slice(), t.owner.as_str()),
+                )
+            })
             .collect();
 
-        let from_seq_acl: HashMap<(&str, &str), &[String]> = self
+        let from_seq_map: HashMap<(&str, &str), (&[String], &str)> = self
             .from
             .sequences
             .iter()
-            .map(|s| ((s.schema.as_str(), s.name.as_str()), s.acl.as_slice()))
+            .map(|s| {
+                (
+                    (s.schema.as_str(), s.name.as_str()),
+                    (s.acl.as_slice(), s.owner.as_str()),
+                )
+            })
             .collect();
 
-        let from_view_acl: HashMap<(&str, &str), &[String]> = self
+        let from_view_map: HashMap<(&str, &str), (&[String], &str)> = self
             .from
             .views
             .iter()
-            .map(|v| ((v.schema.as_str(), v.name.as_str()), v.acl.as_slice()))
+            .map(|v| {
+                (
+                    (v.schema.as_str(), v.name.as_str()),
+                    (v.acl.as_slice(), v.owner.as_str()),
+                )
+            })
             .collect();
 
-        let from_routine_acl: HashMap<(&str, &str, &str), &[String]> = self
+        let from_routine_map: HashMap<(&str, &str, &str), (&[String], &str)> = self
             .from
             .routines
             .iter()
             .map(|r| {
                 (
                     (r.schema.as_str(), r.name.as_str(), r.arguments.as_str()),
-                    r.acl.as_slice(),
+                    (r.acl.as_slice(), r.owner.as_str()),
                 )
             })
             .collect();
@@ -2222,12 +2237,22 @@ impl Comparer {
 
         // --- Schemas ---
         for schema in &self.to.schemas {
-            let from_acl = from_schema_acl
+            let (from_acl, from_owner) = from_schema_map
                 .get(schema.name.as_str())
                 .copied()
-                .unwrap_or(&[]);
-            let grants_script =
-                acl::generate_grants_script(from_acl, &schema.acl, full, "SCHEMA", &schema.name);
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, schema.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &schema.acl,
+                full,
+                "SCHEMA",
+                &schema.name,
+                &owners,
+            );
             if !grants_script.is_empty() {
                 if self.use_comments {
                     self.script
@@ -2239,13 +2264,23 @@ impl Comparer {
 
         // --- Tables ---
         for table in &self.to.tables {
-            let from_acl = from_table_acl
+            let (from_acl, from_owner) = from_table_map
                 .get(&(table.schema.as_str(), table.name.as_str()))
                 .copied()
-                .unwrap_or(&[]);
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, table.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
             let object_name = format!("{}.{}", table.schema, table.name);
-            let grants_script =
-                acl::generate_grants_script(from_acl, &table.acl, full, "TABLE", &object_name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &table.acl,
+                full,
+                "TABLE",
+                &object_name,
+                &owners,
+            );
             if !grants_script.is_empty() {
                 if self.use_comments {
                     self.script
@@ -2257,13 +2292,23 @@ impl Comparer {
 
         // --- Sequences ---
         for seq in &self.to.sequences {
-            let from_acl = from_seq_acl
+            let (from_acl, from_owner) = from_seq_map
                 .get(&(seq.schema.as_str(), seq.name.as_str()))
                 .copied()
-                .unwrap_or(&[]);
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, seq.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
             let object_name = format!("{}.{}", seq.schema, seq.name);
-            let grants_script =
-                acl::generate_grants_script(from_acl, &seq.acl, full, "SEQUENCE", &object_name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &seq.acl,
+                full,
+                "SEQUENCE",
+                &object_name,
+                &owners,
+            );
             if !grants_script.is_empty() {
                 if self.use_comments {
                     self.script
@@ -2275,13 +2320,23 @@ impl Comparer {
 
         // --- Views ---
         for view in &self.to.views {
-            let from_acl = from_view_acl
+            let (from_acl, from_owner) = from_view_map
                 .get(&(view.schema.as_str(), view.name.as_str()))
                 .copied()
-                .unwrap_or(&[]);
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, view.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
             let object_name = format!("{}.{}", view.schema, view.name);
-            let grants_script =
-                acl::generate_grants_script(from_acl, &view.acl, full, "TABLE", &object_name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &view.acl,
+                full,
+                "TABLE",
+                &object_name,
+                &owners,
+            );
             if !grants_script.is_empty() {
                 if self.use_comments {
                     self.script
@@ -2293,14 +2348,18 @@ impl Comparer {
 
         // --- Routines ---
         for routine in &self.to.routines {
-            let from_acl = from_routine_acl
+            let (from_acl, from_owner) = from_routine_map
                 .get(&(
                     routine.schema.as_str(),
                     routine.name.as_str(),
                     routine.arguments.as_str(),
                 ))
                 .copied()
-                .unwrap_or(&[]);
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, routine.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
             let object_kind = match routine.kind.as_str() {
                 "procedure" => "PROCEDURE",
                 _ => "FUNCTION",
@@ -2312,6 +2371,7 @@ impl Comparer {
                 full,
                 object_kind,
                 &object_name,
+                &owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -6098,6 +6158,135 @@ mod tests {
         assert!(
             !script.contains("GRANT"),
             "No new grant expected, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_excludes_owner_acl_entries() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Table with ownership change: old_owner → new_owner
+        let mut from_table = Table::new(
+            "public".to_string(),
+            "data".to_string(),
+            "public".to_string(),
+            "data".to_string(),
+            "old_owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        from_table.acl = vec![
+            "old_owner=arwdDxt/old_owner".to_string(),
+            "reader=r/old_owner".to_string(),
+        ];
+
+        let mut to_table = Table::new(
+            "public".to_string(),
+            "data".to_string(),
+            "public".to_string(),
+            "data".to_string(),
+            "new_owner".to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        to_table.acl = vec![
+            "new_owner=arwdDxt/new_owner".to_string(),
+            "reader=r/new_owner".to_string(),
+        ];
+
+        from_dump.tables.push(from_table);
+        to_dump.tables.push(to_table);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("old_owner"),
+            "Must not REVOKE from old owner, got: {script}"
+        );
+        assert!(
+            !script.contains("new_owner"),
+            "Must not GRANT to new owner, got: {script}"
+        );
+        assert!(
+            !script.contains("GRANT"),
+            "No grants expected (reader unchanged), got: {script}"
+        );
+        assert!(
+            !script.contains("REVOKE"),
+            "No revokes expected (reader unchanged), got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_owner_excluded_nonowner_still_diffed() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_routine = Routine::new(
+            "public".to_string(),
+            Oid(50),
+            "process".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        from_routine.owner = "the_owner".to_string();
+        from_routine.acl = vec![
+            "the_owner=X/the_owner".to_string(),
+            "old_app=X/the_owner".to_string(),
+        ];
+
+        let mut to_routine = Routine::new(
+            "public".to_string(),
+            Oid(50),
+            "process".to_string(),
+            "plpgsql".to_string(),
+            "function".to_string(),
+            "void".to_string(),
+            "".to_string(),
+            None,
+            None,
+            "BEGIN END".to_string(),
+        );
+        to_routine.owner = "the_owner".to_string();
+        to_routine.acl = vec![
+            "the_owner=X/the_owner".to_string(),
+            "new_app=X/the_owner".to_string(),
+        ];
+
+        from_dump.routines.push(from_routine);
+        to_dump.routines.push(to_routine);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT EXECUTE ON FUNCTION public.process() TO new_app;"),
+            "Must grant to non-owner, got: {script}"
+        );
+        assert!(
+            script.contains("REVOKE EXECUTE ON FUNCTION public.process() FROM old_app;"),
+            "Must revoke from non-owner, got: {script}"
+        );
+        assert!(
+            !script.contains("the_owner"),
+            "Must not reference owner in grants/revokes, got: {script}"
         );
     }
 }

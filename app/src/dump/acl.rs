@@ -245,11 +245,15 @@ fn build_privilege_map(
 /// Compares on a normalised representation (grantee + privilege set + grant-option),
 /// **ignoring the grantor** field entirely.  Returns one [`AclDiffEntry`] per grantee
 /// that has at least one action.  Revoke entries are only produced when `full` is `true`.
+///
+/// Grantees listed in `owners` are skipped entirely — PostgreSQL object owners have
+/// implicit full privileges, so GRANT/REVOKE targeting them is meaningless.
 pub fn diff_acls(
     from_acl: &[String],
     to_acl: &[String],
     full: bool,
     object_kind: &str,
+    owners: &[&str],
 ) -> Vec<AclDiffEntry> {
     use std::collections::BTreeSet;
 
@@ -264,6 +268,11 @@ pub fn diff_acls(
     }
     for g in to_map.keys() {
         all_grantees.insert(g.as_str());
+    }
+
+    // Remove object owners — they have implicit full privileges
+    for owner in owners {
+        all_grantees.remove(owner);
     }
 
     let mut result = Vec::new();
@@ -329,14 +338,17 @@ pub fn diff_acls(
 }
 
 /// Generate the combined GRANT/REVOKE script for an object.
+///
+/// `owners` lists role names that own the object (from/to); their ACL entries are skipped.
 pub fn generate_grants_script(
     from_acl: &[String],
     to_acl: &[String],
     full: bool,
     object_kind: &str,
     object_name: &str,
+    owners: &[&str],
 ) -> String {
-    let diffs = diff_acls(from_acl, to_acl, full, object_kind);
+    let diffs = diff_acls(from_acl, to_acl, full, object_kind, owners);
     let mut script = String::new();
 
     for entry in &diffs {
@@ -384,12 +396,15 @@ pub fn generate_grants_script(
 }
 
 /// Generate GRANT statements for a new object (all ACL entries from "to").
+///
+/// `owners` lists role names that own the object; their ACL entries are skipped.
 pub fn generate_new_object_grants(
     to_acl: &[String],
     object_kind: &str,
     object_name: &str,
+    owners: &[&str],
 ) -> String {
-    generate_grants_script(&[], to_acl, false, object_kind, object_name)
+    generate_grants_script(&[], to_acl, false, object_kind, object_name, owners)
 }
 
 #[cfg(test)]
@@ -468,7 +483,7 @@ mod tests {
         // FROM: plain SELECT; TO: SELECT with grant option → upgrade, no revoke
         let from = vec!["user1=r/owner".to_string()];
         let to = vec!["user1=r*/owner".to_string()];
-        let diffs = diff_acls(&from, &to, true, "TABLE");
+        let diffs = diff_acls(&from, &to, true, "TABLE", &[]);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].grantee, "user1");
         assert_eq!(diffs[0].grants_with_option, vec!["SELECT"]);
@@ -482,7 +497,7 @@ mod tests {
         // FROM: SELECT with grant option; TO: plain SELECT → revoke grant option
         let from = vec!["user1=r*/owner".to_string()];
         let to = vec!["user1=r/owner".to_string()];
-        let diffs = diff_acls(&from, &to, true, "TABLE");
+        let diffs = diff_acls(&from, &to, true, "TABLE", &[]);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].revoke_option_for, vec!["SELECT"]);
         assert!(diffs[0].revokes.is_empty());
@@ -492,7 +507,7 @@ mod tests {
     fn test_diff_acls_addonly() {
         let from = vec!["user1=r/owner".to_string()];
         let to = vec!["user1=r/owner".to_string(), "user2=rw/owner".to_string()];
-        let diffs = diff_acls(&from, &to, false, "TABLE");
+        let diffs = diff_acls(&from, &to, false, "TABLE", &[]);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].grantee, "user2");
         assert_eq!(diffs[0].grants_plain, vec!["SELECT", "UPDATE"]);
@@ -502,7 +517,7 @@ mod tests {
     fn test_diff_acls_full() {
         let from = vec!["user1=r/owner".to_string(), "user3=d/owner".to_string()];
         let to = vec!["user1=r/owner".to_string(), "user2=rw/owner".to_string()];
-        let diffs = diff_acls(&from, &to, true, "TABLE");
+        let diffs = diff_acls(&from, &to, true, "TABLE", &[]);
         assert_eq!(diffs.len(), 2);
         let user2 = diffs.iter().find(|d| d.grantee == "user2").unwrap();
         assert_eq!(user2.grants_plain, vec!["SELECT", "UPDATE"]);
@@ -515,7 +530,7 @@ mod tests {
         // Same grantee and privileges, different grantor → no diff
         let from = vec!["user1=rw/owner1".to_string()];
         let to = vec!["user1=rw/owner2".to_string()];
-        let diffs = diff_acls(&from, &to, true, "TABLE");
+        let diffs = diff_acls(&from, &to, true, "TABLE", &[]);
         assert!(diffs.is_empty());
     }
 
@@ -524,7 +539,7 @@ mod tests {
         // Same grantee, privileges split across grantors → merged, no diff
         let from = vec!["user1=r/owner1".to_string(), "user1=w/owner2".to_string()];
         let to = vec!["user1=rw/owner3".to_string()];
-        let diffs = diff_acls(&from, &to, true, "TABLE");
+        let diffs = diff_acls(&from, &to, true, "TABLE", &[]);
         assert!(diffs.is_empty());
     }
 
@@ -546,6 +561,68 @@ mod tests {
         assert_eq!(
             script,
             "GRANT SELECT ON TABLE public.t TO PUBLIC WITH GRANT OPTION;\n"
+        );
+    }
+
+    #[test]
+    fn test_diff_acls_excludes_owners() {
+        // Owner in FROM has explicit entry, absent in TO → should NOT produce a REVOKE
+        let from = vec![
+            "owner_a=arwdDxt/owner_a".to_string(),
+            "reader=r/owner_a".to_string(),
+        ];
+        let to = vec![
+            "owner_b=arwdDxt/owner_b".to_string(),
+            "reader=r/owner_b".to_string(),
+        ];
+        let diffs = diff_acls(&from, &to, true, "TABLE", &["owner_a", "owner_b"]);
+        assert!(
+            diffs.is_empty(),
+            "Owner grantees must be excluded, got: {diffs:?}"
+        );
+    }
+
+    #[test]
+    fn test_diff_acls_excludes_owner_keeps_others() {
+        let from = vec![
+            "theowner=arwdDxt/theowner".to_string(),
+            "old_reader=r/theowner".to_string(),
+        ];
+        let to = vec![
+            "theowner=arwdDxt/theowner".to_string(),
+            "new_reader=r/theowner".to_string(),
+        ];
+        let diffs = diff_acls(&from, &to, true, "TABLE", &["theowner"]);
+        assert_eq!(diffs.len(), 2);
+        let added = diffs.iter().find(|d| d.grantee == "new_reader").unwrap();
+        assert_eq!(added.grants_plain, vec!["SELECT"]);
+        let removed = diffs.iter().find(|d| d.grantee == "old_reader").unwrap();
+        assert_eq!(removed.revokes, vec!["SELECT"]);
+    }
+
+    #[test]
+    fn test_generate_grants_script_excludes_owner() {
+        let from = vec!["owner_a=X/owner_a".to_string()];
+        let to = vec!["owner_b=X/owner_b".to_string(), "app=X/owner_b".to_string()];
+        let script = generate_grants_script(
+            &from,
+            &to,
+            true,
+            "FUNCTION",
+            "public.my_func()",
+            &["owner_a", "owner_b"],
+        );
+        assert!(
+            script.contains("GRANT EXECUTE ON FUNCTION public.my_func() TO app;"),
+            "Must grant to non-owner, got: {script}"
+        );
+        assert!(
+            !script.contains("owner_a"),
+            "Must not reference old owner, got: {script}"
+        );
+        assert!(
+            !script.contains("owner_b"),
+            "Must not reference new owner, got: {script}"
         );
     }
 }
