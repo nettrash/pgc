@@ -959,7 +959,11 @@ impl Dump {
                 );
                 Ok(table)
             })
-            .buffer_unordered(max_connections.saturating_sub(FILL_SIBLING_BRANCH_COUNT).max(1) as usize)
+            .buffer_unordered(
+                max_connections
+                    .saturating_sub(FILL_SIBLING_BRANCH_COUNT)
+                    .max(1) as usize,
+            )
             .collect()
             .await;
 
