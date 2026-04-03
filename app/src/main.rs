@@ -129,7 +129,7 @@ async fn run_main() -> Result<(), Error> {
                         ssl: args.use_ssl,
                         file: args.output.unwrap(),
                     },
-                    args.max_connections.unwrap(),
+                    args.max_connections,
                 )
                 .await;
             }
