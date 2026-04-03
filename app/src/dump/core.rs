@@ -20,6 +20,15 @@ use std::io::{Error, Read};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+/// Number of sibling branches in `fill()` that run concurrently with the
+/// table-fetching stream via `tokio::try_join!`: types/enums, extensions,
+/// sequences, routines, and views.  We reserve this many pool connections so
+/// the `buffer_unordered` table stream doesn't starve them.
+///
+/// **Keep in sync** with the number of non-table futures passed to
+/// `tokio::try_join!` in `Dump::fill()`.
+const FILL_SIBLING_BRANCH_COUNT: u32 = 5;
+
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dump {
@@ -932,9 +941,9 @@ impl Dump {
             });
         }
 
-        // Fill all tables concurrently, reserving 5 connections for the
-        // sibling branches (extensions, sequences, routines, types/enums, views)
-        // that run in parallel via tokio::try_join! in fill().
+        // Fill all tables concurrently, reserving FILL_SIBLING_BRANCH_COUNT
+        // connections for the sibling branches (extensions, sequences, routines,
+        // types/enums, views) that run in parallel via tokio::try_join! in fill().
         let pool_ref = pool;
         let tables: Vec<Result<Table, Error>> = stream::iter(shell_tables)
             .map(|mut table| async move {
@@ -950,7 +959,7 @@ impl Dump {
                 );
                 Ok(table)
             })
-            .buffer_unordered(max_connections.saturating_sub(5).max(1) as usize)
+            .buffer_unordered(max_connections.saturating_sub(FILL_SIBLING_BRANCH_COUNT).max(1) as usize)
             .collect()
             .await;
 
