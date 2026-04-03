@@ -18,6 +18,8 @@ pub struct Config {
     pub use_comments: bool,
     // How to handle grants (privileges) during comparison
     pub grants_mode: GrantsMode,
+    // Maximum number of connections in the PostgreSQL connection pool
+    pub max_connections: u32,
 }
 
 impl Config {
@@ -58,6 +60,7 @@ impl Config {
         let mut use_single_transaction = false;
         let mut use_comments = true;
         let mut grants_mode = GrantsMode::Ignore;
+        let mut max_connections: u32 = 8;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -93,6 +96,7 @@ impl Config {
                 && key != "USE_SINGLE_TRANSACTION"
                 && key != "USE_COMMENTS"
                 && key != "GRANTS_MODE"
+                && key != "MAX_CONNECTIONS"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -136,6 +140,12 @@ impl Config {
                         .parse::<GrantsMode>()
                         .unwrap_or_else(|e| panic!("{e}"));
                 }
+                "MAX_CONNECTIONS" => {
+                    max_connections = parts[1]
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or_else(|e| panic!("Invalid value for MAX_CONNECTIONS: {e}"));
+                }
                 _ => {}
             }
         }
@@ -167,6 +177,7 @@ impl Config {
             use_single_transaction,
             use_comments,
             grants_mode,
+            max_connections,
         }
     }
 }

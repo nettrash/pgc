@@ -69,14 +69,8 @@ impl Dump {
     }
 
     // Retrieve the dump from the configuration.
-    pub async fn process(&mut self) -> Result<(), Error> {
-        const TABLE_FILL_CONCURRENCY: u32 = 6;
-        const POOL_CONNECTION_BUFFER: u32 = 2;
-        let max_connections = TABLE_FILL_CONCURRENCY + POOL_CONNECTION_BUFFER;
-
+    pub async fn process(&mut self, max_connections: u32) -> Result<(), Error> {
         let pool = PgPoolOptions::new()
-            // Match the pool size to the intended concurrent workload instead of hard-coding
-            // a lower value that would force tasks to block on connection acquisition.
             .max_connections(max_connections)
             .connect(self.configuration.get_connection_string().as_str())
             .await
@@ -89,7 +83,7 @@ impl Dump {
             })?;
 
         // Fill the dump.
-        self.fill(&pool).await?;
+        self.fill(&pool, max_connections).await?;
 
         pool.close().await;
 
@@ -129,7 +123,7 @@ impl Dump {
         format!("({})", names.join(", "))
     }
 
-    async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
+    async fn fill(&mut self, pool: &PgPool, max_connections: u32) -> Result<(), Error> {
         self.get_schemas(pool).await?;
         if self.schemas.is_empty() {
             println!("No accessible schemas to dump.");
@@ -155,7 +149,7 @@ impl Dump {
         let extensions_fut = Self::fetch_extensions_standalone(pool, &schema_filter);
         let sequences_fut = Self::fetch_sequences_standalone(pool, &schema_filter);
         let routines_fut = Self::fetch_routines_standalone(pool, &schema_filter);
-        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter);
+        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter, max_connections);
         let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
 
         let (types_enums, extensions, sequences, routines, tables, views) = tokio::try_join!(
@@ -848,11 +842,12 @@ impl Dump {
 
     /// Fetch all tables with bounded-parallel fills.
     ///
-    /// Up to 6 tables are filled concurrently so that per-table sub-queries
+    /// Tables are filled concurrently so that per-table sub-queries
     /// overlap, drastically reducing wall-clock time on remote connections.
     async fn fetch_tables_standalone(
         pool: &PgPool,
         schema_filter: &str,
+        max_connections: u32,
     ) -> Result<Vec<Table>, Error> {
         // Check once whether the pg_get_tabledef extension function exists.
         let has_tabledef_fn =
@@ -953,7 +948,7 @@ impl Dump {
                 );
                 Ok(table)
             })
-            .buffer_unordered(6)
+            .buffer_unordered(max_connections.saturating_sub(2).max(1) as usize)
             .collect()
             .await;
 
