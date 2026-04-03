@@ -1532,6 +1532,33 @@ impl Comparer {
                 );
             }
         }
+
+        // Track parent tables that will be dropped + recreated (partition key
+        // changed, or a column in the partition key has a type change, etc.).
+        // Their children were implicitly dropped and must be re-created from
+        // scratch instead of altered.
+        // Seed with explicit partition_key differences; additional parents may
+        // be discovered during the alter loop when their generated script
+        // contains a DROP TABLE.
+        let mut recreated_parents: HashSet<String> = HashSet::new();
+        for table in ordered_from.iter() {
+            if let Some(to_table) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.name == table.name && t.schema == table.schema)
+                && table.partition_key != to_table.partition_key
+            {
+                recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+            }
+        }
+
+        // New partition children that have to be created after their parent is recreated
+        let mut deferred_new_children: Vec<&Table> = Vec::new();
+
+        // All table keys whose creation has been deferred
+        let mut deferred_new_keys: HashSet<String> = HashSet::new();
+
         // We will find all new tables from "to" dump that are not in "from" dump
         // and add them to the script.
         for table in ordered_to.iter() {
@@ -1566,31 +1593,27 @@ impl Comparer {
                     // Will be added in next comparision (below)
                 }
             } else {
+                // Table creation must be deferred if it belongs to a parent that is being recreated
+                let parent_being_recreated_or_deferred =
+                    table.partition_of.as_ref().is_some_and(|pref| {
+                        let parent_key = Self::normalise_partition_of(pref);
+                        recreated_parents.contains(&parent_key)
+                            || deferred_new_keys.contains(&parent_key)
+                    });
+
+                if parent_being_recreated_or_deferred {
+                    deferred_new_keys.insert(Self::table_key(&table.schema, &table.name));
+                    deferred_new_children.push(table);
+
+                    continue;
+                }
+
                 self.script
                     .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
                 self.script
                     .push_str(table.get_script_without_triggers().as_str());
                 self.trigger_post_script
                     .push_str(table.get_trigger_script().as_str());
-            }
-        }
-        // Track parent tables that will be dropped + recreated (partition key
-        // changed, or a column in the partition key has a type change, etc.).
-        // Their children were implicitly dropped and must be re-created from
-        // scratch instead of altered.
-        // Seed with explicit partition_key differences; additional parents may
-        // be discovered during the alter loop when their generated script
-        // contains a DROP TABLE.
-        let mut recreated_parents: HashSet<String> = HashSet::new();
-        for table in ordered_from.iter() {
-            if let Some(to_table) = self
-                .to
-                .tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                && table.partition_key != to_table.partition_key
-            {
-                recreated_parents.insert(Self::table_key(&table.schema, &table.name));
             }
         }
 
@@ -1665,6 +1688,16 @@ impl Comparer {
                 continue; // Table is present in both dumps, we already processed it
             }
         }
+
+        for table in deferred_new_children {
+            self.script
+                .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
+            self.script
+                .push_str(table.get_script_without_triggers().as_str());
+            self.trigger_post_script
+                .push_str(table.get_trigger_script().as_str());
+        }
+
         self.script
             .append_block("\n/* ---> Tables: End section --------------- */");
         Ok(())
@@ -6578,6 +6611,146 @@ mod tests {
         assert!(
             !script.contains("create or replace"),
             "Unchanged overload must not be recreated, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_partition_children_deferred_until_parent_is_recreated() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Root partitioned table (unchanged in both dumps)
+        let mut root = Table::new(
+            "data".to_string(),
+            "events".to_string(),
+            "data".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("data", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        root.partition_key = Some("RANGE (id)".to_string());
+        root.hash();
+
+        // FROM: events_2023 exists but is NOT sub-partitioned (no partition_key)
+        let mut from_events_2023 = Table::new(
+            "data".to_string(),
+            "events_2023".to_string(),
+            "data".to_string(),
+            "events_2023".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("data", "events_2023", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        from_events_2023.partition_of = Some("\"data\".\"events\"".to_string());
+        from_events_2023.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
+        from_events_2023.hash();
+
+        // TO: events_2023 now gains a partition_key (LIST region)
+        let mut to_events_2023 = Table::new(
+            "data".to_string(),
+            "events_2023".to_string(),
+            "data".to_string(),
+            "events_2023".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("data", "events_2023", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        to_events_2023.partition_of = Some("\"data\".\"events\"".to_string());
+        to_events_2023.partition_bound = Some("FOR VALUES FROM (2023) TO (2024)".to_string());
+        to_events_2023.partition_key = Some("LIST (region)".to_string());
+        to_events_2023.hash();
+
+        let mut leaf_eu = Table::new(
+            "data".to_string(),
+            "events_2023_eu".to_string(),
+            "data".to_string(),
+            "events_2023_eu".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("data", "events_2023_eu", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        leaf_eu.partition_of = Some("\"data\".\"events_2023\"".to_string());
+        leaf_eu.partition_bound = Some("FOR VALUES IN ('eu')".to_string());
+        leaf_eu.hash();
+
+        let mut leaf_us = Table::new(
+            "data".to_string(),
+            "events_2023_us".to_string(),
+            "data".to_string(),
+            "events_2023_us".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("data", "events_2023_us", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        leaf_us.partition_of = Some("\"data\".\"events_2023\"".to_string());
+        leaf_us.partition_bound = Some("FOR VALUES IN ('us')".to_string());
+        leaf_us.hash();
+
+        // FROM dump: root + old events_2023 (no sub-partition key)
+        from_dump.tables.push(root.clone());
+        from_dump.tables.push(from_events_2023);
+
+        // TO dump: root + new events_2023 (with sub-partition key) + two leaves
+        // Push in reverse depth order to stress the sorting
+        to_dump.tables.push(leaf_us);
+        to_dump.tables.push(leaf_eu);
+        to_dump.tables.push(to_events_2023);
+        to_dump.tables.push(root);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let pos_recreate = script
+            .find("create table data.events_2023 partition of")
+            .expect("events_2023 recreate not found");
+        let pos_eu = script
+            .find("create table data.events_2023_eu partition of")
+            .expect("events_2023_eu create not found");
+        let pos_us = script
+            .find("create table data.events_2023_us partition of")
+            .expect("events_2023_us create not found");
+
+        assert!(
+            pos_recreate < pos_eu,
+            "events_2023 must be recreated before events_2023_eu is created (got recreate={pos_recreate}, eu={pos_eu})"
+        );
+        assert!(
+            pos_recreate < pos_us,
+            "events_2023 must be recreated before events_2023_us is created (got recreate={pos_recreate}, us={pos_us})"
+        );
+
+        let pos_drop = script
+            .find("drop table if exists data.events_2023")
+            .expect("events_2023 drop not found");
+        assert!(
+            pos_drop < pos_eu,
+            "events_2023 must be dropped before events_2023_eu is created"
+        );
+        assert!(
+            pos_drop < pos_us,
+            "events_2023 must be dropped before events_2023_us is created"
         );
     }
 }
