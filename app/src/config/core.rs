@@ -553,4 +553,60 @@ mod tests {
         let _ = Config::new(file.clone());
         let _ = std::fs::remove_file(file);
     }
+
+    // --- MAX_CONNECTIONS validation ---
+
+    #[test]
+    fn test_max_connections_valid_value() {
+        let config_content = "MAX_CONNECTIONS=16\n";
+        let file = write_temp_config(config_content, "test_max_connections_valid.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.max_connections, 16);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_max_connections_default_value() {
+        let config_content = "FROM_HOST=localhost\n";
+        let file = write_temp_config(config_content, "test_max_connections_default.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.max_connections, 8);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_max_connections_minimum_value() {
+        let config_content = "MAX_CONNECTIONS=1\n";
+        let file = write_temp_config(config_content, "test_max_connections_min.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.max_connections, 1);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_CONNECTIONS must be at least 1")]
+    fn test_max_connections_zero_panics() {
+        let config_content = "MAX_CONNECTIONS=0\n";
+        let file = write_temp_config(config_content, "test_max_connections_zero.cfg");
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid value for MAX_CONNECTIONS")]
+    fn test_max_connections_non_numeric_panics() {
+        let config_content = "MAX_CONNECTIONS=abc\n";
+        let file = write_temp_config(config_content, "test_max_connections_non_numeric.cfg");
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid value for MAX_CONNECTIONS")]
+    fn test_max_connections_negative_panics() {
+        let config_content = "MAX_CONNECTIONS=-1\n";
+        let file = write_temp_config(config_content, "test_max_connections_negative.cfg");
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
 }
