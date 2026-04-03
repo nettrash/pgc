@@ -932,7 +932,9 @@ impl Dump {
             });
         }
 
-        // Fill all tables concurrently (up to 6 at a time to stay within pool limits).
+        // Fill all tables concurrently, reserving 5 connections for the
+        // sibling branches (extensions, sequences, routines, types/enums, views)
+        // that run in parallel via tokio::try_join! in fill().
         let pool_ref = pool;
         let tables: Vec<Result<Table, Error>> = stream::iter(shell_tables)
             .map(|mut table| async move {
@@ -948,7 +950,7 @@ impl Dump {
                 );
                 Ok(table)
             })
-            .buffer_unordered(max_connections.saturating_sub(2).max(1) as usize)
+            .buffer_unordered(max_connections.saturating_sub(5).max(1) as usize)
             .collect()
             .await;
 
