@@ -141,10 +141,14 @@ impl Config {
                         .unwrap_or_else(|e| panic!("{e}"));
                 }
                 "MAX_CONNECTIONS" => {
-                    max_connections = parts[1]
+                    let v = parts[1]
                         .trim()
                         .parse::<u32>()
                         .unwrap_or_else(|e| panic!("Invalid value for MAX_CONNECTIONS: {e}"));
+                    if v < 1 {
+                        panic!("MAX_CONNECTIONS must be at least 1, got {v}");
+                    }
+                    max_connections = v;
                 }
                 _ => {}
             }
