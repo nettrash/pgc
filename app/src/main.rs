@@ -86,8 +86,8 @@ struct Args {
     grants_mode: GrantsMode,
 
     /// Maximum number of connections in the PostgreSQL connection pool
-    #[arg(long, default_value = "8")]
-    max_connections: Option<u32>,
+    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
 }
 
 fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
