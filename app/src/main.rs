@@ -84,6 +84,10 @@ struct Args {
     /// Grants handling mode: ignore, addonly, full
     #[arg(long, value_parser = parse_grants_mode, default_value = "ignore")]
     grants_mode: GrantsMode,
+
+    /// Maximum number of connections in the PostgreSQL connection pool
+    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
 }
 
 fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
@@ -114,16 +118,19 @@ async fn run_main() -> Result<(), Error> {
         match command {
             "dump" => {
                 println!("Dumping database...");
-                return create_dump(DumpConfig {
-                    host: args.server.unwrap(),
-                    port: args.port.unwrap(),
-                    user: args.user.unwrap(),
-                    password: args.password.unwrap(),
-                    database: args.database.unwrap(),
-                    scheme: args.scheme.unwrap(),
-                    ssl: args.use_ssl,
-                    file: args.output.unwrap(),
-                })
+                return create_dump(
+                    DumpConfig {
+                        host: args.server.unwrap(),
+                        port: args.port.unwrap(),
+                        user: args.user.unwrap(),
+                        password: args.password.unwrap(),
+                        database: args.database.unwrap(),
+                        scheme: args.scheme.unwrap(),
+                        ssl: args.use_ssl,
+                        file: args.output.unwrap(),
+                    },
+                    args.max_connections,
+                )
                 .await;
             }
             "compare" => {
@@ -169,31 +176,37 @@ async fn run_by_config(config: String) -> Result<(), Error> {
         let to_file = cfg.to.file.clone();
         let output_file = cfg.output.clone();
 
-        let result = create_dump(DumpConfig {
-            host: cfg.from.host,
-            port: cfg.from.port,
-            user: cfg.from.user,
-            password: cfg.from.password,
-            database: cfg.from.database,
-            scheme: cfg.from.scheme,
-            ssl: cfg.from.ssl,
-            file: from_file.clone(),
-        })
+        let result = create_dump(
+            DumpConfig {
+                host: cfg.from.host,
+                port: cfg.from.port,
+                user: cfg.from.user,
+                password: cfg.from.password,
+                database: cfg.from.database,
+                scheme: cfg.from.scheme,
+                ssl: cfg.from.ssl,
+                file: from_file.clone(),
+            },
+            cfg.max_connections,
+        )
         .await;
         if let Err(e) = result {
             eprintln!("Error creating dump: {e}");
             return Err(e);
         }
-        let result = create_dump(DumpConfig {
-            host: cfg.to.host,
-            port: cfg.to.port,
-            user: cfg.to.user,
-            password: cfg.to.password,
-            database: cfg.to.database,
-            scheme: cfg.to.scheme,
-            ssl: cfg.to.ssl,
-            file: to_file.clone(),
-        })
+        let result = create_dump(
+            DumpConfig {
+                host: cfg.to.host,
+                port: cfg.to.port,
+                user: cfg.to.user,
+                password: cfg.to.password,
+                database: cfg.to.database,
+                scheme: cfg.to.scheme,
+                ssl: cfg.to.ssl,
+                file: to_file.clone(),
+            },
+            cfg.max_connections,
+        )
         .await;
         if let Err(e) = result {
             eprintln!("Error creating dump: {e}");
@@ -226,10 +239,10 @@ async fn run_by_config(config: String) -> Result<(), Error> {
     }
 }
 
-async fn create_dump(dump_config: DumpConfig) -> Result<(), Error> {
+async fn create_dump(dump_config: DumpConfig, max_connections: u32) -> Result<(), Error> {
     let mut dump = Dump::new(dump_config);
     println!("Creating dump...");
-    let result = dump.process().await;
+    let result = dump.process(max_connections).await;
     if let Err(e) = result {
         eprintln!("Error creating dump: {e}");
         return Err(e);

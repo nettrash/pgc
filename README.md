@@ -71,6 +71,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--grants-mode {ignore|addonly|full}` - controls how grants (privileges) are handled during comparison. `ignore` (default) skips grants entirely; `addonly` adds grants that exist in TO but not in FROM; `full` makes grants identical by adding missing and revoking extra.
 
+`--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `8`.
+
 ## Functionality
 
 ### Create database schema dump
@@ -124,4 +126,46 @@ USE_DROP=true
 USE_SINGLE_TRANSACTION=true
 USE_COMMENTS=false
 GRANTS_MODE=ignore
+MAX_CONNECTIONS=8
+```
+
+## Choosing `MAX_CONNECTIONS`
+
+The `MAX_CONNECTIONS` setting controls how many concurrent PostgreSQL connections the tool opens per dump. During a dump the tool runs several independent queries in parallel (extensions, sequences, routines, types, views) and additionally fills each table concurrently — so the connection count directly affects wall-clock time on remote or high-latency servers.
+
+### Key constraints
+
+- **Server budget** — never exceed half of the server's `max_connections` (check with `SHOW max_connections;`). The PostgreSQL default is 100.
+- **Two pools** — when dumping both `FROM` and `TO` against the same server the combined usage is `2 × MAX_CONNECTIONS`; halve your budget per pool.
+- **Memory overhead** — each PostgreSQL connection costs roughly 5–10 MB of RAM on the server.
+- **Diminishing returns** — beyond ~24–32 connections, query planner contention and lock overhead typically negate the parallelism gains.
+
+### Recommended values
+
+| Tables in schema | Suggested `MAX_CONNECTIONS` |
+|------------------|-----------------------------|
+| < 20             | 8 (default)                 |
+| 20 – 50          | 12 – 16                     |
+| 50 – 200         | 16 – 24                     |
+| 200+             | 24 – 32                     |
+
+### Formula
+
+As a rule of thumb:
+
+```math
+\text{max\_connections} = \min\!\Big(\max\!\big(\lceil T / 2 \rceil + 5,\; 8\big),\; \lfloor PG_{max} / 2 \rfloor,\; 32\Big)
+```
+
+Where $T$ is the number of tables in the target schema(s) and $PG_{max}$ is the server's `max_connections` value.
+
+You can query both values at connect time:
+
+```sql
+-- Server limit
+SHOW max_connections;
+
+-- Table count for the target schema(s)
+SELECT count(*) FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
 ```
