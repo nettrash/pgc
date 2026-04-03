@@ -153,11 +153,11 @@ The `MAX_CONNECTIONS` setting controls how many concurrent PostgreSQL connection
 
 As a rule of thumb:
 
-```
-max_connections = min(max(⌈tables / 2⌉ + 5, 8), pg_max_connections / 2, 32)
+```math
+\text{max\_connections} = \min\!\Big(\max\!\big(\lceil T / 2 \rceil + 5,\; 8\big),\; \lfloor PG_{max} / 2 \rfloor,\; 32\Big)
 ```
 
-Where `tables` is the number of tables in the target schema(s) and `pg_max_connections` is the server's `max_connections` value.
+Where $T$ is the number of tables in the target schema(s) and $PG_{max}$ is the server's `max_connections` value.
 
 You can query both values at connect time:
 
