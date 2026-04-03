@@ -1,7 +1,7 @@
                 v1.0.11
 
                 Features:
-                    - Added --max-connections argument to setup a proper amount of connections.
+                    - Added --max-connections argument to set up a proper amount of connections.
 
 2026-04-02      v1.0.10
 
