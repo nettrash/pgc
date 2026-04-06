@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::types::Oid;
 
+use crate::utils::string_extensions::StringExt;
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableTrigger {
@@ -21,7 +23,7 @@ impl TableTrigger {
     pub fn get_script(&self) -> String {
         let mut script = String::new();
         script.push_str(&self.definition);
-        script.push_str(";\n");
+        script.append_block(";");
         script
     }
 }
@@ -173,7 +175,7 @@ mod tests {
         let trigger = create_test_trigger();
         let script = trigger.get_script();
 
-        let expected = "before insert or update on test_table for each row execute function test_function();\n";
+        let expected = "before insert or update on test_table for each row execute function test_function();\n\n";
         assert_eq!(script, expected);
     }
 
@@ -182,7 +184,7 @@ mod tests {
         let trigger = create_simple_trigger();
         let script = trigger.get_script();
 
-        let expected = "after delete on users for each row execute function audit_delete();\n";
+        let expected = "after delete on users for each row execute function audit_delete();\n\n";
         assert_eq!(script, expected);
     }
 
@@ -191,7 +193,7 @@ mod tests {
         let trigger = create_complex_trigger();
         let script = trigger.get_script();
 
-        let expected = "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user();\n";
+        let expected = "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user();\n\n";
         assert_eq!(script, expected);
     }
 
@@ -204,7 +206,7 @@ mod tests {
         };
 
         let script = trigger.get_script();
-        let expected = "before insert on \"special-table\" for each row execute function \"validate_data\"();\n";
+        let expected = "before insert on \"special-table\" for each row execute function \"validate_data\"();\n\n";
         assert_eq!(script, expected);
     }
 
@@ -217,7 +219,7 @@ mod tests {
         };
 
         let script = trigger.get_script();
-        let expected = ";\n";
+        let expected = ";\n\n";
         assert_eq!(script, expected);
     }
 
@@ -328,7 +330,7 @@ mod tests {
 
         // Script should work with empty strings
         let script = trigger.get_script();
-        assert_eq!(script, ";\n");
+        assert_eq!(script, ";\n\n");
 
         // Equality should work
         let trigger2 = TableTrigger {
@@ -348,7 +350,7 @@ mod tests {
         };
 
         let script = trigger.get_script();
-        let expected = "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email();\n";
+        let expected = "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email();\n\n";
         assert_eq!(script, expected);
 
         // Hash should work with multiline definitions
@@ -375,7 +377,7 @@ mod tests {
         assert_eq!(trigger.definition, long_definition);
 
         let script = trigger.get_script();
-        assert_eq!(script, format!("{};\n", long_definition));
+        assert_eq!(script, format!("{};\n\n", long_definition));
 
         // Hash should work with very long definitions
         let mut hasher = Sha256::new();
@@ -439,7 +441,7 @@ mod tests {
         for trigger in triggers {
             // Each should produce a valid script (definition + semicolon)
             let script = trigger.get_script();
-            assert_eq!(script, format!("{};\n", trigger.definition));
+            assert_eq!(script, format!("{};\n\n", trigger.definition));
 
             // Each should produce a valid hash
             let mut hasher = Sha256::new();

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::utils::string_extensions::StringExt;
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableIndex {
@@ -26,7 +28,7 @@ impl TableIndex {
     pub fn get_script(&self) -> String {
         let mut script = String::new();
         script.push_str(&self.indexdef);
-        script.push_str(";\n");
+        script.append_block(";");
         script
     }
 }
@@ -239,7 +241,8 @@ mod tests {
         let index = create_test_index();
         let script = index.get_script();
 
-        let expected = "CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email);\n";
+        let expected =
+            "CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email);\n\n";
         assert_eq!(script, expected);
     }
 
@@ -248,7 +251,7 @@ mod tests {
         let index = create_simple_index();
         let script = index.get_script();
 
-        let expected = "CREATE INDEX idx_orders_date ON app.orders USING btree (created_at);\n";
+        let expected = "CREATE INDEX idx_orders_date ON app.orders USING btree (created_at);\n\n";
         assert_eq!(script, expected);
     }
 
@@ -261,7 +264,7 @@ mod tests {
         assert!(script.starts_with("CREATE INDEX idx_events_composite"));
         assert!(script.contains("USING gin"));
         assert!(script.contains("WHERE active = true"));
-        assert!(script.ends_with(";\n"));
+        assert!(script.ends_with(";\n\n"));
     }
 
     #[test]
@@ -269,7 +272,7 @@ mod tests {
         let index = create_partial_index();
         let script = index.get_script();
 
-        let expected = "CREATE INDEX idx_products_active ON public.products (name, price) WHERE active = true;\n";
+        let expected = "CREATE INDEX idx_products_active ON public.products (name, price) WHERE active = true;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -286,7 +289,7 @@ mod tests {
         };
 
         let script = index.get_script();
-        let expected = "CREATE UNIQUE INDEX IDX_USERS_NAME ON PUBLIC.USERS USING BTREE (NAME);\n";
+        let expected = "CREATE UNIQUE INDEX IDX_USERS_NAME ON PUBLIC.USERS USING BTREE (NAME);\n\n";
         assert_eq!(script, expected);
     }
 
@@ -302,7 +305,7 @@ mod tests {
         };
 
         let script = index.get_script();
-        let expected = ";\n";
+        let expected = ";\n\n";
         assert_eq!(script, expected);
     }
 
@@ -467,7 +470,7 @@ mod tests {
 
         // Script should work with empty strings
         let script = index.get_script();
-        assert_eq!(script, ";\n");
+        assert_eq!(script, ";\n\n");
 
         // Equality should work
         let index2 = TableIndex {
@@ -503,7 +506,7 @@ mod tests {
         assert!(script.contains("test-schema"));
         assert!(script.contains("table$name"));
         assert!(script.contains("column-name"));
-        assert!(script.ends_with(";\n"));
+        assert!(script.ends_with(";\n\n"));
     }
 
     #[test]
@@ -549,7 +552,7 @@ mod tests {
             // Each should produce a valid script
             let script = index.get_script();
             assert!(script.contains(&format!("CREATE INDEX {}", index.name)));
-            assert!(script.ends_with(";\n"));
+            assert!(script.ends_with(";\n\n"));
 
             // Each should produce a valid hash
             let mut hasher = Sha256::new();
@@ -627,9 +630,9 @@ mod tests {
 
         let script = index.get_script();
         assert!(script.contains("CREATE INDEX multiline_idx"));
-        assert!(script.contains("\n"));
+        assert!(script.contains("\n\n"));
         assert!(script.contains("WHERE active = true"));
-        assert!(script.ends_with(";\n"));
+        assert!(script.ends_with(";\n\n"));
 
         // Hash should work with multiline definitions
         let mut hasher = Sha256::new();
