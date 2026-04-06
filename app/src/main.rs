@@ -71,15 +71,15 @@ struct Args {
     use_ssl: bool,
 
     /// Use DROP statements in the output
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     use_drop: bool,
 
     /// True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     use_single_transaction: bool,
 
     /// Include comments in the output script
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     use_comments: bool,
 
     /// Grants handling mode: ignore, addonly, full
