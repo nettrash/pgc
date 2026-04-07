@@ -5,6 +5,7 @@
                     - Added string_extensions - to format statements in resulting diff file.
                     - Fixed --use-comments argument.
                     - Fixed CRLF endings.
+                    - Fix: new partition children created after recreated sub-partitioned parent.
 
 2026-04-02      v1.0.10
 
