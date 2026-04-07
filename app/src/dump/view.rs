@@ -54,7 +54,7 @@ impl View {
     }
 
     /// Returns the SQL keyword for this view type ("view" or "materialized view")
-    fn view_keyword(&self) -> &'static str {
+    pub fn view_keyword(&self) -> &'static str {
         if self.is_materialized {
             "materialized view"
         } else {
