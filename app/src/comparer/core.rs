@@ -2354,10 +2354,19 @@ impl Comparer {
 
         // --- Views ---
         for view in &self.to.views {
-            let (from_acl, from_owner) = from_view_map
-                .get(&(view.schema.as_str(), view.name.as_str()))
-                .copied()
-                .unwrap_or((&[], ""));
+            let normalized_key = Self::normalized_view_key(&view.schema, &view.name);
+            // When a view was dropped earlier in the script (e.g. as a
+            // dependency of an altered table), its ACL will be lost after
+            // the DROP.  Treat from_acl as empty so that all required
+            // grants are emitted in the migration script.
+            let (from_acl, from_owner) = if self.dropped_views.contains(&normalized_key) {
+                (&[] as &[String], "")
+            } else {
+                from_view_map
+                    .get(&(view.schema.as_str(), view.name.as_str()))
+                    .copied()
+                    .unwrap_or((&[], ""))
+            };
             let owners: Vec<&str> = [from_owner, view.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
@@ -5494,6 +5503,46 @@ mod tests {
         assert!(
             !script.contains("REVOKE"),
             "No revoke expected when unchanged grant remains, got: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_grants_dropped_view_restores_all_grants() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // Both FROM and TO have the same grant on the view.
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["reader=r/owner".to_string()];
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["reader=r/owner".to_string()];
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        // Simulate that the view was dropped earlier in the script
+        // (e.g. as a dependency of an altered table).
+        comparer
+            .dropped_views
+            .insert(Comparer::normalized_view_key("public", "my_view"));
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("GRANT SELECT ON TABLE public.my_view TO reader;"),
+            "Dropped view must restore grants even when FROM has the same ACL, got: {script}"
         );
     }
 

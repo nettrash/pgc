@@ -821,7 +821,7 @@ impl Dump {
                         .get::<Option<String>, _>("owner_name")
                         .unwrap_or_default(),
                     comment: row.get("routine_comment"),
-                    source_code: row.get("prosrc"),
+                    source_code: row.get::<String, _>("prosrc").replace("\r\n", "\n"),
                     volatility,
                     is_strict: row.get("proisstrict"),
                     is_leakproof: row.get("proleakproof"),
@@ -1128,8 +1128,17 @@ impl Dump {
         let mut serialized_data = String::new();
         dump_file.read_to_string(&mut serialized_data)?;
 
-        let dump: Dump = serde_json::from_str(&serialized_data)
+        let mut dump: Dump = serde_json::from_str(&serialized_data)
             .map_err(|e| Error::other(format!("Failed to deserialize dump: {e}.")))?;
+
+        // Normalize CRLF -> LF in routine source code so that hashes are
+        // consistent regardless of the line-ending style stored in the dump.
+        for routine in &mut dump.routines {
+            if routine.source_code.contains("\r\n") {
+                routine.source_code = routine.source_code.replace("\r\n", "\n");
+                routine.hash();
+            }
+        }
 
         Ok(dump)
     }

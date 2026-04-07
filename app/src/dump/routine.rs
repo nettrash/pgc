@@ -238,7 +238,7 @@ impl Routine {
             arguments_defaults,
             owner: String::new(),
             comment,
-            source_code,
+            source_code: source_code.replace("\r\n", "\n"),
             volatility: "volatile".to_string(),
             is_strict: false,
             is_leakproof: false,
@@ -263,6 +263,7 @@ impl Routine {
             ),
             None => String::new(),
         };
+        let normalized_source = self.source_code.replace("\r\n", "\n");
         let src = format!(
             "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
@@ -273,7 +274,7 @@ impl Routine {
             self.arguments,
             self.owner,
             self.comment.clone().unwrap_or_default(),
-            self.source_code,
+            normalized_source,
             self.volatility,
             self.is_strict,
             self.is_leakproof,
@@ -749,6 +750,36 @@ mod tests {
 
         let updated_hash = routine.hash.clone().expect("hash should be recomputed");
         assert_ne!(updated_hash, original_hash);
+    }
+
+    #[test]
+    fn hash_is_identical_for_crlf_and_lf_source_code() {
+        let lf_routine = Routine::new(
+            "public".to_string(),
+            Oid(42),
+            "add".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "a integer".to_string(),
+            None,
+            None,
+            "BEGIN\n  RETURN a + 1;\nEND".to_string(),
+        );
+        let crlf_routine = Routine::new(
+            "public".to_string(),
+            Oid(42),
+            "add".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "a integer".to_string(),
+            None,
+            None,
+            "BEGIN\r\n  RETURN a + 1;\r\nEND".to_string(),
+        );
+        assert_eq!(lf_routine.hash, crlf_routine.hash);
+        assert_eq!(lf_routine.source_code, crlf_routine.source_code);
     }
 
     #[test]
