@@ -19,16 +19,16 @@ begin;
 /* ---> Drop Views --------------- */
 
 /* Drop materialized view: clear_shared.mv_audit_stats */
-drop materialized view if exists clear_shared.mv_audit_stats cascade;
+drop materialized view if exists clear_shared.mv_audit_stats;
 
 /* Drop materialized view: clear_app.mv_daily_orders */
-drop materialized view if exists clear_app.mv_daily_orders cascade;
+drop materialized view if exists clear_app.mv_daily_orders;
 
 /* Drop view: clear_app.v_top_customers */
-drop view if exists clear_app.v_top_customers cascade;
+drop view if exists clear_app.v_top_customers;
 
 /* Drop view: clear_app.v_customer_summary */
-drop view if exists clear_app.v_customer_summary cascade;
+drop view if exists clear_app.v_customer_summary;
 
 /* ---> Drop Tables --------------- */
 
@@ -45,22 +45,22 @@ alter table clear_app.order_items drop constraint if exists order_items_order_id
 alter table clear_app.employees drop constraint if exists employees_manager_id_fkey;
 
 /* Drop table: clear_app.customers */
-drop table if exists clear_app.customers cascade;
+drop table if exists clear_app.customers;
 
 /* Drop table: clear_app.categories */
-drop table if exists clear_app.categories cascade;
+drop table if exists clear_app.categories;
 
 /* Drop table: clear_app.orders */
-drop table if exists clear_app.orders cascade;
+drop table if exists clear_app.orders;
 
 /* Drop table: clear_app.order_items */
-drop table if exists clear_app.order_items cascade;
+drop table if exists clear_app.order_items;
 
 /* Drop table: clear_shared.audit_log */
-drop table if exists clear_shared.audit_log cascade;
+drop table if exists clear_shared.audit_log;
 
 /* Drop table: clear_app.employees */
-drop table if exists clear_app.employees cascade;
+drop table if exists clear_app.employees;
 
 /* ---> Drop Routines --------------- */
 
@@ -82,36 +82,36 @@ drop procedure if exists clear_app.cleanup_old_orders (p_days integer);
 /* ---> Drop Sequences --------------- */
 
 /* Drop sequence: clear_app.customer_id_seq */
-drop sequence if exists clear_app.customer_id_seq cascade;
+drop sequence if exists clear_app.customer_id_seq;
 
 /* Drop sequence: clear_shared.audit_id_seq */
-drop sequence if exists clear_shared.audit_id_seq cascade;
+drop sequence if exists clear_shared.audit_id_seq;
 
 /* ---> Drop Types --------------- */
 
 /* Drop type: clear_app.order_status */
-drop type if exists clear_app.order_status cascade;
+drop type if exists clear_app.order_status;
 
 /* Drop type: clear_app.full_name */
-drop type if exists clear_app.full_name cascade;
+drop type if exists clear_app.full_name;
 
 /* Drop type: clear_app.positive_int */
-drop type if exists clear_app.positive_int cascade;
+drop type if exists clear_app.positive_int;
 
 /* ---> Drop Extensions --------------- */
 
 /* Drop extension: uuid-ossp */
-drop extension if exists "uuid-ossp" cascade;
+drop extension if exists "uuid-ossp";
 
 /* Drop extension: pg_trgm */
-drop extension if exists pg_trgm cascade;
+drop extension if exists pg_trgm;
 
 /* ---> Drop Schemas --------------- */
 
 /* Drop schema: clear_app */
-drop schema if exists clear_app cascade;
+drop schema if exists clear_app;
 
 /* Drop schema: clear_shared */
-drop schema if exists clear_shared cascade;
+drop schema if exists clear_shared;
 
 commit;

@@ -1187,9 +1187,11 @@ impl Dump {
         &self,
         use_single_transaction: bool,
         use_comments: bool,
+        use_cascade: bool,
     ) -> String {
         use crate::utils::string_extensions::StringExt;
 
+        let cascade_suffix = if use_cascade { " cascade" } else { "" };
         let mut script = String::new();
 
         script.push_str("/*\n");
@@ -1225,7 +1227,7 @@ impl Dump {
                 }
                 script.push_str(
                     &format!(
-                        "drop {} if exists {}.{} cascade;",
+                        "drop {} if exists {}.{}{cascade_suffix};",
                         view.view_keyword(),
                         view.schema,
                         view.name
@@ -1239,7 +1241,7 @@ impl Dump {
                 }
                 script.push_str(
                     &format!(
-                        "drop {} if exists {}.{} cascade;",
+                        "drop {} if exists {}.{}{cascade_suffix};",
                         view.view_keyword(),
                         view.schema,
                         view.name
@@ -1286,7 +1288,7 @@ impl Dump {
                 }
                 script.push_str(
                     &format!(
-                        "drop table if exists {}.{} cascade;",
+                        "drop table if exists {}.{}{cascade_suffix};",
                         table.schema, table.name
                     )
                     .with_empty_lines(),
@@ -1324,7 +1326,7 @@ impl Dump {
                 }
                 script.push_str(
                     &format!(
-                        "drop sequence if exists {}.{} cascade;",
+                        "drop sequence if exists {}.{}{cascade_suffix};",
                         sequence.schema, sequence.name
                     )
                     .with_empty_lines(),
@@ -1346,7 +1348,7 @@ impl Dump {
                 }
                 script.push_str(
                     &format!(
-                        "drop type if exists {}.{} cascade;",
+                        "drop type if exists {}.{}{cascade_suffix};",
                         pg_type.schema, pg_type.typname
                     )
                     .with_empty_lines(),
@@ -1364,7 +1366,8 @@ impl Dump {
                     script.push_str(&format!("/* Drop extension: {} */\n", ext.name));
                 }
                 script.push_str(
-                    &format!("drop extension if exists {} cascade;", ext.name).with_empty_lines(),
+                    &format!("drop extension if exists {}{cascade_suffix};", ext.name)
+                        .with_empty_lines(),
                 );
             }
         }
@@ -1379,7 +1382,8 @@ impl Dump {
                     script.push_str(&format!("/* Drop schema: {} */\n", schema.name));
                 }
                 script.push_str(
-                    &format!("drop schema if exists {} cascade;", schema.name).with_empty_lines(),
+                    &format!("drop schema if exists {}{cascade_suffix};", schema.name)
+                        .with_empty_lines(),
                 );
             }
         }
@@ -1564,7 +1568,7 @@ mod tests {
     #[test]
     fn test_clear_script_empty_dump() {
         let dump = empty_dump();
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         // Should only contain the header comment
         assert!(script.contains("clear command"));
         assert!(script.contains("testdb"));
@@ -1575,7 +1579,7 @@ mod tests {
     fn test_clear_script_single_transaction() {
         let mut dump = empty_dump();
         dump.schemas.push(make_schema("public"));
-        let script = dump.generate_clear_script(true, false);
+        let script = dump.generate_clear_script(true, false, false);
         assert!(script.contains("begin;\n"));
         assert!(script.contains("commit;\n"));
     }
@@ -1584,7 +1588,7 @@ mod tests {
     fn test_clear_script_no_transaction() {
         let mut dump = empty_dump();
         dump.schemas.push(make_schema("public"));
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         assert!(!script.contains("begin;"));
         assert!(!script.contains("commit;"));
     }
@@ -1594,7 +1598,7 @@ mod tests {
         let mut dump = empty_dump();
         dump.schemas.push(make_schema("public"));
         dump.tables.push(make_table("public", "users"));
-        let script = dump.generate_clear_script(false, true);
+        let script = dump.generate_clear_script(false, true, false);
         assert!(script.contains("/* Drop schema: public */"));
         assert!(script.contains("/* Drop table: public.users */"));
         assert!(script.contains("/* ---> Drop Tables --------------- */"));
@@ -1606,12 +1610,13 @@ mod tests {
         let mut dump = empty_dump();
         dump.schemas.push(make_schema("public"));
         dump.tables.push(make_table("public", "users"));
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         assert!(!script.contains("/* Drop schema:"));
         assert!(!script.contains("/* Drop table:"));
-        // Drop statements should still be present
-        assert!(script.contains("drop schema if exists public cascade;"));
-        assert!(script.contains("drop table if exists public.users cascade;"));
+        // Drop statements should still be present (without cascade)
+        assert!(script.contains("drop schema if exists public;"));
+        assert!(script.contains("drop table if exists public.users;"));
+        assert!(!script.contains("cascade"));
     }
 
     #[test]
@@ -1619,9 +1624,9 @@ mod tests {
         let mut dump = empty_dump();
         dump.schemas.push(make_schema("public"));
         dump.schemas.push(make_schema("analytics"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop schema if exists public cascade;"));
-        assert!(script.contains("drop schema if exists analytics cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop schema if exists public;"));
+        assert!(script.contains("drop schema if exists analytics;"));
     }
 
     #[test]
@@ -1629,9 +1634,9 @@ mod tests {
         let mut dump = empty_dump();
         dump.extensions.push(make_extension("uuid-ossp"));
         dump.extensions.push(make_extension("pg_trgm"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop extension if exists uuid-ossp cascade;"));
-        assert!(script.contains("drop extension if exists pg_trgm cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop extension if exists uuid-ossp;"));
+        assert!(script.contains("drop extension if exists pg_trgm;"));
     }
 
     #[test]
@@ -1639,9 +1644,9 @@ mod tests {
         let mut dump = empty_dump();
         dump.tables.push(make_table("public", "users"));
         dump.tables.push(make_table("public", "orders"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop table if exists public.users cascade;"));
-        assert!(script.contains("drop table if exists public.orders cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop table if exists public.users;"));
+        assert!(script.contains("drop table if exists public.orders;"));
     }
 
     #[test]
@@ -1649,12 +1654,12 @@ mod tests {
         let mut dump = empty_dump();
         dump.tables
             .push(make_table_with_fk("public", "orders", "fk_orders_users"));
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         let fk_pos = script
             .find("alter table public.orders drop constraint if exists fk_orders_users;")
             .expect("FK drop missing");
         let table_pos = script
-            .find("drop table if exists public.orders cascade;")
+            .find("drop table if exists public.orders;")
             .expect("table drop missing");
         assert!(fk_pos < table_pos, "FK should be dropped before the table");
     }
@@ -1663,8 +1668,8 @@ mod tests {
     fn test_clear_script_drops_views() {
         let mut dump = empty_dump();
         dump.views.push(make_view("public", "active_users"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop view if exists public.active_users cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop view if exists public.active_users;"));
     }
 
     #[test]
@@ -1672,8 +1677,8 @@ mod tests {
         let mut dump = empty_dump();
         dump.views
             .push(make_materialized_view("public", "daily_stats"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop materialized view if exists public.daily_stats cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop materialized view if exists public.daily_stats;"));
     }
 
     #[test]
@@ -1682,12 +1687,12 @@ mod tests {
         dump.views.push(make_view("public", "regular_view"));
         dump.views
             .push(make_materialized_view("public", "mat_view"));
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         let mat_pos = script
-            .find("drop materialized view if exists public.mat_view cascade;")
+            .find("drop materialized view if exists public.mat_view;")
             .expect("materialized view drop missing");
         let reg_pos = script
-            .find("drop view if exists public.regular_view cascade;")
+            .find("drop view if exists public.regular_view;")
             .expect("regular view drop missing");
         assert!(
             mat_pos < reg_pos,
@@ -1699,15 +1704,15 @@ mod tests {
     fn test_clear_script_drops_sequences() {
         let mut dump = empty_dump();
         dump.sequences.push(make_sequence("public", "users_id_seq"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop sequence if exists public.users_id_seq cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop sequence if exists public.users_id_seq;"));
     }
 
     #[test]
     fn test_clear_script_drops_routines() {
         let mut dump = empty_dump();
         dump.routines.push(make_routine("public", "my_func"));
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         assert!(script.contains("drop function if exists public.my_func ();"));
     }
 
@@ -1715,8 +1720,8 @@ mod tests {
     fn test_clear_script_drops_types() {
         let mut dump = empty_dump();
         dump.types.push(make_pg_type("public", "my_composite"));
-        let script = dump.generate_clear_script(false, false);
-        assert!(script.contains("drop type if exists public.my_composite cascade;"));
+        let script = dump.generate_clear_script(false, false, false);
+        assert!(script.contains("drop type if exists public.my_composite;"));
     }
 
     #[test]
@@ -1730,29 +1735,17 @@ mod tests {
         dump.tables.push(make_table("public", "tbl1"));
         dump.views.push(make_view("public", "v1"));
 
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
 
-        let view_pos = script
-            .find("drop view if exists public.v1 cascade;")
-            .unwrap();
-        let table_pos = script
-            .find("drop table if exists public.tbl1 cascade;")
-            .unwrap();
+        let view_pos = script.find("drop view if exists public.v1;").unwrap();
+        let table_pos = script.find("drop table if exists public.tbl1;").unwrap();
         let routine_pos = script
             .find("drop function if exists public.fn1 ();")
             .unwrap();
-        let seq_pos = script
-            .find("drop sequence if exists public.seq1 cascade;")
-            .unwrap();
-        let type_pos = script
-            .find("drop type if exists public.my_type cascade;")
-            .unwrap();
-        let ext_pos = script
-            .find("drop extension if exists pg_trgm cascade;")
-            .unwrap();
-        let schema_pos = script
-            .find("drop schema if exists public cascade;")
-            .unwrap();
+        let seq_pos = script.find("drop sequence if exists public.seq1;").unwrap();
+        let type_pos = script.find("drop type if exists public.my_type;").unwrap();
+        let ext_pos = script.find("drop extension if exists pg_trgm;").unwrap();
+        let schema_pos = script.find("drop schema if exists public;").unwrap();
 
         assert!(view_pos < table_pos, "views before tables");
         assert!(table_pos < routine_pos, "tables before routines");
@@ -1765,10 +1758,54 @@ mod tests {
     #[test]
     fn test_clear_script_header_contains_db_info() {
         let dump = empty_dump();
-        let script = dump.generate_clear_script(false, false);
+        let script = dump.generate_clear_script(false, false, false);
         assert!(script.contains("Database: testdb"));
         assert!(script.contains("Schema(s): public"));
         assert!(script.contains("Dump Info:"));
+    }
+
+    #[test]
+    fn test_clear_script_no_cascade_by_default() {
+        let mut dump = empty_dump();
+        dump.schemas.push(make_schema("public"));
+        dump.extensions.push(make_extension("pg_trgm"));
+        dump.types.push(make_pg_type("public", "my_type"));
+        dump.sequences.push(make_sequence("public", "seq1"));
+        dump.tables.push(make_table("public", "tbl1"));
+        dump.views.push(make_view("public", "v1"));
+
+        let script = dump.generate_clear_script(false, false, false);
+
+        assert!(
+            !script.contains("cascade"),
+            "default should not use CASCADE"
+        );
+        assert!(script.contains("drop view if exists public.v1;"));
+        assert!(script.contains("drop table if exists public.tbl1;"));
+        assert!(script.contains("drop sequence if exists public.seq1;"));
+        assert!(script.contains("drop type if exists public.my_type;"));
+        assert!(script.contains("drop extension if exists pg_trgm;"));
+        assert!(script.contains("drop schema if exists public;"));
+    }
+
+    #[test]
+    fn test_clear_script_cascade_when_enabled() {
+        let mut dump = empty_dump();
+        dump.schemas.push(make_schema("public"));
+        dump.extensions.push(make_extension("pg_trgm"));
+        dump.types.push(make_pg_type("public", "my_type"));
+        dump.sequences.push(make_sequence("public", "seq1"));
+        dump.tables.push(make_table("public", "tbl1"));
+        dump.views.push(make_view("public", "v1"));
+
+        let script = dump.generate_clear_script(false, false, true);
+
+        assert!(script.contains("drop view if exists public.v1 cascade;"));
+        assert!(script.contains("drop table if exists public.tbl1 cascade;"));
+        assert!(script.contains("drop sequence if exists public.seq1 cascade;"));
+        assert!(script.contains("drop type if exists public.my_type cascade;"));
+        assert!(script.contains("drop extension if exists pg_trgm cascade;"));
+        assert!(script.contains("drop schema if exists public cascade;"));
     }
 
     #[test]
@@ -1786,7 +1823,7 @@ mod tests {
         dump.routines.push(make_routine("app", "calc_total"));
         dump.types.push(make_pg_type("app", "order_status"));
 
-        let script = dump.generate_clear_script(true, true);
+        let script = dump.generate_clear_script(true, true, false);
 
         // Transaction wrapping
         assert!(script.contains("begin;"));
@@ -1801,16 +1838,17 @@ mod tests {
         assert!(script.contains("/* ---> Drop Extensions --------------- */"));
         assert!(script.contains("/* ---> Drop Schemas --------------- */"));
 
-        // All objects are dropped
-        assert!(script.contains("drop materialized view if exists app.daily_report cascade;"));
-        assert!(script.contains("drop view if exists app.order_summary cascade;"));
+        // All objects are dropped (without cascade by default)
+        assert!(script.contains("drop materialized view if exists app.daily_report;"));
+        assert!(script.contains("drop view if exists app.order_summary;"));
         assert!(script.contains("alter table app.orders drop constraint if exists fk_user;"));
-        assert!(script.contains("drop table if exists app.orders cascade;"));
-        assert!(script.contains("drop table if exists app.users cascade;"));
+        assert!(script.contains("drop table if exists app.orders;"));
+        assert!(script.contains("drop table if exists app.users;"));
         assert!(script.contains("drop function if exists app.calc_total ();"));
-        assert!(script.contains("drop sequence if exists app.orders_id_seq cascade;"));
-        assert!(script.contains("drop type if exists app.order_status cascade;"));
-        assert!(script.contains("drop extension if exists uuid-ossp cascade;"));
-        assert!(script.contains("drop schema if exists app cascade;"));
+        assert!(script.contains("drop sequence if exists app.orders_id_seq;"));
+        assert!(script.contains("drop type if exists app.order_status;"));
+        assert!(script.contains("drop extension if exists uuid-ossp;"));
+        assert!(script.contains("drop schema if exists app;"));
+        assert!(!script.contains("cascade"));
     }
 }

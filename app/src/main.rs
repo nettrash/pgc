@@ -89,6 +89,13 @@ struct Args {
     /// Maximum number of connections in the PostgreSQL connection pool
     #[arg(long, default_value = "8", value_parser = clap::value_parser!(u32).range(1..))]
     max_connections: u32,
+
+    /// Use CASCADE in DROP statements for the clear command. WARNING: CASCADE can drop
+    /// dependent objects outside the selected schema(s) (e.g., foreign keys or views in
+    /// other schemas that reference the dropped objects). Without this flag, drops rely
+    /// on explicit ordering only and will fail if unresolved cross-schema dependencies exist.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
+    use_cascade: bool,
 }
 
 fn parse_grants_mode(src: &str) -> Result<GrantsMode, String> {
@@ -163,6 +170,7 @@ async fn run_main() -> Result<(), Error> {
                     args.output.unwrap(),
                     args.use_single_transaction,
                     args.use_comments,
+                    args.use_cascade,
                     args.max_connections,
                 )
                 .await;
@@ -276,6 +284,7 @@ async fn clear_database(
     output: String,
     use_single_transaction: bool,
     use_comments: bool,
+    use_cascade: bool,
     max_connections: u32,
 ) -> Result<(), Error> {
     let mut dump = Dump::new(dump_config);
@@ -283,7 +292,7 @@ async fn clear_database(
     dump.inspect(max_connections).await?;
     println!("--> Database info:\n{}\n", dump.get_info());
     println!("Generating clear script...");
-    let script = dump.generate_clear_script(use_single_transaction, use_comments);
+    let script = dump.generate_clear_script(use_single_transaction, use_comments, use_cascade);
     let mut file = std::fs::File::create(&output)?;
     std::io::Write::write_all(&mut file, script.as_bytes())?;
     println!("Clear script generated successfully: {output}");

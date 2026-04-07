@@ -73,6 +73,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `8`.
 
+`--use-cascade` - add `CASCADE` to every `DROP` statement in the clear script. **Warning:** `CASCADE` can silently drop dependent objects that live outside the selected schema(s) (e.g., foreign keys or views in other schemas referencing the dropped objects). Use only when you are certain no cross-schema dependencies should survive. Without this flag the generated drops rely on the explicit dependency ordering and will fail cleanly if unresolved dependencies exist.
+
 ## Functionality
 
 ### Create database schema dump
@@ -115,6 +117,7 @@ The resulting script can be applied on another database that shares the same sch
 Optional flags:
 - `--use-single-transaction` wraps the script in `BEGIN` / `COMMIT`.
 - `--use-comments` (default `true`) adds explanatory comments before each drop statement.
+- `--use-cascade` appends `CASCADE` to every `DROP` statement so that dependent objects outside the inspected schema(s) are removed automatically. **Use with caution** — this can drop objects you did not intend to remove (see `--use-cascade` description above).
 
 ## Configuration file
 
