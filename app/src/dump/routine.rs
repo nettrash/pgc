@@ -1226,6 +1226,16 @@ mod tests {
     }
 
     #[test]
+    fn split_arguments_jsonb_default_multiline() {
+        // A multiline JSONB literal (containing newlines inside the quoted string)
+        // must be treated as a single argument — newlines and commas inside the
+        // single-quoted literal must not trigger a split.
+        let input = "p jsonb DEFAULT '{\n    \"key1\": \"value1\",\n    \"key2\": \"value2\"\n}'::jsonb";
+        let result = Routine::split_arguments(input);
+        assert_eq!(result, vec![input]);
+    }
+
+    #[test]
     fn arguments_with_defaults_jsonb_default() {
         // Full round-trip for Issue #155: a function with a multi-key JSONB
         // default must reconstruct the full default without splitting on the
