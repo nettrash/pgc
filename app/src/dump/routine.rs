@@ -458,7 +458,6 @@ impl Routine {
         let mut parts = Vec::new();
         let mut depth: i32 = 0;
         let mut in_quote = false;
-        let mut in_dollar_quote: Option<String> = None;
         let mut current = String::new();
 
         let chars: Vec<(usize, char)> = s.char_indices().collect();
@@ -466,7 +465,7 @@ impl Routine {
         let mut i = 0;
 
         while i < len {
-            let (byte_i, ch) = chars[i];
+            let (_byte_i, ch) = chars[i];
 
             if in_quote {
                 // Inside a single-quoted string literal.
@@ -492,43 +491,12 @@ impl Routine {
                 }
             }
 
-            if let Some(ref tag) = in_dollar_quote {
-                // Inside a dollar-quoted string: scan for the closing tag.
-                if ch == '$' && s[byte_i..].starts_with(tag.as_str()) {
-                    // Closing dollar tag found.
-                    current.push_str(tag);
-                    i += tag.chars().count();
-                    in_dollar_quote = None;
-                    continue;
-                } else {
-                    current.push(ch);
-                    i += 1;
-                    continue;
-                }
-            }
-
             // Outside any string literal.
             match ch {
                 '\'' => {
                     in_quote = true;
                     current.push(ch);
                     i += 1;
-                }
-                '$' => {
-                    // Detect dollar-quote opening tag: $tag$ or $$.
-                    // Scan ahead for the next '$'.
-                    let rest = &s[byte_i..];
-                    if let Some(end_offset) = rest[1..].find('$') {
-                        // end_offset is relative to rest[1..], so the closing '$' is at
-                        // position byte_i + 1 + end_offset in the original string.
-                        let tag = &rest[..end_offset + 2]; // includes both '$' delimiters
-                        in_dollar_quote = Some(tag.to_string());
-                        current.push_str(tag);
-                        i += tag.chars().count();
-                    } else {
-                        current.push(ch);
-                        i += 1;
-                    }
                 }
                 '(' => {
                     depth += 1;
@@ -1208,7 +1176,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // split_arguments: single-quote and dollar-quote handling (Issue #154)
+    // split_arguments: single-quote handling (Issue #154)
     // -----------------------------------------------------------------
 
     #[test]
@@ -1241,14 +1209,6 @@ mod tests {
         let input = "a numeric(10,2), b text";
         let result = Routine::split_arguments(input);
         assert_eq!(result, vec!["a numeric(10,2)", " b text"]);
-    }
-
-    #[test]
-    fn split_arguments_dollar_quoted_string() {
-        assert_eq!(
-            Routine::split_arguments("$$hello, world$$, 42"),
-            vec!["$$hello, world$$", " 42"]
-        );
     }
 
     #[test]
