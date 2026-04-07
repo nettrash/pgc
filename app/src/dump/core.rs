@@ -1181,8 +1181,9 @@ impl Dump {
     }
 
     /// Generate a SQL script that drops all objects found in this dump.
-    /// The drop order respects dependencies: views, tables (with foreign keys
-    /// dropped first), routines, sequences, types/enums, extensions, schemas.
+    /// The drop order respects dependencies: views (topologically sorted by
+    /// table_relation), tables (with foreign keys dropped first), routines,
+    /// sequences, types/enums, extensions, schemas.
     pub fn generate_clear_script(
         &self,
         use_single_transaction: bool,
@@ -1205,39 +1206,92 @@ impl Dump {
             script.append_block("begin;");
         }
 
-        // 1. Drop views (materialized first, then regular) — they depend on tables
-        let mut materialized_views: Vec<&View> =
-            self.views.iter().filter(|v| v.is_materialized).collect();
-        let mut regular_views: Vec<&View> =
-            self.views.iter().filter(|v| !v.is_materialized).collect();
-        // Reverse order to handle inter-view dependencies
-        materialized_views.reverse();
-        regular_views.reverse();
-
+        // 1. Drop views in dependency-safe order (topological sort on table_relation).
+        //    Views that depend on other views are dropped first.  Tie-breaker:
+        //    materialized views before regular views, then alphabetical by schema.name.
         if !self.views.is_empty() {
+            use std::collections::HashSet;
+
+            let n = self.views.len();
+
+            // Qualified name for each view.
+            let view_keys: Vec<String> = self
+                .views
+                .iter()
+                .map(|v| format!("{}.{}", v.schema, v.name))
+                .collect();
+
+            // Map qualified name → index (only views, not tables).
+            let key_to_idx: HashMap<&str, usize> = view_keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.as_str(), i))
+                .collect();
+
+            // Build the drop-order graph.
+            // Edge i → j means view i depends on view j, so i must be dropped first.
+            // in_degree[j] = number of views that must be dropped before j.
+            let mut in_degree = vec![0usize; n];
+            let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+            for (i, view) in self.views.iter().enumerate() {
+                for rel in &view.table_relation {
+                    if let Some(&j) = key_to_idx.get(rel.as_str())
+                        && j != i
+                    {
+                        edges[i].push(j);
+                        in_degree[j] += 1;
+                    }
+                }
+            }
+
+            // Kahn's algorithm with a deterministic tie-breaker.
+            let sort_key = |idx: &usize| {
+                let v = &self.views[*idx];
+                // materialized first (false < true, so negate), then alphabetical
+                (!v.is_materialized, view_keys[*idx].clone())
+            };
+
+            let mut ready: Vec<usize> = (0..n).filter(|i| in_degree[*i] == 0).collect();
+            ready.sort_by_key(sort_key);
+
+            let mut drop_order: Vec<usize> = Vec::with_capacity(n);
+            while let Some(idx) = ready.first().copied() {
+                ready.remove(0);
+                drop_order.push(idx);
+
+                for &j in &edges[idx] {
+                    in_degree[j] -= 1;
+                    if in_degree[j] == 0 {
+                        ready.push(j);
+                        ready.sort_by_key(sort_key);
+                    }
+                }
+            }
+
+            // If cycles exist, append remaining views in stable order.
+            if drop_order.len() < n {
+                let processed: HashSet<usize> = drop_order.iter().copied().collect();
+                let mut remaining: Vec<usize> = (0..n).filter(|i| !processed.contains(i)).collect();
+                remaining.sort_by_key(sort_key);
+                drop_order.extend(remaining);
+            }
+
             if use_comments {
                 script.append_block("\n/* ---> Drop Views --------------- */");
             }
-            for view in materialized_views {
+            for &idx in &drop_order {
+                let view = &self.views[idx];
                 if use_comments {
-                    script.push_str(&format!(
-                        "/* Drop materialized view: {}.{} */\n",
-                        view.schema, view.name
-                    ));
-                }
-                script.push_str(
-                    &format!(
-                        "drop {} if exists {}.{}{cascade_suffix};",
-                        view.view_keyword(),
-                        view.schema,
-                        view.name
-                    )
-                    .with_empty_lines(),
-                );
-            }
-            for view in regular_views {
-                if use_comments {
-                    script.push_str(&format!("/* Drop view: {}.{} */\n", view.schema, view.name));
+                    if view.is_materialized {
+                        script.push_str(&format!(
+                            "/* Drop materialized view: {}.{} */\n",
+                            view.schema, view.name
+                        ));
+                    } else {
+                        script
+                            .push_str(&format!("/* Drop view: {}.{} */\n", view.schema, view.name));
+                    }
                 }
                 script.push_str(
                     &format!(
@@ -1496,6 +1550,15 @@ mod tests {
             "select 1".to_string(),
             schema.to_string(),
             Vec::new(),
+        )
+    }
+
+    fn make_view_with_deps(schema: &str, name: &str, deps: Vec<&str>) -> View {
+        View::new(
+            name.to_string(),
+            "select 1".to_string(),
+            schema.to_string(),
+            deps.into_iter().map(String::from).collect(),
         )
     }
 
@@ -1870,5 +1933,115 @@ mod tests {
         assert!(script.contains("drop extension if exists \"uuid-ossp\";"));
         assert!(script.contains("drop schema if exists app;"));
         assert!(!script.contains("cascade"));
+    }
+
+    #[test]
+    fn test_clear_script_view_on_view_dependency_order() {
+        // v_top_customers depends on v_customer_summary — must be dropped first
+        let mut dump = empty_dump();
+        dump.views.push(make_view_with_deps(
+            "app",
+            "v_customer_summary",
+            vec!["app.customers"],
+        ));
+        dump.views.push(make_view_with_deps(
+            "app",
+            "v_top_customers",
+            vec!["app.v_customer_summary"],
+        ));
+
+        let script = dump.generate_clear_script(false, false, false);
+        let top_pos = script
+            .find("drop view if exists app.v_top_customers;")
+            .expect("v_top_customers drop missing");
+        let summary_pos = script
+            .find("drop view if exists app.v_customer_summary;")
+            .expect("v_customer_summary drop missing");
+        assert!(
+            top_pos < summary_pos,
+            "dependent view must be dropped before its dependency"
+        );
+    }
+
+    #[test]
+    fn test_clear_script_regular_view_depends_on_materialized_view() {
+        // regular view depends on a materialized view
+        let mut dump = empty_dump();
+        let mut mv = make_view_with_deps("app", "base_stats", vec!["app.orders"]);
+        mv.is_materialized = true;
+        mv.hash();
+        dump.views.push(mv);
+        dump.views.push(make_view_with_deps(
+            "app",
+            "top_stats",
+            vec!["app.base_stats"],
+        ));
+
+        let script = dump.generate_clear_script(false, false, false);
+        let top_pos = script
+            .find("drop view if exists app.top_stats;")
+            .expect("top_stats drop missing");
+        let base_pos = script
+            .find("drop materialized view if exists app.base_stats;")
+            .expect("base_stats drop missing");
+        assert!(
+            top_pos < base_pos,
+            "regular view that depends on materialized view must be dropped first"
+        );
+    }
+
+    #[test]
+    fn test_clear_script_three_level_view_chain() {
+        // c depends on b, b depends on a — must drop c, b, a
+        let mut dump = empty_dump();
+        dump.views
+            .push(make_view_with_deps("s", "a", vec!["s.tbl"]));
+        dump.views.push(make_view_with_deps("s", "b", vec!["s.a"]));
+        dump.views.push(make_view_with_deps("s", "c", vec!["s.b"]));
+
+        let script = dump.generate_clear_script(false, false, false);
+        let pos_c = script.find("drop view if exists s.c;").unwrap();
+        let pos_b = script.find("drop view if exists s.b;").unwrap();
+        let pos_a = script.find("drop view if exists s.a;").unwrap();
+        assert!(pos_c < pos_b, "c before b");
+        assert!(pos_b < pos_a, "b before a");
+    }
+
+    #[test]
+    fn test_clear_script_views_stable_alphabetical_tie_break() {
+        // Independent views with no deps — must appear in alphabetical order
+        let mut dump = empty_dump();
+        dump.views.push(make_view("s", "zeta"));
+        dump.views.push(make_view("s", "alpha"));
+        dump.views.push(make_view("s", "mu"));
+
+        let script = dump.generate_clear_script(false, false, false);
+        let pos_a = script.find("drop view if exists s.alpha;").unwrap();
+        let pos_m = script.find("drop view if exists s.mu;").unwrap();
+        let pos_z = script.find("drop view if exists s.zeta;").unwrap();
+        assert!(pos_a < pos_m, "alpha before mu");
+        assert!(pos_m < pos_z, "mu before zeta");
+    }
+
+    #[test]
+    fn test_clear_script_views_materialized_tie_break_before_regular() {
+        // At the same dependency level, materialized views come first
+        let mut dump = empty_dump();
+        dump.views.push(make_view("s", "regular_b"));
+        dump.views.push(make_materialized_view("s", "mat_a"));
+        dump.views.push(make_view("s", "regular_a"));
+
+        let script = dump.generate_clear_script(false, false, false);
+        let mat_pos = script
+            .find("drop materialized view if exists s.mat_a;")
+            .unwrap();
+        let reg_a_pos = script.find("drop view if exists s.regular_a;").unwrap();
+        let reg_b_pos = script.find("drop view if exists s.regular_b;").unwrap();
+        assert!(mat_pos < reg_a_pos, "materialized before regular_a");
+        assert!(mat_pos < reg_b_pos, "materialized before regular_b");
+        assert!(
+            reg_a_pos < reg_b_pos,
+            "regular_a before regular_b alphabetically"
+        );
     }
 }

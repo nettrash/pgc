@@ -303,15 +303,16 @@ The `clear_test.sql` file creates a self-contained set of database objects acros
 
 The generated clear script must drop objects in this order to avoid dependency errors:
 
-1. **Materialized views** (`mv_daily_orders`, `mv_audit_stats`)
-2. **Regular views** (`v_top_customers` before `v_customer_summary`)
-3. **Foreign key constraints** (all FKs across all tables)
-4. **Tables** (`customers`, `categories`, `orders`, `order_items`, `audit_log`, `employees`)
-5. **Routines** (`update_timestamp`, `get_customer_order_total`, `format_audit_entry`, `active_customer_count`, `cleanup_old_orders`)
-6. **Sequences** (`customer_id_seq`, `audit_id_seq`)
-7. **Types** (`order_status`, `full_name`, `positive_int`)
-8. **Extensions** (`uuid-ossp`, `pg_trgm`)
-9. **Schemas** (`clear_app`, `clear_shared`)
+1. **Views** (topologically sorted by `table_relation`; tie-break: materialized before regular, then alphabetical by `schema.name`)
+   - `v_top_customers` depends on `v_customer_summary`, so it is dropped first
+   - Materialized views with no view-dependencies appear before regular views at the same level
+2. **Foreign key constraints** (all FKs across all tables)
+3. **Tables** (`customers`, `categories`, `orders`, `order_items`, `audit_log`, `employees`)
+4. **Routines** (`update_timestamp`, `get_customer_order_total`, `format_audit_entry`, `active_customer_count`, `cleanup_old_orders`)
+5. **Sequences** (`customer_id_seq`, `audit_id_seq`)
+6. **Types** (`order_status`, `full_name`, `positive_int`)
+7. **Extensions** (`uuid-ossp`, `pg_trgm`)
+8. **Schemas** (`clear_app`, `clear_shared`)
 
 ### How to Run
 

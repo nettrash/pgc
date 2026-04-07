@@ -4,7 +4,7 @@
  The actual script header will differ (it includes runtime dump info).
 
  Objects are dropped in dependency-safe order:
-   1. Views (materialized first, then regular)
+   1. Views (topologically sorted by table_relation; tie-break: materialized first, then alphabetical)
    2. Foreign key constraints
    3. Tables
    4. Routines (functions, procedures)

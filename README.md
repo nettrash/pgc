@@ -103,7 +103,7 @@ pgc --command clear --server {host} --database {database} --scheme {scheme} --ou
 
 This command connects to the specified database, discovers all objects in the given schema(s) and produces a SQL script that drops every found object in dependency-safe order:
 
-1. Views (materialized views first, then regular views)
+1. Views (topologically sorted by `table_relation`; tie-break: materialized before regular, then alphabetical)
 2. Foreign key constraints
 3. Tables
 4. Routines (functions, procedures, aggregates)
