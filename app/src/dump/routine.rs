@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn arguments_with_defaults_jsonb_default() {
-        // Full round-trip for Issue #155: a function with a multi-key JSONB
+        // Full round-trip for Issue #154: a function with a multi-key JSONB
         // default must reconstruct the full default without splitting on the
         // commas inside the quoted literal.
         let routine = Routine::new(
