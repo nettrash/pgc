@@ -6,6 +6,16 @@ pub trait StringExt {
     fn append_block(&mut self, other: &str);
 }
 
+/// Normalize CRLF line endings to LF, returning the original string
+/// unchanged (no allocation) when it contains no `\r\n`.
+pub fn normalize_line_endings(s: String) -> String {
+    if s.contains("\r\n") {
+        s.replace("\r\n", "\n")
+    } else {
+        s
+    }
+}
+
 impl StringExt for String {
     fn with_empty_lines(mut self) -> String {
         self.push_str(EMPTY_LINES);
