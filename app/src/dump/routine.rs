@@ -456,7 +456,7 @@ impl Routine {
     /// E.g. "','::character varying, 0"  → ["','::character varying", " 0"]
     fn split_arguments(s: &str) -> Vec<String> {
         let mut parts = Vec::new();
-        let mut depth: i32 = 0;
+        let mut depth = 0;
         let mut in_quote = false;
         let mut current = String::new();
         let mut iter = s.chars().peekable();
@@ -483,13 +483,24 @@ impl Routine {
 
             // Outside any string literal.
             match ch {
-                '\'' => { in_quote = true; current.push(ch); }
-                '(' => { depth += 1; current.push(ch); }
-                ')' => { depth -= 1; current.push(ch); }
+                '\'' => {
+                    in_quote = true;
+                    current.push(ch);
+                }
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
                 ',' if depth == 0 => {
                     parts.push(std::mem::take(&mut current));
                 }
-                _ => { current.push(ch); }
+                _ => {
+                    current.push(ch);
+                }
             }
         }
 
