@@ -1194,6 +1194,62 @@ mod tests {
         assert_eq!(result, vec!["a numeric(10,2)", " b text"]);
     }
 
+    // -----------------------------------------------------------------
+    // split_arguments: JSONB default with commas (Issue #155)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn split_arguments_jsonb_default_with_commas() {
+        // A JSONB literal default containing multiple comma-separated key-value
+        // pairs must not be split into multiple arguments.
+        let input = r#"p jsonb DEFAULT '{"key1": "value1", "key2": "value2"}'::jsonb"#;
+        let result = Routine::split_arguments(input);
+        assert_eq!(
+            result,
+            vec![r#"p jsonb DEFAULT '{"key1": "value1", "key2": "value2"}'::jsonb"#]
+        );
+    }
+
+    #[test]
+    fn split_arguments_jsonb_default_multiple_args() {
+        // JSONB default alongside other arguments: only the top-level comma
+        // (outside the single-quoted literal) must be treated as a delimiter.
+        let input = r#"id integer, opts jsonb DEFAULT '{"a": 1, "b": 2}'::jsonb"#;
+        let result = Routine::split_arguments(input);
+        assert_eq!(
+            result,
+            vec![
+                "id integer",
+                r#" opts jsonb DEFAULT '{"a": 1, "b": 2}'::jsonb"#
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_with_defaults_jsonb_default() {
+        // Full round-trip for Issue #155: a function with a multi-key JSONB
+        // default must reconstruct the full default without splitting on the
+        // commas inside the quoted literal.
+        let routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(400),
+            "foo".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "void".to_string(),
+            "p jsonb".to_string(),
+            Some(r#"'{"key1": "value1", "key2": "value2"}'::jsonb"#.to_string()),
+            None,
+            "BEGIN END".to_string(),
+        );
+
+        let result = routine.arguments_with_defaults();
+        assert_eq!(
+            result,
+            r#"p jsonb DEFAULT '{"key1": "value1", "key2": "value2"}'::jsonb"#
+        );
+    }
+
     #[test]
     fn arguments_with_defaults_comma_default() {
         // Full round-trip: a procedure with two varchar params where only the
