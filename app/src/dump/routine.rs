@@ -504,7 +504,9 @@ impl Routine {
             }
         }
 
-        parts.push(current);
+        if !current.is_empty() {
+            parts.push(current);
+        }
         parts
     }
 
