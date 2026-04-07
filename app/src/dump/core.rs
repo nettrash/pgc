@@ -1632,10 +1632,10 @@ mod tests {
     #[test]
     fn test_clear_script_drops_extensions() {
         let mut dump = empty_dump();
-        dump.extensions.push(make_extension("uuid-ossp"));
+        dump.extensions.push(make_extension("\"uuid-ossp\""));
         dump.extensions.push(make_extension("pg_trgm"));
         let script = dump.generate_clear_script(false, false, false);
-        assert!(script.contains("drop extension if exists uuid-ossp;"));
+        assert!(script.contains("drop extension if exists \"uuid-ossp\";"));
         assert!(script.contains("drop extension if exists pg_trgm;"));
     }
 
@@ -1812,7 +1812,7 @@ mod tests {
     fn test_clear_script_full_integration() {
         let mut dump = empty_dump();
         dump.schemas.push(make_schema("app"));
-        dump.extensions.push(make_extension("uuid-ossp"));
+        dump.extensions.push(make_extension("\"uuid-ossp\""));
         dump.tables
             .push(make_table_with_fk("app", "orders", "fk_user"));
         dump.tables.push(make_table("app", "users"));
@@ -1847,7 +1847,7 @@ mod tests {
         assert!(script.contains("drop function if exists app.calc_total ();"));
         assert!(script.contains("drop sequence if exists app.orders_id_seq;"));
         assert!(script.contains("drop type if exists app.order_status;"));
-        assert!(script.contains("drop extension if exists uuid-ossp;"));
+        assert!(script.contains("drop extension if exists \"uuid-ossp\";"));
         assert!(script.contains("drop schema if exists app;"));
         assert!(!script.contains("cascade"));
     }
