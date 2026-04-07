@@ -1265,7 +1265,13 @@ impl Dump {
                                 constraint.schema, constraint.table_name, constraint.name
                             ));
                         }
-                        script.push_str(&constraint.get_drop_script());
+                        script.push_str(
+                            &format!(
+                                "alter table {}.{} drop constraint if exists {};",
+                                constraint.schema, constraint.table_name, constraint.name
+                            )
+                            .with_empty_lines(),
+                        );
                     }
                 }
             }
@@ -1645,7 +1651,7 @@ mod tests {
             .push(make_table_with_fk("public", "orders", "fk_orders_users"));
         let script = dump.generate_clear_script(false, false);
         let fk_pos = script
-            .find("alter table public.orders drop constraint fk_orders_users;")
+            .find("alter table public.orders drop constraint if exists fk_orders_users;")
             .expect("FK drop missing");
         let table_pos = script
             .find("drop table if exists public.orders cascade;")
@@ -1798,7 +1804,7 @@ mod tests {
         // All objects are dropped
         assert!(script.contains("drop materialized view if exists app.daily_report cascade;"));
         assert!(script.contains("drop view if exists app.order_summary cascade;"));
-        assert!(script.contains("alter table app.orders drop constraint fk_user;"));
+        assert!(script.contains("alter table app.orders drop constraint if exists fk_user;"));
         assert!(script.contains("drop table if exists app.orders cascade;"));
         assert!(script.contains("drop table if exists app.users cascade;"));
         assert!(script.contains("drop function if exists app.calc_total ();"));

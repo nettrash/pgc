@@ -33,16 +33,16 @@ drop view if exists clear_app.v_customer_summary cascade;
 /* ---> Drop Tables --------------- */
 
 /* Drop foreign key: clear_app.orders.orders_customer_id_fkey */
-alter table clear_app.orders drop constraint orders_customer_id_fkey;
+alter table clear_app.orders drop constraint if exists orders_customer_id_fkey;
 
 /* Drop foreign key: clear_app.orders.orders_category_id_fkey */
-alter table clear_app.orders drop constraint orders_category_id_fkey;
+alter table clear_app.orders drop constraint if exists orders_category_id_fkey;
 
 /* Drop foreign key: clear_app.order_items.order_items_order_id_fkey */
-alter table clear_app.order_items drop constraint order_items_order_id_fkey;
+alter table clear_app.order_items drop constraint if exists order_items_order_id_fkey;
 
 /* Drop foreign key: clear_app.employees.employees_manager_id_fkey */
-alter table clear_app.employees drop constraint employees_manager_id_fkey;
+alter table clear_app.employees drop constraint if exists employees_manager_id_fkey;
 
 /* Drop table: clear_app.customers */
 drop table if exists clear_app.customers cascade;
