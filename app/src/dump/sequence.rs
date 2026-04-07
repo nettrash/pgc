@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::utils::string_extensions::StringExt;
+
 // This is an information about a PostgreSQL sequence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sequence {
@@ -174,13 +176,13 @@ impl Sequence {
             script.push_str(" no cycle");
         }
 
-        script.push_str(";\n");
+        script.append_block(";");
 
         script.push_str(&self.get_owner_script());
 
         if let Some(comment) = &self.comment {
-            script.push_str(&format!(
-                "comment on sequence {}.{} is '{}';\n",
+            script.append_block(&format!(
+                "comment on sequence {}.{} is '{}';",
                 self.schema,
                 self.name,
                 comment.replace('\'', "''")
@@ -191,7 +193,7 @@ impl Sequence {
     }
 
     pub fn get_drop_script(&self) -> String {
-        format!("drop sequence if exists {}.{};\n", self.schema, self.name)
+        format!("drop sequence if exists {}.{};", self.schema, self.name).with_empty_lines()
     }
 
     pub fn get_alter_script(&self) -> String {
@@ -228,17 +230,19 @@ impl Sequence {
         }
 
         let mut script = format!("alter sequence {}.{}", self.schema, self.name);
+
         if !clauses.is_empty() {
             script.push(' ');
             script.push_str(&clauses.join(" "));
         }
-        script.push_str(";\n");
+
+        script.append_block(";");
 
         script.push_str(&self.get_owner_script());
 
         if let Some(comment) = &self.comment {
-            script.push_str(&format!(
-                "comment on sequence {}.{} is '{}';\n",
+            script.append_block(&format!(
+                "comment on sequence {}.{} is '{}';",
                 self.schema,
                 self.name,
                 comment.replace('\'', "''")
@@ -254,9 +258,10 @@ impl Sequence {
         }
 
         format!(
-            "alter sequence {}.{} owner to {};\n",
+            "alter sequence {}.{} owner to {};",
             self.schema, self.name, self.owner
         )
+        .with_empty_lines()
     }
 }
 
@@ -313,7 +318,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\nalter sequence public.order_id_seq owner to postgres;\n",
+            "create sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle;\n\nalter sequence public.order_id_seq owner to postgres;\n\n",
         );
     }
 
@@ -338,7 +343,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_script(),
-            "create sequence public.minimal_seq no minvalue no maxvalue no cycle;\nalter sequence public.minimal_seq owner to postgres;\n",
+            "create sequence public.minimal_seq no minvalue no maxvalue no cycle;\n\nalter sequence public.minimal_seq owner to postgres;\n\n",
         );
     }
 
@@ -347,7 +352,7 @@ mod tests {
         let sequence = build_sequence();
         assert_eq!(
             sequence.get_drop_script(),
-            "drop sequence if exists public.order_id_seq;\n"
+            "drop sequence if exists public.order_id_seq;\n\n"
         );
     }
 
@@ -357,7 +362,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by public.orders.id;\nalter sequence public.order_id_seq owner to postgres;\n",
+            "alter sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by public.orders.id;\n\nalter sequence public.order_id_seq owner to postgres;\n\n",
         );
     }
 
@@ -382,7 +387,7 @@ mod tests {
 
         assert_eq!(
             sequence.get_alter_script(),
-            "alter sequence audit.event_seq start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".column;\nalter sequence audit.event_seq owner to postgres;\n",
+            "alter sequence audit.event_seq start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".column;\n\nalter sequence audit.event_seq owner to postgres;\n\n",
         );
     }
 }

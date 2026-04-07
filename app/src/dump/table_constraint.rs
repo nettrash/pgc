@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::utils::string_extensions::StringExt;
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableConstraint {
@@ -78,7 +80,7 @@ impl TableConstraint {
         };
 
         script.push_str(&format!("{} ", clause));
-        script.push_str(";\n");
+        script.append_block(";");
         script
     }
 
@@ -209,19 +211,19 @@ impl TableConstraint {
             {
                 if target.is_deferrable {
                     if target.initially_deferred {
-                        script.push_str(&format!(
-                            "alter table {}.{} alter constraint {} deferrable initially deferred;\n",
+                        script.append_block(&format!(
+                            "alter table {}.{} alter constraint {} deferrable initially deferred;",
                             self.schema, self.table_name, target.name
                         ));
                     } else {
-                        script.push_str(&format!(
-                            "alter table {}.{} alter constraint {} deferrable initially immediate;\n",
+                        script.append_block(&format!(
+                            "alter table {}.{} alter constraint {} deferrable initially immediate;",
                             self.schema, self.table_name, target.name
                         ));
                     }
                 } else {
-                    script.push_str(&format!(
-                        "alter table {}.{} alter constraint {} not deferrable;\n",
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} not deferrable;",
                         self.schema, self.table_name, target.name
                     ));
                 }
@@ -258,9 +260,10 @@ impl TableConstraint {
     /// Get drop script for this constraint
     pub fn get_drop_script(&self) -> String {
         format!(
-            "alter table {}.{} drop constraint {};\n",
+            "alter table {}.{} drop constraint {};",
             self.schema, self.table_name, self.name
         )
+        .with_empty_lines()
     }
 }
 
@@ -500,7 +503,7 @@ mod tests {
         let constraint = create_primary_key_constraint();
         let script = constraint.get_script();
 
-        let expected = "alter table public.users add constraint pk_users_id primary key ;\n";
+        let expected = "alter table public.users add constraint pk_users_id primary key ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -509,7 +512,7 @@ mod tests {
         let constraint = create_foreign_key_constraint();
         let script = constraint.get_script();
 
-        let expected = "alter table app.orders add constraint fk_orders_user_id foreign key deferrable initially deferred ;\n";
+        let expected = "alter table app.orders add constraint fk_orders_user_id foreign key deferrable initially deferred ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -518,7 +521,7 @@ mod tests {
         let constraint = create_unique_constraint();
         let script = constraint.get_script();
         // With reduced fields/behavior we no longer append null handling
-        let expected = "alter table analytics.products add constraint uk_products_sku unique ;\n";
+        let expected = "alter table analytics.products add constraint uk_products_sku unique ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -527,7 +530,7 @@ mod tests {
         let constraint = create_check_constraint();
         let script = constraint.get_script();
         // Simplified behavior: just the base type
-        let expected = "alter table test.persons add constraint chk_age_positive check ;\n";
+        let expected = "alter table test.persons add constraint chk_age_positive check ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -546,7 +549,7 @@ mod tests {
         };
 
         let script = constraint.get_script();
-        let expected = "alter table test.test_table add constraint test_constraint unique (id) deferrable initially deferred ;\n";
+        let expected = "alter table test.test_table add constraint test_constraint unique (id) deferrable initially deferred ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -565,7 +568,7 @@ mod tests {
         };
 
         let script = constraint.get_script();
-        let expected = "alter table \"PUBLIC\".\"USERS\" add constraint \"CONSTRAINT_NAME\" primary key (id) ;\n";
+        let expected = "alter table \"PUBLIC\".\"USERS\" add constraint \"CONSTRAINT_NAME\" primary key (id) ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -585,7 +588,7 @@ mod tests {
 
         let script = constraint.get_script();
         // Note: constraint_type.to_lowercase() produces empty string, but format!("{} ", "") produces " "
-        let expected = "alter table . add constraint   ;\n";
+        let expected = "alter table . add constraint   ;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -731,7 +734,7 @@ mod tests {
         assert!(script.contains("\"app$schema\".\"table#name\""));
         assert!(script.contains("\"constraint@name\""));
         assert!(script.contains("unique"));
-        assert!(script.ends_with(";\n"));
+        assert!(script.ends_with(";\n\n"));
     }
 
     #[test]
@@ -788,7 +791,7 @@ mod tests {
             let script = constraint.get_script();
             assert!(script.contains(&format!("add constraint {}", constraint.name)));
             assert!(script.contains(&constraint.constraint_type.to_lowercase()));
-            assert!(script.ends_with(";\n"));
+            assert!(script.ends_with(";\n\n"));
 
             // Each should produce a valid hash
             let mut hasher = Sha256::new();
@@ -962,7 +965,7 @@ mod tests {
 
         assert_eq!(
             drop_script,
-            "alter table app.orders drop constraint fk_orders_user_id;\n"
+            "alter table app.orders drop constraint fk_orders_user_id;\n\n"
         );
     }
 

@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::types::Oid;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::utils::string_extensions::StringExt;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DomainConstraint {
     pub name: String,
@@ -278,13 +280,14 @@ impl PgType {
                     .join(", ");
 
                 let mut script = format!(
-                    "create type {}.{} as enum ({});\n",
+                    "create type {}.{} as enum ({});",
                     self.schema, self.typname, variants
-                );
+                )
+                .with_empty_lines();
 
                 if let Some(comment) = &self.comment {
-                    script.push_str(&format!(
-                        "comment on type {}.{} is '{}';\n",
+                    script.append_block(&format!(
+                        "comment on type {}.{} is '{}';",
                         self.schema,
                         self.typname,
                         escape_single_quotes(comment)
@@ -320,11 +323,11 @@ impl PgType {
                     script.push_str(&clauses.join(" "));
                 }
 
-                script.push_str(";\n");
+                script.append_block(";");
 
                 for constraint in &self.domain_constraints {
-                    script.push_str(&format!(
-                        "alter domain {}.{} add constraint {} {};\n",
+                    script.append_block(&format!(
+                        "alter domain {}.{} add constraint {} {};",
                         self.schema,
                         self.typname,
                         quote_ident(&constraint.name),
@@ -332,8 +335,8 @@ impl PgType {
                     ));
                 }
                 if let Some(comment) = &self.comment {
-                    script.push_str(&format!(
-                        "comment on domain {}.{} is '{}';\n",
+                    script.append_block(&format!(
+                        "comment on domain {}.{} is '{}';",
                         self.schema,
                         self.typname,
                         escape_single_quotes(comment)
@@ -366,13 +369,14 @@ impl PgType {
                     .join(",\n");
 
                 let mut script = format!(
-                    "create type {}.{} as (\n{}\n);\n",
+                    "create type {}.{} as (\n{}\n);",
                     self.schema, self.typname, attributes
-                );
+                )
+                .with_empty_lines();
 
                 if let Some(comment) = &self.comment {
-                    script.push_str(&format!(
-                        "comment on type {}.{} is '{}';\n",
+                    script.append_block(&format!(
+                        "comment on type {}.{} is '{}';",
                         self.schema,
                         self.typname,
                         escape_single_quotes(comment)
@@ -400,7 +404,7 @@ impl PgType {
 
     /// Returns a statement to drop the user-defined type if it exists.
     pub fn get_drop_script(&self) -> String {
-        format!("drop type if exists {}.{};\n", self.schema, self.typname)
+        format!("drop type if exists {}.{};", self.schema, self.typname).with_empty_lines()
     }
 
     /// Returns a string to alter the existing user-defined type to match the target definition.
@@ -451,7 +455,7 @@ impl PgType {
                             ));
                         }
 
-                        statement.push_str(";\n");
+                        statement.append_block(";");
                         script.push_str(&statement);
                         known_labels.push(label.clone());
                     }
@@ -589,7 +593,7 @@ impl PgType {
                         self.schema, self.typname
                     )
                 } else {
-                    statements.join("\n") + "\n"
+                    statements.join("\n\n").with_empty_lines()
                 }
             }
             ('r', 'r') => format!(
@@ -609,18 +613,18 @@ impl PgType {
         if self.comment != target.comment {
             let comment_stmt = if let Some(cmt) = &target.comment {
                 format!(
-                    "comment on type {}.{} is '{}';\n",
+                    "comment on type {}.{} is '{}';",
                     target.schema,
                     target.typname,
                     escape_single_quotes(cmt)
                 )
             } else {
                 format!(
-                    "comment on type {}.{} is null;\n",
+                    "comment on type {}.{} is null;",
                     target.schema, target.typname
                 )
             };
-            script.push_str(&comment_stmt);
+            script.append_block(&comment_stmt);
         }
 
         if self.owner != target.owner {
@@ -642,9 +646,10 @@ impl PgType {
         };
 
         format!(
-            "alter {} {}.{} owner to {};\n",
+            "alter {} {}.{} owner to {};",
             object_keyword, self.schema, self.typname, self.owner
         )
+        .with_empty_lines()
     }
 }
 
@@ -750,7 +755,7 @@ mod tests {
 
         assert_eq!(
             script,
-            "create type public.status as enum ('simple', 'O''Reilly');\n"
+            "create type public.status as enum ('simple', 'O''Reilly');\n\n"
         );
     }
 
@@ -780,8 +785,8 @@ mod tests {
 
         let script = pg_type.get_script();
 
-        let expected = "create domain public.amount as integer default 42 not null;\n\
-alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
+        let expected = "create domain public.amount as integer default 42 not null;\n\n\
+alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n\n";
         assert_eq!(script, expected);
     }
 
@@ -803,7 +808,7 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
 
         assert_eq!(
             script,
-            "alter type public.status add value if not exists 'in_progress' before 'completed';\n"
+            "alter type public.status add value if not exists 'in_progress' before 'completed';\n\n"
         );
     }
 
@@ -846,11 +851,11 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n";
 
         let script = current.get_alter_script(&target);
 
-        let expected = "alter domain public.amount set default 84;\n\
-alter domain public.amount drop not null;\n\
-alter domain public.amount drop constraint \"ValueCheck\";\n\
-alter domain public.amount add constraint \"ValueCheck\" check (value >= 0);\n\
-alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0);\n";
+        let expected = "alter domain public.amount set default 84;\n\n\
+alter domain public.amount drop not null;\n\n\
+alter domain public.amount drop constraint \"ValueCheck\";\n\n\
+alter domain public.amount add constraint \"ValueCheck\" check (value >= 0);\n\n\
+alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0);\n\n";
 
         assert_eq!(script, expected);
     }
@@ -872,7 +877,7 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
 
         let script = pg_type.get_script();
 
-        let expected = "create type public.address_type as (\n    \"street\" varchar(255),\n    \"city\" varchar(100)\n);\n";
+        let expected = "create type public.address_type as (\n    \"street\" varchar(255),\n    \"city\" varchar(100)\n);\n\n";
         assert_eq!(script, expected);
     }
 
@@ -882,7 +887,7 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
 
         assert_eq!(
             pg_type.get_drop_script(),
-            "drop type if exists public.my_type;\n"
+            "drop type if exists public.my_type;\n\n"
         );
     }
 

@@ -24,6 +24,7 @@ target/
 dump.*
 *.dump
 output.sql
+clear_output.sql
 test.conf
 database.sql
 

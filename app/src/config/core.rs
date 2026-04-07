@@ -18,6 +18,8 @@ pub struct Config {
     pub use_comments: bool,
     // How to handle grants (privileges) during comparison
     pub grants_mode: GrantsMode,
+    // Maximum number of connections in the PostgreSQL connection pool
+    pub max_connections: u32,
 }
 
 impl Config {
@@ -58,6 +60,7 @@ impl Config {
         let mut use_single_transaction = false;
         let mut use_comments = true;
         let mut grants_mode = GrantsMode::Ignore;
+        let mut max_connections: u32 = 8;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -93,6 +96,7 @@ impl Config {
                 && key != "USE_SINGLE_TRANSACTION"
                 && key != "USE_COMMENTS"
                 && key != "GRANTS_MODE"
+                && key != "MAX_CONNECTIONS"
             {
                 panic!("Unknown configuration key: {}", parts[0]);
             }
@@ -136,6 +140,16 @@ impl Config {
                         .parse::<GrantsMode>()
                         .unwrap_or_else(|e| panic!("{e}"));
                 }
+                "MAX_CONNECTIONS" => {
+                    let v = parts[1]
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or_else(|e| panic!("Invalid value for MAX_CONNECTIONS: {e}"));
+                    if v < 1 {
+                        panic!("MAX_CONNECTIONS must be at least 1, got {v}");
+                    }
+                    max_connections = v;
+                }
                 _ => {}
             }
         }
@@ -167,6 +181,7 @@ impl Config {
             use_single_transaction,
             use_comments,
             grants_mode,
+            max_connections,
         }
     }
 }
@@ -535,6 +550,62 @@ mod tests {
             config_content,
             "test_from_ssl_invalid_value_still_panics.cfg",
         );
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
+
+    // --- MAX_CONNECTIONS validation ---
+
+    #[test]
+    fn test_max_connections_valid_value() {
+        let config_content = "MAX_CONNECTIONS=16\n";
+        let file = write_temp_config(config_content, "test_max_connections_valid.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.max_connections, 16);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_max_connections_default_value() {
+        let config_content = "FROM_HOST=localhost\n";
+        let file = write_temp_config(config_content, "test_max_connections_default.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.max_connections, 8);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_max_connections_minimum_value() {
+        let config_content = "MAX_CONNECTIONS=1\n";
+        let file = write_temp_config(config_content, "test_max_connections_min.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.max_connections, 1);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_CONNECTIONS must be at least 1")]
+    fn test_max_connections_zero_panics() {
+        let config_content = "MAX_CONNECTIONS=0\n";
+        let file = write_temp_config(config_content, "test_max_connections_zero.cfg");
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid value for MAX_CONNECTIONS")]
+    fn test_max_connections_non_numeric_panics() {
+        let config_content = "MAX_CONNECTIONS=abc\n";
+        let file = write_temp_config(config_content, "test_max_connections_non_numeric.cfg");
+        let _ = Config::new(file.clone());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid value for MAX_CONNECTIONS")]
+    fn test_max_connections_negative_panics() {
+        let config_content = "MAX_CONNECTIONS=-1\n";
+        let file = write_temp_config(config_content, "test_max_connections_negative.cfg");
         let _ = Config::new(file.clone());
         let _ = std::fs::remove_file(file);
     }

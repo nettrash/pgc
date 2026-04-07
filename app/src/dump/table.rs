@@ -1,6 +1,9 @@
-use crate::dump::{
-    table_column::TableColumn, table_constraint::TableConstraint, table_index::TableIndex,
-    table_policy::TablePolicy, table_trigger::TableTrigger,
+use crate::{
+    dump::{
+        table_column::TableColumn, table_constraint::TableConstraint, table_index::TableIndex,
+        table_policy::TablePolicy, table_trigger::TableTrigger,
+    },
+    utils::string_extensions::StringExt,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -715,7 +718,7 @@ impl Table {
                 script.push_str(&format!("\ntablespace {}", quote_ident(space)));
             }
 
-            script.push_str(";\n\n");
+            script.append_block(";");
         } else {
             // 1. Build CREATE TABLE statement
             script.push_str(&format!("create table {}.{} (\n", self.schema, self.name));
@@ -844,7 +847,7 @@ impl Table {
                 script.push_str(&format!("\ntablespace {}", quote_ident(space)));
             }
 
-            script.push_str(";\n\n");
+            script.append_block(";");
         }
 
         // 5. Add other constraints (excluding primary key and foreign key)
@@ -871,8 +874,8 @@ impl Table {
 
         // 8. Enable row-level security before creating policies
         if self.has_rowsecurity {
-            script.push_str(&format!(
-                "alter table {}.{} enable row level security;\n",
+            script.append_block(&format!(
+                "alter table {}.{} enable row level security;",
                 self.schema, self.name
             ));
         }
@@ -884,8 +887,8 @@ impl Table {
 
         // 10. Add table comment (if any) and column comments
         if let Some(comment) = &self.comment {
-            script.push_str(&format!(
-                "comment on table {}.{} is '{}';\n",
+            script.append_block(&format!(
+                "comment on table {}.{} is '{}';",
                 self.schema,
                 self.name,
                 escape_single_quotes(comment)
@@ -924,7 +927,7 @@ impl Table {
 
     /// Get drop script for the table
     pub fn get_drop_script(&self) -> String {
-        format!("drop table if exists {}.{};\n", self.schema, self.name)
+        format!("drop table if exists {}.{};", self.schema, self.name).with_empty_lines()
     }
 
     pub fn get_owner_script(&self) -> String {
@@ -933,9 +936,10 @@ impl Table {
         }
 
         format!(
-            "alter table {}.{} owner to {};\n",
+            "alter table {}.{} owner to {};",
             self.schema, self.name, self.owner
         )
+        .with_empty_lines()
     }
 
     /// Get script for creating foreign keys
@@ -1020,9 +1024,10 @@ impl Table {
             // If it was a partition, detach it
             if let Some(old_parent) = &self.partition_of {
                 let detach_cmd = format!(
-                    "alter table {} detach partition {}.{};\n",
+                    "alter table {} detach partition {}.{};",
                     old_parent, self.schema, self.name
-                );
+                )
+                .with_empty_lines();
                 if use_drop {
                     partition_script.push_str(&detach_cmd);
                 } else {
@@ -1034,8 +1039,8 @@ impl Table {
             if let Some(new_parent) = &to_table.partition_of
                 && let Some(bound) = &to_table.partition_bound
             {
-                partition_script.push_str(&format!(
-                    "alter table {} attach partition {}.{} {};\n",
+                partition_script.append_block(&format!(
+                    "alter table {} attach partition {}.{} {};",
                     new_parent, self.schema, self.name, bound
                 ));
             }
@@ -1203,18 +1208,18 @@ impl Table {
         if self.comment != to_table.comment {
             let comment_stmt = if let Some(cmt) = &to_table.comment {
                 format!(
-                    "comment on table {}.{} is '{}';\n",
+                    "comment on table {}.{} is '{}';",
                     to_table.schema,
                     to_table.name,
                     escape_single_quotes(cmt)
                 )
             } else {
                 format!(
-                    "comment on table {}.{} is null;\n",
+                    "comment on table {}.{} is null;",
                     to_table.schema, to_table.name
                 )
             };
-            constraint_post_script.push_str(&comment_stmt);
+            constraint_post_script.append_block(&comment_stmt);
         }
 
         // Collect index updates (skip partition-inherited indexes, managed by parent)
@@ -1225,9 +1230,10 @@ impl Table {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
                     let drop_cmd = format!(
-                        "drop index if exists {}.{};\n",
+                        "drop index if exists {}.{};",
                         new_index.schema, new_index.name
-                    );
+                    )
+                    .with_empty_lines();
                     if use_drop {
                         index_drop_script.push_str(&drop_cmd);
                     } else {
@@ -1245,9 +1251,10 @@ impl Table {
             if let Some(old_policy) = self.policies.iter().find(|p| p.name == new_policy.name) {
                 if old_policy != new_policy {
                     let drop_cmd = format!(
-                        "drop policy if exists {} on {}.{};\n",
+                        "drop policy if exists {} on {}.{};",
                         old_policy.name, self.schema, self.name
-                    );
+                    )
+                    .with_empty_lines();
                     if use_drop {
                         policy_drop_script.push_str(&drop_cmd);
                     } else {
@@ -1266,9 +1273,10 @@ impl Table {
             }
             if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
                 let drop_cmd = format!(
-                    "drop index if exists {}.{};\n",
+                    "drop index if exists {}.{};",
                     old_index.schema, old_index.name
-                );
+                )
+                .with_empty_lines();
                 if use_drop {
                     index_drop_script.push_str(&drop_cmd);
                 } else {
@@ -1280,9 +1288,10 @@ impl Table {
         for old_policy in &self.policies {
             if !to_table.policies.iter().any(|p| p.name == old_policy.name) {
                 let drop_cmd = format!(
-                    "drop policy if exists {} on {}.{};\n",
+                    "drop policy if exists {} on {}.{};",
                     old_policy.name, self.schema, self.name
-                );
+                )
+                .with_empty_lines();
                 if use_drop {
                     policy_drop_script.push_str(&drop_cmd);
                 } else {
@@ -1294,16 +1303,16 @@ impl Table {
         if self.has_rowsecurity != to_table.has_rowsecurity {
             let stmt = if to_table.has_rowsecurity {
                 format!(
-                    "alter table {}.{} enable row level security;\n",
+                    "alter table {}.{} enable row level security;",
                     self.schema, self.name
                 )
             } else {
                 format!(
-                    "alter table {}.{} disable row level security;\n",
+                    "alter table {}.{} disable row level security;",
                     self.schema, self.name
                 )
             };
-            row_security_script.push_str(&stmt);
+            row_security_script.append_block(&stmt);
         }
 
         let (trigger_drop_script, trigger_script) = if include_triggers {
@@ -1374,9 +1383,10 @@ impl Table {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
                     let drop_cmd = format!(
-                        "drop trigger if exists {} on {}.{};\n",
+                        "drop trigger if exists {} on {}.{};",
                         old_trigger.name, self.schema, self.name
-                    );
+                    )
+                    .with_empty_lines();
                     if use_drop {
                         trigger_drop_script.push_str(&drop_cmd);
                     } else {
@@ -1392,9 +1402,10 @@ impl Table {
         for old_trigger in &self.triggers {
             if !to_table.triggers.iter().any(|t| t.name == old_trigger.name) {
                 let drop_cmd = format!(
-                    "drop trigger if exists {} on {}.{};\n",
+                    "drop trigger if exists {} on {}.{};",
                     old_trigger.name, self.schema, self.name
-                );
+                )
+                .with_empty_lines();
                 if use_drop {
                     trigger_drop_script.push_str(&drop_cmd);
                 } else {
@@ -1730,10 +1741,10 @@ mod tests {
             "    constraint users_pkey primary key (\"id\")\n",
             ")\n",
             "tablespace \"pg_default\";\n\n",
-            "alter table public.users add constraint users_name_check check (name <> '') ;\n",
-            "create index idx_users_name on public.users using btree (name);\n",
-            "create trigger audit_user before insert on public.users for each row execute function log_user();\n",
-            "alter table public.users owner to postgres;\n",
+            "alter table public.users add constraint users_name_check check (name <> '') ;\n\n",
+            "create index idx_users_name on public.users using btree (name);\n\n",
+            "create trigger audit_user before insert on public.users for each row execute function log_user();\n\n",
+            "alter table public.users owner to postgres;\n\n",
         );
 
         assert_eq!(script, expected);
@@ -1808,7 +1819,7 @@ mod tests {
         let table = basic_table();
         assert_eq!(
             table.get_drop_script(),
-            "drop table if exists public.users;\n"
+            "drop table if exists public.users;\n\n"
         );
     }
 

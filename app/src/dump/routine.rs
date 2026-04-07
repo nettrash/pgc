@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::types::Oid;
 
+use crate::utils::string_extensions::StringExt;
+
 /// Information about a PostgreSQL aggregate function from pg_aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateInfo {
@@ -236,7 +238,7 @@ impl Routine {
             arguments_defaults,
             owner: String::new(),
             comment,
-            source_code,
+            source_code: crate::utils::string_extensions::normalize_line_endings(source_code),
             volatility: "volatile".to_string(),
             is_strict: false,
             is_leakproof: false,
@@ -355,7 +357,7 @@ impl Routine {
 
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure {}.{}({}) language {}{flags} as {d}{body}{d};\n",
+                "create or replace procedure {}.{}({}) language {}{flags} as {d}{body}{d};",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
@@ -363,9 +365,9 @@ impl Routine {
                 flags = flags,
                 d = delimiter,
                 body = self.source_code
-            ),
+            ).with_empty_lines(),
             _ => format!(
-                "create or replace {create_kind} {}.{}({}) returns {} language {}{flags} as {d}{body}{d};\n",
+                "create or replace {create_kind} {}.{}({}) returns {} language {}{flags} as {d}{body}{d};",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
@@ -375,7 +377,7 @@ impl Routine {
                 flags = flags,
                 d = delimiter,
                 body = self.source_code
-            ),
+            ).with_empty_lines(),
         };
 
         let mut script = script_body;
@@ -385,8 +387,8 @@ impl Routine {
                 "procedure" => "procedure",
                 _ => "function",
             };
-            script.push_str(&format!(
-                "comment on {object_kind} {}.{}({}) is '{}';\n",
+            script.append_block(&format!(
+                "comment on {object_kind} {}.{}({}) is '{}';",
                 self.schema,
                 self.name,
                 self.arguments,
@@ -524,8 +526,8 @@ impl Routine {
                 self.arguments.clone()
             };
 
-            script.push_str(&format!(
-                "create aggregate {}.{}({}) (\n{}\n);\n",
+            script.append_block(&format!(
+                "create aggregate {}.{}({}) (\n{}\n);",
                 self.schema,
                 self.name,
                 args,
@@ -540,8 +542,8 @@ impl Routine {
         }
 
         if let Some(comment) = &self.comment {
-            script.push_str(&format!(
-                "comment on aggregate {}.{}({}) is '{}';\n",
+            script.append_block(&format!(
+                "comment on aggregate {}.{}({}) is '{}';",
                 self.schema,
                 self.name,
                 self.signature_args(),
@@ -572,12 +574,13 @@ impl Routine {
             other => other.to_string(),
         };
         format!(
-            "drop {} if exists {}.{} ({});\n",
+            "drop {} if exists {}.{} ({});",
             drop_kind,
             self.schema,
             self.name,
             self.signature_args()
         )
+        .with_empty_lines()
     }
 
     pub fn get_owner_script(&self) -> String {
@@ -592,13 +595,14 @@ impl Routine {
         };
 
         format!(
-            "alter {} {}.{}({}) owner to {};\n",
+            "alter {} {}.{}({}) owner to {};",
             object_kind,
             self.schema,
             self.name,
             self.signature_args(),
             self.owner
         )
+        .with_empty_lines()
     }
 
     /// Generates a unique dollar-quoted delimiter tag for the routine body.
@@ -748,6 +752,36 @@ mod tests {
     }
 
     #[test]
+    fn hash_is_identical_for_crlf_and_lf_source_code() {
+        let lf_routine = Routine::new(
+            "public".to_string(),
+            Oid(42),
+            "add".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "a integer".to_string(),
+            None,
+            None,
+            "BEGIN\n  RETURN a + 1;\nEND".to_string(),
+        );
+        let crlf_routine = Routine::new(
+            "public".to_string(),
+            Oid(42),
+            "add".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "integer".to_string(),
+            "a integer".to_string(),
+            None,
+            None,
+            "BEGIN\r\n  RETURN a + 1;\r\nEND".to_string(),
+        );
+        assert_eq!(lf_routine.hash, crlf_routine.hash);
+        assert_eq!(lf_routine.source_code, crlf_routine.source_code);
+    }
+
+    #[test]
     fn get_script_uses_custom_delimiter_when_body_contains_dollar_dollar() {
         let routine = Routine::new(
             "public".to_string(),
@@ -785,7 +819,7 @@ mod tests {
         let routine = build_function_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace function public.add(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\n";
+        let expected = "create or replace function public.add(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -795,7 +829,7 @@ mod tests {
         routine.owner = "pgc_owner".to_string();
         routine.hash();
 
-        let expected = "create or replace function public.add(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\nalter function public.add(a integer) owner to pgc_owner;\n";
+        let expected = "create or replace function public.add(a integer DEFAULT 1) returns integer language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN a + 1; END$$;\n\nalter function public.add(a integer) owner to pgc_owner;\n\n";
         assert_eq!(routine.get_script(), expected);
     }
 
@@ -804,7 +838,7 @@ mod tests {
         let routine = build_procedure_routine();
         let script = routine.get_script();
 
-        let expected = "create or replace procedure public.do_something(a integer) language sql as $$SELECT a;$$;\n";
+        let expected = "create or replace procedure public.do_something(a integer) language sql as $$SELECT a;$$;\n\n";
         assert_eq!(script, expected);
     }
 
@@ -813,7 +847,7 @@ mod tests {
         let routine = build_function_routine();
         let drop_script = routine.get_drop_script();
 
-        let expected = "drop function if exists public.add (a integer);\n";
+        let expected = "drop function if exists public.add (a integer);\n\n";
         assert_eq!(drop_script, expected);
     }
 
@@ -833,7 +867,7 @@ mod tests {
         );
         let script = routine.get_script();
 
-        let expected = "create or replace function data.test(fetching_id bigint, fetching_event_id character varying) returns TABLE(row_to_json json) language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END$$;\n";
+        let expected = "create or replace function data.test(fetching_id bigint, fetching_event_id character varying) returns TABLE(row_to_json json) language plpgsql VOLATILE PARALLEL UNSAFE as $$BEGIN RETURN QUERY SELECT row_to_json(t) FROM t; END$$;\n\n";
         assert_eq!(script, expected);
     }
 

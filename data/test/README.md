@@ -6,6 +6,8 @@ This folder contains two comprehensive PostgreSQL schemas designed to test all p
 
 - `schema_a.sql` - The "FROM" database schema
 - `schema_b.sql` - The "TO" database schema
+- `clear_test.sql` - Schema for testing the `clear` command (drop-all script generation)
+- `clear_expected.sql` - Expected structure of the `clear` command output
 
 ## Testing Coverage
 
@@ -261,6 +263,105 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 #### Routine Dependency Ordering
 - View ↔ routine cross-dependencies: `get_user_count()` → `v_user_stats` → `report_user_stats()` / `print_user_stats()`
 - Routine chain: `r_base_value()` → `x_step_one()` → `a_middle_layer()` → `z_final_report()`
+
+---
+
+## Clear Command Test (`clear_test.sql`)
+
+The `clear_test.sql` file creates a self-contained set of database objects across two schemas (`clear_app` and `clear_shared`) to verify the `pgc --command clear` drop-all script generation.
+
+### Objects Created
+
+| Object Type          | Schema         | Count | Names                                                                                    |
+|----------------------|----------------|-------|------------------------------------------------------------------------------------------|
+| Schemas              | —              | 2     | `clear_app`, `clear_shared`                                                              |
+| Extensions           | public         | 2     | `uuid-ossp`, `pg_trgm`                                                                   |
+| Enum Types           | clear_app      | 1     | `order_status`                                                                           |
+| Composite Types      | clear_app      | 1     | `full_name`                                                                              |
+| Domain Types         | clear_app      | 1     | `positive_int`                                                                           |
+| Sequences            | both           | 2     | `customer_id_seq`, `audit_id_seq`                                                        |
+| Tables               | both           | 6     | `customers`, `categories`, `orders`, `order_items`, `audit_log`, `employees`              |
+| Foreign Keys         | clear_app      | 4     | on `orders` (×2), `order_items`, `employees` (self-ref)                                  |
+| Indexes              | both           | 11    | various B-tree and GIN indexes                                                           |
+| Functions            | both           | 4     | `update_timestamp`, `get_customer_order_total`, `format_audit_entry`, `active_customer_count` |
+| Procedures           | clear_app      | 1     | `cleanup_old_orders`                                                                     |
+| Triggers             | clear_app      | 2     | `trg_customers_timestamp`, `trg_orders_timestamp`                                        |
+| Views                | clear_app      | 2     | `v_customer_summary`, `v_top_customers` (depends on first)                               |
+| Materialized Views   | both           | 2     | `mv_daily_orders`, `mv_audit_stats`                                                      |
+| Comments             | both           | 8     | on schemas, tables, columns, functions, views                                            |
+
+### Dependency Chains Tested
+
+- **FK chain**: `order_items` → `orders` → `customers`, `orders` → `categories`
+- **Self-reference**: `employees.manager_id` → `employees.id`
+- **View chain**: `v_top_customers` → `v_customer_summary` → `customers` + `orders`
+- **Trigger → function**: `trg_customers_timestamp` → `update_timestamp()`
+- **Sequence → table**: `customer_id_seq` → `customers.id`
+- **Type → table**: `order_status`, `full_name`, `positive_int` → `customers`
+
+### Expected Drop Order
+
+The generated clear script must drop objects in this order to avoid dependency errors:
+
+1. **Views** (topologically sorted by `table_relation`; tie-break: materialized before regular, then alphabetical by `schema.name`)
+   - `v_top_customers` depends on `v_customer_summary`, so it is dropped first
+   - Materialized views with no view-dependencies appear before regular views at the same level
+2. **Foreign key constraints** (all FKs across all tables)
+3. **Tables** (`customers`, `categories`, `orders`, `order_items`, `audit_log`, `employees`)
+4. **Routines** (`update_timestamp`, `get_customer_order_total`, `format_audit_entry`, `active_customer_count`, `cleanup_old_orders`)
+5. **Sequences** (`customer_id_seq`, `audit_id_seq`)
+6. **Types** (`order_status`, `full_name`, `positive_int`)
+7. **Extensions** (`uuid-ossp`, `pg_trgm`)
+8. **Schemas** (`clear_app`, `clear_shared`)
+
+### How to Run
+
+```bash
+# 1. Create a test database and apply the schema
+createdb pgc_clear_test
+psql -d pgc_clear_test -f data/test/clear_test.sql
+
+# 2. Generate the clear script
+pgc --command clear \
+    --database pgc_clear_test \
+    --scheme "clear_app|clear_shared" \
+    --output data/test/clear_output.sql \
+    --use-single-transaction \
+    --use-comments
+
+# 3. Review the output against the expected structure
+diff data/test/clear_expected.sql data/test/clear_output.sql
+
+# 4. Apply the clear script to verify it executes cleanly
+psql -d pgc_clear_test -f data/test/clear_output.sql
+
+# 5. Verify that no objects remain
+psql -d pgc_clear_test -c "
+    SELECT schemaname, tablename FROM pg_tables
+    WHERE schemaname IN ('clear_app', 'clear_shared');
+"
+# Expected: 0 rows
+
+# 6. Cleanup
+dropdb pgc_clear_test
+```
+
+### Validation Checklist
+
+- [ ] All materialized views are dropped before regular views
+- [ ] All regular views are dropped (inter-view dependencies respected)
+- [ ] All foreign keys are dropped before their parent tables
+- [ ] All tables are dropped
+- [ ] All functions and procedures are dropped
+- [ ] All sequences are dropped (including those used by SERIAL columns)
+- [ ] All custom types (enum, composite, domain) are dropped
+- [ ] All extensions are dropped
+- [ ] All schemas are dropped
+- [ ] Script executes without errors when `--use-single-transaction` is set
+- [ ] Script is idempotent (uses `IF EXISTS` on all drop statements)
+- [ ] Comments option controls presence of `/* ... */` annotations
+
+---
 
 ## Usage
 

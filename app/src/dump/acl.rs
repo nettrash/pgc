@@ -1,3 +1,5 @@
+use crate::utils::string_extensions::StringExt;
+
 /// Represents a single parsed PostgreSQL ACL entry.
 ///
 /// PostgreSQL ACL items have the format: `grantee=privileges/grantor`
@@ -133,8 +135,8 @@ impl AclEntry {
             .map(|p| p.name.as_str())
             .collect();
         if !plain.is_empty() {
-            script.push_str(&format!(
-                "GRANT {} ON {} {} TO {};\n",
+            script.append_block(&format!(
+                "GRANT {} ON {} {} TO {};",
                 plain.join(", "),
                 object_kind,
                 object_name,
@@ -149,8 +151,8 @@ impl AclEntry {
             .map(|p| p.name.as_str())
             .collect();
         if !with_go.is_empty() {
-            script.push_str(&format!(
-                "GRANT {} ON {} {} TO {} WITH GRANT OPTION;\n",
+            script.append_block(&format!(
+                "GRANT {} ON {} {} TO {} WITH GRANT OPTION;",
                 with_go.join(", "),
                 object_kind,
                 object_name,
@@ -183,8 +185,8 @@ impl AclEntry {
             .map(|p| p.name.as_str())
             .collect();
         if !with_go.is_empty() {
-            script.push_str(&format!(
-                "REVOKE GRANT OPTION FOR {} ON {} {} FROM {};\n",
+            script.append_block(&format!(
+                "REVOKE GRANT OPTION FOR {} ON {} {} FROM {};",
                 with_go.join(", "),
                 object_kind,
                 object_name,
@@ -194,8 +196,8 @@ impl AclEntry {
 
         // Revoke all privileges (both plain and grant-option ones)
         let all: Vec<&str> = items.iter().map(|p| p.name.as_str()).collect();
-        script.push_str(&format!(
-            "REVOKE {} ON {} {} FROM {};\n",
+        script.append_block(&format!(
+            "REVOKE {} ON {} {} FROM {};",
             all.join(", "),
             object_kind,
             object_name,
@@ -355,8 +357,8 @@ pub fn generate_grants_script(
         let grantee = AclEntry::format_grantee(&entry.grantee);
 
         if !entry.revoke_option_for.is_empty() {
-            script.push_str(&format!(
-                "REVOKE GRANT OPTION FOR {} ON {} {} FROM {};\n",
+            script.append_block(&format!(
+                "REVOKE GRANT OPTION FOR {} ON {} {} FROM {};",
                 entry.revoke_option_for.join(", "),
                 object_kind,
                 object_name,
@@ -364,8 +366,8 @@ pub fn generate_grants_script(
             ));
         }
         if !entry.revokes.is_empty() {
-            script.push_str(&format!(
-                "REVOKE {} ON {} {} FROM {};\n",
+            script.append_block(&format!(
+                "REVOKE {} ON {} {} FROM {};",
                 entry.revokes.join(", "),
                 object_kind,
                 object_name,
@@ -373,8 +375,8 @@ pub fn generate_grants_script(
             ));
         }
         if !entry.grants_plain.is_empty() {
-            script.push_str(&format!(
-                "GRANT {} ON {} {} TO {};\n",
+            script.append_block(&format!(
+                "GRANT {} ON {} {} TO {};",
                 entry.grants_plain.join(", "),
                 object_kind,
                 object_name,
@@ -382,8 +384,8 @@ pub fn generate_grants_script(
             ));
         }
         if !entry.grants_with_option.is_empty() {
-            script.push_str(&format!(
-                "GRANT {} ON {} {} TO {} WITH GRANT OPTION;\n",
+            script.append_block(&format!(
+                "GRANT {} ON {} {} TO {} WITH GRANT OPTION;",
                 entry.grants_with_option.join(", "),
                 object_kind,
                 object_name,
@@ -438,7 +440,7 @@ mod tests {
         let script = AclEntry::get_grant_script("myuser=rw/owner", "TABLE", "public.my_table");
         assert_eq!(
             script,
-            "GRANT SELECT, UPDATE ON TABLE public.my_table TO myuser;\n"
+            "GRANT SELECT, UPDATE ON TABLE public.my_table TO myuser;\n\n"
         );
     }
 
@@ -447,7 +449,7 @@ mod tests {
         let script = AclEntry::get_grant_script("myuser=r*w/owner", "TABLE", "public.my_table");
         assert_eq!(
             script,
-            "GRANT UPDATE ON TABLE public.my_table TO myuser;\nGRANT SELECT ON TABLE public.my_table TO myuser WITH GRANT OPTION;\n"
+            "GRANT UPDATE ON TABLE public.my_table TO myuser;\n\nGRANT SELECT ON TABLE public.my_table TO myuser WITH GRANT OPTION;\n\n"
         );
     }
 
@@ -456,7 +458,7 @@ mod tests {
         let script = AclEntry::get_grant_script("myuser=r*w*/owner", "TABLE", "public.my_table");
         assert_eq!(
             script,
-            "GRANT SELECT, UPDATE ON TABLE public.my_table TO myuser WITH GRANT OPTION;\n"
+            "GRANT SELECT, UPDATE ON TABLE public.my_table TO myuser WITH GRANT OPTION;\n\n"
         );
     }
 
@@ -465,7 +467,7 @@ mod tests {
         let script = AclEntry::get_revoke_script("myuser=r/owner", "TABLE", "public.my_table");
         assert_eq!(
             script,
-            "REVOKE SELECT ON TABLE public.my_table FROM myuser;\n"
+            "REVOKE SELECT ON TABLE public.my_table FROM myuser;\n\n"
         );
     }
 
@@ -474,7 +476,7 @@ mod tests {
         let script = AclEntry::get_revoke_script("myuser=r*w/owner", "TABLE", "public.my_table");
         assert_eq!(
             script,
-            "REVOKE GRANT OPTION FOR SELECT ON TABLE public.my_table FROM myuser;\nREVOKE SELECT, UPDATE ON TABLE public.my_table FROM myuser;\n"
+            "REVOKE GRANT OPTION FOR SELECT ON TABLE public.my_table FROM myuser;\n\nREVOKE SELECT, UPDATE ON TABLE public.my_table FROM myuser;\n\n"
         );
     }
 
@@ -560,7 +562,7 @@ mod tests {
         let script = AclEntry::get_grant_script("=r*/owner", "TABLE", "public.t");
         assert_eq!(
             script,
-            "GRANT SELECT ON TABLE public.t TO PUBLIC WITH GRANT OPTION;\n"
+            "GRANT SELECT ON TABLE public.t TO PUBLIC WITH GRANT OPTION;\n\n"
         );
     }
 
