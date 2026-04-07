@@ -821,7 +821,9 @@ impl Dump {
                         .get::<Option<String>, _>("owner_name")
                         .unwrap_or_default(),
                     comment: row.get("routine_comment"),
-                    source_code: row.get::<String, _>("prosrc").replace("\r\n", "\n"),
+                    source_code: crate::utils::string_extensions::normalize_line_endings(
+                        row.get::<String, _>("prosrc"),
+                    ),
                     volatility,
                     is_strict: row.get("proisstrict"),
                     is_leakproof: row.get("proleakproof"),
@@ -1135,7 +1137,9 @@ impl Dump {
         // consistent regardless of the line-ending style stored in the dump.
         for routine in &mut dump.routines {
             if routine.source_code.contains("\r\n") {
-                routine.source_code = routine.source_code.replace("\r\n", "\n");
+                routine.source_code = crate::utils::string_extensions::normalize_line_endings(
+                    std::mem::take(&mut routine.source_code),
+                );
                 routine.hash();
             }
         }

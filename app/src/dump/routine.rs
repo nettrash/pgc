@@ -238,7 +238,7 @@ impl Routine {
             arguments_defaults,
             owner: String::new(),
             comment,
-            source_code: source_code.replace("\r\n", "\n"),
+            source_code: crate::utils::string_extensions::normalize_line_endings(source_code),
             volatility: "volatile".to_string(),
             is_strict: false,
             is_leakproof: false,
@@ -263,7 +263,6 @@ impl Routine {
             ),
             None => String::new(),
         };
-        let normalized_source = self.source_code.replace("\r\n", "\n");
         let src = format!(
             "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
@@ -274,7 +273,7 @@ impl Routine {
             self.arguments,
             self.owner,
             self.comment.clone().unwrap_or_default(),
-            normalized_source,
+            self.source_code,
             self.volatility,
             self.is_strict,
             self.is_leakproof,
