@@ -1201,7 +1201,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // split_arguments: JSONB default with commas (Issue #155)
+    // split_arguments: JSONB default with commas (Issue #154)
     // -----------------------------------------------------------------
 
     #[test]
