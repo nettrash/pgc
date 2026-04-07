@@ -1,4 +1,4 @@
-                v1.0.11
+2026-04-07      v1.0.11
 
                 Features:
                     - Added --max-connections argument to set up a proper amount of connections.
@@ -6,6 +6,8 @@
                     - Fixed --use-comments argument.
                     - Fixed CRLF endings.
                     - Fix: new partition children created after recreated sub-partitioned parent.
+                    - Added clear command to produce sql files for removing objects.
+                    - Support --use-cascade argument for clear command.
 
 2026-04-02      v1.0.10
 
