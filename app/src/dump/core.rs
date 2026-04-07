@@ -1308,7 +1308,25 @@ impl Dump {
                         routine.kind, routine.schema, routine.name
                     ));
                 }
-                script.push_str(&routine.get_drop_script());
+                let drop_kind = match routine.kind.to_lowercase().as_str() {
+                    "window" => "function",
+                    "procedure" => "procedure",
+                    "aggregate" => "aggregate",
+                    _ => "function",
+                };
+                let args =
+                    if routine.kind.to_lowercase() == "aggregate" && routine.arguments.is_empty() {
+                        "*".to_string()
+                    } else {
+                        routine.arguments.clone()
+                    };
+                script.push_str(
+                    &format!(
+                        "drop {} if exists {}.{} ({}){cascade_suffix};",
+                        drop_kind, routine.schema, routine.name, args
+                    )
+                    .with_empty_lines(),
+                );
             }
         }
 
@@ -1795,6 +1813,7 @@ mod tests {
         dump.extensions.push(make_extension("pg_trgm"));
         dump.types.push(make_pg_type("public", "my_type"));
         dump.sequences.push(make_sequence("public", "seq1"));
+        dump.routines.push(make_routine("public", "fn1"));
         dump.tables.push(make_table("public", "tbl1"));
         dump.views.push(make_view("public", "v1"));
 
@@ -1802,6 +1821,7 @@ mod tests {
 
         assert!(script.contains("drop view if exists public.v1 cascade;"));
         assert!(script.contains("drop table if exists public.tbl1 cascade;"));
+        assert!(script.contains("drop function if exists public.fn1 () cascade;"));
         assert!(script.contains("drop sequence if exists public.seq1 cascade;"));
         assert!(script.contains("drop type if exists public.my_type cascade;"));
         assert!(script.contains("drop extension if exists pg_trgm cascade;"));
