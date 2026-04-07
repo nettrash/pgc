@@ -162,6 +162,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 #### Unchanged Procedures
 - **notify_event(uuid, varchar, jsonb)**: 3-param overload, identical in both schemas
 - **notify_event(uuid, varchar, varchar, jsonb, jsonb)**: 5-param overload, identical in both schemas (tests overloaded routine matching by argument signature)
+- **format_csv_line(varchar, varchar)**: procedure with a comma-in-string default (`DEFAULT ','`) - identical in both schemas; no diff should be emitted (Issue #154 regression test)
 
 ### 12. Triggers
 - **Added**: `trigger_reviews_update_timestamp`, `trigger_reviews_audit` on `reviews` table
@@ -263,6 +264,12 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 #### Routine Dependency Ordering
 - View ↔ routine cross-dependencies: `get_user_count()` → `v_user_stats` → `report_user_stats()` / `print_user_stats()`
 - Routine chain: `r_base_value()` → `x_step_one()` → `a_middle_layer()` → `z_final_report()`
+
+#### Comma-in-String Default (Issue #154)
+- `test_schema.format_csv_line(p_value varchar, p_delimiter varchar DEFAULT ',')` is present and identical in both schemas
+- PostgreSQL stores the default separately via `pg_get_expr(proargdefaults, 0)`, which returns `','::character varying`
+- The comma inside the quoted string literal must not be treated as a delimiter when splitting the defaults string
+- The comparer must produce no diff for this procedure, confirming the round-trip is correct
 
 ---
 
