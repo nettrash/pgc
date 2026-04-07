@@ -454,6 +454,11 @@ impl Routine {
     /// single-quoted string literals.
     /// E.g. "a numeric(10,2), b text"    → ["a numeric(10,2)", " b text"]
     /// E.g. "','::character varying, 0"  → ["','::character varying", " 0"]
+    ///
+    /// Dollar-quoted strings (`$$...$$`) are intentionally not handled: both
+    /// call sites receive output from `pg_get_function_identity_arguments` or
+    /// `pg_get_expr(proargdefaults, 0)`, which always produce single-quoted
+    /// expressions and never emit dollar-quotes.
     fn split_arguments(s: &str) -> Vec<String> {
         let mut parts = Vec::new();
         let mut depth = 0;
@@ -469,7 +474,7 @@ impl Routine {
                     if iter.peek() == Some(&'\'') {
                         // Escaped quote: consume both characters and stay in-quote.
                         current.push('\'');
-                        current.push(iter.next().unwrap());
+                        current.push(iter.next().unwrap()); // safe: peek() confirmed Some above
                     } else {
                         // Closing quote.
                         in_quote = false;
@@ -507,6 +512,7 @@ impl Routine {
         if !current.is_empty() {
             parts.push(current);
         }
+        debug_assert!(!in_quote, "split_arguments: unclosed single-quote in input: {s:?}");
         parts
     }
 
