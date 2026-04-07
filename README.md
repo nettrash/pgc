@@ -39,7 +39,7 @@ Command line arguments can be used to execute just one function in one time.
 
 ## Command line arguments
 
-`--command {dump|compare}` - the command name, dump - to create a dump file, compare - to compare two dumps.
+`--command {dump|compare|clear}` - the command name, dump - to create a dump file, compare - to compare two dumps, clear - to generate a script that drops all objects found in the database.
 
 `--server {server name}` - to specify `server name` for a command, without it tool will use localhost as a host for command.
 
@@ -73,6 +73,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `8`.
 
+`--use-cascade` - add `CASCADE` to every `DROP` statement in the clear script. **Warning:** `CASCADE` can silently drop dependent objects that live outside the selected schema(s) (e.g., foreign keys or views in other schemas referencing the dropped objects). Use only when you are certain no cross-schema dependencies should survive. Without this flag the generated drops rely on the explicit dependency ordering and will fail cleanly if unresolved dependencies exist.
+
 ## Functionality
 
 ### Create database schema dump
@@ -92,6 +94,30 @@ pgc --command compare --from {from_dump} --to {to_dump} --output {file} --use-dr
 This command comparing two dumps and produce SQL script for the `FROM` database to be equal to `TO` database after applying it.
 If we add `--use-drop` argument comparer will add drop scripts for all items that non exists in target database, otherwise drop scripts will be ignored.  
 By default, comparer ignore drops.
+
+### Generate a clear (drop-all) script for a database
+
+```bash
+pgc --command clear --server {host} --database {database} --scheme {scheme} --output {file} --use-single-transaction --use-comments
+```
+
+This command connects to the specified database, discovers all objects in the given schema(s) and produces a SQL script that drops every found object in dependency-safe order:
+
+1. Views (materialized views first, then regular views)
+2. Foreign key constraints
+3. Tables
+4. Routines (functions, procedures, aggregates)
+5. Sequences
+6. Types (enums, composites, domains)
+7. Extensions
+8. Schemas
+
+The resulting script can be applied on another database that shares the same schema to fully remove all objects originating from it.
+
+Optional flags:
+- `--use-single-transaction` wraps the script in `BEGIN` / `COMMIT`.
+- `--use-comments` (default `true`) adds explanatory comments before each drop statement.
+- `--use-cascade` appends `CASCADE` to every `DROP` statement so that dependent objects outside the inspected schema(s) are removed automatically. **Use with caution** — this can drop objects you did not intend to remove (see `--use-cascade` description above).
 
 ## Configuration file
 
