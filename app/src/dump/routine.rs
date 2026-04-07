@@ -459,71 +459,41 @@ impl Routine {
         let mut depth: i32 = 0;
         let mut in_quote = false;
         let mut current = String::new();
+        let mut iter = s.chars().peekable();
 
-        let chars: Vec<(usize, char)> = s.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0;
-
-        while i < len {
-            let (_byte_i, ch) = chars[i];
-
+        while let Some(ch) = iter.next() {
             if in_quote {
                 // Inside a single-quoted string literal.
                 // Two consecutive single quotes represent an escaped quote ('').
                 if ch == '\'' {
-                    if i + 1 < len && chars[i + 1].1 == '\'' {
+                    if iter.peek() == Some(&'\'') {
                         // Escaped quote: consume both characters and stay in-quote.
                         current.push('\'');
-                        current.push('\'');
-                        i += 2;
-                        continue;
+                        current.push(iter.next().unwrap());
                     } else {
                         // Closing quote.
                         in_quote = false;
                         current.push(ch);
-                        i += 1;
-                        continue;
                     }
                 } else {
                     current.push(ch);
-                    i += 1;
-                    continue;
                 }
+                continue;
             }
 
             // Outside any string literal.
             match ch {
-                '\'' => {
-                    in_quote = true;
-                    current.push(ch);
-                    i += 1;
-                }
-                '(' => {
-                    depth += 1;
-                    current.push(ch);
-                    i += 1;
-                }
-                ')' => {
-                    depth -= 1;
-                    current.push(ch);
-                    i += 1;
-                }
+                '\'' => { in_quote = true; current.push(ch); }
+                '(' => { depth += 1; current.push(ch); }
+                ')' => { depth -= 1; current.push(ch); }
                 ',' if depth == 0 => {
-                    parts.push(current.clone());
-                    current.clear();
-                    i += 1;
+                    parts.push(std::mem::take(&mut current));
                 }
-                _ => {
-                    current.push(ch);
-                    i += 1;
-                }
+                _ => { current.push(ch); }
             }
         }
 
-        if !current.is_empty() {
-            parts.push(current);
-        }
-
+        parts.push(current);
         parts
     }
 
