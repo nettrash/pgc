@@ -86,6 +86,18 @@ CREATE SEQUENCE shared_schema.global_counter_seq
     MAXVALUE 999999999
     CACHE 5;  -- MODIFIED: different cache size
 
+-- MODIFIED: start_value and MINVALUE raised from 1 to 10000000.
+-- The comparer must emit RESTART WITH 10000000 so PostgreSQL does not fall back to
+-- the old recorded start value (1) and raise:
+--   ERROR: RESTART value (1) cannot be less than MINVALUE (10000000)
+CREATE SEQUENCE test_schema.minvalue_raise_seq
+    START WITH 10000000  -- MODIFIED: raised from 1
+    INCREMENT BY 1
+    MINVALUE 10000000    -- MODIFIED: raised from 1
+    MAXVALUE 999999999
+    CACHE 1
+    CYCLE;               -- MODIFIED: NO CYCLE → CYCLE
+
 -- New sequence
 CREATE SEQUENCE new_reporting_schema.report_id_seq
     START WITH 1

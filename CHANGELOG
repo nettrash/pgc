@@ -1,7 +1,8 @@
                 v1.0.12
                     - Fixed splitting arguments issue.
                     - Flag `use_drop` / `--use-drop` currently affects all DROP statements; when disabled, DROP statements are commented out instead of executed.
-                    - `coninhcount` i16 -> i32
+                    - `coninhcount` i16 -> i32.
+                    - Fixed altering sequences with values.
 
 2026-04-07      v1.0.11
 

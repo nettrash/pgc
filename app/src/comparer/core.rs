@@ -1095,7 +1095,8 @@ impl Comparer {
                     self.script.push_str(
                         format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                     );
-                    self.script.push_str(sequence.get_alter_script().as_str());
+                    self.script
+                        .push_str(sequence.get_alter_script(Some(from_sequence)).as_str());
                 }
             } else {
                 // Check if the sequence is owned by a column that is an identity column or serial type.
@@ -3632,6 +3633,125 @@ mod tests {
         let script = comparer.get_script();
 
         assert!(script.contains("alter sequence public.test_seq owner to new_owner;"));
+    }
+
+    /// When MINVALUE is raised and start_value changes, the comparer must emit RESTART WITH so
+    /// PostgreSQL does not implicitly restart from the old start value (< new MINVALUE):
+    ///
+    ///   ERROR: RESTART value (1) cannot be less than MINVALUE (10000000)
+    #[tokio::test]
+    async fn compare_sequences_emits_restart_with_when_start_value_changes() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_sequence = Sequence::new(
+            "my_schema".to_string(),
+            "my_sequence_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(999_999_999),
+            Some(1),
+            false,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        );
+        let to_sequence = Sequence::new(
+            "my_schema".to_string(),
+            "my_sequence_id_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(10_000_000),
+            Some(10_000_000),
+            Some(999_999_999),
+            Some(1),
+            true,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        from_dump.sequences.push(from_sequence);
+        to_dump.sequences.push(to_sequence);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            script.contains("start with 10000000"),
+            "script must contain START WITH: {script}"
+        );
+        assert!(
+            script.contains("restart with 10000000"),
+            "script must contain RESTART WITH to prevent RESTART value < MINVALUE error: {script}"
+        );
+    }
+
+    /// When only non-start parameters change (here: cycle), the comparer must NOT emit RESTART
+    /// WITH. Doing so would silently reset a live sequence's current position to its start value,
+    /// risking duplicate-key violations on active tables.
+    #[tokio::test]
+    async fn compare_sequences_no_restart_when_only_other_params_change() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_sequence = Sequence::new(
+            "public".to_string(),
+            "live_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(9999),
+            Some(1),
+            false, // cycle was false
+            Some(1),
+            Some(500_000),
+            None,
+            None,
+            None,
+        );
+        let to_sequence = Sequence::new(
+            "public".to_string(),
+            "live_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1), // start_value unchanged
+            Some(1),
+            Some(9999),
+            Some(1),
+            true, // only cycle changed
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        from_dump.sequences.push(from_sequence);
+        to_dump.sequences.push(to_sequence);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("restart with"),
+            "script must NOT contain RESTART WITH when start_value is unchanged: {script}"
+        );
+        assert!(
+            script.contains("alter sequence public.live_seq"),
+            "script must still contain the ALTER SEQUENCE: {script}"
+        );
     }
 
     #[tokio::test]

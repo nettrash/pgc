@@ -41,6 +41,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 ### 4. Sequences
 - **Modified**: `test_schema.user_id_seq` — START changed from 1000 → 2000
 - **Modified**: `shared_schema.global_counter_seq` — CACHE changed from 1 → 5
+- **Modified**: `test_schema.minvalue_raise_seq` — START WITH and MINVALUE both raised from 1 → 10000000; NO CYCLE → CYCLE. The comparer must emit `RESTART WITH 10000000` alongside `START WITH 10000000` to prevent PostgreSQL from implicitly restarting from the old recorded start value (1), which would violate the new MINVALUE and produce: `ERROR: RESTART value (1) cannot be less than MINVALUE (10000000)`
 - **Removed**: `test_schema.order_id_seq` in Schema B
 - **Added**: `new_reporting_schema.report_id_seq` in Schema B
 
