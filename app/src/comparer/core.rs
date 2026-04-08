@@ -1957,10 +1957,10 @@ impl Comparer {
                     }
                 }
                 if was_dropped && !drop_was_active {
-                    // Kind transition (mat→regular): DROP was commented, so
-                    // CREATE OR REPLACE VIEW would fail; comment it out too.
+                    // DROP was commented out (for example, because use_drop=false),
+                    // so CREATE OR REPLACE VIEW would fail; comment it out too.
                     self.script.push_str(&format!(
-                        "-- use_drop=false: view {}.{} requires drop+recreate (kind transition); create commented out (manual intervention needed)\n",
+                        "-- use_drop=false: DROP for view {}.{} was commented out, so create is also commented out because it would fail (manual intervention needed)\n",
                         to_view.schema, to_view.name
                     ));
                     self.script.push_str(
