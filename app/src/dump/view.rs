@@ -374,8 +374,7 @@ mod tests {
 
         // Should contain a warning about manual intervention
         assert!(
-            script.contains("use_drop=false")
-                && script.contains("manual intervention needed"),
+            script.contains("use_drop=false") && script.contains("manual intervention needed"),
             "should contain a warning comment, script:\n{}",
             script
         );
