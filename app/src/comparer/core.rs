@@ -1790,8 +1790,12 @@ impl Comparer {
                 is_dependent || (self.use_drop && is_from_only) || is_changed_mat_view;
 
             if should_drop {
-                let force_drop = self.use_drop || is_changed_mat_view;
-                candidates.push((idx, normalized_view, force_drop));
+                // The drop is emitted as active SQL only when use_drop is true.
+                // Changed materialized views still *need* a drop+recreate, but when
+                // use_drop is false the DROP (and its dependent CREATE) are commented
+                // out so the user can review them manually.
+                let drop_is_active = self.use_drop;
+                candidates.push((idx, normalized_view, drop_is_active));
             }
         }
 
