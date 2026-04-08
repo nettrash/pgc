@@ -155,9 +155,15 @@ impl View {
             );
         }
 
-        // Materialized views do not support CREATE OR REPLACE; drop and recreate instead.
-        if target.is_materialized {
-            let drop_script = target.get_drop_script();
+        // When the view kind changes (regular <-> materialized) or the target is
+        // a materialized view, we must drop and recreate because neither kind
+        // supports an in-place ALTER to the other, and materialized views do not
+        // support CREATE OR REPLACE.
+        let kind_changed = self.is_materialized != target.is_materialized;
+        if target.is_materialized || kind_changed {
+            // DROP must match the *current* object type so the existing object
+            // is actually removed.
+            let drop_script = self.get_drop_script();
             if use_drop {
                 return format!("{}{}", drop_script, target.get_script());
             } else {
@@ -171,7 +177,7 @@ impl View {
                     .map(|l| format!("-- {}\n", l))
                     .collect::<String>();
                 return format!(
-                    "-- use_drop=false: materialized view {}.{} requires drop+recreate; statements commented out (manual intervention needed)\n{}{}",
+                    "-- use_drop=false: view {}.{} requires drop+recreate; statements commented out (manual intervention needed)\n{}{}",
                     target.schema, target.name, commented_drop, commented_create
                 );
             }
@@ -414,5 +420,84 @@ mod tests {
         // Regular views use CREATE OR REPLACE, no drop involved
         assert_eq!(with_drop, without_drop);
         assert!(!with_drop.contains("drop"));
+    }
+
+    #[test]
+    fn test_get_alter_script_regular_to_materialized_drops_view() {
+        let current = create_view("select 1");
+        let target = create_materialized_view("select 1");
+
+        let script = current.get_alter_script(&target, true);
+
+        // DROP must target the current kind (regular view), not the target kind
+        assert!(
+            script.contains("drop view if exists"),
+            "should drop the regular view, script:\n{}",
+            script
+        );
+        assert!(
+            !script.contains("drop materialized view"),
+            "should NOT emit DROP MATERIALIZED VIEW for a regular view"
+        );
+        // Then create the materialized view
+        assert!(script.contains("create materialized view"));
+    }
+
+    #[test]
+    fn test_get_alter_script_materialized_to_regular_drops_materialized() {
+        let current = create_materialized_view("select 1");
+        let target = create_view("select 1");
+
+        let script = current.get_alter_script(&target, true);
+
+        // DROP must target the current kind (materialized view)
+        assert!(
+            script.contains("drop materialized view if exists"),
+            "should drop the materialized view, script:\n{}",
+            script
+        );
+        // Then create the regular view
+        assert!(script.contains("create view"));
+    }
+
+    #[test]
+    fn test_get_alter_script_regular_to_materialized_use_drop_false() {
+        let current = create_view("select 1");
+        let target = create_materialized_view("select 1");
+
+        let script = current.get_alter_script(&target, false);
+
+        assert!(
+            script.contains("use_drop=false") && script.contains("manual intervention needed"),
+            "should warn about manual intervention, script:\n{}",
+            script
+        );
+
+        // Both drop and create should be commented out
+        for line in script.lines() {
+            if line.contains("drop view") || line.contains("create materialized view") {
+                assert!(line.starts_with("--"), "should be commented: {}", line);
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_alter_script_materialized_to_regular_use_drop_false() {
+        let current = create_materialized_view("select 1");
+        let target = create_view("select 1");
+
+        let script = current.get_alter_script(&target, false);
+
+        assert!(
+            script.contains("use_drop=false") && script.contains("manual intervention needed"),
+            "should warn about manual intervention, script:\n{}",
+            script
+        );
+
+        for line in script.lines() {
+            if line.contains("drop materialized view") || line.contains("create view") {
+                assert!(line.starts_with("--"), "should be commented: {}", line);
+            }
+        }
     }
 }
