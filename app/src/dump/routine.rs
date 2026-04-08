@@ -450,15 +450,48 @@ impl Routine {
         result_parts.join(", ")
     }
 
-    /// Splits a comma-separated string respecting parenthesized groups.
-    /// E.g. "a numeric(10,2), b text" → ["a numeric(10,2)", " b text"]
+    /// Splits a comma-separated string respecting parenthesized groups and
+    /// single-quoted string literals.
+    /// E.g. "a numeric(10,2), b text"    → ["a numeric(10,2)", " b text"]
+    /// E.g. "','::character varying, 0"  → ["','::character varying", " 0"]
+    ///
+    /// Dollar-quoted strings (`$$...$$`) are intentionally not handled: both
+    /// call sites receive output from `pg_get_function_identity_arguments` or
+    /// `pg_get_expr(proargdefaults, 0)`, which always produce single-quoted
+    /// expressions and never emit dollar-quotes.
     fn split_arguments(s: &str) -> Vec<String> {
         let mut parts = Vec::new();
         let mut depth = 0;
+        let mut in_quote = false;
         let mut current = String::new();
+        let mut iter = s.chars().peekable();
 
-        for ch in s.chars() {
+        while let Some(ch) = iter.next() {
+            if in_quote {
+                // Inside a single-quoted string literal.
+                // Two consecutive single quotes represent an escaped quote ('').
+                if ch == '\'' {
+                    if iter.peek() == Some(&'\'') {
+                        // Escaped quote: consume both characters and stay in-quote.
+                        current.push('\'');
+                        current.push(iter.next().unwrap()); // safe: peek() confirmed Some above
+                    } else {
+                        // Closing quote.
+                        in_quote = false;
+                        current.push(ch);
+                    }
+                } else {
+                    current.push(ch);
+                }
+                continue;
+            }
+
+            // Outside any string literal.
             match ch {
+                '\'' => {
+                    in_quote = true;
+                    current.push(ch);
+                }
                 '(' => {
                     depth += 1;
                     current.push(ch);
@@ -468,8 +501,7 @@ impl Routine {
                     current.push(ch);
                 }
                 ',' if depth == 0 => {
-                    parts.push(current.clone());
-                    current.clear();
+                    parts.push(std::mem::take(&mut current));
                 }
                 _ => {
                     current.push(ch);
@@ -480,7 +512,10 @@ impl Routine {
         if !current.is_empty() {
             parts.push(current);
         }
-
+        debug_assert!(
+            !in_quote,
+            "split_arguments: unclosed single-quote in input: {s:?}"
+        );
         parts
     }
 
@@ -1129,6 +1164,133 @@ mod tests {
             script.contains("create aggregate public.my_mode(ORDER BY anyelement)"),
             "Expected ordered-set syntax with no direct args, got: {}",
             script
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // split_arguments: single-quote handling (Issue #154)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn split_arguments_respects_single_quoted_comma() {
+        // A single default value whose expression contains a comma inside quotes.
+        let input = "','::character varying";
+        let result = Routine::split_arguments(input);
+        assert_eq!(result, vec!["','::character varying"]);
+    }
+
+    #[test]
+    fn split_arguments_multiple_defaults_with_quoted_comma() {
+        // Two defaults: the first contains a quoted comma, the second is a plain number.
+        let input = "','::character varying, 0";
+        let result = Routine::split_arguments(input);
+        assert_eq!(result, vec!["','::character varying", " 0"]);
+    }
+
+    #[test]
+    fn split_arguments_escaped_quotes() {
+        // Two defaults: the first uses escaped single-quotes ('' inside a string).
+        let input = "'''hello'''::text, 42";
+        let result = Routine::split_arguments(input);
+        assert_eq!(result, vec!["'''hello'''::text", " 42"]);
+    }
+
+    #[test]
+    fn split_arguments_parenthesized_still_works() {
+        // Existing behaviour: parenthesised type expressions must not be split.
+        let input = "a numeric(10,2), b text";
+        let result = Routine::split_arguments(input);
+        assert_eq!(result, vec!["a numeric(10,2)", " b text"]);
+    }
+
+    // -----------------------------------------------------------------
+    // split_arguments: JSONB default with commas (Issue #154)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn split_arguments_jsonb_default_with_commas() {
+        // A JSONB literal default containing multiple comma-separated key-value
+        // pairs must not be split into multiple arguments.
+        let input = r#"p jsonb DEFAULT '{"key1": "value1", "key2": "value2"}'::jsonb"#;
+        let result = Routine::split_arguments(input);
+        assert_eq!(
+            result,
+            vec![r#"p jsonb DEFAULT '{"key1": "value1", "key2": "value2"}'::jsonb"#]
+        );
+    }
+
+    #[test]
+    fn split_arguments_jsonb_default_multiple_args() {
+        // JSONB default alongside other arguments: only the top-level comma
+        // (outside the single-quoted literal) must be treated as a delimiter.
+        let input = r#"id integer, opts jsonb DEFAULT '{"a": 1, "b": 2}'::jsonb"#;
+        let result = Routine::split_arguments(input);
+        assert_eq!(
+            result,
+            vec![
+                "id integer",
+                r#" opts jsonb DEFAULT '{"a": 1, "b": 2}'::jsonb"#
+            ]
+        );
+    }
+
+    #[test]
+    fn split_arguments_jsonb_default_multiline() {
+        // A multiline JSONB literal (containing newlines inside the quoted string)
+        // must be treated as a single argument — newlines and commas inside the
+        // single-quoted literal must not trigger a split.
+        let input =
+            "p jsonb DEFAULT '{\n    \"key1\": \"value1\",\n    \"key2\": \"value2\"\n}'::jsonb";
+        let result = Routine::split_arguments(input);
+        assert_eq!(result, vec![input]);
+    }
+
+    #[test]
+    fn arguments_with_defaults_jsonb_default() {
+        // Full round-trip for Issue #154: a function with a multi-key JSONB
+        // default must reconstruct the full default without splitting on the
+        // commas inside the quoted literal.
+        let routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(400),
+            "foo".to_string(),
+            "plpgsql".to_string(),
+            "FUNCTION".to_string(),
+            "void".to_string(),
+            "p jsonb".to_string(),
+            Some(r#"'{"key1": "value1", "key2": "value2"}'::jsonb"#.to_string()),
+            None,
+            "BEGIN END".to_string(),
+        );
+
+        let result = routine.arguments_with_defaults();
+        assert_eq!(
+            result,
+            r#"p jsonb DEFAULT '{"key1": "value1", "key2": "value2"}'::jsonb"#
+        );
+    }
+
+    #[test]
+    fn arguments_with_defaults_comma_default() {
+        // Full round-trip: a procedure with two varchar params where only the
+        // second has a default of ','::character varying.
+        let routine = Routine::new(
+            "test_schema".to_string(),
+            Oid(300),
+            "format_csv_line".to_string(),
+            "plpgsql".to_string(),
+            "PROCEDURE".to_string(),
+            "void".to_string(),
+            "p_value character varying, p_delimiter character varying".to_string(),
+            Some("','::character varying".to_string()),
+            None,
+            "BEGIN RAISE NOTICE '%', p_value || p_delimiter; END".to_string(),
+        );
+
+        let result = routine.arguments_with_defaults();
+        assert_eq!(
+            result,
+            "p_value character varying, p_delimiter character varying DEFAULT ','::character varying"
         );
     }
 }
