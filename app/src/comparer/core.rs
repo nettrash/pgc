@@ -31,7 +31,7 @@ pub struct Comparer {
     type_post_script: String,
     sequence_post_script: String,
     trigger_post_script: String,
-    dropped_views: HashSet<String>,
+    dropped_views: HashMap<String, bool>,
     // Tracks columns that should use serial/bigserial/smallserial type.
     // Key: "schema.table.column", Value: "serial", "bigserial", or "smallserial".
     serial_columns: HashMap<String, String>,
@@ -60,7 +60,7 @@ impl Comparer {
             type_post_script: String::new(),
             sequence_post_script: String::new(),
             trigger_post_script: String::new(),
-            dropped_views: HashSet::new(),
+            dropped_views: HashMap::new(),
             serial_columns: HashMap::new(),
         };
 
@@ -1862,7 +1862,7 @@ impl Comparer {
                         .as_str(),
                 );
             }
-            self.dropped_views.insert(normalized_view.clone());
+            self.dropped_views.insert(normalized_view.clone(), force_drop);
         }
 
         self.script
@@ -1886,7 +1886,8 @@ impl Comparer {
                 .find(|view| view.schema == to_view.schema && view.name == to_view.name);
 
             let existed_in_from = from_view.is_some();
-            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let was_dropped = self.dropped_views.contains_key(&normalized_view);
+            let drop_was_active = self.dropped_views.get(&normalized_view).copied().unwrap_or(false);
             let definition_changed = from_view
                 .map(|fv| Self::hashes_differ(&fv.hash, &to_view.hash))
                 .unwrap_or(false);
@@ -1910,7 +1911,22 @@ impl Comparer {
             if to_view.is_materialized {
                 // Materialized views do not support CREATE OR REPLACE — get_script()
                 // already emits the correct CREATE MATERIALIZED VIEW syntax.
-                self.script.push_str(&to_view.get_script());
+                if was_dropped && !drop_was_active {
+                    // DROP was commented out, so CREATE would fail; comment it out too.
+                    let create_script = to_view.get_script();
+                    self.script.push_str(&format!(
+                        "-- use_drop=false: materialized view {}.{} requires drop+recreate; create commented out (manual intervention needed)\n",
+                        to_view.schema, to_view.name
+                    ));
+                    self.script.push_str(
+                        &create_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                } else {
+                    self.script.push_str(&to_view.get_script());
+                }
             } else {
                 let mut view_script = to_view.get_script();
                 if !view_script
@@ -1939,7 +1955,24 @@ impl Comparer {
             .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
 
         if to_view.is_materialized {
-            self.script.push_str(&to_view.get_script());
+            let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
+            let drop_was_active = self.dropped_views.get(&normalized_view).copied().unwrap_or(true);
+            if !drop_was_active {
+                // DROP was commented out, so CREATE would fail; comment it out too.
+                let create_script = to_view.get_script();
+                self.script.push_str(&format!(
+                    "-- use_drop=false: materialized view {}.{} requires drop+recreate; create commented out (manual intervention needed)\n",
+                    to_view.schema, to_view.name
+                ));
+                self.script.push_str(
+                    &create_script
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>(),
+                );
+            } else {
+                self.script.push_str(&to_view.get_script());
+            }
         } else {
             let mut view_script = to_view.get_script();
             if !view_script
@@ -2077,7 +2110,7 @@ impl Comparer {
                 .views
                 .iter()
                 .find(|v| v.schema == view.schema && v.name == view.name);
-            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let was_dropped = self.dropped_views.contains_key(&normalized_view);
             let definition_changed = from_view
                 .map(|fv| Self::hashes_differ(&fv.hash, &view.hash))
                 .unwrap_or(false);
@@ -2407,7 +2440,7 @@ impl Comparer {
             // dependency of an altered table), its ACL will be lost after
             // the DROP.  Treat from_acl as empty so that all required
             // grants are emitted in the migration script.
-            let (from_acl, from_owner) = if self.dropped_views.contains(&normalized_key) {
+            let (from_acl, from_owner) = if self.dropped_views.contains_key(&normalized_key) {
                 (&[] as &[String], "")
             } else {
                 from_view_map
@@ -5585,7 +5618,7 @@ mod tests {
         // (e.g. as a dependency of an altered table).
         comparer
             .dropped_views
-            .insert(Comparer::normalized_view_key("public", "my_view"));
+            .insert(Comparer::normalized_view_key("public", "my_view"), true);
         comparer.compare_grants().await.unwrap();
         let script = comparer.get_script();
 
