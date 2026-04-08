@@ -31,7 +31,7 @@ pub struct Comparer {
     type_post_script: String,
     sequence_post_script: String,
     trigger_post_script: String,
-    dropped_views: HashSet<String>,
+    dropped_views: HashMap<String, bool>,
     // Tracks columns that should use serial/bigserial/smallserial type.
     // Key: "schema.table.column", Value: "serial", "bigserial", or "smallserial".
     serial_columns: HashMap<String, String>,
@@ -60,7 +60,7 @@ impl Comparer {
             type_post_script: String::new(),
             sequence_post_script: String::new(),
             trigger_post_script: String::new(),
-            dropped_views: HashSet::new(),
+            dropped_views: HashMap::new(),
             serial_columns: HashMap::new(),
         };
 
@@ -868,7 +868,7 @@ impl Comparer {
                     self.script.push_str(
                         format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
                     );
-                    let alter_script = from_type.get_alter_script(to_type);
+                    let alter_script = from_type.get_alter_script(to_type, self.use_drop);
                     if alter_script.trim().is_empty() {
                         self.script.push_str(
                             "-- No supported alterations for this type; manual review required.\n",
@@ -981,7 +981,7 @@ impl Comparer {
                     create_alter_section.push_str(
                         format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
                     );
-                    let alter_script = from_enum.get_alter_script(to_enum);
+                    let alter_script = from_enum.get_alter_script(to_enum, self.use_drop);
                     if alter_script.trim().is_empty() {
                         create_alter_section.push_str(
                             "-- No supported alterations for this enum; manual review required.\n",
@@ -1477,7 +1477,17 @@ impl Comparer {
                                 constraint.schema, constraint.table_name, constraint.name
                             );
                             if dropped_fk_keys.insert(key) {
-                                fk_pre_drop.push_str(&constraint.get_drop_script());
+                                let drop_cmd = constraint.get_drop_script();
+                                if self.use_drop {
+                                    fk_pre_drop.push_str(&drop_cmd);
+                                } else {
+                                    fk_pre_drop.push_str(
+                                        &drop_cmd
+                                            .lines()
+                                            .map(|l| format!("-- {}\n", l))
+                                            .collect::<String>(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1504,10 +1514,15 @@ impl Comparer {
 
             // Drop triggers on the table
             for trigger in &table.triggers {
-                pre_drop.append_block(&format!(
+                let drop_cmd = format!(
                     "drop trigger if exists {} on {}.{};",
                     trigger.name, table.schema, table.name
-                ));
+                );
+                if self.use_drop {
+                    pre_drop.append_block(&drop_cmd);
+                } else {
+                    pre_drop.append_block(&format!("-- {}", drop_cmd));
+                }
             }
 
             self.script
@@ -1771,12 +1786,24 @@ impl Comparer {
                     .map(|tv| Self::hashes_differ(&from_view.hash, &tv.hash))
                     .unwrap_or(false);
 
-            let should_drop =
-                is_dependent || (self.use_drop && is_from_only) || is_changed_mat_view;
+            // Kind transition (regular <-> materialized) requires drop+recreate
+            // because neither supports an in-place ALTER to the other kind.
+            let is_kind_transition = to_view
+                .map(|tv| from_view.is_materialized != tv.is_materialized)
+                .unwrap_or(false);
+
+            let should_drop = is_dependent
+                || (self.use_drop && is_from_only)
+                || is_changed_mat_view
+                || is_kind_transition;
 
             if should_drop {
-                let force_drop = self.use_drop || is_changed_mat_view;
-                candidates.push((idx, normalized_view, force_drop));
+                // The drop is emitted as active SQL only when use_drop is true.
+                // Changed materialized views still *need* a drop+recreate, but when
+                // use_drop is false the DROP (and its dependent CREATE) are commented
+                // out so the user can review them manually.
+                let drop_is_active = self.use_drop;
+                candidates.push((idx, normalized_view, drop_is_active));
             }
         }
 
@@ -1847,7 +1874,8 @@ impl Comparer {
                         .as_str(),
                 );
             }
-            self.dropped_views.insert(normalized_view.clone());
+            self.dropped_views
+                .insert(normalized_view.clone(), force_drop);
         }
 
         self.script
@@ -1871,7 +1899,12 @@ impl Comparer {
                 .find(|view| view.schema == to_view.schema && view.name == to_view.name);
 
             let existed_in_from = from_view.is_some();
-            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let was_dropped = self.dropped_views.contains_key(&normalized_view);
+            let drop_was_active = self
+                .dropped_views
+                .get(&normalized_view)
+                .copied()
+                .unwrap_or(false);
             let definition_changed = from_view
                 .map(|fv| Self::hashes_differ(&fv.hash, &to_view.hash))
                 .unwrap_or(false);
@@ -1895,7 +1928,22 @@ impl Comparer {
             if to_view.is_materialized {
                 // Materialized views do not support CREATE OR REPLACE — get_script()
                 // already emits the correct CREATE MATERIALIZED VIEW syntax.
-                self.script.push_str(&to_view.get_script());
+                if was_dropped && !drop_was_active {
+                    // DROP was commented out, so CREATE would fail; comment it out too.
+                    let create_script = to_view.get_script();
+                    self.script.push_str(&format!(
+                        "-- use_drop=false: materialized view {}.{} requires drop+recreate; create commented out (manual intervention needed)\n",
+                        to_view.schema, to_view.name
+                    ));
+                    self.script.push_str(
+                        &create_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                } else {
+                    self.script.push_str(&to_view.get_script());
+                }
             } else {
                 let mut view_script = to_view.get_script();
                 if !view_script
@@ -1909,7 +1957,22 @@ impl Comparer {
                         view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
                     }
                 }
-                self.script.push_str(&view_script);
+                if was_dropped && !drop_was_active {
+                    // Kind transition (mat→regular): DROP was commented, so
+                    // CREATE OR REPLACE VIEW would fail; comment it out too.
+                    self.script.push_str(&format!(
+                        "-- use_drop=false: view {}.{} requires drop+recreate (kind transition); create commented out (manual intervention needed)\n",
+                        to_view.schema, to_view.name
+                    ));
+                    self.script.push_str(
+                        &view_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                } else {
+                    self.script.push_str(&view_script);
+                }
             }
         }
 
@@ -1924,7 +1987,28 @@ impl Comparer {
             .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
 
         if to_view.is_materialized {
-            self.script.push_str(&to_view.get_script());
+            let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
+            let drop_was_active = self
+                .dropped_views
+                .get(&normalized_view)
+                .copied()
+                .unwrap_or(true);
+            if !drop_was_active {
+                // DROP was commented out, so CREATE would fail; comment it out too.
+                let create_script = to_view.get_script();
+                self.script.push_str(&format!(
+                    "-- use_drop=false: materialized view {}.{} requires drop+recreate; create commented out (manual intervention needed)\n",
+                    to_view.schema, to_view.name
+                ));
+                self.script.push_str(
+                    &create_script
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>(),
+                );
+            } else {
+                self.script.push_str(&to_view.get_script());
+            }
         } else {
             let mut view_script = to_view.get_script();
             if !view_script
@@ -1937,7 +2021,29 @@ impl Comparer {
                     view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
                 }
             }
-            self.script.push_str(&view_script);
+            let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
+            let drop_was_active = self
+                .dropped_views
+                .get(&normalized_view)
+                .copied()
+                .unwrap_or(true);
+            let was_dropped = self.dropped_views.contains_key(&normalized_view);
+            if was_dropped && !drop_was_active {
+                // Kind transition (mat→regular): DROP was commented, so
+                // CREATE OR REPLACE VIEW would fail; comment it out too.
+                self.script.push_str(&format!(
+                    "-- use_drop=false: view {}.{} requires drop+recreate (kind transition); create commented out (manual intervention needed)\n",
+                    to_view.schema, to_view.name
+                ));
+                self.script.push_str(
+                    &view_script
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>(),
+                );
+            } else {
+                self.script.push_str(&view_script);
+            }
         }
     }
 
@@ -2062,7 +2168,7 @@ impl Comparer {
                 .views
                 .iter()
                 .find(|v| v.schema == view.schema && v.name == view.name);
-            let was_dropped = self.dropped_views.contains(&normalized_view);
+            let was_dropped = self.dropped_views.contains_key(&normalized_view);
             let definition_changed = from_view
                 .map(|fv| Self::hashes_differ(&fv.hash, &view.hash))
                 .unwrap_or(false);
@@ -2392,7 +2498,7 @@ impl Comparer {
             // dependency of an altered table), its ACL will be lost after
             // the DROP.  Treat from_acl as empty so that all required
             // grants are emitted in the migration script.
-            let (from_acl, from_owner) = if self.dropped_views.contains(&normalized_key) {
+            let (from_acl, from_owner) = if self.dropped_views.contains_key(&normalized_key) {
                 (&[] as &[String], "")
             } else {
                 from_view_map
@@ -3189,6 +3295,7 @@ mod tests {
     use crate::dump::table::Table;
     use crate::dump::table_column::TableColumn;
     use crate::dump::table_constraint::TableConstraint;
+    use crate::dump::table_trigger::TableTrigger;
     use crate::dump::view::View;
 
     fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
@@ -5569,7 +5676,7 @@ mod tests {
         // (e.g. as a dependency of an altered table).
         comparer
             .dropped_views
-            .insert(Comparer::normalized_view_key("public", "my_view"));
+            .insert(Comparer::normalized_view_key("public", "my_view"), true);
         comparer.compare_grants().await.unwrap();
         let script = comparer.get_script();
 
@@ -6751,6 +6858,460 @@ mod tests {
         assert!(
             pos_drop < pos_us,
             "events_2023 must be dropped before events_2023_us is created"
+        );
+    }
+
+    #[tokio::test]
+    async fn fk_pre_drop_commented_when_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // "from" has a table referenced by FK
+        let mut referenced = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        referenced.hash();
+
+        // "from" has a table with FK referencing "users"
+        let mut referencing = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                int_column("public", "orders", "id", 1),
+                int_column("public", "orders", "user_id", 2),
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "orders_user_fk".to_string(),
+                table_name: "orders".to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
+                coninhcount: 0,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+        referencing.hash();
+
+        from_dump.tables.push(referenced.clone());
+        from_dump.tables.push(referencing.clone());
+
+        // "to" has only "orders" — "users" is being dropped, so its FK must be pre-dropped
+        to_dump.tables.push(referencing);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        // FK drop should be commented out because use_drop=false
+        let has_commented_fk_drop = script.lines().any(|l| {
+            l.starts_with("--") && l.contains("drop constraint") && l.contains("orders_user_fk")
+        });
+        assert!(
+            has_commented_fk_drop,
+            "FK pre-drop should be commented out when use_drop=false, script:\n{}",
+            script
+        );
+
+        // Should NOT have an active (uncommented) drop constraint for the FK
+        let has_active_fk_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop constraint") && l.contains("orders_user_fk")
+        });
+        assert!(
+            !has_active_fk_drop,
+            "FK pre-drop should NOT be active when use_drop=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn fk_pre_drop_active_when_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut referenced = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        referenced.hash();
+
+        let mut referencing = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                int_column("public", "orders", "id", 1),
+                int_column("public", "orders", "user_id", 2),
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "orders_user_fk".to_string(),
+                table_name: "orders".to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
+                coninhcount: 0,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+        referencing.hash();
+
+        from_dump.tables.push(referenced.clone());
+        from_dump.tables.push(referencing.clone());
+        to_dump.tables.push(referencing);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let has_active_fk_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop constraint") && l.contains("orders_user_fk")
+        });
+        assert!(
+            has_active_fk_drop,
+            "FK pre-drop should be active when use_drop=true, script:\n{}",
+            script
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_pre_drop_commented_when_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        // "from" has a table with a trigger; table is absent in "to"
+        let mut table_with_trigger = Table::new(
+            "public".to_string(),
+            "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![TableTrigger {
+                oid: Oid(9999),
+                name: "trg_events_audit".to_string(),
+                definition: "before insert on events for each row execute function audit()"
+                    .to_string(),
+            }],
+            None,
+        );
+        table_with_trigger.hash();
+
+        from_dump.tables.push(table_with_trigger);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        // Trigger drop should be commented out when use_drop=false
+        let has_commented_trigger_drop = script.lines().any(|l| {
+            l.starts_with("--") && l.contains("drop trigger") && l.contains("trg_events_audit")
+        });
+        assert!(
+            has_commented_trigger_drop,
+            "Trigger pre-drop should be commented when use_drop=false, script:\n{}",
+            script
+        );
+
+        let has_active_trigger_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop trigger") && l.contains("trg_events_audit")
+        });
+        assert!(
+            !has_active_trigger_drop,
+            "Trigger pre-drop should NOT be active when use_drop=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_pre_drop_active_when_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let mut table_with_trigger = Table::new(
+            "public".to_string(),
+            "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![TableTrigger {
+                oid: Oid(9999),
+                name: "trg_events_audit".to_string(),
+                definition: "before insert on events for each row execute function audit()"
+                    .to_string(),
+            }],
+            None,
+        );
+        table_with_trigger.hash();
+
+        from_dump.tables.push(table_with_trigger);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let has_active_trigger_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop trigger") && l.contains("trg_events_audit")
+        });
+        assert!(
+            has_active_trigger_drop,
+            "Trigger pre-drop should be active when use_drop=true, script:\n{}",
+            script
+        );
+    }
+
+    // ------ Kind-transition tests (regular <-> materialized) ------
+
+    #[tokio::test]
+    async fn kind_transition_regular_to_materialized_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        from_view.is_materialized = false;
+        from_view.hash();
+        from_dump.views.push(from_view);
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        to_view.is_materialized = true;
+        to_view.hash();
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.drop_views().await.unwrap();
+        comparer.create_views().await.unwrap();
+        let script = comparer.get_script();
+
+        // DROP VIEW (regular) should be active
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
+        assert!(
+            has_active_drop,
+            "Regular→mat: DROP VIEW should be active when use_drop=true, script:\n{}",
+            script
+        );
+        // CREATE MATERIALIZED VIEW should be active
+        let has_active_create = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create materialized view"));
+        assert!(
+            has_active_create,
+            "Regular→mat: CREATE MATERIALIZED VIEW should be active when use_drop=true, script:\n{}",
+            script
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_transition_regular_to_materialized_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        from_view.is_materialized = false;
+        from_view.hash();
+        from_dump.views.push(from_view);
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        to_view.is_materialized = true;
+        to_view.hash();
+        to_dump.views.push(to_view);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.drop_views().await.unwrap();
+        comparer.create_views().await.unwrap();
+        let script = comparer.get_script();
+
+        // DROP should be commented
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
+        assert!(
+            !has_active_drop,
+            "Regular→mat: DROP VIEW should be commented when use_drop=false, script:\n{}",
+            script
+        );
+        // CREATE should be commented (manual intervention needed)
+        let has_active_create = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create materialized view"));
+        assert!(
+            !has_active_create,
+            "Regular→mat: CREATE MATERIALIZED VIEW should be commented when use_drop=false, script:\n{}",
+            script
+        );
+        assert!(
+            script.contains("manual intervention needed"),
+            "Should contain manual intervention warning, script:\n{}",
+            script
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_transition_materialized_to_regular_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        from_view.is_materialized = true;
+        from_view.hash();
+        from_dump.views.push(from_view);
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        to_view.is_materialized = false;
+        to_view.hash();
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.drop_views().await.unwrap();
+        comparer.create_views().await.unwrap();
+        let script = comparer.get_script();
+
+        // DROP MATERIALIZED VIEW should be active
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop materialized view"));
+        assert!(
+            has_active_drop,
+            "Mat→regular: DROP MATERIALIZED VIEW should be active when use_drop=true, script:\n{}",
+            script
+        );
+        // CREATE OR REPLACE VIEW should be active
+        let has_active_create = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create or replace view"));
+        assert!(
+            has_active_create,
+            "Mat→regular: CREATE OR REPLACE VIEW should be active when use_drop=true, script:\n{}",
+            script
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_transition_materialized_to_regular_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        from_view.is_materialized = true;
+        from_view.hash();
+        from_dump.views.push(from_view);
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        to_view.is_materialized = false;
+        to_view.hash();
+        to_dump.views.push(to_view);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.drop_views().await.unwrap();
+        comparer.create_views().await.unwrap();
+        let script = comparer.get_script();
+
+        // DROP should be commented
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop materialized view"));
+        assert!(
+            !has_active_drop,
+            "Mat→regular: DROP MATERIALIZED VIEW should be commented when use_drop=false, script:\n{}",
+            script
+        );
+        // CREATE OR REPLACE VIEW should also be commented (kind transition)
+        let has_active_create = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create or replace view"));
+        assert!(
+            !has_active_create,
+            "Mat→regular: CREATE OR REPLACE VIEW should be commented when use_drop=false, script:\n{}",
+            script
+        );
+        assert!(
+            script.contains("manual intervention needed"),
+            "Should contain manual intervention warning, script:\n{}",
+            script
         );
     }
 }
