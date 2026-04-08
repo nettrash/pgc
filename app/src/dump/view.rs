@@ -165,7 +165,15 @@ impl View {
                     .lines()
                     .map(|l| format!("-- {}\n", l))
                     .collect::<String>();
-                return format!("{}{}", commented_drop, target.get_script());
+                let commented_create = target
+                    .get_script()
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>();
+                return format!(
+                    "-- use_drop=false: materialized view {}.{} requires drop+recreate; statements commented out (manual intervention needed)\n{}{}",
+                    target.schema, target.name, commented_drop, commented_create
+                );
             }
         }
 
@@ -364,15 +372,21 @@ mod tests {
 
         let script = current.get_alter_script(&target, false);
 
-        // The drop part should be commented out
+        // Should contain a warning about manual intervention
+        assert!(
+            script.contains("use_drop=false")
+                && script.contains("manual intervention needed"),
+            "should contain a warning comment, script:\n{}",
+            script
+        );
+
+        // Both drop and create should be commented out
         for line in script.lines() {
-            if line.contains("drop materialized view") {
-                assert!(line.starts_with("--"), "drop should be commented: {}", line);
+            if line.contains("drop materialized view") || line.contains("create materialized view")
+            {
+                assert!(line.starts_with("--"), "should be commented: {}", line);
             }
         }
-        // The create part should still be active
-        assert!(script.contains("create materialized view analytics.active_users as"));
-        assert!(script.contains("select id from public.users"));
     }
 
     #[test]
