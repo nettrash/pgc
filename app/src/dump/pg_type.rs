@@ -408,7 +408,7 @@ impl PgType {
     }
 
     /// Returns a string to alter the existing user-defined type to match the target definition.
-    pub fn get_alter_script(&self, target: &PgType) -> String {
+    pub fn get_alter_script(&self, target: &PgType, use_drop: bool) -> String {
         if self.schema != target.schema || self.typname != target.typname {
             return format!(
                 "-- Cannot alter type {}.{} because target is {}.{}\n",
@@ -507,10 +507,15 @@ impl PgType {
                             self.schema, self.typname, default
                         ));
                     } else {
-                        statements.push(format!(
+                        let drop_cmd = format!(
                             "alter domain {}.{} drop default;",
                             self.schema, self.typname
-                        ));
+                        );
+                        if use_drop {
+                            statements.push(drop_cmd);
+                        } else {
+                            statements.push(format!("-- {}", drop_cmd));
+                        }
                     }
                 }
 
@@ -521,10 +526,15 @@ impl PgType {
                             self.schema, self.typname
                         ));
                     } else {
-                        statements.push(format!(
+                        let drop_cmd = format!(
                             "alter domain {}.{} drop not null;",
                             self.schema, self.typname
-                        ));
+                        );
+                        if use_drop {
+                            statements.push(drop_cmd);
+                        } else {
+                            statements.push(format!("-- {}", drop_cmd));
+                        }
                     }
                 }
 
@@ -544,12 +554,17 @@ impl PgType {
                     match target_constraints.get(name) {
                         Some(target_constraint) => {
                             if current_constraint.definition != target_constraint.definition {
-                                statements.push(format!(
+                                let drop_cmd = format!(
                                     "alter domain {}.{} drop constraint {};",
                                     self.schema,
                                     self.typname,
                                     quote_ident(name)
-                                ));
+                                );
+                                if use_drop {
+                                    statements.push(drop_cmd);
+                                } else {
+                                    statements.push(format!("-- {}", drop_cmd));
+                                }
                                 statements.push(format!(
                                     "alter domain {}.{} add constraint {} {};",
                                     self.schema,
@@ -561,12 +576,17 @@ impl PgType {
                             }
                         }
                         None => {
-                            statements.push(format!(
+                            let drop_cmd = format!(
                                 "alter domain {}.{} drop constraint {};",
                                 self.schema,
                                 self.typname,
                                 quote_ident(name)
-                            ));
+                            );
+                            if use_drop {
+                                statements.push(drop_cmd);
+                            } else {
+                                statements.push(format!("-- {}", drop_cmd));
+                            }
                         }
                     }
                 }
@@ -804,7 +824,7 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n\n"
             "completed".to_string(),
         ];
 
-        let script = current.get_alter_script(&target);
+        let script = current.get_alter_script(&target, true);
 
         assert_eq!(
             script,
@@ -818,7 +838,7 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n\n"
         current.enum_labels = vec!["pending".to_string(), "completed".to_string()];
         let target = current.clone();
 
-        let script = current.get_alter_script(&target);
+        let script = current.get_alter_script(&target, true);
 
         assert_eq!(script, "-- Enum public.my_type requires no changes.\n");
     }
@@ -849,7 +869,7 @@ alter domain public.amount add constraint \"ValueCheck\" check (value > 0);\n\n"
             },
         ];
 
-        let script = current.get_alter_script(&target);
+        let script = current.get_alter_script(&target, true);
 
         let expected = "alter domain public.amount set default 84;\n\n\
 alter domain public.amount drop not null;\n\n\
@@ -901,8 +921,236 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
         let mut target = current.clone();
         target.owner = "new_owner".to_string();
 
-        let script = current.get_alter_script(&target);
+        let script = current.get_alter_script(&target, true);
 
         assert!(script.contains("alter type public.status owner to new_owner;"));
+    }
+
+    #[test]
+    fn get_alter_script_domain_drop_default_use_drop_false() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.typdefault = Some("42".to_string());
+
+        let mut target = current.clone();
+        target.typdefault = None;
+
+        let script = current.get_alter_script(&target, false);
+
+        assert!(script.contains("drop default"));
+        // The drop default line should be commented out
+        for line in script.lines() {
+            if line.contains("drop default") {
+                assert!(
+                    line.starts_with("--"),
+                    "drop default should be commented: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_alter_script_domain_drop_default_use_drop_true() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.typdefault = Some("42".to_string());
+
+        let mut target = current.clone();
+        target.typdefault = None;
+
+        let script = current.get_alter_script(&target, true);
+
+        assert!(script.contains("alter domain public.amount drop default;"));
+        // Should NOT be commented out
+        for line in script.lines() {
+            if line.contains("drop default") {
+                assert!(
+                    !line.starts_with("--"),
+                    "drop default should be active: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_alter_script_domain_drop_not_null_use_drop_false() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.typnotnull = true;
+
+        let mut target = current.clone();
+        target.typnotnull = false;
+
+        let script = current.get_alter_script(&target, false);
+
+        assert!(script.contains("drop not null"));
+        for line in script.lines() {
+            if line.contains("drop not null") {
+                assert!(
+                    line.starts_with("--"),
+                    "drop not null should be commented: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_alter_script_domain_drop_not_null_use_drop_true() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.typnotnull = true;
+
+        let mut target = current.clone();
+        target.typnotnull = false;
+
+        let script = current.get_alter_script(&target, true);
+
+        assert!(script.contains("alter domain public.amount drop not null;"));
+        for line in script.lines() {
+            if line.contains("drop not null") {
+                assert!(
+                    !line.starts_with("--"),
+                    "drop not null should be active: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_alter_script_domain_drop_constraint_use_drop_false() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.domain_constraints = vec![DomainConstraint {
+            name: "ValueCheck".to_string(),
+            definition: "check (value > 0)".to_string(),
+        }];
+
+        let mut target = current.clone();
+        target.domain_constraints = vec![DomainConstraint {
+            name: "ValueCheck".to_string(),
+            definition: "check (value >= 0)".to_string(),
+        }];
+
+        let script = current.get_alter_script(&target, false);
+
+        assert!(script.contains("drop constraint"));
+        for line in script.lines() {
+            if line.contains("drop constraint") {
+                assert!(
+                    line.starts_with("--"),
+                    "drop constraint should be commented: {}",
+                    line
+                );
+            }
+        }
+        // The add constraint should still be active
+        assert!(script.contains("add constraint"));
+        for line in script.lines() {
+            if line.contains("add constraint") {
+                assert!(
+                    !line.starts_with("--"),
+                    "add constraint should be active: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_alter_script_domain_remove_constraint_use_drop_false() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.domain_constraints = vec![DomainConstraint {
+            name: "OldCheck".to_string(),
+            definition: "check (value > 0)".to_string(),
+        }];
+
+        let mut target = current.clone();
+        target.domain_constraints = vec![];
+
+        let script = current.get_alter_script(&target, false);
+
+        assert!(script.contains("drop constraint"));
+        for line in script.lines() {
+            if line.contains("drop constraint") {
+                assert!(
+                    line.starts_with("--"),
+                    "drop constraint should be commented: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_alter_script_domain_all_drops_use_drop_false() {
+        let mut current = base_pg_type('d');
+        current.typname = "amount".to_string();
+        current.formatted_basetype = Some("integer".to_string());
+        current.typdefault = Some("42".to_string());
+        current.typnotnull = true;
+        current.domain_constraints = vec![DomainConstraint {
+            name: "ValueCheck".to_string(),
+            definition: "check (value > 0)".to_string(),
+        }];
+
+        let mut target = current.clone();
+        target.typdefault = Some("84".to_string());
+        target.typnotnull = false;
+        target.domain_constraints = vec![
+            DomainConstraint {
+                name: "ValueCheck".to_string(),
+                definition: "check (value >= 0)".to_string(),
+            },
+            DomainConstraint {
+                name: "FreshConstraint".to_string(),
+                definition: "check (value <> 0)".to_string(),
+            },
+        ];
+
+        let script = current.get_alter_script(&target, false);
+
+        // set default should still be active (not a drop)
+        assert!(script.contains("set default 84"));
+        // drop not null should be commented
+        for line in script.lines() {
+            if line.contains("drop not null") {
+                assert!(
+                    line.starts_with("--"),
+                    "drop not null should be commented: {}",
+                    line
+                );
+            }
+        }
+        // drop constraint should be commented
+        for line in script.lines() {
+            if line.contains("drop constraint") {
+                assert!(
+                    line.starts_with("--"),
+                    "drop constraint should be commented: {}",
+                    line
+                );
+            }
+        }
+        // add constraint should still be active
+        for line in script.lines() {
+            if line.contains("add constraint") {
+                assert!(
+                    !line.starts_with("--"),
+                    "add constraint should be active: {}",
+                    line
+                );
+            }
+        }
     }
 }

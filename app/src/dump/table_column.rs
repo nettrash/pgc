@@ -439,13 +439,23 @@ impl TableColumn {
                     )
                     .with_empty_lines(),
                 ),
-                None => statements.push(
-                    format!(
+                None => {
+                    let drop_cmd = format!(
                         "alter table {}.{} alter column {} drop default;",
                         self.schema, self.table, self.name
                     )
-                    .with_empty_lines(),
-                ),
+                    .with_empty_lines();
+                    if use_drop {
+                        statements.push(drop_cmd);
+                    } else {
+                        statements.push(
+                            drop_cmd
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect::<String>(),
+                        );
+                    }
+                }
             }
         }
 
@@ -481,13 +491,21 @@ impl TableColumn {
             if self.is_identity {
                 statements.push(self.build_identity_add_statement(existing));
             } else {
-                statements.push(
-                    format!(
-                        "alter table {}.{} alter column {} drop identity if exists;",
-                        self.schema, self.table, self.name
-                    )
-                    .with_empty_lines(),
-                );
+                let drop_cmd = format!(
+                    "alter table {}.{} alter column {} drop identity if exists;",
+                    self.schema, self.table, self.name
+                )
+                .with_empty_lines();
+                if use_drop {
+                    statements.push(drop_cmd);
+                } else {
+                    statements.push(
+                        drop_cmd
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                }
             }
         } else if self.is_identity {
             self.build_identity_update_statements(existing, &mut statements);
@@ -522,13 +540,21 @@ impl TableColumn {
                 }
             } else {
                 if old_is_generated {
-                    statements.push(
-                        format!(
-                            "alter table {}.{} alter column {} drop expression;",
-                            self.schema, self.table, self.name
-                        )
-                        .with_empty_lines(),
-                    );
+                    let drop_cmd = format!(
+                        "alter table {}.{} alter column {} drop expression;",
+                        self.schema, self.table, self.name
+                    )
+                    .with_empty_lines();
+                    if use_drop {
+                        statements.push(drop_cmd);
+                    } else {
+                        statements.push(
+                            drop_cmd
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect::<String>(),
+                        );
+                    }
                 }
 
                 if new_is_generated && let Some(expr) = &self.generation_expression {
@@ -1511,5 +1537,128 @@ mod tests {
             script,
             "alter table public.test_table alter column test_column drop expression;\n\n"
         );
+    }
+
+    #[test]
+    fn test_get_alter_script_drop_default_use_drop_false() {
+        let mut existing = create_test_column();
+        existing.column_default = Some("'old_default'".to_string());
+        let mut updated = existing.clone();
+        updated.column_default = None;
+
+        let script = updated
+            .get_alter_script(&existing, false)
+            .expect("expected commented drop default when use_drop is false");
+
+        assert!(script.contains("drop default"));
+        assert!(script.lines().all(|l| l.starts_with("--")));
+    }
+
+    #[test]
+    fn test_get_alter_script_drop_default_use_drop_true() {
+        let mut existing = create_test_column();
+        existing.column_default = Some("'old_default'".to_string());
+        let mut updated = existing.clone();
+        updated.column_default = None;
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected drop default when use_drop is true");
+
+        assert_eq!(
+            script,
+            "alter table public.test_table alter column test_column drop default;\n\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_drop_identity_use_drop_false() {
+        let mut existing = create_test_column();
+        existing.is_identity = true;
+        existing.identity_generation = Some("BY DEFAULT".to_string());
+        existing.identity_start = Some("1".to_string());
+        existing.identity_increment = Some("1".to_string());
+
+        let mut updated = existing.clone();
+        updated.is_identity = false;
+        updated.identity_generation = None;
+        updated.identity_start = None;
+        updated.identity_increment = None;
+
+        let script = updated
+            .get_alter_script(&existing, false)
+            .expect("expected commented drop identity when use_drop is false");
+
+        assert!(script.contains("drop identity if exists"));
+        assert!(script.lines().all(|l| l.starts_with("--")));
+    }
+
+    #[test]
+    fn test_get_alter_script_drop_identity_use_drop_true() {
+        let mut existing = create_test_column();
+        existing.is_identity = true;
+        existing.identity_generation = Some("BY DEFAULT".to_string());
+        existing.identity_start = Some("1".to_string());
+        existing.identity_increment = Some("1".to_string());
+
+        let mut updated = existing.clone();
+        updated.is_identity = false;
+        updated.identity_generation = None;
+        updated.identity_start = None;
+        updated.identity_increment = None;
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected drop identity when use_drop is true");
+
+        assert_eq!(
+            script,
+            "alter table public.test_table alter column test_column drop identity if exists;\n\n"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_drop_expression_use_drop_false() {
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+
+        let updated = create_test_column();
+
+        let script = updated
+            .get_alter_script(&existing, false)
+            .expect("expected commented drop expression when use_drop is false");
+
+        assert!(script.contains("drop expression"));
+        assert!(script.lines().all(|l| l.starts_with("--")));
+    }
+
+    #[test]
+    fn test_get_alter_script_update_generated_expression_use_drop_false() {
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+
+        let mut updated = existing.clone();
+        updated.generation_expression = Some("(id * 3)".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, false)
+            .expect("expected output when use_drop is false for expression update");
+
+        // The drop expression part should be commented out
+        let lines: Vec<&str> = script.lines().collect();
+        let drop_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("drop expression"))
+            .collect();
+        assert!(!drop_lines.is_empty(), "should contain drop expression");
+        assert!(
+            drop_lines.iter().all(|l| l.starts_with("--")),
+            "drop expression should be commented out"
+        );
+
+        // The add generated part should still be active
+        assert!(script.contains("add generated always as (id * 3) stored"));
     }
 }

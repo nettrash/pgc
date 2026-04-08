@@ -868,7 +868,7 @@ impl Comparer {
                     self.script.push_str(
                         format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
                     );
-                    let alter_script = from_type.get_alter_script(to_type);
+                    let alter_script = from_type.get_alter_script(to_type, self.use_drop);
                     if alter_script.trim().is_empty() {
                         self.script.push_str(
                             "-- No supported alterations for this type; manual review required.\n",
@@ -981,7 +981,7 @@ impl Comparer {
                     create_alter_section.push_str(
                         format!("/* Enum: {}.{} */\n", to_enum.schema, to_enum.typname).as_str(),
                     );
-                    let alter_script = from_enum.get_alter_script(to_enum);
+                    let alter_script = from_enum.get_alter_script(to_enum, self.use_drop);
                     if alter_script.trim().is_empty() {
                         create_alter_section.push_str(
                             "-- No supported alterations for this enum; manual review required.\n",
@@ -1477,7 +1477,17 @@ impl Comparer {
                                 constraint.schema, constraint.table_name, constraint.name
                             );
                             if dropped_fk_keys.insert(key) {
-                                fk_pre_drop.push_str(&constraint.get_drop_script());
+                                let drop_cmd = constraint.get_drop_script();
+                                if self.use_drop {
+                                    fk_pre_drop.push_str(&drop_cmd);
+                                } else {
+                                    fk_pre_drop.push_str(
+                                        &drop_cmd
+                                            .lines()
+                                            .map(|l| format!("-- {}\n", l))
+                                            .collect::<String>(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1504,10 +1514,15 @@ impl Comparer {
 
             // Drop triggers on the table
             for trigger in &table.triggers {
-                pre_drop.append_block(&format!(
+                let drop_cmd = format!(
                     "drop trigger if exists {} on {}.{};",
                     trigger.name, table.schema, table.name
-                ));
+                );
+                if self.use_drop {
+                    pre_drop.append_block(&drop_cmd);
+                } else {
+                    pre_drop.push_str(&format!("-- {}\n", drop_cmd));
+                }
             }
 
             self.script
@@ -3189,6 +3204,7 @@ mod tests {
     use crate::dump::table::Table;
     use crate::dump::table_column::TableColumn;
     use crate::dump::table_constraint::TableConstraint;
+    use crate::dump::table_trigger::TableTrigger;
     use crate::dump::view::View;
 
     fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColumn {
@@ -6751,6 +6767,246 @@ mod tests {
         assert!(
             pos_drop < pos_us,
             "events_2023 must be dropped before events_2023_us is created"
+        );
+    }
+
+    #[tokio::test]
+    async fn fk_pre_drop_commented_when_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        // "from" has a table referenced by FK
+        let mut referenced = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        referenced.hash();
+
+        // "from" has a table with FK referencing "users"
+        let mut referencing = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                int_column("public", "orders", "id", 1),
+                int_column("public", "orders", "user_id", 2),
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "orders_user_fk".to_string(),
+                table_name: "orders".to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
+                coninhcount: 0,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+        referencing.hash();
+
+        from_dump.tables.push(referenced.clone());
+        from_dump.tables.push(referencing.clone());
+
+        // "to" has only "orders" — "users" is being dropped, so its FK must be pre-dropped
+        to_dump.tables.push(referencing);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        // FK drop should be commented out because use_drop=false
+        let has_commented_fk_drop = script.lines().any(|l| {
+            l.starts_with("--") && l.contains("drop constraint") && l.contains("orders_user_fk")
+        });
+        assert!(
+            has_commented_fk_drop,
+            "FK pre-drop should be commented out when use_drop=false, script:\n{}",
+            script
+        );
+
+        // Should NOT have an active (uncommented) drop constraint for the FK
+        let has_active_fk_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop constraint") && l.contains("orders_user_fk")
+        });
+        assert!(
+            !has_active_fk_drop,
+            "FK pre-drop should NOT be active when use_drop=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn fk_pre_drop_active_when_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut referenced = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "users", "id", 1)],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        referenced.hash();
+
+        let mut referencing = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                int_column("public", "orders", "id", 1),
+                int_column("public", "orders", "user_id", 2),
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "orders_user_fk".to_string(),
+                table_name: "orders".to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
+                coninhcount: 0,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+        referencing.hash();
+
+        from_dump.tables.push(referenced.clone());
+        from_dump.tables.push(referencing.clone());
+        to_dump.tables.push(referencing);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let has_active_fk_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop constraint") && l.contains("orders_user_fk")
+        });
+        assert!(
+            has_active_fk_drop,
+            "FK pre-drop should be active when use_drop=true, script:\n{}",
+            script
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_pre_drop_commented_when_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        // "from" has a table with a trigger; table is absent in "to"
+        let mut table_with_trigger = Table::new(
+            "public".to_string(),
+            "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![TableTrigger {
+                oid: Oid(9999),
+                name: "trg_events_audit".to_string(),
+                definition: "before insert on events for each row execute function audit()"
+                    .to_string(),
+            }],
+            None,
+        );
+        table_with_trigger.hash();
+
+        from_dump.tables.push(table_with_trigger);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        // Trigger drop should be commented out when use_drop=false
+        let has_commented_trigger_drop = script.lines().any(|l| {
+            l.starts_with("--") && l.contains("drop trigger") && l.contains("trg_events_audit")
+        });
+        assert!(
+            has_commented_trigger_drop,
+            "Trigger pre-drop should be commented when use_drop=false, script:\n{}",
+            script
+        );
+
+        let has_active_trigger_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop trigger") && l.contains("trg_events_audit")
+        });
+        assert!(
+            !has_active_trigger_drop,
+            "Trigger pre-drop should NOT be active when use_drop=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_pre_drop_active_when_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let mut table_with_trigger = Table::new(
+            "public".to_string(),
+            "events".to_string(),
+            "public".to_string(),
+            "events".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![int_column("public", "events", "id", 1)],
+            vec![],
+            vec![],
+            vec![TableTrigger {
+                oid: Oid(9999),
+                name: "trg_events_audit".to_string(),
+                definition: "before insert on events for each row execute function audit()"
+                    .to_string(),
+            }],
+            None,
+        );
+        table_with_trigger.hash();
+
+        from_dump.tables.push(table_with_trigger);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+
+        let has_active_trigger_drop = script.lines().any(|l| {
+            !l.starts_with("--") && l.contains("drop trigger") && l.contains("trg_events_audit")
+        });
+        assert!(
+            has_active_trigger_drop,
+            "Trigger pre-drop should be active when use_drop=true, script:\n{}",
+            script
         );
     }
 }

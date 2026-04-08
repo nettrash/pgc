@@ -135,7 +135,7 @@ impl View {
     }
 
     /// Returns a script that alters the current view to match the target definition.
-    pub fn get_alter_script(&self, target: &View) -> String {
+    pub fn get_alter_script(&self, target: &View, use_drop: bool) -> String {
         if self.schema != target.schema || self.name != target.name {
             return format!(
                 "-- Cannot alter view {}.{} because target is {}.{}\n",
@@ -157,7 +157,16 @@ impl View {
 
         // Materialized views do not support CREATE OR REPLACE; drop and recreate instead.
         if target.is_materialized {
-            return format!("{}{}", target.get_drop_script(), target.get_script());
+            let drop_script = target.get_drop_script();
+            if use_drop {
+                return format!("{}{}", drop_script, target.get_script());
+            } else {
+                let commented_drop = drop_script
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>();
+                return format!("{}{}", commented_drop, target.get_script());
+            }
         }
 
         let script = target.get_script();
@@ -294,7 +303,7 @@ mod tests {
         target.definition = "select 1".to_string();
 
         assert_eq!(
-            view.get_alter_script(&target),
+            view.get_alter_script(&target, true),
             "-- View analytics.active_users requires no changes.\n"
         );
     }
@@ -310,7 +319,7 @@ mod tests {
         );
 
         assert_eq!(
-            view.get_alter_script(&target),
+            view.get_alter_script(&target, true),
             "-- Cannot alter view analytics.active_users because target is analytics.other\n"
         );
     }
@@ -321,7 +330,7 @@ mod tests {
         let replacement = create_view("create or replace view analytics.active_users as select 2");
 
         assert_eq!(
-            current.get_alter_script(&replacement),
+            current.get_alter_script(&replacement, true),
             "create view analytics.active_users as\ncreate or replace view analytics.active_users as select 2\n\n"
         );
     }
@@ -332,7 +341,7 @@ mod tests {
         let target = create_view("select id, active from public.users where active");
 
         assert_eq!(
-            current.get_alter_script(&target),
+            current.get_alter_script(&target, true),
             "CREATE OR REPLACE VIEW analytics.active_users AS\nselect id, active from public.users where active\n\n"
         );
     }
@@ -343,8 +352,54 @@ mod tests {
         let target = create_materialized_view("select id from public.users");
 
         assert_eq!(
-            current.get_alter_script(&target),
+            current.get_alter_script(&target, true),
             "drop materialized view if exists analytics.active_users;\n\ncreate materialized view analytics.active_users as\nselect id from public.users\n\n"
         );
+    }
+
+    #[test]
+    fn test_get_alter_script_materialized_use_drop_false() {
+        let current = create_materialized_view("select 1");
+        let target = create_materialized_view("select id from public.users");
+
+        let script = current.get_alter_script(&target, false);
+
+        // The drop part should be commented out
+        for line in script.lines() {
+            if line.contains("drop materialized view") {
+                assert!(line.starts_with("--"), "drop should be commented: {}", line);
+            }
+        }
+        // The create part should still be active
+        assert!(script.contains("create materialized view analytics.active_users as"));
+        assert!(script.contains("select id from public.users"));
+    }
+
+    #[test]
+    fn test_get_alter_script_materialized_use_drop_true_contains_active_drop() {
+        let current = create_materialized_view("select 1");
+        let target = create_materialized_view("select id from public.users");
+
+        let script = current.get_alter_script(&target, true);
+
+        // The drop line should NOT be commented
+        for line in script.lines() {
+            if line.contains("drop materialized view") {
+                assert!(!line.starts_with("--"), "drop should be active: {}", line);
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_alter_script_regular_view_unaffected_by_use_drop() {
+        let current = create_view("select 1");
+        let target = create_view("select id, active from public.users where active");
+
+        let with_drop = current.get_alter_script(&target, true);
+        let without_drop = current.get_alter_script(&target, false);
+
+        // Regular views use CREATE OR REPLACE, no drop involved
+        assert_eq!(with_drop, without_drop);
+        assert!(!with_drop.contains("drop"));
     }
 }
