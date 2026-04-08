@@ -3635,15 +3635,17 @@ mod tests {
         assert!(script.contains("alter sequence public.test_seq owner to new_owner;"));
     }
 
-    /// When MINVALUE is raised and start_value changes, the comparer must emit RESTART WITH so
-    /// PostgreSQL does not implicitly restart from the old start value (< new MINVALUE):
+    /// When MINVALUE is raised above the sequence's effective current position (last_value if
+    /// known, otherwise old start_value), the comparer must emit RESTART WITH so PostgreSQL does
+    /// not fall back to an old recorded start value that violates the new MINVALUE:
     ///
     ///   ERROR: RESTART value (1) cannot be less than MINVALUE (10000000)
     #[tokio::test]
-    async fn compare_sequences_emits_restart_with_when_start_value_changes() {
+    async fn compare_sequences_emits_restart_when_effective_current_below_new_minvalue() {
         let mut from_dump = Dump::new(DumpConfig::default());
         let mut to_dump = Dump::new(DumpConfig::default());
 
+        // last_value is None → effective_current falls back to start_value (1), which is < 10M.
         let from_sequence = Sequence::new(
             "my_schema".to_string(),
             "my_sequence_id_seq".to_string(),
@@ -3695,9 +3697,67 @@ mod tests {
         );
     }
 
-    /// When only non-start parameters change (here: cycle), the comparer must NOT emit RESTART
-    /// WITH. Doing so would silently reset a live sequence's current position to its start value,
-    /// risking duplicate-key violations on active tables.
+    /// When last_value is already above the new MINVALUE, RESTART WITH must NOT be emitted
+    /// even though start_value and MINVALUE are both raised.  Emitting it would rewind the
+    /// live sequence and risk duplicate-key violations.
+    #[tokio::test]
+    async fn compare_sequences_no_restart_when_last_value_already_above_new_minvalue() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let from_sequence = Sequence::new(
+            "public".to_string(),
+            "busy_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(999_999_999),
+            Some(1),
+            false,
+            Some(1),
+            Some(15_000_000), // last_value is already well above the new MINVALUE (10M)
+            None,
+            None,
+            None,
+        );
+        let to_sequence = Sequence::new(
+            "public".to_string(),
+            "busy_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(10_000_000), // start_value raised
+            Some(10_000_000), // MINVALUE raised — but last_value (15M) already satisfies it
+            Some(999_999_999),
+            Some(1),
+            false,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        from_dump.sequences.push(from_sequence);
+        to_dump.sequences.push(to_sequence);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.compare_sequences().await.unwrap();
+        let script = comparer.get_script();
+
+        assert!(
+            !script.contains("restart with"),
+            "script must NOT contain RESTART WITH when last_value is already above new MINVALUE: {script}"
+        );
+        assert!(
+            script.contains("alter sequence public.busy_seq"),
+            "script must still emit ALTER SEQUENCE to update start_value/minvalue: {script}"
+        );
+    }
+
+    /// When only non-start/minvalue parameters change (here: cycle) and the effective current
+    /// position is already within the new bounds, RESTART WITH must NOT be emitted.
     #[tokio::test]
     async fn compare_sequences_no_restart_when_only_other_params_change() {
         let mut from_dump = Dump::new(DumpConfig::default());

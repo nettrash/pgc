@@ -198,26 +198,35 @@ impl Sequence {
 
     /// Generates an ALTER SEQUENCE script targeting `self` (the desired state).
     ///
-    /// `from` is the current sequence state. When `start_value` has actually changed
-    /// (or is newly set), `RESTART WITH` is emitted alongside `START WITH` so that
-    /// PostgreSQL repositions the sequence's current value. Without it an implicit
-    /// restart would fall back to the old recorded start value, which may now be
-    /// below the new `MINVALUE`:
+    /// `from` is the current sequence state. `RESTART WITH` is emitted only when the
+    /// sequence's effective current position would fall below the new `MINVALUE`, i.e.
+    /// when `effective_current < new_minvalue` where
+    /// `effective_current = from.last_value ?? from.start_value`.
+    ///
+    /// This is the minimal condition required to prevent PostgreSQL from rejecting the
+    /// statement with:
     ///
     ///   ERROR: RESTART value (1) cannot be less than MINVALUE (10000000)
     ///
-    /// When only other parameters change (cycle, cache, owner, comment …) `RESTART
-    /// WITH` is **not** emitted, preserving the live sequence position.
+    /// Emitting `RESTART WITH` unconditionally (e.g. whenever `start_value` differs)
+    /// would rewind a live sequence whose current position is already above the new
+    /// `start_value`, risking duplicate-key violations.
     pub fn get_alter_script(&self, from: Option<&Sequence>) -> String {
         let mut clauses = Vec::new();
 
         if let Some(start_value) = self.start_value {
             clauses.push(format!("start with {start_value}"));
-            // Emit RESTART WITH only when start_value has actually changed so that
-            // we do not silently reset a live sequence's current position.
-            let old_start = from.and_then(|s| s.start_value);
-            if old_start != Some(start_value) {
-                clauses.push(format!("restart with {start_value}"));
+            // Emit RESTART WITH only when the effective current position (last_value if
+            // available, otherwise old start_value) lies below the new MINVALUE.  Any other
+            // restart would risk rewinding a live sequence.
+            if let (Some(from_seq), Some(new_minvalue)) = (from, self.min_value) {
+                let effective_current = from_seq
+                    .last_value
+                    .or(from_seq.start_value)
+                    .unwrap_or(start_value);
+                if effective_current < new_minvalue {
+                    clauses.push(format!("restart with {start_value}"));
+                }
             }
         }
         if let Some(increment_by) = self.increment_by {
@@ -471,10 +480,60 @@ mod tests {
         );
     }
 
-    /// When only non-start parameters change (e.g. cycle, cache, owner) and start_value is
-    /// identical in both dumps, RESTART WITH must NOT be emitted. Emitting it would silently
-    /// reset a live sequence's current position back to its start value, risking duplicate-key
-    /// violations on active tables.
+    /// RESTART WITH must NOT be emitted when the sequence's effective current position
+    /// (last_value) is already above the new MINVALUE — even when start_value and MINVALUE are
+    /// both raised.  Emitting it would rewind the live sequence from its current position back
+    /// to the new start_value, risking duplicate-key violations.
+    #[test]
+    fn test_get_alter_script_no_restart_when_last_value_above_new_minvalue() {
+        let from_sequence = Sequence::new(
+            "public".to_string(),
+            "busy_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(1),
+            Some(1),
+            Some(999_999_999),
+            Some(1),
+            false,
+            Some(1),
+            Some(15_000_000), // sequence is already well above the new MINVALUE
+            None,
+            None,
+            None,
+        );
+        let to_sequence = Sequence::new(
+            "public".to_string(),
+            "busy_seq".to_string(),
+            "postgres".to_string(),
+            "bigint".to_string(),
+            Some(10_000_000), // start_value raised
+            Some(10_000_000), // MINVALUE raised — but last_value (15M) is already above it
+            Some(999_999_999),
+            Some(1),
+            false,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let script = to_sequence.get_alter_script(Some(&from_sequence));
+
+        assert!(
+            !script.contains("restart with"),
+            "script must NOT contain RESTART WITH when last_value ({}) is already above new MINVALUE (10000000): {script}",
+            15_000_000
+        );
+        assert!(
+            script.contains("start with 10000000"),
+            "script must still update START WITH: {script}"
+        );
+    }
+
+    /// When only non-start/minvalue parameters change (e.g. cycle) and the effective current
+    /// position is already within the new bounds, RESTART WITH must NOT be emitted.
     #[test]
     fn test_get_alter_script_no_restart_when_only_other_params_change() {
         let from_sequence = Sequence::new(
