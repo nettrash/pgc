@@ -415,8 +415,19 @@ BEGIN
     DELETE FROM test_schema.reviews
     WHERE created_at < CURRENT_DATE - INTERVAL '1 day' * days_old
     AND helpful_count = 0;
-    
+
     COMMIT;
+END;
+$$;
+
+-- Procedure with comma-in-string default (Issue #154 regression test)
+CREATE OR REPLACE PROCEDURE test_schema.format_csv_line(
+    p_value varchar,
+    p_delimiter varchar DEFAULT ','
+)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE '%', p_value || p_delimiter;
 END;
 $$;
 
