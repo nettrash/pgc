@@ -1096,7 +1096,7 @@ impl Comparer {
                         format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                     );
                     self.script
-                        .push_str(sequence.get_alter_script(Some(from_sequence)).as_str());
+                        .push_str(sequence.get_alter_script(from_sequence).as_str());
                 }
             } else {
                 // Check if the sequence is owned by a column that is an identity column or serial type.

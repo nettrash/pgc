@@ -198,9 +198,10 @@ impl Sequence {
 
     /// Generates an ALTER SEQUENCE script targeting `self` (the desired state).
     ///
-    /// `from` is the current sequence state. `RESTART WITH` is emitted only when the
-    /// sequence's effective current position would fall below the new `MINVALUE`, i.e.
-    /// when `effective_current < new_minvalue` where
+    /// `from` is the prior sequence state (always required — callers that own the comparer
+    /// always have it).  `RESTART WITH` is emitted only when the sequence's effective current
+    /// position would fall below the new `MINVALUE`, i.e. when
+    /// `effective_current < new_minvalue` where
     /// `effective_current = from.last_value ?? from.start_value`.
     ///
     /// This is the minimal condition required to prevent PostgreSQL from rejecting the
@@ -211,7 +212,7 @@ impl Sequence {
     /// Emitting `RESTART WITH` unconditionally (e.g. whenever `start_value` differs)
     /// would rewind a live sequence whose current position is already above the new
     /// `start_value`, risking duplicate-key violations.
-    pub fn get_alter_script(&self, from: Option<&Sequence>) -> String {
+    pub fn get_alter_script(&self, from: &Sequence) -> String {
         let mut clauses = Vec::new();
 
         if let Some(start_value) = self.start_value {
@@ -219,11 +220,8 @@ impl Sequence {
             // Emit RESTART WITH only when the effective current position (last_value if
             // available, otherwise old start_value) lies below the new MINVALUE.  Any other
             // restart would risk rewinding a live sequence.
-            if let (Some(from_seq), Some(new_minvalue)) = (from, self.min_value) {
-                let effective_current = from_seq
-                    .last_value
-                    .or(from_seq.start_value)
-                    .unwrap_or(start_value);
+            if let Some(new_minvalue) = self.min_value {
+                let effective_current = from.last_value.or(from.start_value).unwrap_or(start_value);
                 if effective_current < new_minvalue {
                     clauses.push(format!("restart with {start_value}"));
                 }
@@ -388,7 +386,7 @@ mod tests {
 
         // start_value unchanged (from == to == 1): no RESTART WITH expected.
         assert_eq!(
-            sequence.get_alter_script(Some(&sequence.clone())),
+            sequence.get_alter_script(&sequence.clone()),
             "alter sequence public.order_id_seq start with 1 increment by 5 minvalue 1 maxvalue 1000 cache 20 cycle owned by public.orders.id;\n\nalter sequence public.order_id_seq owner to postgres;\n\n",
         );
     }
@@ -414,7 +412,7 @@ mod tests {
 
         // start_value unchanged (from == to == 10): no RESTART WITH expected.
         assert_eq!(
-            sequence.get_alter_script(Some(&sequence.clone())),
+            sequence.get_alter_script(&sequence.clone()),
             "alter sequence audit.event_seq start with 10 increment by 2 no minvalue no maxvalue no cycle owned by \"my\"\"schema\".\"my.table\".column;\n\nalter sequence audit.event_seq owner to postgres;\n\n",
         );
     }
@@ -463,7 +461,7 @@ mod tests {
             None,
         );
 
-        let script = to_sequence.get_alter_script(Some(&from_sequence));
+        let script = to_sequence.get_alter_script(&from_sequence);
 
         // Both clauses must appear so that PostgreSQL does not fall back to the old start value.
         assert!(
@@ -519,7 +517,7 @@ mod tests {
             None,
         );
 
-        let script = to_sequence.get_alter_script(Some(&from_sequence));
+        let script = to_sequence.get_alter_script(&from_sequence);
 
         assert!(
             !script.contains("restart with"),
@@ -569,7 +567,7 @@ mod tests {
             None,
         );
 
-        let script = to_sequence.get_alter_script(Some(&from_sequence));
+        let script = to_sequence.get_alter_script(&from_sequence);
 
         assert!(
             !script.contains("restart with"),
