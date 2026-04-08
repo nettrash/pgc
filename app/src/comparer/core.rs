@@ -2493,11 +2493,13 @@ impl Comparer {
         // --- Views ---
         for view in &self.to.views {
             let normalized_key = Self::normalized_view_key(&view.schema, &view.name);
-            // When a view was dropped earlier in the script (e.g. as a
-            // dependency of an altered table), its ACL will be lost after
+            // When a view was actively dropped earlier in the script (e.g. as
+            // a dependency of an altered table), its ACL will be lost after
             // the DROP.  Treat from_acl as empty so that all required
-            // grants are emitted in the migration script.
-            let (from_acl, from_owner) = if self.dropped_views.contains_key(&normalized_key) {
+            // grants are emitted in the migration script.  When the drop
+            // was only commented out (use_drop=false), the view still
+            // exists so we must keep the original ACL for correct diffs.
+            let (from_acl, from_owner) = if self.dropped_views.get(&normalized_key) == Some(&true) {
                 (&[] as &[String], "")
             } else {
                 from_view_map
@@ -5861,6 +5863,59 @@ mod tests {
         assert!(
             script.contains("GRANT SELECT ON TABLE public.my_view TO reader;"),
             "Dropped view must restore grants even when FROM has the same ACL, got: {script}"
+        );
+    }
+
+    /// When a view's DROP was only commented out (use_drop=false), the view still
+    /// exists in the database.  compare_grants must keep the original from_acl so
+    /// that identical ACLs produce no diff (no redundant GRANTs/REVOKEs).
+    #[tokio::test]
+    async fn compare_grants_commented_drop_keeps_from_acl() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let mut to_dump = Dump::new(DumpConfig::default());
+
+        let mut from_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        from_view.acl = vec!["reader=r/owner".to_string()];
+
+        let mut to_view = View::new(
+            "my_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            Vec::new(),
+        );
+        to_view.acl = vec!["reader=r/owner".to_string()];
+
+        from_dump.views.push(from_view);
+        to_dump.views.push(to_view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+        // Simulate a commented-out drop (use_drop=false → stored as false).
+        comparer
+            .dropped_views
+            .insert(Comparer::normalized_view_key("public", "my_view"), false);
+        comparer.compare_grants().await.unwrap();
+        let script = comparer.get_script();
+
+        // ACLs are identical and the view was NOT actually dropped,
+        // so no GRANT/REVOKE should appear.
+        let has_grant_stmt = script
+            .lines()
+            .any(|l| l.trim_start().to_lowercase().starts_with("grant "));
+        assert!(
+            !has_grant_stmt,
+            "Commented-out drop must not cause redundant GRANTs, got: {script}"
+        );
+        let has_revoke_stmt = script
+            .lines()
+            .any(|l| l.trim_start().to_lowercase().starts_with("revoke "));
+        assert!(
+            !has_revoke_stmt,
+            "Commented-out drop must not cause redundant REVOKEs, got: {script}"
         );
     }
 
