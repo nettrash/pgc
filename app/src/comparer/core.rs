@@ -2028,10 +2028,10 @@ impl Comparer {
                 .unwrap_or(true);
             let was_dropped = self.dropped_views.contains_key(&normalized_view);
             if was_dropped && !drop_was_active {
-                // Kind transition (mat→regular): DROP was commented, so
-                // CREATE OR REPLACE VIEW would fail; comment it out too.
+                // DROP was commented out, so CREATE OR REPLACE VIEW would fail;
+                // comment it out too.
                 self.script.push_str(&format!(
-                    "-- use_drop=false: view {}.{} requires drop+recreate (kind transition); create commented out (manual intervention needed)\n",
+                    "-- use_drop=false: view {}.{} requires drop+recreate; create commented out (manual intervention needed)\n",
                     to_view.schema, to_view.name
                 ));
                 self.script.push_str(
