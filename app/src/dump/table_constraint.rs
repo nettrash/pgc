@@ -15,7 +15,7 @@ pub struct TableConstraint {
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
     #[serde(default)]
-    pub coninhcount: i16, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
+    pub coninhcount: i32, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
 }
 
 impl TableConstraint {
