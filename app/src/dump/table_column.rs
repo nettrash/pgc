@@ -560,10 +560,24 @@ impl TableColumn {
                 if new_is_generated && let Some(expr) = &self.generation_expression {
                     let norm_expr = Self::normalized_generation_expression(expr);
                     let wrapped = format!("({norm_expr})");
-                    statements.push(format!(
+                    let add_cmd = format!(
                         "alter table {}.{} alter column {} add generated always as {wrapped} stored;",
                         self.schema, self.table, self.name
-                    ).with_empty_lines());
+                    ).with_empty_lines();
+                    if use_drop || !old_is_generated {
+                        statements.push(add_cmd);
+                    } else {
+                        // Drop was commented out, so add would fail; comment it out too
+                        statements.push(format!(
+                            "-- use_drop=false: drop expression + add generated requires drop; statements commented out (manual intervention needed)\n"
+                        ));
+                        statements.push(
+                            add_cmd
+                                .lines()
+                                .map(|l| format!("-- {}\n", l))
+                                .collect::<String>(),
+                        );
+                    }
                 }
             }
         }
@@ -1646,19 +1660,22 @@ mod tests {
             .get_alter_script(&existing, false)
             .expect("expected output when use_drop is false for expression update");
 
-        // The drop expression part should be commented out
-        let lines: Vec<&str> = script.lines().collect();
-        let drop_lines: Vec<&&str> = lines
-            .iter()
-            .filter(|l| l.contains("drop expression"))
-            .collect();
-        assert!(!drop_lines.is_empty(), "should contain drop expression");
+        // Should contain a warning about manual intervention
         assert!(
-            drop_lines.iter().all(|l| l.starts_with("--")),
-            "drop expression should be commented out"
+            script.contains("use_drop=false") && script.contains("manual intervention needed"),
+            "should contain a warning comment, script:\n{}",
+            script
         );
 
-        // The add generated part should still be active
-        assert!(script.contains("add generated always as (id * 3) stored"));
+        // Both drop expression and add generated should be commented out
+        for line in script.lines() {
+            if line.contains("drop expression") || line.contains("add generated always") {
+                assert!(
+                    line.starts_with("--"),
+                    "should be commented out: {}",
+                    line
+                );
+            }
+        }
     }
 }
