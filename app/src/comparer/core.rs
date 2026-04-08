@@ -1793,10 +1793,8 @@ impl Comparer {
                 .map(|tv| from_view.is_materialized != tv.is_materialized)
                 .unwrap_or(false);
 
-            let should_drop = is_dependent
-                || (self.use_drop && is_from_only)
-                || is_changed_mat_view
-                || is_kind_transition;
+            let should_drop =
+                is_dependent || is_from_only || is_changed_mat_view || is_kind_transition;
 
             if should_drop {
                 // The drop is emitted as active SQL only when use_drop is true.
@@ -7491,6 +7489,77 @@ mod tests {
         assert!(
             script.contains("manual intervention needed"),
             "Should contain manual intervention warning, script:\n{}",
+            script
+        );
+    }
+
+    /// FROM-only views (present in FROM, absent in TO) must still appear in the output
+    /// when use_drop=false — as a commented-out DROP statement so the user is aware the
+    /// view should be removed.  Previously `should_drop` gated `is_from_only` behind
+    /// `self.use_drop`, which suppressed the DROP entirely.
+    #[tokio::test]
+    async fn from_only_view_commented_drop_when_use_drop_false() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let mut view = View::new(
+            "obsolete_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        view.is_materialized = false;
+        view.hash();
+        from_dump.views.push(view);
+
+        let mut comparer =
+            Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        comparer.drop_views().await.unwrap();
+        let script = comparer.get_script();
+
+        // The DROP must appear in the output …
+        assert!(
+            script.to_lowercase().contains("drop view"),
+            "FROM-only view must produce a DROP statement even with use_drop=false, script:\n{}",
+            script
+        );
+        // … but it must be commented out, not active SQL.
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
+        assert!(
+            !has_active_drop,
+            "FROM-only view DROP should be commented when use_drop=false, script:\n{}",
+            script
+        );
+    }
+
+    /// Counterpart: with use_drop=true the DROP for a FROM-only view must be active SQL.
+    #[tokio::test]
+    async fn from_only_view_active_drop_when_use_drop_true() {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+
+        let mut view = View::new(
+            "obsolete_view".to_string(),
+            "SELECT 1".to_string(),
+            "public".to_string(),
+            vec![],
+        );
+        view.is_materialized = false;
+        view.hash();
+        from_dump.views.push(view);
+
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        comparer.drop_views().await.unwrap();
+        let script = comparer.get_script();
+
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
+        assert!(
+            has_active_drop,
+            "FROM-only view DROP should be active SQL when use_drop=true, script:\n{}",
             script
         );
     }
