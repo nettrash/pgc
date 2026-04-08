@@ -7128,8 +7128,7 @@ mod tests {
         to_view.hash();
         to_dump.views.push(to_view);
 
-        let mut comparer =
-            Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.drop_views().await.unwrap();
         comparer.create_views().await.unwrap();
         let script = comparer.get_script();
@@ -7235,16 +7234,15 @@ mod tests {
         to_view.hash();
         to_dump.views.push(to_view);
 
-        let mut comparer =
-            Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+        let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
         comparer.drop_views().await.unwrap();
         comparer.create_views().await.unwrap();
         let script = comparer.get_script();
 
         // DROP MATERIALIZED VIEW should be active
-        let has_active_drop = script.lines().any(|l| {
-            !l.starts_with("--") && l.to_lowercase().contains("drop materialized view")
-        });
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop materialized view"));
         assert!(
             has_active_drop,
             "Mat→regular: DROP MATERIALIZED VIEW should be active when use_drop=true, script:\n{}",
@@ -7293,9 +7291,9 @@ mod tests {
         let script = comparer.get_script();
 
         // DROP should be commented
-        let has_active_drop = script.lines().any(|l| {
-            !l.starts_with("--") && l.to_lowercase().contains("drop materialized view")
-        });
+        let has_active_drop = script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop materialized view"));
         assert!(
             !has_active_drop,
             "Mat→regular: DROP MATERIALIZED VIEW should be commented when use_drop=false, script:\n{}",
