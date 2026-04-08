@@ -512,7 +512,10 @@ impl Routine {
         if !current.is_empty() {
             parts.push(current);
         }
-        debug_assert!(!in_quote, "split_arguments: unclosed single-quote in input: {s:?}");
+        debug_assert!(
+            !in_quote,
+            "split_arguments: unclosed single-quote in input: {s:?}"
+        );
         parts
     }
 
@@ -1236,7 +1239,8 @@ mod tests {
         // A multiline JSONB literal (containing newlines inside the quoted string)
         // must be treated as a single argument — newlines and commas inside the
         // single-quoted literal must not trigger a split.
-        let input = "p jsonb DEFAULT '{\n    \"key1\": \"value1\",\n    \"key2\": \"value2\"\n}'::jsonb";
+        let input =
+            "p jsonb DEFAULT '{\n    \"key1\": \"value1\",\n    \"key2\": \"value2\"\n}'::jsonb";
         let result = Routine::split_arguments(input);
         assert_eq!(result, vec![input]);
     }
