@@ -1058,11 +1058,7 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
         // Both drop and add constraint should be commented out
         for line in script.lines() {
             if line.contains("drop constraint") || line.contains("add constraint") {
-                assert!(
-                    line.starts_with("--"),
-                    "should be commented: {}",
-                    line
-                );
+                assert!(line.starts_with("--"), "should be commented: {}", line);
             }
         }
     }

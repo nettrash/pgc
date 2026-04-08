@@ -568,9 +568,7 @@ impl TableColumn {
                         statements.push(add_cmd);
                     } else {
                         // Drop was commented out, so add would fail; comment it out too
-                        statements.push(format!(
-                            "-- use_drop=false: drop expression + add generated requires drop; statements commented out (manual intervention needed)\n"
-                        ));
+                        statements.push("-- use_drop=false: drop expression + add generated requires drop; statements commented out (manual intervention needed)\n".to_string());
                         statements.push(
                             add_cmd
                                 .lines()
@@ -1670,11 +1668,7 @@ mod tests {
         // Both drop expression and add generated should be commented out
         for line in script.lines() {
             if line.contains("drop expression") || line.contains("add generated always") {
-                assert!(
-                    line.starts_with("--"),
-                    "should be commented out: {}",
-                    line
-                );
+                assert!(line.starts_with("--"), "should be commented out: {}", line);
             }
         }
     }

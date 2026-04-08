@@ -1862,7 +1862,8 @@ impl Comparer {
                         .as_str(),
                 );
             }
-            self.dropped_views.insert(normalized_view.clone(), force_drop);
+            self.dropped_views
+                .insert(normalized_view.clone(), force_drop);
         }
 
         self.script
@@ -1887,7 +1888,11 @@ impl Comparer {
 
             let existed_in_from = from_view.is_some();
             let was_dropped = self.dropped_views.contains_key(&normalized_view);
-            let drop_was_active = self.dropped_views.get(&normalized_view).copied().unwrap_or(false);
+            let drop_was_active = self
+                .dropped_views
+                .get(&normalized_view)
+                .copied()
+                .unwrap_or(false);
             let definition_changed = from_view
                 .map(|fv| Self::hashes_differ(&fv.hash, &to_view.hash))
                 .unwrap_or(false);
@@ -1956,7 +1961,11 @@ impl Comparer {
 
         if to_view.is_materialized {
             let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
-            let drop_was_active = self.dropped_views.get(&normalized_view).copied().unwrap_or(true);
+            let drop_was_active = self
+                .dropped_views
+                .get(&normalized_view)
+                .copied()
+                .unwrap_or(true);
             if !drop_was_active {
                 // DROP was commented out, so CREATE would fail; comment it out too.
                 let create_script = to_view.get_script();
