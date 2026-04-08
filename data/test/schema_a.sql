@@ -81,6 +81,17 @@ CREATE SEQUENCE shared_schema.global_counter_seq
     MAXVALUE 999999999
     CACHE 1;
 
+-- Sequence used to test MINVALUE raise: start/minvalue begin at 1 so that when Schema B
+-- raises both to 10000000 the comparer must emit RESTART WITH to avoid:
+--   ERROR: RESTART value (1) cannot be less than MINVALUE (10000000)
+CREATE SEQUENCE test_schema.minvalue_raise_seq
+    START WITH 1
+    INCREMENT BY 1
+    MINVALUE 1
+    MAXVALUE 999999999
+    CACHE 1
+    NO CYCLE;
+
 -- Tables
 CREATE TABLE test_schema.users (
     id INTEGER PRIMARY KEY DEFAULT nextval('test_schema.user_id_seq'),
