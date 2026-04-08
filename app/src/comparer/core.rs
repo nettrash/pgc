@@ -1521,7 +1521,7 @@ impl Comparer {
                 if self.use_drop {
                     pre_drop.append_block(&drop_cmd);
                 } else {
-                    pre_drop.push_str(&format!("-- {}\n", drop_cmd));
+                    pre_drop.append_block(&format!("-- {}", drop_cmd));
                 }
             }
 
