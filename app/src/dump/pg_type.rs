@@ -560,18 +560,24 @@ impl PgType {
                                     self.typname,
                                     quote_ident(name)
                                 );
-                                if use_drop {
-                                    statements.push(drop_cmd);
-                                } else {
-                                    statements.push(format!("-- {}", drop_cmd));
-                                }
-                                statements.push(format!(
+                                let add_cmd = format!(
                                     "alter domain {}.{} add constraint {} {};",
                                     self.schema,
                                     self.typname,
                                     quote_ident(name),
                                     target_constraint.definition
-                                ));
+                                );
+                                if use_drop {
+                                    statements.push(drop_cmd);
+                                    statements.push(add_cmd);
+                                } else {
+                                    statements.push(format!(
+                                        "-- use_drop=false: constraint {} requires drop+add; statements commented out (manual intervention needed)",
+                                        quote_ident(name)
+                                    ));
+                                    statements.push(format!("-- {}", drop_cmd));
+                                    statements.push(format!("-- {}", add_cmd));
+                                }
                                 replaced_or_added.insert((*name).to_string());
                             }
                         }
@@ -1042,23 +1048,19 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
 
         let script = current.get_alter_script(&target, false);
 
-        assert!(script.contains("drop constraint"));
+        // Should contain a warning about manual intervention
+        assert!(
+            script.contains("use_drop=false") && script.contains("manual intervention needed"),
+            "should contain a warning comment, script:\n{}",
+            script
+        );
+
+        // Both drop and add constraint should be commented out
         for line in script.lines() {
-            if line.contains("drop constraint") {
+            if line.contains("drop constraint") || line.contains("add constraint") {
                 assert!(
                     line.starts_with("--"),
-                    "drop constraint should be commented: {}",
-                    line
-                );
-            }
-        }
-        // The add constraint should still be active
-        assert!(script.contains("add constraint"));
-        for line in script.lines() {
-            if line.contains("add constraint") {
-                assert!(
-                    !line.starts_with("--"),
-                    "add constraint should be active: {}",
+                    "should be commented: {}",
                     line
                 );
             }
@@ -1142,12 +1144,18 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
                 );
             }
         }
-        // add constraint should still be active
+        // add constraint for changed constraint should also be commented (depends on drop)
+        // but add constraint for new constraint should be active
+        assert!(
+            script.contains("-- use_drop=false: constraint \"ValueCheck\""),
+            "should warn about ValueCheck requiring manual intervention"
+        );
+        // FreshConstraint is brand new, its add should be active
         for line in script.lines() {
-            if line.contains("add constraint") {
+            if line.contains("add constraint") && line.contains("FreshConstraint") {
                 assert!(
                     !line.starts_with("--"),
-                    "add constraint should be active: {}",
+                    "new constraint add should be active: {}",
                     line
                 );
             }
