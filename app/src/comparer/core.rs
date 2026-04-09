@@ -2641,6 +2641,47 @@ impl Comparer {
             }
         }
 
+        // --- Foreign Tables ---
+        let from_ft_map: HashMap<(&str, &str), (&[String], &str)> = self
+            .from
+            .foreign_tables
+            .iter()
+            .map(|ft| {
+                (
+                    (ft.schema.as_str(), ft.name.as_str()),
+                    (ft.acl.as_slice(), ft.owner.as_str()),
+                )
+            })
+            .collect();
+
+        for ft in &self.to.foreign_tables {
+            let (from_acl, from_owner) = from_ft_map
+                .get(&(ft.schema.as_str(), ft.name.as_str()))
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, ft.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_name = format!("{}.{}", ft.schema, ft.name);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &ft.acl,
+                full,
+                "FOREIGN TABLE",
+                &object_name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script.push_str(
+                        format!("/* Grants for foreign table: {} */\n", object_name).as_str(),
+                    );
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
         // --- Routines ---
         for routine in &self.to.routines {
             let (from_acl, from_owner) = from_routine_map

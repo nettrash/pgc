@@ -1744,8 +1744,17 @@ impl Dump {
                 }
             }
 
-            // Now drop the tables
+            // Now drop the tables — partitions before their parents
+            let mut partition_children: Vec<&Table> = Vec::new();
+            let mut regular_tables: Vec<&Table> = Vec::new();
             for table in &self.tables {
+                if table.partition_of.is_some() {
+                    partition_children.push(table);
+                } else {
+                    regular_tables.push(table);
+                }
+            }
+            for table in partition_children.iter().chain(regular_tables.iter()) {
                 if use_comments {
                     script.push_str(&format!(
                         "/* Drop table: {}.{} */\n",
@@ -1762,7 +1771,7 @@ impl Dump {
             }
         }
 
-        // 3. Drop routines (functions, procedures, aggregates)
+        // 3. Drop foreign tables
         if !self.foreign_tables.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Foreign Tables --------------- */");
@@ -1840,7 +1849,7 @@ impl Dump {
             }
         }
 
-        // 4. Drop sequences
+        // 6. Drop sequences
         if !self.sequences.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Sequences --------------- */");
@@ -1862,7 +1871,7 @@ impl Dump {
             }
         }
 
-        // 5. Drop types (includes enums, composites, domains, etc.)
+        // 7. Drop types (includes enums, composites, domains, range types, etc.)
         if !self.types.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Types --------------- */");
@@ -1884,7 +1893,7 @@ impl Dump {
             }
         }
 
-        // 6. Drop extensions
+        // 8. Drop extensions
         if !self.extensions.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Extensions --------------- */");
@@ -1900,7 +1909,7 @@ impl Dump {
             }
         }
 
-        // 7. Drop schemas (last, since everything else lives inside them)
+        // 9. Drop schemas (last, since everything else lives inside them)
         if !self.schemas.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Schemas --------------- */");
