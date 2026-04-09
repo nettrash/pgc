@@ -1180,6 +1180,159 @@ CREATE TABLE test_schema.test_identity (
 );
 
 -- =============================================================================
+-- PG14–18 feature test: Exclusion constraints (btree_gist)
+-- =============================================================================
+-- TO: table with exclusion constraint (unchanged) plus new column.
+-- shift_schedule removed (FROM-only → should be dropped).
+-- New: booking_slots table with exclusion constraint (TO-only → should be created).
+CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public;
+
+CREATE TABLE test_schema.reservations (
+    id SERIAL PRIMARY KEY,
+    room_id INTEGER NOT NULL,
+    during TSTZRANGE NOT NULL,
+    guest_name VARCHAR(255),  -- NEW column in TO
+    EXCLUDE USING gist (room_id WITH =, during WITH &&)
+);
+
+-- shift_schedule removed (FROM-only)
+
+-- TO-only exclusion constraint table (should be created)
+CREATE TABLE test_schema.booking_slots (
+    id SERIAL PRIMARY KEY,
+    resource_id INTEGER NOT NULL,
+    slot TSTZRANGE NOT NULL,
+    EXCLUDE USING gist (resource_id WITH =, slot WITH &&)
+);
+
+-- =============================================================================
+-- PG14–18 feature test: NULLS NOT DISTINCT (PG15+)
+-- =============================================================================
+-- TO: UNIQUE NULLS NOT DISTINCT (only one NULL allowed).
+-- FROM had standard UNIQUE.
+CREATE TABLE test_schema.unique_nulls_test (
+    id SERIAL PRIMARY KEY,
+    code VARCHAR(50),
+    CONSTRAINT uq_unique_nulls_code UNIQUE NULLS NOT DISTINCT (code)
+);
+
+-- =============================================================================
+-- PG14–18 feature test: NO INHERIT constraint flag
+-- =============================================================================
+-- TO: same CHECK constraint with NO INHERIT flag added.
+ALTER TABLE test_schema.categories ADD CONSTRAINT chk_categories_sort_order
+    CHECK (sort_order >= 0) NO INHERIT;
+
+-- =============================================================================
+-- PG14–18 feature test: Column STORAGE and COMPRESSION (PG14+)
+-- =============================================================================
+-- TO: STORAGE changed to EXTERNAL on payload, compression set to lz4 on blob.
+CREATE TABLE test_schema.storage_test (
+    id SERIAL PRIMARY KEY,
+    payload TEXT,
+    blob BYTEA
+);
+ALTER TABLE test_schema.storage_test ALTER COLUMN payload SET STORAGE EXTERNAL;
+ALTER TABLE test_schema.storage_test ALTER COLUMN blob SET STORAGE EXTERNAL;
+-- Note: COMPRESSION lz4 requires PG14+ compiled --with-lz4.
+-- Uncomment below if available:
+-- ALTER TABLE test_schema.storage_test ALTER COLUMN blob SET COMPRESSION lz4;
+
+-- =============================================================================
+-- PG14–18 feature test: SECURITY INVOKER views (PG15+)
+-- =============================================================================
+-- TO: same view definition but WITH (security_invoker = true).
+CREATE VIEW test_schema.security_invoker_view
+WITH (security_invoker = true)
+AS
+SELECT id, username, email
+FROM test_schema.users
+WHERE status = 'active';
+
+-- =============================================================================
+-- PG14–18 feature test: Range types
+-- =============================================================================
+-- TO: float_range without subtype_diff (modified → drop+recreate).
+-- old_range removed (FROM-only → should be dropped).
+-- int_range added (TO-only → should be created).
+CREATE TYPE test_schema.float_range AS RANGE (
+    SUBTYPE = float8
+);
+
+-- old_range removed (FROM-only)
+
+CREATE TYPE test_schema.int_range AS RANGE (
+    SUBTYPE = int4
+);
+
+-- =============================================================================
+-- PG14–18 feature test: Foreign tables (postgres_fdw)
+-- =============================================================================
+-- TO: foreign table modified (column type widened, new column added).
+-- foreign_logs removed (FROM-only → should be dropped).
+-- foreign_products added (TO-only → should be created).
+CREATE EXTENSION IF NOT EXISTS postgres_fdw WITH SCHEMA public;
+
+CREATE SERVER test_foreign_server
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'localhost', dbname 'postgres');
+
+-- TO: modified foreign table (username widened, status column added)
+CREATE FOREIGN TABLE test_schema.foreign_users (
+    id INTEGER NOT NULL,
+    username VARCHAR(100),
+    email VARCHAR(255),
+    status VARCHAR(20)
+) SERVER test_foreign_server
+OPTIONS (schema_name 'public', table_name 'users');
+
+-- foreign_logs removed (FROM-only)
+
+-- TO-only foreign table (should be created)
+CREATE FOREIGN TABLE test_schema.foreign_products (
+    product_id UUID,
+    name VARCHAR(255),
+    price NUMERIC(10,2)
+) SERVER test_foreign_server
+OPTIONS (schema_name 'public', table_name 'products');
+
+-- =============================================================================
+-- PG14–18 feature test: Extended statistics (PG10+)
+-- =============================================================================
+-- TO: modified statistics (added mcv kind).
+-- stat_products_old removed (FROM-only → should be dropped).
+-- stat_products_new added (TO-only → should be created).
+CREATE STATISTICS test_schema.stat_users_email_status (dependencies, ndistinct, mcv)
+    ON email, status FROM test_schema.users;
+
+-- stat_products_old removed (FROM-only)
+
+-- TO-only statistics (should be created)
+CREATE STATISTICS test_schema.stat_products_new (ndistinct)
+    ON name, category_id FROM test_schema.products;
+
+-- =============================================================================
+-- PG18 feature test: NOT ENFORCED constraints (PG18+)
+-- =============================================================================
+-- TO: same constraint with NOT ENFORCED flag.
+-- Note: Requires PostgreSQL 18+. Comment out if testing on earlier versions.
+ALTER TABLE test_schema.products ADD CONSTRAINT chk_products_sku_format
+    CHECK (sku ~ '^[A-Z]{2,4}-[0-9]+$') NOT ENFORCED;
+
+-- =============================================================================
+-- PG18 feature test: Virtual generated columns (PG18+)
+-- =============================================================================
+-- TO: full_name is now GENERATED ALWAYS AS ... VIRTUAL.
+-- Note: Requires PostgreSQL 18+.
+-- On PG < 18, use STORED instead or comment out.
+CREATE TABLE test_schema.virtual_gen_test (
+    id SERIAL PRIMARY KEY,
+    first_name VARCHAR(50) NOT NULL,
+    last_name VARCHAR(50) NOT NULL,
+    full_name VARCHAR(101) GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED
+);
+
+-- =============================================================================
 -- Grants comparison test (TO side)
 -- =============================================================================
 -- These GRANT statements establish the TO target for grant comparison.
