@@ -2164,19 +2164,25 @@ impl Comparer {
         self.script
             .append_block("/* ---> Compare Foreign Tables --------------- */");
 
-        let from_map: std::collections::HashMap<String, &crate::dump::foreign_table::ForeignTable> =
-            self.from
-                .foreign_tables
-                .iter()
-                .map(|ft| (format!("{}.{}", ft.schema, ft.name), ft))
-                .collect();
+        let from_map: std::collections::HashMap<
+            (&str, &str),
+            &crate::dump::foreign_table::ForeignTable,
+        > = self
+            .from
+            .foreign_tables
+            .iter()
+            .map(|ft| ((ft.schema.as_str(), ft.name.as_str()), ft))
+            .collect();
 
-        let to_map: std::collections::HashMap<String, &crate::dump::foreign_table::ForeignTable> =
-            self.to
-                .foreign_tables
-                .iter()
-                .map(|ft| (format!("{}.{}", ft.schema, ft.name), ft))
-                .collect();
+        let to_map: std::collections::HashMap<
+            (&str, &str),
+            &crate::dump::foreign_table::ForeignTable,
+        > = self
+            .to
+            .foreign_tables
+            .iter()
+            .map(|ft| ((ft.schema.as_str(), ft.name.as_str()), ft))
+            .collect();
 
         // Drop foreign tables that exist only in FROM
         for (key, ft) in &from_map {
@@ -2197,7 +2203,7 @@ impl Comparer {
 
         // Create or alter foreign tables in TO
         for ft in &self.to.foreign_tables {
-            let key = format!("{}.{}", ft.schema, ft.name);
+            let key = (ft.schema.as_str(), ft.name.as_str());
             if let Some(existing) = from_map.get(&key) {
                 // Alter if hash differs
                 if existing.hash != ft.hash {
@@ -2220,19 +2226,19 @@ impl Comparer {
         self.script
             .append_block("/* ---> Compare Statistics --------------- */");
 
-        let from_map: std::collections::HashMap<String, &crate::dump::statistic::Statistic> = self
-            .from
-            .statistics
-            .iter()
-            .map(|s| (format!("{}.{}", s.schema, s.name), s))
-            .collect();
+        let from_map: std::collections::HashMap<(&str, &str), &crate::dump::statistic::Statistic> =
+            self.from
+                .statistics
+                .iter()
+                .map(|s| ((s.schema.as_str(), s.name.as_str()), s))
+                .collect();
 
-        let to_map: std::collections::HashMap<String, &crate::dump::statistic::Statistic> = self
-            .to
-            .statistics
-            .iter()
-            .map(|s| (format!("{}.{}", s.schema, s.name), s))
-            .collect();
+        let to_map: std::collections::HashMap<(&str, &str), &crate::dump::statistic::Statistic> =
+            self.to
+                .statistics
+                .iter()
+                .map(|s| ((s.schema.as_str(), s.name.as_str()), s))
+                .collect();
 
         // Drop statistics that exist only in FROM
         for (key, stat) in &from_map {
@@ -2253,7 +2259,7 @@ impl Comparer {
 
         // Create or alter statistics in TO
         for stat in &self.to.statistics {
-            let key = format!("{}.{}", stat.schema, stat.name);
+            let key = (stat.schema.as_str(), stat.name.as_str());
             if let Some(existing) = from_map.get(&key) {
                 if existing.hash != stat.hash {
                     let alter = existing.get_alter_script(stat, self.use_drop);

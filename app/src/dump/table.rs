@@ -8,6 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Error, PgPool, Row};
+use std::collections::HashMap;
 
 fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
@@ -77,6 +78,57 @@ fn extract_partition_key_identifiers(pk: &str) -> Vec<String> {
         }
     }
     identifiers
+}
+
+/// Pre-computed catalog capability flags.
+///
+/// These booleans indicate whether certain columns / features exist in the
+/// connected PostgreSQL server's system catalogs.  They are probed **once**
+/// per dump run (via [`PgCatalogCaps::detect`]) and then threaded into every
+/// per-table fetch function, avoiding a repeated `EXISTS` query per table.
+#[derive(Debug, Clone, Copy)]
+pub struct PgCatalogCaps {
+    /// pg_attribute.attcompression exists (PG 14+)
+    pub has_attcompression: bool,
+    /// pg_constraint.conenforced exists (PG 18+)
+    pub has_conenforced: bool,
+    /// pg_constraint.connullsnotdistinct exists (PG 15+)
+    pub has_connullsnotdistinct: bool,
+}
+
+impl PgCatalogCaps {
+    /// Probe the catalog once and return the capability flags.
+    pub async fn detect(pool: &PgPool, pg_version: i32) -> Self {
+        let has_attcompression = pg_version >= 140000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_attribute'::regclass AND attname = 'attcompression' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+        let has_conenforced = pg_version >= 180000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_constraint'::regclass AND attname = 'conenforced' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+        let has_connullsnotdistinct = pg_version >= 150000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_constraint'::regclass AND attname = 'connullsnotdistinct' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+        Self {
+            has_attcompression,
+            has_conenforced,
+            has_connullsnotdistinct,
+        }
+    }
 }
 
 // This is an information about a PostgreSQL table.
@@ -164,19 +216,23 @@ impl Table {
     ///
     /// `has_tabledef_fn` should be pre-checked once per dump run so we don't
     /// repeat the `pg_proc` lookup for every table.
+    ///
+    /// `caps` carries pre-computed catalog capability flags so that per-table
+    /// fetches never issue redundant `EXISTS` probes.
     pub async fn fill(
         &mut self,
         pool: &PgPool,
         has_tabledef_fn: bool,
         pg_version: i32,
+        caps: PgCatalogCaps,
     ) -> Result<(), Error> {
         let raw_schema = self.raw_schema.clone();
         let raw_name = self.raw_name.clone();
 
         let (columns, indexes, constraints, triggers, policies_data, partition, definition) = tokio::try_join!(
-            Self::fetch_columns(pool, &raw_schema, &raw_name, pg_version),
+            Self::fetch_columns(pool, &raw_schema, &raw_name, caps),
             Self::fetch_indexes(pool, &raw_schema, &raw_name),
-            Self::fetch_constraints(pool, &raw_schema, &raw_name, pg_version),
+            Self::fetch_constraints(pool, &raw_schema, &raw_name, pg_version, caps),
             Self::fetch_triggers(pool, &raw_schema, &raw_name),
             Self::fetch_policies(pool, &raw_schema, &raw_name),
             Self::fetch_partition_info(pool, &raw_schema, &raw_name),
@@ -207,16 +263,9 @@ impl Table {
         pool: &PgPool,
         schema: &str,
         name: &str,
-        pg_version: i32,
+        caps: PgCatalogCaps,
     ) -> Result<Vec<TableColumn>, Error> {
-        let has_attcompression: bool = pg_version >= 140000
-            && sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_attribute'::regclass AND attname = 'attcompression' AND NOT attisdropped)",
-            )
-            .fetch_one(pool)
-            .await
-            .unwrap_or(false);
-        let compression_col = if has_attcompression {
+        let compression_col = if caps.has_attcompression {
             ",\n                                a.attcompression::text as col_compression"
         } else {
             ""
@@ -389,7 +438,7 @@ impl Table {
                             _ => None,
                         }
                     },
-                    compression: if has_attcompression {
+                    compression: if caps.has_attcompression {
                         let c: String = row.get("col_compression");
                         match c.as_str() {
                             "p" => Some("pglz".to_string()),
@@ -467,27 +516,14 @@ impl Table {
         schema: &str,
         name: &str,
         pg_version: i32,
+        caps: PgCatalogCaps,
     ) -> Result<Vec<TableConstraint>, Error> {
-        let has_conenforced: bool = pg_version >= 180000
-            && sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_constraint'::regclass AND attname = 'conenforced' AND NOT attisdropped)",
-            )
-            .fetch_one(pool)
-            .await
-            .unwrap_or(false);
-        let conenforced_col = if has_conenforced {
+        let conenforced_col = if caps.has_conenforced {
             ",\n                c.conenforced AS is_enforced"
         } else {
             ""
         };
-        let has_connullsnotdistinct: bool = pg_version >= 150000
-            && sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_constraint'::regclass AND attname = 'connullsnotdistinct' AND NOT attisdropped)",
-            )
-            .fetch_one(pool)
-            .await
-            .unwrap_or(false);
-        let connullsnotdistinct_col = if has_connullsnotdistinct {
+        let connullsnotdistinct_col = if caps.has_connullsnotdistinct {
             ",\n                coalesce(c.connullsnotdistinct, false) AS nulls_not_distinct"
         } else {
             ""
@@ -811,6 +847,28 @@ impl Table {
             script.push_str(&format!("create table {}.{} (\n", self.schema, self.name));
 
             // 2. Add column definitions
+            // Build a map from column name (lowered) to named NOT NULL constraint.
+            // A NOT NULL constraint is "named" if its name differs from PG's
+            // auto-generated default "{table}_{col}_not_null".
+            let named_nn_constraints: HashMap<String, &TableConstraint> = self
+                .constraints
+                .iter()
+                .filter(|c| c.constraint_type.eq_ignore_ascii_case("not null"))
+                .filter_map(|c| {
+                    let def = c.definition.as_deref()?;
+                    let def_lower = def.to_lowercase();
+                    let col_name = def_lower.strip_prefix("not null ")?.trim().to_string();
+                    let raw_cname = c.name.trim_matches('"');
+                    let raw_col = col_name.trim_matches('"');
+                    let default_name = format!("{}_{}_not_null", self.raw_name, raw_col);
+                    if !raw_cname.eq_ignore_ascii_case(&default_name) {
+                        Some((col_name, c))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             let mut column_definitions = Vec::new();
             for column in &self.columns {
                 let mut col_def = String::new();
@@ -822,7 +880,26 @@ impl Table {
                 let col_script = column.get_script();
                 // Extract just the type and constraints part (skip the quoted name)
                 if let Some(type_start) = col_script.find(' ') {
-                    col_def.push_str(&col_script[type_start + 1..]);
+                    let mut col_part = col_script[type_start + 1..].to_string();
+
+                    // If there is a named NOT NULL constraint for this column,
+                    // replace the plain "not null" with "constraint <name> not null"
+                    // (plus any modifier flags like NO INHERIT / NOT ENFORCED).
+                    if let Some(nn) = named_nn_constraints.get(&column.name.to_lowercase())
+                        && col_part.ends_with("not null")
+                    {
+                        col_part.truncate(col_part.len() - "not null".len());
+                        let mut nn_clause = format!("constraint {} not null", nn.name);
+                        if nn.no_inherit {
+                            nn_clause.push_str(" no inherit");
+                        }
+                        if !nn.is_enforced {
+                            nn_clause.push_str(" not enforced");
+                        }
+                        col_part.push_str(&nn_clause);
+                    }
+
+                    col_def.push_str(&col_part);
                 }
 
                 column_definitions.push(col_def);
@@ -944,7 +1021,7 @@ impl Table {
             }
 
             if let Some(am) = &self.access_method {
-                script.push_str(&format!("\nusing {}", am));
+                script.push_str(&format!("\nusing {}", quote_ident(am)));
             }
 
             if let Some(space) = &self.space {
@@ -954,8 +1031,9 @@ impl Table {
             script.append_block(";");
         }
 
-        // 5. Add other constraints (excluding primary key, foreign key, and NOT NULL)
-        // NOT NULL constraints are already expressed in column definitions.
+        // 5. Add other constraints (excluding primary key, foreign key, and NOT NULL).
+        // NOT NULL constraints are already expressed in column definitions
+        // (named ones with CONSTRAINT <name>, unnamed ones as plain NOT NULL).
         for constraint in &self.constraints {
             let c_type = constraint.constraint_type.to_lowercase();
             if c_type != "primary key" && c_type != "foreign key" && c_type != "not null" {
@@ -1477,7 +1555,9 @@ impl Table {
             if let Some(am) = &to_table.access_method {
                 script.append_block(&format!(
                     "alter table {}.{} set access method {};",
-                    to_table.schema, to_table.name, am
+                    to_table.schema,
+                    to_table.name,
+                    quote_ident(am)
                 ));
             } else {
                 script.append_block(&format!(
@@ -3901,6 +3981,140 @@ mod tests {
         assert!(
             script.contains("generated always as (price * qty) virtual"),
             "expected virtual generated column in table script: {script}"
+        );
+    }
+
+    // --- Named NOT NULL constraint tests (PG18 contype='n') ---
+
+    fn not_null_constraint(name: &str, column: &str) -> TableConstraint {
+        TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: name.to_string(),
+            table_name: "users".to_string(),
+            constraint_type: "NOT NULL".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(format!("NOT NULL {column}")),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        }
+    }
+
+    #[test]
+    fn test_named_not_null_constraint_emitted_in_column_def() {
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("name_must_exist", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("constraint name_must_exist not null"),
+            "expected named NOT NULL constraint in column definition: {script}"
+        );
+        // Must NOT appear as a separate ALTER TABLE statement
+        assert!(
+            !script.contains("alter table public.users add constraint name_must_exist"),
+            "named NOT NULL should not be emitted as ALTER TABLE: {script}"
+        );
+    }
+
+    #[test]
+    fn test_auto_generated_not_null_name_skips_constraint_keyword() {
+        // Auto-generated name follows the pattern {table}_{col}_not_null
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("users_name_not_null", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        // Auto-generated name: plain "not null" without CONSTRAINT keyword
+        assert!(
+            script.contains("name text not null"),
+            "expected plain NOT NULL for auto-generated name: {script}"
+        );
+        assert!(
+            !script.contains("constraint users_name_not_null"),
+            "auto-generated NOT NULL name should not use CONSTRAINT keyword: {script}"
+        );
+    }
+
+    #[test]
+    fn test_named_not_null_with_not_enforced() {
+        let mut nn = not_null_constraint("name_nn", "name");
+        nn.is_enforced = false;
+
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![primary_key_constraint(), nn],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("constraint name_nn not null not enforced"),
+            "expected NOT ENFORCED on named NOT NULL constraint: {script}"
+        );
+    }
+
+    #[test]
+    fn test_named_not_null_with_no_inherit() {
+        let mut nn = not_null_constraint("name_nn", "name");
+        nn.no_inherit = true;
+
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![primary_key_constraint(), nn],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("constraint name_nn not null no inherit"),
+            "expected NO INHERIT on named NOT NULL constraint: {script}"
         );
     }
 }

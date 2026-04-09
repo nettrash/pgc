@@ -131,6 +131,16 @@ impl TableColumn {
         }
     }
 
+    /// Returns the effective generation type: `"s"` (stored) or `"v"` (virtual).
+    /// Treats `None` as `"s"` so that older dumps missing the field compare
+    /// equal to newer dumps that explicitly record `Some("s")`.
+    fn effective_generation_type(&self) -> &str {
+        match self.generation_type.as_deref() {
+            Some("v") => "v",
+            _ => "s",
+        }
+    }
+
     fn normalized_generation_expression(expr: &str) -> String {
         let mut trimmed = expr.trim();
         // Strip redundant outer parentheses to avoid emitted ((expr)) which some servers reject
@@ -285,9 +295,7 @@ impl TableColumn {
         if let Some(expr) = &self.generation_expression {
             hasher.update(expr.as_bytes());
         }
-        if let Some(gt) = &self.generation_type {
-            hasher.update(gt.as_bytes());
-        }
+        hasher.update(self.effective_generation_type().as_bytes());
         if let Some(comment) = &self.comment {
             hasher.update(comment.as_bytes());
         }
@@ -797,7 +805,7 @@ impl PartialEq for TableColumn {
             && self_generated == other_generated
             && (self_generated != "ALWAYS"
                 || (self.generation_expression == other.generation_expression
-                    && self.generation_type == other.generation_type))
+                    && self.effective_generation_type() == other.effective_generation_type()))
             && self.is_updatable == other.is_updatable
             && self.comment == other.comment
             && self.storage == other.storage
@@ -1364,7 +1372,7 @@ mod tests {
         // This is a known hash for the test data - if the hashing logic changes, this will fail
         assert_eq!(
             hash_hex,
-            "e8f4ac1ac6ef0cb7edf47a8fe070ccf7b80c70e4ba37937f80e06cb663ee65e2"
+            "e71094fafb6a1f2d03c80ba04c8fea5dac0269f681cbe1c0e4afb1a8482b0db2"
         );
     }
 
@@ -1853,8 +1861,8 @@ mod tests {
         let mut b = a.clone();
         b.generation_type = Some("s".to_string());
 
-        // None != Some("s") in PartialEq (they differ structurally)
-        assert_ne!(a, b);
+        // None is treated as stored ("s"), so they are semantically equal
+        assert_eq!(a, b);
     }
 
     #[test]

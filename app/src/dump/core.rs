@@ -5,7 +5,7 @@ use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::statistic::Statistic;
-use crate::dump::table::Table;
+use crate::dump::table::{PgCatalogCaps, Table};
 use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use futures::stream::{self, StreamExt};
@@ -402,7 +402,7 @@ impl Dump {
                          from pg_collation c join pg_namespace n on n.oid = c.collnamespace
                          where c.oid = r.rngcollation)
                     else null end as range_collation,
-                    quote_ident(opc.opcname) as range_opclass,
+                    quote_ident(opc_ns.nspname) || '.' || quote_ident(opc.opcname) as range_opclass,
                     case when r.rngcanonical <> 0 then r.rngcanonical::regproc::text else null end as range_canonical,
                     case when r.rngsubdiff <> 0 then r.rngsubdiff::regproc::text else null end as range_subdiff,
                     {}
@@ -410,6 +410,7 @@ impl Dump {
                 join pg_type t on t.oid = r.rngtypid
                 join pg_namespace n on n.oid = t.typnamespace
                 join pg_opclass opc on opc.oid = r.rngsubopc
+                join pg_namespace opc_ns on opc_ns.oid = opc.opcnamespace
                 {}
                 where n.nspname in {}
                   and not exists (
@@ -1013,6 +1014,9 @@ impl Dump {
                 .await
                 .unwrap_or(0);
 
+        // Probe catalog capabilities once for the entire dump run.
+        let caps = PgCatalogCaps::detect(pool, pg_version).await;
+
         let query = format!(
             "
                 select
@@ -1100,7 +1104,7 @@ impl Dump {
         let tables: Vec<Result<Table, Error>> = stream::iter(shell_tables)
             .map(|mut table| async move {
                 table
-                    .fill(pool_ref, has_tabledef_fn, pg_version)
+                    .fill(pool_ref, has_tabledef_fn, pg_version, caps)
                     .await
                     .map_err(|e| {
                         Error::other(format!("Failed to fill table {}: {}.", table.name, e))

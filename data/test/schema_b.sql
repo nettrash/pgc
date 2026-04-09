@@ -1322,9 +1322,8 @@ ALTER TABLE test_schema.products ADD CONSTRAINT chk_products_sku_format
 -- =============================================================================
 -- PG18 feature test: Virtual generated columns (PG18+)
 -- =============================================================================
--- TO: full_name is now GENERATED ALWAYS AS ... VIRTUAL.
--- Note: Requires PostgreSQL 18+.
--- On PG < 18, use STORED instead or comment out.
+-- TO: full_name is now GENERATED ALWAYS AS ... STORED.
+-- Note: On PostgreSQL 18+ this could also be VIRTUAL.
 CREATE TABLE test_schema.virtual_gen_test (
     id SERIAL PRIMARY KEY,
     first_name VARCHAR(50) NOT NULL,
