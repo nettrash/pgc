@@ -2,6 +2,27 @@
 
                 Features:
                     - Changed `coninhcount` i16 -> i32 to support PG14+.
+                    - Added PostgreSQL 14–18 support:
+                        - Virtual generated columns (`GENERATED ALWAYS AS (...) VIRTUAL`).
+                        - `NOT ENFORCED` / `ENFORCED` constraints with ALTER support.
+                        - Temporal primary key and unique constraints (`WITHOUT OVERLAPS`).
+                        - Exclusion constraints (`contype 'x'`) support.
+                        - Named NOT NULL constraints (PG18 `contype 'n'`).
+                        - `NULLS NOT DISTINCT` for unique constraints and indexes.
+                        - `NO INHERIT` constraint flag with ALTER support.
+                        - Table access method (`USING`) with `ALTER TABLE SET ACCESS METHOD`.
+                        - Column `STORAGE` and `COMPRESSION` settings with ALTER support.
+                        - `SECURITY INVOKER` views with ALTER SET/RESET support.
+                        - Unlogged sequences (`CREATE UNLOGGED SEQUENCE`) with ALTER support.
+                        - `MAINTAIN` privilege for table ACLs.
+                        - Range and multirange type support (`CREATE TYPE AS RANGE`), including
+                          `pg_range` metadata fetch (subtype, collation, opclass, canonical,
+                          subdiff, multirange name) with PG13/PG14 compatibility.
+                    - New object types:
+                        - Foreign tables: full support for `CREATE FOREIGN TABLE`, `ALTER`,
+                          `DROP`, column management, table/column options, and comparison.
+                        - Extended statistics: `CREATE STATISTICS`, `ALTER`, `DROP`, and
+                          comparison via `pg_statistic_ext`.
 
 2026-04-08      v1.0.12
 

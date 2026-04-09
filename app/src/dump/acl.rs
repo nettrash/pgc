@@ -58,6 +58,7 @@ impl AclEntry {
             'C' => Some("CREATE"),
             'c' => Some("CONNECT"),
             'T' => Some("TEMPORARY"),
+            'm' => Some("MAINTAIN"),
             _ => None,
         }
     }
@@ -73,6 +74,7 @@ impl AclEntry {
                 "TRUNCATE",
                 "REFERENCES",
                 "TRIGGER",
+                "MAINTAIN",
             ],
             "SEQUENCE" => &["USAGE", "SELECT", "UPDATE"],
             "FUNCTION" | "PROCEDURE" => &["EXECUTE"],

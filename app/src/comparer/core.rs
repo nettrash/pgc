@@ -105,6 +105,8 @@ impl Comparer {
         self.drop_views().await?;
         self.compare_tables().await?;
         self.compare_foreign_keys().await?;
+        self.compare_foreign_tables().await?;
+        self.compare_statistics().await?;
         if !self.sequence_post_script.is_empty() {
             self.script.push_str(&self.sequence_post_script);
             self.sequence_post_script.clear();
@@ -2046,6 +2048,116 @@ impl Comparer {
         }
     }
 
+    /// Compare foreign tables between dumps.
+    async fn compare_foreign_tables(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Foreign Tables --------------- */");
+
+        let from_map: std::collections::HashMap<String, &crate::dump::foreign_table::ForeignTable> =
+            self.from
+                .foreign_tables
+                .iter()
+                .map(|ft| (format!("{}.{}", ft.schema, ft.name), ft))
+                .collect();
+
+        let to_map: std::collections::HashMap<String, &crate::dump::foreign_table::ForeignTable> =
+            self.to
+                .foreign_tables
+                .iter()
+                .map(|ft| (format!("{}.{}", ft.schema, ft.name), ft))
+                .collect();
+
+        // Drop foreign tables that exist only in FROM
+        for (key, ft) in &from_map {
+            if !to_map.contains_key(key) {
+                if self.use_drop {
+                    self.script.push_str(&ft.get_drop_script());
+                } else {
+                    let drop_script = ft.get_drop_script();
+                    self.script.push_str(
+                        &drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                }
+            }
+        }
+
+        // Create or alter foreign tables in TO
+        for ft in &self.to.foreign_tables {
+            let key = format!("{}.{}", ft.schema, ft.name);
+            if let Some(existing) = from_map.get(&key) {
+                // Alter if hash differs
+                if existing.hash != ft.hash {
+                    let alter = existing.get_alter_script(ft);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                // Create new foreign table
+                self.script.push_str(&ft.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compare extended statistics between dumps.
+    async fn compare_statistics(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Statistics --------------- */");
+
+        let from_map: std::collections::HashMap<String, &crate::dump::statistic::Statistic> = self
+            .from
+            .statistics
+            .iter()
+            .map(|s| (format!("{}.{}", s.schema, s.name), s))
+            .collect();
+
+        let to_map: std::collections::HashMap<String, &crate::dump::statistic::Statistic> = self
+            .to
+            .statistics
+            .iter()
+            .map(|s| (format!("{}.{}", s.schema, s.name), s))
+            .collect();
+
+        // Drop statistics that exist only in FROM
+        for (key, stat) in &from_map {
+            if !to_map.contains_key(key) {
+                if self.use_drop {
+                    self.script.push_str(&stat.get_drop_script());
+                } else {
+                    let drop_script = stat.get_drop_script();
+                    self.script.push_str(
+                        &drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                }
+            }
+        }
+
+        // Create or alter statistics in TO
+        for stat in &self.to.statistics {
+            let key = format!("{}.{}", stat.schema, stat.name);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != stat.hash {
+                    let alter = existing.get_alter_script(stat);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&stat.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compare routines and views together, respecting cross-dependencies.
     ///
     /// Instead of processing all routines before all views (which breaks when
@@ -3344,9 +3456,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         }
     }
@@ -3420,9 +3535,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
 
@@ -3521,9 +3639,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
 
@@ -3883,9 +4004,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
 
@@ -3980,9 +4104,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
 
@@ -4048,9 +4175,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
 
@@ -4140,6 +4270,9 @@ mod tests {
                     "FOREIGN KEY (parent_id) REFERENCES public.parent(id)".to_string(),
                 ),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             }],
             vec![],
             vec![],
@@ -4705,9 +4838,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
         let serial_table = Table::new(
@@ -4790,9 +4926,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         };
         let bigserial_table = Table::new(
@@ -7137,6 +7276,9 @@ mod tests {
                 initially_deferred: false,
                 definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             }],
             vec![],
             vec![],
@@ -7216,6 +7358,9 @@ mod tests {
                 initially_deferred: false,
                 definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             }],
             vec![],
             vec![],

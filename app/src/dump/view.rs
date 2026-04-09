@@ -28,6 +28,9 @@ pub struct View {
     /// ACL (grant) entries for this view
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acl: Vec<String>,
+    /// Whether this view uses SECURITY INVOKER (PG15+)
+    #[serde(default)]
+    pub security_invoker: bool,
 }
 
 impl View {
@@ -48,6 +51,7 @@ impl View {
             is_materialized: false,
             hash: None,
             acl: Vec::new(),
+            security_invoker: false,
         };
         view.hash();
         view
@@ -67,13 +71,14 @@ impl View {
         self.hash = Some(format!(
             "{:x}",
             md5::compute(format!(
-                "{}.{}.{}.{}.{}.{}",
+                "{}.{}.{}.{}.{}.{}.{}",
                 self.schema,
                 self.name,
                 self.definition,
                 self.owner,
                 self.comment.clone().unwrap_or_default(),
-                self.is_materialized
+                self.is_materialized,
+                self.security_invoker
             ))
         ));
     }
@@ -81,11 +86,17 @@ impl View {
     /// Returns a string to create the view.
     pub fn get_script(&self) -> String {
         let keyword = self.view_keyword();
+        let with_clause = if self.security_invoker {
+            " with (security_invoker = true)"
+        } else {
+            ""
+        };
         let script = format!(
-            "create {} {}.{} as\n{}",
+            "create {} {}.{}{} as\n{}",
             keyword,
             self.schema,
             self.name,
+            with_clause,
             self.definition.trim_end()
         )
         .with_empty_lines();
@@ -148,6 +159,7 @@ impl View {
 
         if current_definition == desired_definition
             && self.is_materialized == target.is_materialized
+            && self.security_invoker == target.security_invoker
         {
             return format!(
                 "-- View {}.{} requires no changes.\n",
@@ -183,18 +195,48 @@ impl View {
             }
         }
 
-        let script = target.get_script();
-        if script.to_uppercase().contains("CREATE OR REPLACE VIEW") {
-            return script;
+        let mut script = if current_definition != desired_definition {
+            let s = target.get_script();
+            if s.to_uppercase().contains("CREATE OR REPLACE VIEW") {
+                s
+            } else {
+                let with_clause = if target.security_invoker {
+                    " with (security_invoker = true)"
+                } else {
+                    ""
+                };
+                format!(
+                    "CREATE OR REPLACE VIEW {}.{}{} AS\n{}",
+                    target.schema,
+                    target.name,
+                    with_clause,
+                    target.definition.trim_end()
+                )
+                .with_empty_lines()
+            }
+        } else {
+            String::new()
+        };
+
+        // Handle security_invoker changes (only for regular views; materialized
+        // views are handled by drop+recreate above)
+        if self.security_invoker != target.security_invoker
+            && current_definition == desired_definition
+        {
+            if target.security_invoker {
+                script.append_block(&format!(
+                    "alter view {}.{} set (security_invoker = true);",
+                    target.schema, target.name
+                ));
+            } else {
+                script.append_block(&format!(
+                    "alter view {}.{} reset (security_invoker);",
+                    target.schema, target.name
+                ));
+            }
         }
 
-        format!(
-            "CREATE OR REPLACE VIEW {}.{} AS\n{}",
-            target.schema,
-            target.name,
-            target.definition.trim_end()
-        )
-        .with_empty_lines()
+        script
     }
 }
 
@@ -230,7 +272,7 @@ mod tests {
 
         let expected_hash = format!(
             "{:x}",
-            md5::compute(format!("analytics.active_users.{definition}...false"))
+            md5::compute(format!("analytics.active_users.{definition}...false.false"))
         );
 
         assert_eq!(view.hash.as_deref(), Some(expected_hash.as_str()));

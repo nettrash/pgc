@@ -49,10 +49,16 @@ pub struct TableColumn {
     pub identity_cycle: bool,                  // Whether the identity column cycles
     pub is_generated: String,                  // Whether the column is generated
     pub generation_expression: Option<String>, // Generation expression for the column
-    pub is_updatable: bool,                    // Whether the column is updatable
-    pub related_views: Option<Vec<String>>,    // Related views (optional)
+    #[serde(default)]
+    pub generation_type: Option<String>, // 's' for stored, 'v' for virtual (PG18+); None treated as stored
+    pub is_updatable: bool,                 // Whether the column is updatable
+    pub related_views: Option<Vec<String>>, // Related views (optional)
     #[serde(default)]
     pub comment: Option<String>, // Column comment
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>, // TOAST storage strategy (PLAIN, EXTERNAL, MAIN, EXTENDED)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>, // Column compression method (pglz, lz4; PG14+)
     #[serde(skip)]
     pub serial_type: Option<String>, // Transient: set at comparison time to "serial", "bigserial", or "smallserial"
 }
@@ -279,8 +285,17 @@ impl TableColumn {
         if let Some(expr) = &self.generation_expression {
             hasher.update(expr.as_bytes());
         }
+        if let Some(gt) = &self.generation_type {
+            hasher.update(gt.as_bytes());
+        }
         if let Some(comment) = &self.comment {
             hasher.update(comment.as_bytes());
+        }
+        if let Some(storage) = &self.storage {
+            hasher.update(storage.as_bytes());
+        }
+        if let Some(compression) = &self.compression {
+            hasher.update(compression.as_bytes());
         }
         // skip catalog/charset/related_views and other descriptive-only fields
     }
@@ -395,7 +410,11 @@ impl TableColumn {
         {
             let norm_expr = Self::normalized_generation_expression(expr);
             let wrapped = format!("({norm_expr})");
-            script.push_str(&format!(" generated always as {wrapped} stored"));
+            let gen_kind = match self.generation_type.as_deref() {
+                Some("v") => "virtual",
+                _ => "stored",
+            };
+            script.push_str(&format!(" generated always as {wrapped} {gen_kind}"));
         }
 
         // Default
@@ -560,8 +579,12 @@ impl TableColumn {
                 if new_is_generated && let Some(expr) = &self.generation_expression {
                     let norm_expr = Self::normalized_generation_expression(expr);
                     let wrapped = format!("({norm_expr})");
+                    let gen_kind = match self.generation_type.as_deref() {
+                        Some("v") => "virtual",
+                        _ => "stored",
+                    };
                     let add_cmd = format!(
-                        "alter table {}.{} alter column {} add generated always as {wrapped} stored;",
+                        "alter table {}.{} alter column {} add generated always as {wrapped} {gen_kind};",
                         self.schema, self.table, self.name
                     ).with_empty_lines();
                     if use_drop || !old_is_generated {
@@ -577,6 +600,38 @@ impl TableColumn {
                         );
                     }
                 }
+            }
+        }
+
+        if self.storage != existing.storage
+            && let Some(storage) = &self.storage
+        {
+            statements.push(
+                format!(
+                    "alter table {}.{} alter column {} set storage {};",
+                    self.schema, self.table, self.name, storage
+                )
+                .with_empty_lines(),
+            );
+        }
+
+        if self.compression != existing.compression {
+            if let Some(compression) = &self.compression {
+                statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} set compression {};",
+                        self.schema, self.table, self.name, compression
+                    )
+                    .with_empty_lines(),
+                );
+            } else {
+                statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} set compression default;",
+                        self.schema, self.table, self.name
+                    )
+                    .with_empty_lines(),
+                );
             }
         }
 
@@ -656,7 +711,11 @@ impl TableColumn {
         {
             let norm_expr = Self::normalized_generation_expression(expr);
             let wrapped = format!("({norm_expr})");
-            statement.push_str(&format!(" generated always as {wrapped} stored"));
+            let gen_kind = match self.generation_type.as_deref() {
+                Some("v") => "virtual",
+                _ => "stored",
+            };
+            statement.push_str(&format!(" generated always as {wrapped} {gen_kind}"));
         }
 
         if let Some(default) = &self.column_default {
@@ -737,9 +796,12 @@ impl PartialEq for TableColumn {
             && self.identity_cycle == other.identity_cycle
             && self_generated == other_generated
             && (self_generated != "ALWAYS"
-                || self.generation_expression == other.generation_expression)
+                || (self.generation_expression == other.generation_expression
+                    && self.generation_type == other.generation_type))
             && self.is_updatable == other.is_updatable
             && self.comment == other.comment
+            && self.storage == other.storage
+            && self.compression == other.compression
     }
 }
 
@@ -794,9 +856,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         }
     }
@@ -1671,5 +1736,155 @@ mod tests {
                 assert!(line.starts_with("--"), "should be commented out: {}", line);
             }
         }
+    }
+
+    // ---- PG18: generation_type (virtual generated columns) tests ----
+
+    #[test]
+    fn test_get_script_virtual_generated_column() {
+        let mut column = create_test_column();
+        column.data_type = "integer".to_string();
+        column.character_maximum_length = None;
+        column.is_generated = "ALWAYS".to_string();
+        column.generation_expression = Some("(id * 2)".to_string());
+        column.generation_type = Some("v".to_string());
+        let script = column.get_script();
+        assert_eq!(
+            script,
+            "test_column integer generated always as (id * 2) virtual"
+        );
+    }
+
+    #[test]
+    fn test_get_script_stored_generated_column_explicit() {
+        let mut column = create_test_column();
+        column.data_type = "integer".to_string();
+        column.character_maximum_length = None;
+        column.is_generated = "ALWAYS".to_string();
+        column.generation_expression = Some("(id * 2)".to_string());
+        column.generation_type = Some("s".to_string());
+        let script = column.get_script();
+        assert_eq!(
+            script,
+            "test_column integer generated always as (id * 2) stored"
+        );
+    }
+
+    #[test]
+    fn test_get_add_script_virtual_generated_column() {
+        let mut column = create_test_column();
+        column.data_type = "integer".to_string();
+        column.character_maximum_length = None;
+        column.is_generated = "ALWAYS".to_string();
+        column.generation_expression = Some("(price * qty)".to_string());
+        column.generation_type = Some("v".to_string());
+        let script = column.get_add_script();
+        assert!(
+            script.contains("generated always as (price * qty) virtual"),
+            "expected virtual in add script: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_add_virtual_generated_column() {
+        let existing = create_test_column();
+        let mut updated = existing.clone();
+        updated.is_generated = "ALWAYS".to_string();
+        updated.generation_expression = Some("(id * 2)".to_string());
+        updated.generation_type = Some("v".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected alter statement for virtual generated column");
+
+        assert!(
+            script.contains("generated always as (id * 2) virtual"),
+            "expected virtual in alter add script: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_update_virtual_generated_expression() {
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+        existing.generation_type = Some("v".to_string());
+
+        let mut updated = existing.clone();
+        updated.generation_expression = Some("(id * 3)".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("expected alter statement for virtual expression change");
+
+        assert!(
+            script.contains("drop expression"),
+            "expected drop expression: {script}"
+        );
+        assert!(
+            script.contains("generated always as (id * 3) virtual"),
+            "expected virtual in re-add: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_different_generation_type() {
+        let mut a = create_test_column();
+        a.is_generated = "ALWAYS".to_string();
+        a.generation_expression = Some("(id * 2)".to_string());
+        a.generation_type = Some("s".to_string());
+
+        let mut b = a.clone();
+        b.generation_type = Some("v".to_string());
+
+        assert_ne!(
+            a, b,
+            "columns with different generation_type should not be equal"
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_generation_type_none_vs_stored() {
+        let mut a = create_test_column();
+        a.is_generated = "ALWAYS".to_string();
+        a.generation_expression = Some("(id * 2)".to_string());
+        a.generation_type = None;
+
+        let mut b = a.clone();
+        b.generation_type = Some("s".to_string());
+
+        // None != Some("s") in PartialEq (they differ structurally)
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_add_to_hasher_generation_type_affects_hash() {
+        let mut a = create_test_column();
+        a.is_generated = "ALWAYS".to_string();
+        a.generation_expression = Some("(id * 2)".to_string());
+        a.generation_type = None;
+
+        let mut b = a.clone();
+        b.generation_type = Some("v".to_string());
+
+        let mut ha = Sha256::new();
+        let mut hb = Sha256::new();
+        a.add_to_hasher(&mut ha);
+        b.add_to_hasher(&mut hb);
+        assert_ne!(
+            format!("{:x}", ha.finalize()),
+            format!("{:x}", hb.finalize()),
+            "generation_type should affect the hash"
+        );
+    }
+
+    #[test]
+    fn test_serde_default_generation_type() {
+        let json = r#"{"catalog":"c","schema":"s","table":"t","name":"n","ordinal_position":1,"is_nullable":true,"data_type":"int","is_self_referencing":false,"is_identity":false,"identity_cycle":false,"is_generated":"NEVER","is_updatable":true}"#;
+        let c: TableColumn = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            c.generation_type, None,
+            "missing generation_type should default to None"
+        );
     }
 }

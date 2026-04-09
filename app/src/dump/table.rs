@@ -107,6 +107,8 @@ pub struct Table {
     pub hash: Option<String>,              // Hash of the table
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acl: Vec<String>, // ACL (grant) entries for this table
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_method: Option<String>, // Table access method (e.g., "heap", custom AM)
 }
 
 impl Table {
@@ -148,6 +150,7 @@ impl Table {
             comment: None,
             hash: None,
             acl: Vec::new(),
+            access_method: None,
         };
         table.hash();
         table
@@ -161,14 +164,19 @@ impl Table {
     ///
     /// `has_tabledef_fn` should be pre-checked once per dump run so we don't
     /// repeat the `pg_proc` lookup for every table.
-    pub async fn fill(&mut self, pool: &PgPool, has_tabledef_fn: bool) -> Result<(), Error> {
+    pub async fn fill(
+        &mut self,
+        pool: &PgPool,
+        has_tabledef_fn: bool,
+        pg_version: i32,
+    ) -> Result<(), Error> {
         let raw_schema = self.raw_schema.clone();
         let raw_name = self.raw_name.clone();
 
         let (columns, indexes, constraints, triggers, policies_data, partition, definition) = tokio::try_join!(
-            Self::fetch_columns(pool, &raw_schema, &raw_name),
+            Self::fetch_columns(pool, &raw_schema, &raw_name, pg_version),
             Self::fetch_indexes(pool, &raw_schema, &raw_name),
-            Self::fetch_constraints(pool, &raw_schema, &raw_name),
+            Self::fetch_constraints(pool, &raw_schema, &raw_name, pg_version),
             Self::fetch_triggers(pool, &raw_schema, &raw_name),
             Self::fetch_policies(pool, &raw_schema, &raw_name),
             Self::fetch_partition_info(pool, &raw_schema, &raw_name),
@@ -199,7 +207,13 @@ impl Table {
         pool: &PgPool,
         schema: &str,
         name: &str,
+        pg_version: i32,
     ) -> Result<Vec<TableColumn>, Error> {
+        let compression_col = if pg_version >= 140000 {
+            ",\n                                a.attcompression::text as col_compression"
+        } else {
+            ""
+        };
         let query = format!(
                         "SELECT
                                 c.table_catalog,
@@ -249,8 +263,10 @@ impl Table {
                                 c.identity_cycle,
                                 c.is_generated,
                                 c.generation_expression,
+                                a.attgenerated::text as attgenerated,
+                                a.attstorage::text as col_storage,
                                 c.is_updatable,
-                                pd.description as column_comment,
+                                pd.description as column_comment{compression_col},
                                 (
                                         SELECT string_agg(DISTINCT rel, ', ')
                                         FROM (
@@ -344,6 +360,10 @@ impl Table {
                     identity_cycle: row.get::<&str, _>("identity_cycle") == "YES", // Convert to boolean
                     is_generated: row.get("is_generated"),
                     generation_expression: row.get("generation_expression"),
+                    generation_type: {
+                        let ag: String = row.get("attgenerated");
+                        if ag.is_empty() { None } else { Some(ag) }
+                    },
                     is_updatable: row.get::<&str, _>("is_updatable") == "YES", // Convert to boolean
                     related_views: row.get::<Option<String>, _>("related_views").map(|s| {
                         let mut views: Vec<String> =
@@ -352,6 +372,26 @@ impl Table {
                         views
                     }),
                     comment: row.get("column_comment"),
+                    storage: {
+                        let s: String = row.get("col_storage");
+                        match s.as_str() {
+                            "p" => Some("PLAIN".to_string()),
+                            "e" => Some("EXTERNAL".to_string()),
+                            "m" => Some("MAIN".to_string()),
+                            "x" => Some("EXTENDED".to_string()),
+                            _ => None,
+                        }
+                    },
+                    compression: if pg_version >= 140000 {
+                        let c: String = row.get("col_compression");
+                        match c.as_str() {
+                            "p" => Some("pglz".to_string()),
+                            "l" => Some("lz4".to_string()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    },
                     serial_type: None,
                 };
 
@@ -418,7 +458,24 @@ impl Table {
         pool: &PgPool,
         schema: &str,
         name: &str,
+        pg_version: i32,
     ) -> Result<Vec<TableConstraint>, Error> {
+        let conenforced_col = if pg_version >= 180000 {
+            ",\n                c.conenforced AS is_enforced"
+        } else {
+            ""
+        };
+        let connullsnotdistinct_col = if pg_version >= 150000 {
+            ",\n                coalesce(c.connullsnotdistinct, false) AS nulls_not_distinct"
+        } else {
+            ""
+        };
+        // PG18 stores named NOT NULL constraints in pg_constraint as contype = 'n'.
+        let contype_filter = if pg_version >= 180000 {
+            "('p','u','f','c','x','n')"
+        } else {
+            "('p','u','f','c','x')"
+        };
         let query = format!(
             "SELECT
                 current_database() AS catalog,
@@ -430,12 +487,14 @@ impl Table {
                     WHEN 'f' THEN 'FOREIGN KEY'
                     WHEN 'u' THEN 'UNIQUE'
                     WHEN 'c' THEN 'CHECK'
+                    WHEN 'x' THEN 'EXCLUDE'
+                    WHEN 'n' THEN 'NOT NULL'
                     ELSE c.contype::text
                 END AS constraint_type,
                 c.condeferrable AS is_deferrable,
                 c.condeferred AS initially_deferred,
                 pg_get_constraintdef(c.oid, true) AS definition,
-                c.coninhcount::int4 AS coninhcount
+                c.coninhcount::int4 AS coninhcount,\n                c.connoinherit AS no_inherit{conenforced_col}{connullsnotdistinct_col}
             FROM
                 pg_constraint c
                 JOIN pg_class t ON t.oid = c.conrelid
@@ -443,7 +502,7 @@ impl Table {
                 WHERE
                     n.nspname = '{}' AND
                     t.relname = '{}' AND
-                    c.contype IN ('p','u','f','c') AND
+                    c.contype IN {contype_filter} AND
                     c.conislocal
                 ORDER BY
                     n.nspname,
@@ -467,6 +526,9 @@ impl Table {
                 initially_deferred: row.get("initially_deferred"),
                 definition: row.get("definition"),
                 coninhcount: row.get("coninhcount"),
+                is_enforced: row.try_get("is_enforced").unwrap_or(true),
+                no_inherit: row.get("no_inherit"),
+                nulls_not_distinct: row.try_get("nulls_not_distinct").unwrap_or(false),
             });
         }
 
@@ -693,6 +755,9 @@ impl Table {
         if let Some(cmt) = &self.comment {
             hasher.update(cmt.as_bytes());
         }
+        if let Some(am) = &self.access_method {
+            hasher.update(am.as_bytes());
+        }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
@@ -805,32 +870,45 @@ impl Table {
                     && let Some(end) = pk_constraint[start + 1..].find(')')
                 {
                     let cols_part = &pk_constraint[start + 1..start + 1 + end];
-                    let pk_cols: Vec<&str> = cols_part
-                        .split(',')
-                        .map(|c| c.trim().trim_matches('"'))
-                        .collect();
-                    if !pk_cols.is_empty() {
+                    // For temporal PKs with WITHOUT OVERLAPS, preserve the raw definition
+                    if cols_part.to_lowercase().contains("without overlaps") {
                         let pk_def = if pk_constraint_name.is_empty() {
-                            format!(
-                                "    primary key ({})",
-                                pk_cols
-                                    .iter()
-                                    .map(|c| format!("\"{c}\""))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
+                            format!("    primary key ({cols_part})")
                         } else {
                             format!(
-                                "    constraint {} primary key ({})",
-                                pk_constraint_name,
-                                pk_cols
-                                    .iter()
-                                    .map(|c| format!("\"{c}\""))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
+                                "    constraint {} primary key ({cols_part})",
+                                pk_constraint_name
                             )
                         };
                         column_definitions.push(pk_def);
+                    } else {
+                        let pk_cols: Vec<&str> = cols_part
+                            .split(',')
+                            .map(|c| c.trim().trim_matches('"'))
+                            .collect();
+                        if !pk_cols.is_empty() {
+                            let pk_def = if pk_constraint_name.is_empty() {
+                                format!(
+                                    "    primary key ({})",
+                                    pk_cols
+                                        .iter()
+                                        .map(|c| format!("\"{c}\""))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            } else {
+                                format!(
+                                    "    constraint {} primary key ({})",
+                                    pk_constraint_name,
+                                    pk_cols
+                                        .iter()
+                                        .map(|c| format!("\"{c}\""))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
+                            column_definitions.push(pk_def);
+                        }
                     }
                 }
             }
@@ -843,6 +921,10 @@ impl Table {
                 script.push_str(&format!("\npartition by {}", partition_key));
             }
 
+            if let Some(am) = &self.access_method {
+                script.push_str(&format!("\nusing {}", am));
+            }
+
             if let Some(space) = &self.space {
                 script.push_str(&format!("\ntablespace {}", quote_ident(space)));
             }
@@ -850,11 +932,29 @@ impl Table {
             script.append_block(";");
         }
 
-        // 5. Add other constraints (excluding primary key and foreign key)
+        // 5. Add other constraints (excluding primary key, foreign key, and NOT NULL)
+        // NOT NULL constraints are already expressed in column definitions.
         for constraint in &self.constraints {
             let c_type = constraint.constraint_type.to_lowercase();
-            if c_type != "primary key" && c_type != "foreign key" {
+            if c_type != "primary key" && c_type != "foreign key" && c_type != "not null" {
                 script.push_str(&constraint.get_script());
+            }
+        }
+
+        // 5a. Emit SET STORAGE / SET COMPRESSION for columns with non-default values
+        for column in &self.columns {
+            if let Some(storage) = &column.storage {
+                // EXTENDED is the default for most varlena types; always emit to be explicit
+                script.append_block(&format!(
+                    "alter table {}.{} alter column {} set storage {};",
+                    self.schema, self.name, column.name, storage
+                ));
+            }
+            if let Some(compression) = &column.compression {
+                script.append_block(&format!(
+                    "alter table {}.{} alter column {} set compression {};",
+                    self.schema, self.name, column.name, compression
+                ));
             }
         }
 
@@ -1351,6 +1451,20 @@ impl Table {
             script.push_str(&to_table.get_owner_script());
         }
 
+        if self.access_method != to_table.access_method {
+            if let Some(am) = &to_table.access_method {
+                script.append_block(&format!(
+                    "alter table {}.{} set access method {};",
+                    to_table.schema, to_table.name, am
+                ));
+            } else {
+                script.append_block(&format!(
+                    "alter table {}.{} set access method heap;",
+                    to_table.schema, to_table.name
+                ));
+            }
+        }
+
         if self.space != to_table.space
             && let Some(new_space) = &to_table.space
         {
@@ -1474,9 +1588,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "NEVER".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         }
     }
@@ -1525,6 +1642,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -1539,6 +1659,9 @@ mod tests {
             initially_deferred: false,
             definition: Some(definition.to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -1553,6 +1676,9 @@ mod tests {
             initially_deferred,
             definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -1567,6 +1693,9 @@ mod tests {
             initially_deferred: false,
             definition: Some(definition.to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -2003,6 +2132,9 @@ mod tests {
             initially_deferred: false,
             definition: Some(definition.to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -2296,9 +2428,12 @@ mod tests {
             identity_cycle: false,
             is_generated: "".to_string(),
             generation_expression: None,
+            generation_type: None,
             is_updatable: true,
             related_views: None,
             comment: None,
+            storage: None,
+            compression: None,
             serial_type: None,
         }
     }
@@ -2734,6 +2869,9 @@ mod tests {
             initially_deferred: false,
             definition: definition.map(|d| d.to_string()),
             coninhcount: 1,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -2988,6 +3126,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         let to = partition_child_table(
             vec![partition_child_identity_column("id", 1, "integer")],
@@ -3152,6 +3293,9 @@ mod tests {
             initially_deferred: false,
             definition: definition.map(|d| d.to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -3541,5 +3685,200 @@ mod tests {
         // A column actually named "list" inside the key should be extracted
         let ids = extract_partition_key_identifiers("range (list)");
         assert_eq!(ids, vec!["list"]);
+    }
+
+    // ---- PG18: WITHOUT OVERLAPS temporal constraint tests ----
+
+    #[test]
+    fn test_get_script_temporal_pk_without_overlaps() {
+        let table = Table::new(
+            "public".to_string(),
+            "reservations".to_string(),
+            "public".to_string(),
+            "reservations".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                {
+                    let mut c = base_column("id", 1);
+                    c.data_type = "integer".to_string();
+                    c.is_nullable = false;
+                    c
+                },
+                {
+                    let mut c = base_column("valid_range", 2);
+                    c.table = "reservations".to_string();
+                    c.data_type = "tsrange".to_string();
+                    c.is_nullable = false;
+                    c
+                },
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "reservations_pkey".to_string(),
+                table_name: "reservations".to_string(),
+                constraint_type: "PRIMARY KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("PRIMARY KEY (id, valid_range WITHOUT OVERLAPS)".to_string()),
+                coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("primary key (id, valid_range WITHOUT OVERLAPS)"),
+            "expected WITHOUT OVERLAPS in PK definition: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_script_temporal_pk_named_constraint_without_overlaps() {
+        let table = Table::new(
+            "public".to_string(),
+            "bookings".to_string(),
+            "public".to_string(),
+            "bookings".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                {
+                    let mut c = base_column("room_id", 1);
+                    c.data_type = "integer".to_string();
+                    c.is_nullable = false;
+                    c
+                },
+                {
+                    let mut c = base_column("period", 2);
+                    c.table = "bookings".to_string();
+                    c.data_type = "tsrange".to_string();
+                    c.is_nullable = false;
+                    c
+                },
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "bookings_pk".to_string(),
+                table_name: "bookings".to_string(),
+                constraint_type: "PRIMARY KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("PRIMARY KEY (room_id, period WITHOUT OVERLAPS)".to_string()),
+                coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script
+                .contains("constraint bookings_pk primary key (room_id, period WITHOUT OVERLAPS)"),
+            "expected named constraint with WITHOUT OVERLAPS: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_script_not_enforced_constraint_in_table() {
+        let table = Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                {
+                    let mut c = base_column("id", 1);
+                    c.data_type = "integer".to_string();
+                    c.is_nullable = false;
+                    c
+                },
+                {
+                    let mut c = base_column("status", 2);
+                    c.data_type = "text".to_string();
+                    c
+                },
+            ],
+            vec![TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: "chk_status".to_string(),
+                table_name: "orders".to_string(),
+                constraint_type: "CHECK".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some("CHECK (status <> '')".to_string()),
+                coninhcount: 0,
+                is_enforced: false,
+                no_inherit: false,
+                nulls_not_distinct: false,
+            }],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("not enforced"),
+            "expected NOT ENFORCED check constraint in table script: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_script_virtual_generated_column_in_table() {
+        let table = Table::new(
+            "public".to_string(),
+            "products".to_string(),
+            "public".to_string(),
+            "products".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![
+                {
+                    let mut c = base_column("price", 1);
+                    c.data_type = "numeric".to_string();
+                    c.is_nullable = false;
+                    c
+                },
+                {
+                    let mut c = base_column("qty", 2);
+                    c.data_type = "integer".to_string();
+                    c
+                },
+                {
+                    let mut c = base_column("total", 3);
+                    c.table = "products".to_string();
+                    c.data_type = "numeric".to_string();
+                    c.is_generated = "ALWAYS".to_string();
+                    c.generation_expression = Some("(price * qty)".to_string());
+                    c.generation_type = Some("v".to_string());
+                    c
+                },
+            ],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("generated always as (price * qty) virtual"),
+            "expected virtual generated column in table script: {script}"
+        );
     }
 }

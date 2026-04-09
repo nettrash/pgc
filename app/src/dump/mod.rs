@@ -1,11 +1,13 @@
 pub mod acl;
 pub mod core;
 pub mod extension;
+pub mod foreign_table;
 pub mod pg_enum;
 pub mod pg_type;
 pub mod routine;
 pub mod schema;
 pub mod sequence;
+pub mod statistic;
 pub mod table;
 pub mod table_column;
 pub mod table_constraint;
