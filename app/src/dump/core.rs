@@ -373,12 +373,20 @@ impl Dump {
                     ))
                 })?;
 
-        let multirange_col = if range_pg_version >= 140000 {
+        let has_rngmultitypid: bool = range_pg_version >= 140000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_range'::regclass AND attname = 'rngmultitypid' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+        let multirange_col = if has_rngmultitypid {
             "quote_ident(mt.typname) as multirange_name"
         } else {
             "null::text as multirange_name"
         };
-        let multirange_join = if range_pg_version >= 140000 {
+        let multirange_join = if has_rngmultitypid {
             "left join pg_type mt on mt.oid = r.rngmultitypid"
         } else {
             ""
@@ -1275,7 +1283,13 @@ impl Dump {
                     quote_ident(c.relname) as ft_name,
                     quote_ident(s.srvname) as ft_server,
                     quote_ident(r.rolname) as ft_owner,
-                    ft.ftoptions as ft_options,
+                    coalesce(
+                        array(
+                            select option_name || ' ' || quote_literal(option_value)
+                            from pg_options_to_table(ft.ftoptions)
+                        ),
+                        array[]::text[]
+                    ) as ft_options,
                     d.description as ft_comment,
                     c.relacl::text[] as ft_acl
                 from pg_foreign_table ft
@@ -1462,8 +1476,8 @@ impl Dump {
                 let kinds: Vec<String> = kind_chars
                     .iter()
                     .map(|k| match k.as_str() {
-                        "d" => "dependencies".to_string(),
-                        "f" => "ndistinct".to_string(),
+                        "d" => "ndistinct".to_string(),
+                        "f" => "dependencies".to_string(),
                         "m" => "mcv".to_string(),
                         "e" => "expressions".to_string(),
                         other => other.to_string(),

@@ -209,7 +209,14 @@ impl Table {
         name: &str,
         pg_version: i32,
     ) -> Result<Vec<TableColumn>, Error> {
-        let compression_col = if pg_version >= 140000 {
+        let has_attcompression: bool = pg_version >= 140000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_attribute'::regclass AND attname = 'attcompression' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+        let compression_col = if has_attcompression {
             ",\n                                a.attcompression::text as col_compression"
         } else {
             ""
@@ -382,7 +389,7 @@ impl Table {
                             _ => None,
                         }
                     },
-                    compression: if pg_version >= 140000 {
+                    compression: if has_attcompression {
                         let c: String = row.get("col_compression");
                         match c.as_str() {
                             "p" => Some("pglz".to_string()),
@@ -422,9 +429,10 @@ impl Table {
                          JOIN pg_class ic ON ic.relname = i.indexname
                          JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
                          JOIN pg_index idx ON idx.indexrelid = ic.oid
-                         LEFT JOIN pg_constraint con ON con.conindid = ic.oid AND con.contype IN ('p', 'u')
+                         LEFT JOIN pg_constraint puc ON puc.conindid = ic.oid AND puc.contype IN ('p', 'u')
                          WHERE idx.indisprimary = false
-                             AND (idx.indisunique = false OR con.oid IS NULL)
+                             AND (idx.indisunique = false OR puc.oid IS NULL)
+                             AND NOT EXISTS (SELECT 1 FROM pg_constraint xc WHERE xc.conindid = ic.oid AND xc.contype = 'x')
                              AND i.schemaname = '{}' AND i.tablename = '{}'
                          ORDER BY i.schemaname, i.tablename, i.indexname",
                         escape_single_quotes(schema),
@@ -460,12 +468,26 @@ impl Table {
         name: &str,
         pg_version: i32,
     ) -> Result<Vec<TableConstraint>, Error> {
-        let conenforced_col = if pg_version >= 180000 {
+        let has_conenforced: bool = pg_version >= 180000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_constraint'::regclass AND attname = 'conenforced' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+        let conenforced_col = if has_conenforced {
             ",\n                c.conenforced AS is_enforced"
         } else {
             ""
         };
-        let connullsnotdistinct_col = if pg_version >= 150000 {
+        let has_connullsnotdistinct: bool = pg_version >= 150000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_constraint'::regclass AND attname = 'connullsnotdistinct' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+        let connullsnotdistinct_col = if has_connullsnotdistinct {
             ",\n                coalesce(c.connullsnotdistinct, false) AS nulls_not_distinct"
         } else {
             ""

@@ -59,7 +59,6 @@ impl Statistic {
         hasher.update(self.owner.as_bytes());
         hasher.update(self.table_schema.as_bytes());
         hasher.update(self.table_name.as_bytes());
-        hasher.update(self.definition.as_bytes());
 
         hasher.update((self.kinds.len() as u32).to_be_bytes());
         for kind in &self.kinds {
@@ -139,8 +138,12 @@ impl Statistic {
             );
         }
 
-        // If the definition changed, drop and recreate
-        if self.definition != target.definition {
+        // If the structural definition changed, drop and recreate
+        if self.kinds != target.kinds
+            || self.columns != target.columns
+            || self.table_schema != target.table_schema
+            || self.table_name != target.table_name
+        {
             return format!("{}{}", self.get_drop_script(), target.get_script());
         }
 

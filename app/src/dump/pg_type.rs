@@ -186,8 +186,6 @@ impl PgType {
 
         hasher.update(self.schema.as_bytes());
         hasher.update(self.typname.as_bytes());
-        hasher.update(self.typnamespace.0.to_be_bytes());
-        hasher.update(self.typowner.0.to_be_bytes());
         hasher.update(self.owner.as_bytes());
         hasher.update(self.typlen.to_be_bytes());
         hasher.update([self.typbyval as u8]);
@@ -197,17 +195,8 @@ impl PgType {
         hasher.update([self.typisdefined as u8]);
         hasher.update(self.typdelim.to_be_bytes());
 
-        update_option(&mut hasher, &self.typrelid, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
-        });
         update_option(&mut hasher, &self.typsubscript, |hasher, value| {
             hasher.update(value.as_bytes());
-        });
-        update_option(&mut hasher, &self.typelem, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
-        });
-        update_option(&mut hasher, &self.typarray, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
         });
 
         hasher.update(self.typinput.as_bytes());
@@ -233,8 +222,8 @@ impl PgType {
         hasher.update(self.typstorage.to_be_bytes());
         hasher.update([self.typnotnull as u8]);
 
-        update_option(&mut hasher, &self.typbasetype, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
+        update_option(&mut hasher, &self.formatted_basetype, |hasher, value| {
+            hasher.update(value.as_bytes());
         });
         update_option(&mut hasher, &self.typtypmod, |hasher, value| {
             hasher.update(value.to_be_bytes());
@@ -242,9 +231,6 @@ impl PgType {
 
         hasher.update(self.typndims.to_be_bytes());
 
-        update_option(&mut hasher, &self.typcollation, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
-        });
         update_option(&mut hasher, &self.typdefault, |hasher, value| {
             hasher.update(value.as_bytes());
         });
