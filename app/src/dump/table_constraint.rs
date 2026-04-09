@@ -15,7 +15,7 @@ pub struct TableConstraint {
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
     #[serde(default)]
-    pub coninhcount: i16, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
+    pub coninhcount: i32, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
 }
 
 impl TableConstraint {
@@ -1297,6 +1297,102 @@ mod tests {
         assert_eq!(
             norm,
             "check (x::character varying = ']::text[]' and y::character varying = 'ok')"
+        );
+    }
+
+    // --- coninhcount i32 compatibility (PG14 INT4 / PG16+ INT2) ---
+
+    #[test]
+    fn test_coninhcount_accepts_i16_range_values() {
+        // PG16+ returns INT2 values, which fit in i32
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "pk_test".to_string(),
+            table_name: "test".to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: None,
+            coninhcount: 0,
+        };
+        assert_eq!(constraint.coninhcount, 0);
+
+        let mut inherited = constraint.clone();
+        inherited.coninhcount = i16::MAX as i32;
+        assert_eq!(inherited.coninhcount, 32767);
+    }
+
+    #[test]
+    fn test_coninhcount_accepts_i32_range_values() {
+        // PG14 returns INT4 values, which require i32
+        let mut constraint = create_primary_key_constraint();
+        constraint.coninhcount = i32::MAX;
+        assert_eq!(constraint.coninhcount, i32::MAX);
+
+        constraint.coninhcount = 100_000; // exceeds i16::MAX
+        assert_eq!(constraint.coninhcount, 100_000);
+    }
+
+    #[test]
+    fn test_coninhcount_serde_roundtrip_zero() {
+        let constraint = create_primary_key_constraint();
+        let json = serde_json::to_string(&constraint).unwrap();
+        let deserialized: TableConstraint = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.coninhcount, 0);
+    }
+
+    #[test]
+    fn test_coninhcount_serde_roundtrip_large_value() {
+        let mut constraint = create_primary_key_constraint();
+        constraint.coninhcount = 100_000;
+        let json = serde_json::to_string(&constraint).unwrap();
+        let deserialized: TableConstraint = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.coninhcount, 100_000);
+    }
+
+    #[test]
+    fn test_coninhcount_serde_default_when_missing() {
+        // Older dumps may not include the field; #[serde(default)] should yield 0
+        let json = r#"{
+            "catalog": "db",
+            "schema": "public",
+            "name": "pk",
+            "table_name": "t",
+            "constraint_type": "PRIMARY KEY",
+            "is_deferrable": false,
+            "initially_deferred": false,
+            "definition": null
+        }"#;
+        let deserialized: TableConstraint = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.coninhcount, 0);
+    }
+
+    #[test]
+    fn test_coninhcount_not_included_in_equality() {
+        // coninhcount is intentionally excluded from PartialEq
+        let mut a = create_primary_key_constraint();
+        let mut b = create_primary_key_constraint();
+        a.coninhcount = 0;
+        b.coninhcount = 5;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_coninhcount_not_included_in_hash() {
+        // coninhcount is intentionally excluded from the SHA256 hash
+        let mut a = create_primary_key_constraint();
+        let mut b = create_primary_key_constraint();
+        a.coninhcount = 0;
+        b.coninhcount = 42;
+
+        let mut ha = Sha256::new();
+        let mut hb = Sha256::new();
+        a.add_to_hasher(&mut ha);
+        b.add_to_hasher(&mut hb);
+        assert_eq!(
+            format!("{:x}", ha.finalize()),
+            format!("{:x}", hb.finalize()),
         );
     }
 }

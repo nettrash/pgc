@@ -435,7 +435,7 @@ impl Table {
                 c.condeferrable AS is_deferrable,
                 c.condeferred AS initially_deferred,
                 pg_get_constraintdef(c.oid, true) AS definition,
-                c.coninhcount
+                c.coninhcount::int4 AS coninhcount
             FROM
                 pg_constraint c
                 JOIN pg_class t ON t.oid = c.conrelid
