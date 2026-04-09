@@ -137,19 +137,39 @@ impl Comparer {
     /// Mark columns in `self.to.tables` that should be output as serial/bigserial/smallserial.
     /// Called after `compare_sequences()` which populates `self.serial_columns`.
     fn mark_serial_columns(&mut self) {
-        for (key, serial_type) in &self.serial_columns {
-            let parts: Vec<&str> = key.splitn(3, '.').collect();
-            if parts.len() == 3 {
-                let (schema, table, column) = (parts[0], parts[1], parts[2]);
-                if let Some(to_table) = self
-                    .to
-                    .tables
-                    .iter_mut()
-                    .find(|t| t.schema == schema && t.name == table)
-                    && let Some(to_column) = to_table.columns.iter_mut().find(|c| c.name == column)
-                {
-                    to_column.serial_type = Some(serial_type.clone());
+        // Build index map for O(1) table lookup
+        let to_table_idx: HashMap<(&str, &str), usize> = self
+            .to
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
+        // Collect indices first to avoid borrow conflict
+        let updates: Vec<(usize, String, String)> = self
+            .serial_columns
+            .iter()
+            .filter_map(|(key, serial_type)| {
+                let parts: Vec<&str> = key.splitn(3, '.').collect();
+                if parts.len() == 3 {
+                    let (schema, table, column) = (parts[0], parts[1], parts[2]);
+                    to_table_idx
+                        .get(&(schema, table))
+                        .map(|&idx| (idx, column.to_string(), serial_type.clone()))
+                } else {
+                    None
                 }
+            })
+            .collect();
+
+        for (tidx, column, serial_type) in updates {
+            if let Some(to_column) = self.to.tables[tidx]
+                .columns
+                .iter_mut()
+                .find(|c| c.name == column)
+            {
+                to_column.serial_type = Some(serial_type);
             }
         }
     }
@@ -163,7 +183,7 @@ impl Comparer {
         }
     }
 
-    fn process_target_routine(&mut self, routine: &Routine) {
+    fn process_target_routine(&mut self, routine: &Routine, from_routine: Option<&Routine>) {
         if routine.hash.is_none() {
             self.script.push_str(
                 format!(
@@ -175,9 +195,7 @@ impl Comparer {
             return;
         }
 
-        if let Some(from_routine) = self.from.routines.iter().find(|r| {
-            r.name == routine.name && r.schema == routine.schema && r.arguments == routine.arguments
-        }) {
+        if let Some(from_routine) = from_routine {
             if from_routine.hash.is_none() {
                 self.script.push_str(
                     format!(
@@ -442,7 +460,23 @@ impl Comparer {
     }
 
     fn normalized_view_key(schema: &str, name: &str) -> String {
-        Self::normalized_view_reference(format!("{}.{}", schema, name).as_str())
+        let mut result = String::with_capacity(schema.len() + name.len() + 1);
+        for c in schema.chars() {
+            if !matches!(c, '"' | '\'' | '`') {
+                for lc in c.to_lowercase() {
+                    result.push(lc);
+                }
+            }
+        }
+        result.push('.');
+        for c in name.chars() {
+            if !matches!(c, '"' | '\'' | '`') {
+                for lc in c.to_lowercase() {
+                    result.push(lc);
+                }
+            }
+        }
+        result
     }
 
     /// Check whether `text` contains an occurrence of the qualified name
@@ -657,6 +691,15 @@ impl Comparer {
     fn dependent_view_keys(&self) -> HashSet<String> {
         let mut dependent_views = HashSet::new();
 
+        // Build O(1) lookup for target tables
+        let to_table_map: HashMap<(&str, &str), usize> = self
+            .to
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
         // Collect normalised keys for every table that will be altered or dropped,
         // so we can cheaply look them up when scanning materialized view relations.
         let altered_or_dropped: HashSet<String> = self
@@ -664,11 +707,8 @@ impl Comparer {
             .tables
             .iter()
             .filter(|table| {
-                let matching = self
-                    .to
-                    .tables
-                    .iter()
-                    .find(|t| t.schema == table.schema && t.name == table.name);
+                let matching_idx = to_table_map.get(&(table.schema.as_str(), table.name.as_str()));
+                let matching = matching_idx.map(|&idx| &self.to.tables[idx]);
                 let will_be_dropped = matching.is_none() && self.use_drop;
                 let will_be_altered = matching
                     .map(|target| Self::hashes_differ(&target.hash, &table.hash))
@@ -679,11 +719,8 @@ impl Comparer {
             .collect();
 
         for table in &self.from.tables {
-            let matching_table = self
-                .to
-                .tables
-                .iter()
-                .find(|t| t.schema == table.schema && t.name == table.name);
+            let matching_idx = to_table_map.get(&(table.schema.as_str(), table.name.as_str()));
+            let matching_table = matching_idx.map(|&idx| &self.to.tables[idx]);
 
             let will_be_dropped = matching_table.is_none() && self.use_drop;
             let will_be_altered = matching_table
@@ -734,10 +771,19 @@ impl Comparer {
         self.script
             .append_block("\n/* ---> Schemas: Start section --------------- */");
 
+        let from_schema_map: HashMap<&str, usize> = self
+            .from
+            .schemas
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.as_str(), i))
+            .collect();
+
         // We will find all new schemas from "to" dump that are not in "from" dump
         // and add them to the script.
         for schema in &self.to.schemas {
-            if let Some(from_schema) = self.from.schemas.iter().find(|s| s.name == schema.name) {
+            if let Some(&idx) = from_schema_map.get(schema.name.as_str()) {
+                let from_schema = &self.from.schemas[idx];
                 if Self::hashes_differ(&from_schema.hash, &schema.hash) {
                     self.script
                         .push_str(format!("\n/* Schema: {}*/\n", schema.name).as_str());
@@ -789,13 +835,24 @@ impl Comparer {
         // We will find all new extensions from "to" dump that are not in "from" dump
         // and add them to the script.
         // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
+        let from_ext_map: HashMap<(&str, &str), usize> = self
+            .from
+            .extensions
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((e.schema.as_str(), e.name.as_str()), i))
+            .collect();
+
+        let to_ext_keys: HashSet<(&str, &str)> = self
+            .to
+            .extensions
+            .iter()
+            .map(|e| (e.schema.as_str(), e.name.as_str()))
+            .collect();
+
         for ext in &self.to.extensions {
-            if let Some(from_ext) = self
-                .from
-                .extensions
-                .iter()
-                .find(|r| r.name == ext.name && r.schema == ext.schema)
-            {
+            if let Some(&idx) = from_ext_map.get(&(ext.schema.as_str(), ext.name.as_str())) {
+                let from_ext = &self.from.extensions[idx];
                 if from_ext.owner != ext.owner {
                     self.script.push_str(
                         format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
@@ -816,13 +873,8 @@ impl Comparer {
         }
 
         for ext in &self.from.extensions {
-            if let Some(_to_ext) = self
-                .to
-                .extensions
-                .iter()
-                .find(|r| r.name == ext.name && r.schema == ext.schema)
-            {
-                continue; // Routine is present in both dumps, we already processed it
+            if to_ext_keys.contains(&(ext.schema.as_str(), ext.name.as_str())) {
+                continue; // Extension is present in both dumps, we already processed it
             } else {
                 // Extension is not present in 'to' dump and should be dropped.
                 self.script
@@ -856,16 +908,29 @@ impl Comparer {
         self.script
             .append_block("\n/* ---> User-defined types: Start --------------- */");
 
+        let from_type_map: HashMap<(&str, &str), usize> = self
+            .from
+            .types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.typname.as_str()), i))
+            .collect();
+
+        let to_type_keys: HashSet<(&str, &str)> = self
+            .to
+            .types
+            .iter()
+            .map(|t| (t.schema.as_str(), t.typname.as_str()))
+            .collect();
+
         for to_type in &self.to.types {
             if (to_type.typtype as u8 as char) == 'e' {
                 continue;
             }
-            if let Some(from_type) = self
-                .from
-                .types
-                .iter()
-                .find(|t| t.schema == to_type.schema && t.typname == to_type.typname)
+            if let Some(&idx) =
+                from_type_map.get(&(to_type.schema.as_str(), to_type.typname.as_str()))
             {
+                let from_type = &self.from.types[idx];
                 if Self::hashes_differ(&from_type.hash, &to_type.hash) {
                     self.script.push_str(
                         format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
@@ -893,12 +958,7 @@ impl Comparer {
                 if (from_type.typtype as u8 as char) == 'e' {
                     continue;
                 }
-                if self
-                    .to
-                    .types
-                    .iter()
-                    .any(|t| t.schema == from_type.schema && t.typname == from_type.typname)
-                {
+                if to_type_keys.contains(&(from_type.schema.as_str(), from_type.typname.as_str())) {
                     continue;
                 }
 
@@ -946,6 +1006,22 @@ impl Comparer {
 
         let mut drop_section = String::new();
 
+        // Build lookup maps for O(1) access (reuses type maps since enums are stored in types)
+        let from_type_map: HashMap<(&str, &str), usize> = self
+            .from
+            .types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.typname.as_str()), i))
+            .collect();
+
+        let to_type_keys: HashSet<(&str, &str)> = self
+            .to
+            .types
+            .iter()
+            .map(|t| (t.schema.as_str(), t.typname.as_str()))
+            .collect();
+
         let to_enums = self
             .to
             .types
@@ -963,12 +1039,10 @@ impl Comparer {
                 );
                 continue;
             }
-            if let Some(from_enum) = self
-                .from
-                .types
-                .iter()
-                .find(|t| t.schema == to_enum.schema && t.typname == to_enum.typname)
+            if let Some(&idx) =
+                from_type_map.get(&(to_enum.schema.as_str(), to_enum.typname.as_str()))
             {
+                let from_enum = &self.from.types[idx];
                 if from_enum.hash.is_none() {
                     self.script.push_str(
                         format!(
@@ -1007,12 +1081,7 @@ impl Comparer {
                 .iter()
                 .filter(|t| (t.typtype as u8 as char) == 'e')
             {
-                if self
-                    .to
-                    .types
-                    .iter()
-                    .any(|t| t.schema == from_enum.schema && t.typname == from_enum.typname)
-                {
+                if to_type_keys.contains(&(from_enum.schema.as_str(), from_enum.typname.as_str())) {
                     continue;
                 }
 
@@ -1063,6 +1132,38 @@ impl Comparer {
 
         let mut drop_section = String::new();
 
+        // Build lookup maps for O(1) access
+        let from_seq_map: HashMap<(&str, &str), usize> = self
+            .from
+            .sequences
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((s.schema.as_str(), s.name.as_str()), i))
+            .collect();
+
+        let to_seq_keys: HashSet<(&str, &str)> = self
+            .to
+            .sequences
+            .iter()
+            .map(|s| (s.schema.as_str(), s.name.as_str()))
+            .collect();
+
+        let to_table_map: HashMap<(&str, &str), usize> = self
+            .to
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
+        let from_table_map: HashMap<(&str, &str), usize> = self
+            .from
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
         // We will find all new sequences from "to" dump that are not in "from" dump
         // and we will find all existing sequences in both dumps with different hashes
         // and add them to the script.
@@ -1077,12 +1178,10 @@ impl Comparer {
                 );
                 continue;
             }
-            if let Some(from_sequence) = self
-                .from
-                .sequences
-                .iter()
-                .find(|s| s.name == sequence.name && s.schema == sequence.schema)
+            if let Some(&idx) =
+                from_seq_map.get(&(sequence.schema.as_str(), sequence.name.as_str()))
             {
+                let from_sequence = &self.from.sequences[idx];
                 if from_sequence.hash.is_none() {
                     self.script.push_str(
                         format!(
@@ -1107,38 +1206,37 @@ impl Comparer {
                     &sequence.owned_by_schema,
                     &sequence.owned_by_table,
                     &sequence.owned_by_column,
-                ) && let Some(to_table) = self
-                    .to
-                    .tables
-                    .iter()
-                    .find(|t| t.schema == *schema && t.name == *table)
-                    && let Some(to_column) = to_table.columns.iter().find(|c| c.name == *column)
+                ) && let Some(&tidx) = to_table_map.get(&(schema.as_str(), table.as_str()))
                 {
-                    let is_identity = to_column.is_identity;
-                    let is_serial = to_column
-                        .column_default
-                        .as_ref()
-                        .is_some_and(|d| d.to_lowercase().contains("nextval("));
+                    let to_table = &self.to.tables[tidx];
+                    if let Some(to_column) = to_table.columns.iter().find(|c| c.name == *column) {
+                        let is_identity = to_column.is_identity;
+                        let is_serial = to_column
+                            .column_default
+                            .as_ref()
+                            .is_some_and(|d| d.to_lowercase().contains("nextval("));
 
-                    if is_identity || is_serial {
-                        if is_serial {
-                            let serial_type = match to_column.data_type.to_lowercase().as_str() {
-                                "integer" => "serial",
-                                "bigint" => "bigserial",
-                                "smallint" => "smallserial",
-                                _ => "serial",
-                            };
-                            let key = format!("{}.{}.{}", schema, table, column);
-                            self.serial_columns.insert(key, serial_type.to_string());
+                        if is_identity || is_serial {
+                            if is_serial {
+                                let serial_type = match to_column.data_type.to_lowercase().as_str()
+                                {
+                                    "integer" => "serial",
+                                    "bigint" => "bigserial",
+                                    "smallint" => "smallserial",
+                                    _ => "serial",
+                                };
+                                let key = format!("{}.{}.{}", schema, table, column);
+                                self.serial_columns.insert(key, serial_type.to_string());
+                            }
+                            self.script.push_str(
+                                        format!(
+                                            "/* Skipping sequence {}.{} as it will be created by column {}.{}.{} (identity/serial) */\n",
+                                            sequence.schema, sequence.name, schema, table, column
+                                        )
+                                        .as_str(),
+                                    );
+                            continue;
                         }
-                        self.script.push_str(
-                                    format!(
-                                        "/* Skipping sequence {}.{} as it will be created by column {}.{}.{} (identity/serial) */\n",
-                                        sequence.schema, sequence.name, schema, table, column
-                                    )
-                                    .as_str(),
-                                );
-                        continue;
                     }
                 }
 
@@ -1156,12 +1254,7 @@ impl Comparer {
                     continue;
                 }
 
-                if let Some(_to_sequence) = self
-                    .to
-                    .sequences
-                    .iter()
-                    .find(|s| s.name == sequence.name && s.schema == sequence.schema)
-                {
+                if to_seq_keys.contains(&(sequence.schema.as_str(), sequence.name.as_str())) {
                     continue; // Sequence is present in both dumps, we already processed it
                 }
 
@@ -1169,13 +1262,9 @@ impl Comparer {
                 if let (Some(schema), Some(table)) =
                     (&sequence.owned_by_schema, &sequence.owned_by_table)
                 {
-                    let to_table = self
-                        .to
-                        .tables
-                        .iter()
-                        .find(|t| t.schema == *schema && t.name == *table);
+                    let to_table_idx = to_table_map.get(&(schema.as_str(), table.as_str()));
 
-                    if to_table.is_none() {
+                    if to_table_idx.is_none() {
                         self.script.push_str(
                             format!(
                                 "/* Skipping drop of sequence {}.{} as it is owned by table {}.{} which will be dropped. */\n",
@@ -1188,7 +1277,7 @@ impl Comparer {
 
                     // Table exists in TO. Check if column exists or if it was an identity column.
                     if let Some(column_name) = &sequence.owned_by_column {
-                        let to_table = to_table.unwrap();
+                        let to_table = &self.to.tables[*to_table_idx.unwrap()];
                         let to_column = to_table.columns.iter().find(|c| c.name == *column_name);
 
                         if to_column.is_none() {
@@ -1203,23 +1292,22 @@ impl Comparer {
                         }
 
                         // Column exists in TO. Check if it was an identity column in FROM.
-                        if let Some(from_table) = self
-                            .from
-                            .tables
-                            .iter()
-                            .find(|t| t.schema == *schema && t.name == *table)
-                            && let Some(from_column) =
-                                from_table.columns.iter().find(|c| c.name == *column_name)
-                            && from_column.is_identity
+                        if let Some(&fidx) = from_table_map.get(&(schema.as_str(), table.as_str()))
                         {
-                            self.script.push_str(
-                                        format!(
-                                            "/* Skipping drop of sequence {}.{} as it is owned by identity column {}.{}.{}. */\n",
-                                            sequence.schema, sequence.name, schema, table, column_name
-                                        )
-                                        .as_str(),
-                                    );
-                            continue;
+                            let from_table = &self.from.tables[fidx];
+                            if let Some(from_column) =
+                                from_table.columns.iter().find(|c| c.name == *column_name)
+                                && from_column.is_identity
+                            {
+                                self.script.push_str(
+                                            format!(
+                                                "/* Skipping drop of sequence {}.{} as it is owned by identity column {}.{}.{}. */\n",
+                                                sequence.schema, sequence.name, schema, table, column_name
+                                            )
+                                            .as_str(),
+                                        );
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1269,15 +1357,29 @@ impl Comparer {
         self.script
             .append_block("\n/* ---> Routines: Start section --------------- */");
 
+        // Build O(1) lookup maps (owned keys to avoid borrowing self)
+        let to_routine_keys: HashSet<(String, String, String)> = self
+            .to
+            .routines
+            .iter()
+            .map(|r| (r.schema.clone(), r.name.clone(), r.arguments.clone()))
+            .collect();
+
+        let from_routine_map: HashMap<(String, String, String), usize> = self
+            .from
+            .routines
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.schema.clone(), r.name.clone(), r.arguments.clone()), i))
+            .collect();
+
         // ── Drop routines not present in TO (reverse dependency order) ──
         let routines_to_drop: Vec<Routine> = self
             .from
             .routines
             .iter()
             .filter(|r| {
-                !self.to.routines.iter().any(|tr| {
-                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
-                })
+                !to_routine_keys.contains(&(r.schema.clone(), r.name.clone(), r.arguments.clone()))
             })
             .cloned()
             .collect();
@@ -1395,7 +1497,14 @@ impl Comparer {
 
             for idx in sorted {
                 let routine = &create_routines[idx].1;
-                self.process_target_routine(routine);
+                let from_routine = from_routine_map
+                    .get(&(
+                        routine.schema.clone(),
+                        routine.name.clone(),
+                        routine.arguments.clone(),
+                    ))
+                    .map(|&i| self.from.routines[i].clone());
+                self.process_target_routine(routine, from_routine.as_ref());
             }
         }
 
@@ -1414,16 +1523,28 @@ impl Comparer {
         // We will drop all tables that exists just in "from" dump (partitions first).
         let ordered_from_drop = Self::ordered_tables_for_drop(&self.from.tables);
 
+        // Build lookup maps for O(1) access
+        let to_table_map: HashMap<(&str, &str), usize> = self
+            .to
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
+        let from_table_map: HashMap<(&str, &str), usize> = self
+            .from
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
         // Pass 1: collect FK drops for all tables that will be removed.
         let mut fk_pre_drop = String::new();
         let mut dropped_fk_keys: HashSet<String> = HashSet::new();
         for table in ordered_from_drop.iter() {
-            if self
-                .to
-                .tables
-                .iter()
-                .any(|t| t.name == table.name && t.schema == table.schema)
-            {
+            if to_table_map.contains_key(&(table.schema.as_str(), table.name.as_str())) {
                 continue;
             }
 
@@ -1504,12 +1625,7 @@ impl Comparer {
 
         // Pass 2: drop tables (and their triggers) now that FK dependencies are removed.
         for table in ordered_from_drop.iter() {
-            if let Some(_to_table) = self
-                .to
-                .tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-            {
+            if to_table_map.contains_key(&(table.schema.as_str(), table.name.as_str())) {
                 continue; // Table is present in both dumps, we already processed it
             }
 
@@ -1560,14 +1676,11 @@ impl Comparer {
         // contains a DROP TABLE.
         let mut recreated_parents: HashSet<String> = HashSet::new();
         for table in ordered_from.iter() {
-            if let Some(to_table) = self
-                .to
-                .tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-                && table.partition_key != to_table.partition_key
-            {
-                recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+            if let Some(&tidx) = to_table_map.get(&(table.schema.as_str(), table.name.as_str())) {
+                let to_table = &self.to.tables[tidx];
+                if table.partition_key != to_table.partition_key {
+                    recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+                }
             }
         }
 
@@ -1590,12 +1703,8 @@ impl Comparer {
                 );
                 continue;
             }
-            if let Some(from_table) = self
-                .from
-                .tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-            {
+            if let Some(&fidx) = from_table_map.get(&(table.schema.as_str(), table.name.as_str())) {
+                let from_table = &self.from.tables[fidx];
                 if from_table.hash.is_none() {
                     self.script.push_str(
                         format!(
@@ -1647,12 +1756,8 @@ impl Comparer {
                 );
                 continue;
             }
-            if let Some(to_table) = self
-                .to
-                .tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-            {
+            if let Some(&tidx) = to_table_map.get(&(table.schema.as_str(), table.name.as_str())) {
+                let to_table = &self.to.tables[tidx];
                 if to_table.hash.is_none() {
                     self.script.push_str(
                         format!(
@@ -1726,17 +1831,21 @@ impl Comparer {
         self.script
             .append_block("\n/* ---> Foreign Keys: Start section --------------- */");
 
+        let from_table_map: HashMap<(&str, &str), usize> = self
+            .from
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
         for table in &self.to.tables {
             if table.hash.is_none() {
                 continue;
             }
 
-            if let Some(from_table) = self
-                .from
-                .tables
-                .iter()
-                .find(|t| t.name == table.name && t.schema == table.schema)
-            {
+            if let Some(&fidx) = from_table_map.get(&(table.schema.as_str(), table.name.as_str())) {
+                let from_table = &self.from.tables[fidx];
                 if from_table.hash.is_none() {
                     continue;
                 }
@@ -1763,24 +1872,26 @@ impl Comparer {
         let dependent_views = self.dependent_view_keys();
         self.dropped_views.clear();
 
+        // Build O(1) lookup for target views
+        let to_view_map: HashMap<(&str, &str), usize> = self
+            .to
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| ((v.schema.as_str(), v.name.as_str()), i))
+            .collect();
+
         // Collect all views that should be dropped: (from_view index, normalized_key, force_drop)
         let mut candidates: Vec<(usize, String, bool)> = Vec::new();
 
         for (idx, from_view) in self.from.views.iter().enumerate() {
             let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
 
-            // Determine why this view should be dropped (if at all):
-            // 1. It is temporarily needed before a table alteration/drop (dependent).
-            // 2. It no longer exists in the target dump (FROM-only permanent drop).
-            // 3. It is a materialized view whose definition has changed — mat views
-            //    cannot use CREATE OR REPLACE, so they must be dropped and recreated.
             let is_dependent = dependent_views.contains(&normalized_view);
 
-            let to_view = self
-                .to
-                .views
-                .iter()
-                .find(|v| v.schema == from_view.schema && v.name == from_view.name);
+            let to_view = to_view_map
+                .get(&(from_view.schema.as_str(), from_view.name.as_str()))
+                .map(|&i| &self.to.views[i]);
 
             let is_from_only = to_view.is_none();
 
@@ -2171,6 +2282,30 @@ impl Comparer {
         self.script
             .append_block("\n/* ---> Routines & Views: Start section --------------- */");
 
+        // Build O(1) lookup maps (owned keys to avoid borrowing self)
+        let to_routine_keys: HashSet<(String, String, String)> = self
+            .to
+            .routines
+            .iter()
+            .map(|r| (r.schema.clone(), r.name.clone(), r.arguments.clone()))
+            .collect();
+
+        let from_routine_map: HashMap<(String, String, String), usize> = self
+            .from
+            .routines
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.schema.clone(), r.name.clone(), r.arguments.clone()), i))
+            .collect();
+
+        let from_view_map: HashMap<(String, String), usize> = self
+            .from
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| ((v.schema.clone(), v.name.clone()), i))
+            .collect();
+
         // ──────────────────────────────────────────────────────────
         // Phase 1 – Drop routines that are not present in TO
         // ──────────────────────────────────────────────────────────
@@ -2179,9 +2314,7 @@ impl Comparer {
             .routines
             .iter()
             .filter(|r| {
-                !self.to.routines.iter().any(|tr| {
-                    tr.name == r.name && tr.schema == r.schema && tr.arguments == r.arguments
-                })
+                !to_routine_keys.contains(&(r.schema.clone(), r.name.clone(), r.arguments.clone()))
             })
             .cloned()
             .collect();
@@ -2258,11 +2391,13 @@ impl Comparer {
             if routine.hash.is_none() {
                 continue;
             }
-            let from_routine = self.from.routines.iter().find(|r| {
-                r.name == routine.name
-                    && r.schema == routine.schema
-                    && r.arguments == routine.arguments
-            });
+            let from_routine = from_routine_map
+                .get(&(
+                    routine.schema.clone(),
+                    routine.name.clone(),
+                    routine.arguments.clone(),
+                ))
+                .map(|&i| &self.from.routines[i]);
             let needs_action = match from_routine {
                 None => true,
                 Some(fr) => fr.hash.is_some() && Self::hashes_differ(&fr.hash, &routine.hash),
@@ -2274,11 +2409,9 @@ impl Comparer {
 
         for (idx, view) in self.to.views.iter().enumerate() {
             let normalized_view = Self::normalized_view_key(&view.schema, &view.name);
-            let from_view = self
-                .from
-                .views
-                .iter()
-                .find(|v| v.schema == view.schema && v.name == view.name);
+            let from_view = from_view_map
+                .get(&(view.schema.clone(), view.name.clone()))
+                .map(|&i| &self.from.views[i]);
             let was_dropped = self.dropped_views.contains_key(&normalized_view);
             let definition_changed = from_view
                 .map(|fv| Self::hashes_differ(&fv.hash, &view.hash))
@@ -2425,7 +2558,14 @@ impl Comparer {
                 self.emit_view_create(&view);
             } else {
                 let routine = self.to.routines[orig_idx].clone();
-                self.process_target_routine(&routine);
+                let from_routine = from_routine_map
+                    .get(&(
+                        routine.schema.clone(),
+                        routine.name.clone(),
+                        routine.arguments.clone(),
+                    ))
+                    .map(|&i| self.from.routines[i].clone());
+                self.process_target_routine(&routine, from_routine.as_ref());
             }
         }
 
@@ -2434,16 +2574,15 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         for &idx in &no_action_view_indices {
             let to_view = &self.to.views[idx];
-            if let Some(fv) = self
-                .from
-                .views
-                .iter()
-                .find(|v| v.schema == to_view.schema && v.name == to_view.name)
-                && fv.owner != to_view.owner
+            if let Some(&fidx) = from_view_map.get(&(to_view.schema.clone(), to_view.name.clone()))
             {
-                self.script
-                    .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
-                self.script.push_str(&to_view.get_owner_script());
+                let fv = &self.from.views[fidx];
+                if fv.owner != to_view.owner {
+                    self.script.push_str(
+                        format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str(),
+                    );
+                    self.script.push_str(&to_view.get_owner_script());
+                }
             }
         }
 

@@ -687,11 +687,17 @@ impl Dump {
                     .push((enum_value.enumsortorder, enum_value.enumlabel.clone()));
             }
 
+            // Build OID-indexed map for O(1) lookup
+            let mut type_oid_map: HashMap<u32, usize> = HashMap::new();
+            for (i, t) in types.iter().enumerate() {
+                type_oid_map.insert(t.oid.0, i);
+            }
+
             for (type_oid, mut labels) in labels_by_type {
                 labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
 
-                if let Some(pg_type) = types.iter_mut().find(|t| t.oid.0 == type_oid) {
-                    pg_type.enum_labels = labels.into_iter().map(|(_, label)| label).collect();
+                if let Some(&idx) = type_oid_map.get(&type_oid) {
+                    types[idx].enum_labels = labels.into_iter().map(|(_, label)| label).collect();
                 }
             }
         }
@@ -1394,8 +1400,8 @@ impl Dump {
                     .unwrap_or_default();
 
                 let mut ft = ForeignTable {
-                    schema: schema.clone(),
-                    name: name.clone(),
+                    schema,
+                    name,
                     server: row.get("ft_server"),
                     owner: row.get::<Option<String>, _>("ft_owner").unwrap_or_default(),
                     options,
