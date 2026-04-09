@@ -20,7 +20,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 ### 2. Extensions
 - **Added**: `hstore` extension in Schema B
 - **Removed**: `pgcrypto` extension in Schema B
-- **Unchanged**: `uuid-ossp`, `pg_trgm`
+- **Unchanged**: `uuid-ossp`, `pg_trgm`, `btree_gist`, `postgres_fdw`
 
 ### 3. Custom Types
 
@@ -226,7 +226,47 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 - `USAGE` on `test_schema.user_id_seq` (sequence) → `pgc_grant_reader` (no grant in TO)
 - `EXECUTE` on `test_schema.update_timestamp()` (function) → `pgc_grant_reader` (no grant in TO)
 
-### 18. Special Test Scenarios
+### 18. Exclusion Constraints (btree_gist)
+- **Extension**: `btree_gist` added in both schemas
+- **Modified**: `test_schema.reservations` — exclusion constraint unchanged, but table gains `guest_name` column in Schema B
+- **Removed**: `test_schema.shift_schedule` — FROM-only table with exclusion constraint
+- **Added**: `test_schema.booking_slots` — TO-only table with exclusion constraint
+
+### 19. NULLS NOT DISTINCT (PG15+)
+- **Modified**: `test_schema.unique_nulls_test` — unique constraint `uq_unique_nulls_code` changes from standard UNIQUE (allows multiple NULLs) to `UNIQUE NULLS NOT DISTINCT` (single NULL) in Schema B
+
+### 20. NO INHERIT Constraint Flag
+- **Modified**: `test_schema.categories` constraint `chk_categories_sort_order` — regular CHECK in FROM, `CHECK ... NO INHERIT` in TO
+
+### 21. Column STORAGE and COMPRESSION (PG14+)
+- **Modified**: `test_schema.storage_test` — columns `payload` and `blob` have default STORAGE in FROM; TO sets STORAGE to EXTERNAL on both. Compression (`lz4`) is commented out but can be enabled on PG14+ compiled with `--with-lz4`
+
+### 22. SECURITY INVOKER Views (PG15+)
+- **Modified**: `test_schema.security_invoker_view` — same query in both schemas; TO adds `WITH (security_invoker = true)` option
+
+### 23. Range Types
+- **Modified**: `test_schema.float_range` — FROM has `SUBTYPE_DIFF = float8mi`; TO removes it (triggers drop+recreate since ranges cannot be altered in-place)
+- **Removed**: `test_schema.old_range` — FROM-only range type
+- **Added**: `test_schema.int_range` — TO-only range type
+
+### 24. Foreign Tables (postgres_fdw)
+- **Extensions**: `postgres_fdw` added in both schemas; `test_foreign_server` created in both schemas
+- **Modified**: `test_schema.foreign_users` — `username` VARCHAR(50) → VARCHAR(100); added `status` column in TO
+- **Removed**: `test_schema.foreign_logs` — FROM-only foreign table
+- **Added**: `test_schema.foreign_products` — TO-only foreign table
+
+### 25. Extended Statistics (PG10+)
+- **Modified**: `test_schema.stat_users_email_status` — FROM has `(dependencies, ndistinct)`; TO adds `mcv` kind (triggers drop+recreate)
+- **Removed**: `test_schema.stat_products_old` — FROM-only statistics
+- **Added**: `test_schema.stat_products_new` — TO-only statistics on products table
+
+### 26. NOT ENFORCED Constraints (PG18+)
+- **Modified**: `test_schema.products` constraint `chk_products_sku_format` — enforced CHECK in FROM; `NOT ENFORCED` in TO. Requires PostgreSQL 18+
+
+### 27. Virtual Generated Columns (PG18+)
+- **Modified**: `test_schema.virtual_gen_test` — column `full_name` is a plain NOT NULL column in FROM; becomes `GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED` in TO. On PG18+ this can test VIRTUAL generation; on earlier versions, STORED is used
+
+### 28. Special Test Scenarios
 
 #### CHECK Constraint String Literal Case Preservation
 - `chk_category_values` contains mixed-case string literals (`'Electronics'`, `'Home & Garden'`, `'Books'`) identical in both schemas
@@ -408,3 +448,13 @@ The comparison should detect and generate SQL for:
 - Not emitting extension-owned objects as individual creates/drops
 - Using serial/bigserial types instead of separate sequences where appropriate
 - Stripping SQL comments from output when `--use-comments false` is specified (preserving comments inside function bodies)
+- Handling exclusion constraints (create, drop, alter via table changes)
+- Detecting NULLS NOT DISTINCT changes on unique constraints (PG15+)
+- Detecting NO INHERIT flag changes on CHECK constraints
+- Detecting column STORAGE and COMPRESSION changes (PG14+)
+- Handling SECURITY INVOKER view option changes (PG15+)
+- Handling range type changes via drop+recreate (ranges cannot be altered in-place)
+- Creating, dropping, and altering foreign tables (column add/drop/alter, server changes, options)
+- Creating, dropping, and altering extended statistics (kind changes via drop+recreate)
+- Detecting NOT ENFORCED constraint flag changes (PG18+)
+- Handling virtual/stored generated column transitions (PG18+)

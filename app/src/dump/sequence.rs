@@ -22,6 +22,8 @@ pub struct Sequence {
     pub owned_by_column: Option<String>, // Owning column name
     pub is_identity: bool,               // Whether the sequence is an identity sequence
     #[serde(default)]
+    pub is_unlogged: bool, // Whether the sequence is unlogged (relpersistence = 'u')
+    #[serde(default)]
     pub comment: Option<String>, // Optional sequence comment
     pub hash: Option<String>,            // Hash of the sequence
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -63,6 +65,7 @@ impl Sequence {
             owned_by_table,
             owned_by_column,
             is_identity: false,
+            is_unlogged: false,
             comment: None,
             hash: None,
             acl: Vec::new(),
@@ -101,6 +104,7 @@ impl Sequence {
             hasher.update(cache_size.to_string().as_bytes());
         }
         hasher.update(self.is_identity.to_string().as_bytes());
+        hasher.update(self.is_unlogged.to_string().as_bytes());
         if let Some(comment) = &self.comment {
             hasher.update(comment.as_bytes());
         }
@@ -129,7 +133,14 @@ impl Sequence {
         let mut script = String::new();
 
         // CREATE SEQUENCE statement
-        script.push_str(&format!("create sequence {}.{}", self.schema, self.name));
+        if self.is_unlogged {
+            script.push_str(&format!(
+                "create unlogged sequence {}.{}",
+                self.schema, self.name
+            ));
+        } else {
+            script.push_str(&format!("create sequence {}.{}", self.schema, self.name));
+        }
 
         // Add AS clause for data type if not default
         if !self.data_type.is_empty() && self.data_type != "bigint" {
@@ -215,6 +226,20 @@ impl Sequence {
     pub fn get_alter_script(&self, from: &Sequence) -> String {
         let mut clauses = Vec::new();
 
+        // Handle logged/unlogged change
+        let mut logging_script = String::new();
+        if self.is_unlogged != from.is_unlogged {
+            if self.is_unlogged {
+                logging_script =
+                    format!("alter sequence {}.{} set unlogged;", self.schema, self.name)
+                        .with_empty_lines();
+            } else {
+                logging_script =
+                    format!("alter sequence {}.{} set logged;", self.schema, self.name)
+                        .with_empty_lines();
+            }
+        }
+
         if let Some(start_value) = self.start_value {
             clauses.push(format!("start with {start_value}"));
             // Emit RESTART WITH only when the effective current position (last_value if
@@ -253,7 +278,8 @@ impl Sequence {
             clauses.push(owned_by);
         }
 
-        let mut script = format!("alter sequence {}.{}", self.schema, self.name);
+        let mut script = logging_script;
+        script.push_str(&format!("alter sequence {}.{}", self.schema, self.name));
 
         if !clauses.is_empty() {
             script.push(' ');
@@ -327,7 +353,8 @@ mod tests {
         hasher.update("5".as_bytes());
         hasher.update("true".as_bytes());
         hasher.update("20".as_bytes());
-        hasher.update("false".as_bytes());
+        hasher.update("false".as_bytes()); // is_identity
+        hasher.update("false".as_bytes()); // is_unlogged
 
         let expected_hash = format!("{:x}", hasher.finalize());
 

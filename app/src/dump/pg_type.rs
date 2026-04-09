@@ -70,6 +70,18 @@ pub struct PgType {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub composite_attributes: Vec<CompositeAttribute>, // Composite type attributes ordered by attnum
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_subtype: Option<String>, // Subtype for range types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_collation: Option<String>, // Collation for range types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_opclass: Option<String>, // Operator class for range types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_canonical: Option<String>, // Canonical function for range types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_subdiff: Option<String>, // Subtype diff function for range types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multirange_name: Option<String>, // Multirange type name (for range types)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>, // Optional comment on the type
     pub hash: Option<String>, // SHA256 hash of the type definition
 }
@@ -152,6 +164,12 @@ impl PgType {
             enum_labels,
             domain_constraints,
             composite_attributes: Vec::new(),
+            range_subtype: None,
+            range_collation: None,
+            range_opclass: None,
+            range_canonical: None,
+            range_subdiff: None,
+            multirange_name: None,
             comment,
             hash: None,
         };
@@ -168,8 +186,6 @@ impl PgType {
 
         hasher.update(self.schema.as_bytes());
         hasher.update(self.typname.as_bytes());
-        hasher.update(self.typnamespace.0.to_be_bytes());
-        hasher.update(self.typowner.0.to_be_bytes());
         hasher.update(self.owner.as_bytes());
         hasher.update(self.typlen.to_be_bytes());
         hasher.update([self.typbyval as u8]);
@@ -179,17 +195,8 @@ impl PgType {
         hasher.update([self.typisdefined as u8]);
         hasher.update(self.typdelim.to_be_bytes());
 
-        update_option(&mut hasher, &self.typrelid, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
-        });
         update_option(&mut hasher, &self.typsubscript, |hasher, value| {
             hasher.update(value.as_bytes());
-        });
-        update_option(&mut hasher, &self.typelem, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
-        });
-        update_option(&mut hasher, &self.typarray, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
         });
 
         hasher.update(self.typinput.as_bytes());
@@ -215,8 +222,8 @@ impl PgType {
         hasher.update(self.typstorage.to_be_bytes());
         hasher.update([self.typnotnull as u8]);
 
-        update_option(&mut hasher, &self.typbasetype, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
+        update_option(&mut hasher, &self.formatted_basetype, |hasher, value| {
+            hasher.update(value.as_bytes());
         });
         update_option(&mut hasher, &self.typtypmod, |hasher, value| {
             hasher.update(value.to_be_bytes());
@@ -224,9 +231,6 @@ impl PgType {
 
         hasher.update(self.typndims.to_be_bytes());
 
-        update_option(&mut hasher, &self.typcollation, |hasher, value| {
-            hasher.update(value.0.to_be_bytes());
-        });
         update_option(&mut hasher, &self.typdefault, |hasher, value| {
             hasher.update(value.as_bytes());
         });
@@ -252,6 +256,26 @@ impl PgType {
             hasher.update((attribute.data_type.len() as u32).to_be_bytes());
             hasher.update(attribute.data_type.as_bytes());
         }
+
+        // Range type fields
+        update_option(&mut hasher, &self.range_subtype, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
+        update_option(&mut hasher, &self.range_collation, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
+        update_option(&mut hasher, &self.range_opclass, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
+        update_option(&mut hasher, &self.range_canonical, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
+        update_option(&mut hasher, &self.range_subdiff, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
+        update_option(&mut hasher, &self.multirange_name, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
 
         if let Some(comment) = &self.comment {
             hasher.update((comment.len() as u32).to_be_bytes());
@@ -387,14 +411,61 @@ impl PgType {
 
                 script
             }
-            'r' => format!(
-                "-- Range type {}.{} is not supported yet\n",
-                self.schema, self.typname
-            ),
-            'm' => format!(
-                "-- Multirange type {}.{} is not supported yet\n",
-                self.schema, self.typname
-            ),
+            'r' => {
+                let mut script = format!(
+                    "create type {}.{} as range (\n    subtype = {}",
+                    self.schema,
+                    self.typname,
+                    self.range_subtype.as_deref().unwrap_or("unknown")
+                );
+                if let Some(collation) = &self.range_collation {
+                    script.push_str(&format!(",\n    collation = {}", collation));
+                }
+                if let Some(opclass) = &self.range_opclass {
+                    script.push_str(&format!(",\n    subtype_opclass = {}", opclass));
+                }
+                if let Some(canonical) = &self.range_canonical {
+                    script.push_str(&format!(",\n    canonical = {}", canonical));
+                }
+                if let Some(subdiff) = &self.range_subdiff {
+                    script.push_str(&format!(",\n    subtype_diff = {}", subdiff));
+                }
+                if let Some(multirange) = &self.multirange_name {
+                    script.push_str(&format!(",\n    multirange_type_name = {}", multirange));
+                }
+                script.push_str("\n)");
+                script.append_block(";");
+
+                if let Some(comment) = &self.comment {
+                    script.append_block(&format!(
+                        "comment on type {}.{} is '{}';",
+                        self.schema,
+                        self.typname,
+                        escape_single_quotes(comment)
+                    ));
+                }
+
+                script.push_str(&self.get_owner_script());
+
+                script
+            }
+            'm' => {
+                // Multirange types are automatically created with their associated range type.
+                // We just emit a comment, the range type CREATE handles them.
+                let mut script = format!(
+                    "-- Multirange type {}.{} is created automatically with its range type\n",
+                    self.schema, self.typname
+                );
+                if let Some(comment) = &self.comment {
+                    script.append_block(&format!(
+                        "comment on type {}.{} is '{}';",
+                        self.schema,
+                        self.typname,
+                        escape_single_quotes(comment)
+                    ));
+                }
+                script
+            }
             other => format!(
                 "-- Type {}.{} (typtype = {}) is not supported yet\n",
                 self.schema, self.typname, other
@@ -622,14 +693,36 @@ impl PgType {
                     statements.join("\n\n").with_empty_lines()
                 }
             }
-            ('r', 'r') => format!(
-                "-- Altering range type {}.{} is not supported yet.\n",
-                self.schema, self.typname
-            ),
-            ('m', 'm') => format!(
-                "-- Altering multirange type {}.{} is not supported yet.\n",
-                self.schema, self.typname
-            ),
+            ('r', 'r') => {
+                // Range types cannot be altered in place; must be dropped and recreated
+                let drop_script = self.get_drop_script();
+                let create_script = target.get_script();
+                if use_drop {
+                    format!("{}{}", drop_script, create_script)
+                } else {
+                    let commented = format!(
+                        "-- use_drop=false: range type {}.{} requires drop+recreate; statements commented out\n{}{}",
+                        self.schema,
+                        self.typname,
+                        drop_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                        create_script
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>()
+                    );
+                    commented
+                }
+            }
+            ('m', 'm') => {
+                // Multirange types are auto-managed with range types
+                format!(
+                    "-- Multirange type {}.{} is managed automatically with its range type\n",
+                    self.schema, self.typname
+                )
+            }
             (kind, other) => format!(
                 "-- Alter script not implemented for type {}.{} ({} -> {})\n",
                 self.schema, self.typname, kind, other
@@ -734,6 +827,12 @@ mod tests {
             enum_labels: Vec::new(),
             domain_constraints: Vec::new(),
             composite_attributes: Vec::new(),
+            range_subtype: None,
+            range_collation: None,
+            range_opclass: None,
+            range_canonical: None,
+            range_subdiff: None,
+            multirange_name: None,
             comment: None,
             hash: None,
         }

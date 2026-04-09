@@ -1,9 +1,11 @@
+use crate::dump::foreign_table::{ForeignTable, ForeignTableColumn};
 use crate::dump::pg_enum::PgEnum;
 use crate::dump::pg_type::{CompositeAttribute, DomainConstraint, PgType};
 use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
-use crate::dump::table::Table;
+use crate::dump::statistic::Statistic;
+use crate::dump::table::{PgCatalogCaps, Table};
 use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use futures::stream::{self, StreamExt};
@@ -27,7 +29,7 @@ use zip::write::SimpleFileOptions;
 ///
 /// **Keep in sync** with the number of non-table futures passed to
 /// `tokio::try_join!` in `Dump::fill()`.
-const FILL_SIBLING_BRANCH_COUNT: u32 = 5;
+const FILL_SIBLING_BRANCH_COUNT: u32 = 7;
 
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +61,14 @@ pub struct Dump {
 
     // List of views in the dump.
     pub views: Vec<View>,
+
+    // List of foreign tables in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_tables: Vec<ForeignTable>,
+
+    // List of extended statistics in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statistics: Vec<Statistic>,
 }
 
 impl Dump {
@@ -74,6 +84,8 @@ impl Dump {
             routines: Vec::new(),
             tables: Vec::new(),
             views: Vec::new(),
+            foreign_tables: Vec::new(),
+            statistics: Vec::new(),
         }
     }
 
@@ -160,14 +172,27 @@ impl Dump {
         let routines_fut = Self::fetch_routines_standalone(pool, &schema_filter);
         let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter, max_connections);
         let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
+        let foreign_tables_fut = Self::fetch_foreign_tables_standalone(pool, &schema_filter);
+        let statistics_fut = Self::fetch_statistics_standalone(pool, &schema_filter);
 
-        let (types_enums, extensions, sequences, routines, tables, views) = tokio::try_join!(
+        let (
+            types_enums,
+            extensions,
+            sequences,
+            routines,
+            tables,
+            views,
+            foreign_tables,
+            statistics,
+        ) = tokio::try_join!(
             types_enums_fut,
             extensions_fut,
             sequences_fut,
             routines_fut,
             tables_fut,
             views_fut,
+            foreign_tables_fut,
+            statistics_fut,
         )?;
 
         let (types, enums) = types_enums;
@@ -178,6 +203,8 @@ impl Dump {
         self.routines = routines;
         self.tables = tables;
         self.views = views;
+        self.foreign_tables = foreign_tables;
+        self.statistics = statistics;
 
         Ok(())
     }
@@ -335,6 +362,94 @@ impl Dump {
                 .push(attribute);
         }
 
+        // Fetch range type metadata from pg_range
+        let range_pg_version: i32 =
+            sqlx::query_scalar("select current_setting('server_version_num')::int4;")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    Error::other(format!(
+                        "Failed to fetch server_version_num for types: {e}."
+                    ))
+                })?;
+
+        let has_rngmultitypid: bool = range_pg_version >= 140000
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_range'::regclass AND attname = 'rngmultitypid' AND NOT attisdropped)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+        let multirange_col = if has_rngmultitypid {
+            "quote_ident(mt.typname) as multirange_name"
+        } else {
+            "null::text as multirange_name"
+        };
+        let multirange_join = if has_rngmultitypid {
+            "left join pg_type mt on mt.oid = r.rngmultitypid"
+        } else {
+            ""
+        };
+
+        let range_metadata_rows = sqlx::query(
+            format!(
+                "select
+                    r.rngtypid as type_oid,
+                    pg_catalog.format_type(r.rngsubtype, null) as range_subtype,
+                    case when r.rngcollation <> 0 then
+                        (select quote_ident(n.nspname) || '.' || quote_ident(c.collname)
+                         from pg_collation c join pg_namespace n on n.oid = c.collnamespace
+                         where c.oid = r.rngcollation)
+                    else null end as range_collation,
+                    quote_ident(opc_ns.nspname) || '.' || quote_ident(opc.opcname) as range_opclass,
+                    case when r.rngcanonical <> 0 then r.rngcanonical::regproc::text else null end as range_canonical,
+                    case when r.rngsubdiff <> 0 then r.rngsubdiff::regproc::text else null end as range_subdiff,
+                    {}
+                from pg_range r
+                join pg_type t on t.oid = r.rngtypid
+                join pg_namespace n on n.oid = t.typnamespace
+                join pg_opclass opc on opc.oid = r.rngsubopc
+                join pg_namespace opc_ns on opc_ns.oid = opc.opcnamespace
+                {}
+                where n.nspname in {}
+                  and not exists (
+                      select 1 from pg_depend ext_dep
+                      where ext_dep.objid = t.oid
+                      and ext_dep.deptype = 'e'
+                  )",
+                multirange_col, multirange_join, schema_filter
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch range type metadata: {e}.")))?;
+
+        struct RangeMetadata {
+            subtype: String,
+            collation: Option<String>,
+            opclass: String,
+            canonical: Option<String>,
+            subdiff: Option<String>,
+            multirange_name: Option<String>,
+        }
+        let mut range_metadata_map: HashMap<Oid, RangeMetadata> = HashMap::new();
+        for row in range_metadata_rows {
+            let type_oid: Oid = row.get("type_oid");
+            range_metadata_map.insert(
+                type_oid,
+                RangeMetadata {
+                    subtype: row.get("range_subtype"),
+                    collation: row.get::<Option<String>, _>("range_collation"),
+                    opclass: row.get("range_opclass"),
+                    canonical: row.get::<Option<String>, _>("range_canonical"),
+                    subdiff: row.get::<Option<String>, _>("range_subdiff"),
+                    multirange_name: row.get::<Option<String>, _>("multirange_name"),
+                },
+            );
+        }
+
         let rows = sqlx::query(
             format!(
                 "select 
@@ -447,8 +562,23 @@ impl Dump {
                     composite_attributes: composite_attributes_map
                         .remove(&row.get::<Oid, _>("type_oid"))
                         .unwrap_or_default(),
+                    range_subtype: None,
+                    range_collation: None,
+                    range_opclass: None,
+                    range_canonical: None,
+                    range_subdiff: None,
+                    multirange_name: None,
                     hash: None,
                 };
+                // Populate range metadata if available
+                if let Some(rm) = range_metadata_map.remove(&pgtype.oid) {
+                    pgtype.range_subtype = Some(rm.subtype);
+                    pgtype.range_collation = rm.collation;
+                    pgtype.range_opclass = Some(rm.opclass);
+                    pgtype.range_canonical = rm.canonical;
+                    pgtype.range_subdiff = rm.subdiff;
+                    pgtype.multirange_name = rm.multirange_name;
+                }
                 pgtype.hash();
                 println!(
                     " - {} (namespace: {}, hash: {})",
@@ -558,11 +688,17 @@ impl Dump {
                     .push((enum_value.enumsortorder, enum_value.enumlabel.clone()));
             }
 
+            // Build OID-indexed map for O(1) lookup
+            let mut type_oid_map: HashMap<u32, usize> = HashMap::new();
+            for (i, t) in types.iter().enumerate() {
+                type_oid_map.insert(t.oid.0, i);
+            }
+
             for (type_oid, mut labels) in labels_by_type {
                 labels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
 
-                if let Some(pg_type) = types.iter_mut().find(|t| t.oid.0 == type_oid) {
-                    pg_type.enum_labels = labels.into_iter().map(|(_, label)| label).collect();
+                if let Some(&idx) = type_oid_map.get(&type_oid) {
+                    types[idx].enum_labels = labels.into_iter().map(|(_, label)| label).collect();
                 }
             }
         }
@@ -592,7 +728,8 @@ impl Dump {
                 quote_ident(owner_attr.attname) as owned_by_column,
                 dep.deptype::text as dependency_type,
                 seq_desc.description as seq_comment,
-                seq_class.relacl::text[] as seq_acl
+                seq_class.relacl::text[] as seq_acl,
+                seq_class.relpersistence::text as seq_persistence
             from
                 pg_sequences seq
                 left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
@@ -642,6 +779,8 @@ impl Dump {
                     owned_by_table: row.get::<Option<String>, _>("owned_by_table"),
                     owned_by_column: row.get::<Option<String>, _>("owned_by_column"),
                     is_identity: false,
+                    is_unlogged: row.get::<Option<String>, _>("seq_persistence").as_deref()
+                        == Some("u"),
                     comment: row.get("seq_comment"),
                     hash: None,
                     acl: row
@@ -868,6 +1007,16 @@ impl Dump {
                 .unwrap_or(None)
                 .is_some();
 
+        // Detect PostgreSQL server version for conditional feature support.
+        let pg_version: i32 =
+            sqlx::query_scalar("select current_setting('server_version_num')::int4;")
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
+
+        // Probe catalog capabilities once for the entire dump run.
+        let caps = PgCatalogCaps::detect(pool, pg_version).await;
+
         let query = format!(
             "
                 select
@@ -882,11 +1031,13 @@ impl Dump {
                     t.hasrules,
                     t.rowsecurity,
                     d.description as table_comment,
-                    c.relacl::text[] as table_acl
+                    c.relacl::text[] as table_acl,
+                    am.amname as access_method
                 from pg_tables t
                 left join pg_class c on c.relname = t.tablename
                     and c.relkind in ('r','p')
                     and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
+                left join pg_am am on am.oid = c.relam
                 left join pg_description d on d.objoid = c.oid and d.objsubid = 0
                 where 
                     t.schemaname not in ('pg_catalog', 'information_schema') 
@@ -936,6 +1087,9 @@ impl Dump {
                 partition_of: None,
                 partition_bound: None,
                 comment: row.get("table_comment"),
+                access_method: row
+                    .get::<Option<String>, _>("access_method")
+                    .filter(|am| am != "heap"),
                 hash: None,
                 acl: row
                     .get::<Option<Vec<String>>, _>("table_acl")
@@ -949,9 +1103,12 @@ impl Dump {
         let pool_ref = pool;
         let tables: Vec<Result<Table, Error>> = stream::iter(shell_tables)
             .map(|mut table| async move {
-                table.fill(pool_ref, has_tabledef_fn).await.map_err(|e| {
-                    Error::other(format!("Failed to fill table {}: {}.", table.name, e))
-                })?;
+                table
+                    .fill(pool_ref, has_tabledef_fn, pg_version, caps)
+                    .await
+                    .map_err(|e| {
+                        Error::other(format!("Failed to fill table {}: {}.", table.name, e))
+                    })?;
                 table.hash();
                 println!(
                     " - {}.{} (hash: {})",
@@ -991,7 +1148,8 @@ impl Dump {
                     quote_ident(pv.viewowner) as view_owner,
                     array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
                     d.description as view_comment,
-                    (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl
+                    (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
+                    coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker
             from information_schema.views v
             join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
             left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
@@ -1005,7 +1163,7 @@ impl Dump {
                     where ext_dep.objid = c.oid
                     and ext_dep.deptype = 'e'
                 )
-            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid;",
+            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions;",
             schema_filter
         );
 
@@ -1076,6 +1234,7 @@ impl Dump {
                     acl: row
                         .get::<Option<Vec<String>>, _>("view_acl")
                         .unwrap_or_default(),
+                    security_invoker: row.get("security_invoker"),
                 };
                 view.hash();
                 println!(
@@ -1107,6 +1266,7 @@ impl Dump {
                     acl: row
                         .get::<Option<Vec<String>>, _>("view_acl")
                         .unwrap_or_default(),
+                    security_invoker: false,
                 };
                 view.hash();
                 println!(
@@ -1120,6 +1280,268 @@ impl Dump {
         }
 
         Ok(views)
+    }
+
+    async fn fetch_foreign_tables_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<ForeignTable>, Error> {
+        let rows = sqlx::query(
+            format!(
+                "select
+                    quote_ident(n.nspname) as ft_schema,
+                    quote_ident(c.relname) as ft_name,
+                    quote_ident(s.srvname) as ft_server,
+                    quote_ident(r.rolname) as ft_owner,
+                    coalesce(
+                        array(
+                            select option_name || ' ' || quote_literal(option_value)
+                            from pg_options_to_table(ft.ftoptions)
+                        ),
+                        array[]::text[]
+                    ) as ft_options,
+                    d.description as ft_comment,
+                    c.relacl::text[] as ft_acl
+                from pg_foreign_table ft
+                join pg_class c on c.oid = ft.ftrelid
+                join pg_namespace n on n.oid = c.relnamespace
+                join pg_foreign_server s on s.oid = ft.ftserver
+                left join pg_roles r on r.oid = c.relowner
+                left join pg_description d on d.objoid = c.oid
+                    and d.classoid = 'pg_class'::regclass
+                    and d.objsubid = 0
+                where
+                    n.nspname in {}
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = c.oid
+                        and ext_dep.deptype = 'e'
+                    )
+                order by n.nspname, c.relname",
+                schema_filter
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch foreign tables: {e}.")))?;
+
+        let mut foreign_tables = Vec::new();
+
+        if rows.is_empty() {
+            println!("No foreign tables found.");
+        } else {
+            println!("Foreign tables found:");
+
+            // Fetch all foreign table columns at once
+            let col_rows = sqlx::query(
+                format!(
+                    "select
+                        quote_ident(n.nspname) as ft_schema,
+                        quote_ident(c.relname) as ft_name,
+                        quote_ident(a.attname) as col_name,
+                        pg_catalog.format_type(a.atttypid, a.atttypmod) as col_type,
+                        a.attnotnull as col_notnull,
+                        pg_get_expr(ad.adbin, ad.adrelid) as col_default,
+                        coalesce(
+                            array(
+                                select option_name || ' ' || quote_literal(option_value)
+                                from pg_options_to_table(a.attfdwoptions)
+                            ),
+                            array[]::text[]
+                        ) as col_options
+                    from pg_attribute a
+                    join pg_class c on c.oid = a.attrelid
+                    join pg_namespace n on n.oid = c.relnamespace
+                    join pg_foreign_table ft on ft.ftrelid = c.oid
+                    left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
+                    where
+                        n.nspname in {}
+                        and a.attnum > 0
+                        and not a.attisdropped
+                        and not exists (
+                            select 1 from pg_depend ext_dep
+                            where ext_dep.objid = c.oid
+                            and ext_dep.deptype = 'e'
+                        )
+                    order by n.nspname, c.relname, a.attnum",
+                    schema_filter
+                )
+                .as_str(),
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch foreign table columns: {e}.")))?;
+
+            // Build column map: (schema, name) -> Vec<ForeignTableColumn>
+            let mut col_map: HashMap<(String, String), Vec<ForeignTableColumn>> = HashMap::new();
+            for row in col_rows {
+                let key = (
+                    row.get::<String, _>("ft_schema"),
+                    row.get::<String, _>("ft_name"),
+                );
+                let col = ForeignTableColumn {
+                    name: row.get("col_name"),
+                    data_type: row.get("col_type"),
+                    is_nullable: !row.get::<bool, _>("col_notnull"),
+                    column_default: row.get::<Option<String>, _>("col_default"),
+                    options: row
+                        .get::<Option<Vec<String>>, _>("col_options")
+                        .unwrap_or_default(),
+                };
+                col_map.entry(key).or_default().push(col);
+            }
+
+            for row in rows {
+                let schema: String = row.get("ft_schema");
+                let name: String = row.get("ft_name");
+                let columns = col_map
+                    .remove(&(schema.clone(), name.clone()))
+                    .unwrap_or_default();
+
+                let options = row
+                    .get::<Option<Vec<String>>, _>("ft_options")
+                    .unwrap_or_default();
+
+                let mut ft = ForeignTable {
+                    schema,
+                    name,
+                    server: row.get("ft_server"),
+                    owner: row.get::<Option<String>, _>("ft_owner").unwrap_or_default(),
+                    options,
+                    columns,
+                    comment: row.get::<Option<String>, _>("ft_comment"),
+                    hash: None,
+                    acl: row
+                        .get::<Option<Vec<String>>, _>("ft_acl")
+                        .unwrap_or_default(),
+                };
+                ft.hash();
+                println!(
+                    " - {}.{} (server: {}, hash: {})",
+                    ft.schema,
+                    ft.name,
+                    ft.server,
+                    ft.hash.as_deref().unwrap_or("None")
+                );
+                foreign_tables.push(ft);
+            }
+        }
+
+        Ok(foreign_tables)
+    }
+
+    async fn fetch_statistics_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Statistic>, Error> {
+        let rows = sqlx::query(
+            format!(
+                "select
+                    quote_ident(n.nspname) as stat_schema,
+                    quote_ident(s.stxname) as stat_name,
+                    quote_ident(r.rolname) as stat_owner,
+                    quote_ident(tn.nspname) as table_schema,
+                    quote_ident(tc.relname) as table_name,
+                    s.stxkind::text[] as stat_kinds,
+                    pg_get_statisticsobjdef(s.oid) as stat_def,
+                    d.description as stat_comment
+                from pg_statistic_ext s
+                join pg_namespace n on n.oid = s.stxnamespace
+                join pg_class tc on tc.oid = s.stxrelid
+                join pg_namespace tn on tn.oid = tc.relnamespace
+                left join pg_roles r on r.oid = s.stxowner
+                left join pg_description d on d.objoid = s.oid
+                    and d.classoid = 'pg_statistic_ext'::regclass
+                    and d.objsubid = 0
+                where
+                    n.nspname in {}
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = s.oid
+                        and ext_dep.deptype = 'e'
+                    )
+                order by n.nspname, s.stxname",
+                schema_filter
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch extended statistics: {e}.")))?;
+
+        let mut statistics = Vec::new();
+
+        if rows.is_empty() {
+            println!("No extended statistics found.");
+        } else {
+            println!("Extended statistics found:");
+
+            for row in rows {
+                let stat_def: String = row.get("stat_def");
+                let kind_chars: Vec<String> = row
+                    .get::<Option<Vec<String>>, _>("stat_kinds")
+                    .unwrap_or_default();
+
+                let kinds: Vec<String> = kind_chars
+                    .iter()
+                    .map(|k| match k.as_str() {
+                        "d" => "ndistinct".to_string(),
+                        "f" => "dependencies".to_string(),
+                        "m" => "mcv".to_string(),
+                        "e" => "expressions".to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+
+                // Extract column names from the definition
+                // Definition format: "CREATE STATISTICS ... ON col1, col2 FROM table"
+                let columns = Self::parse_statistics_columns(&stat_def);
+
+                let mut stat = Statistic {
+                    schema: row.get("stat_schema"),
+                    name: row.get("stat_name"),
+                    owner: row
+                        .get::<Option<String>, _>("stat_owner")
+                        .unwrap_or_default(),
+                    table_schema: row.get("table_schema"),
+                    table_name: row.get("table_name"),
+                    kinds,
+                    columns,
+                    definition: stat_def,
+                    comment: row.get::<Option<String>, _>("stat_comment"),
+                    hash: None,
+                };
+                stat.hash();
+                println!(
+                    " - {}.{} (hash: {})",
+                    stat.schema,
+                    stat.name,
+                    stat.hash.as_deref().unwrap_or("None")
+                );
+                statistics.push(stat);
+            }
+        }
+
+        Ok(statistics)
+    }
+
+    fn parse_statistics_columns(def: &str) -> Vec<String> {
+        // Parse columns from pg_get_statisticsobjdef output
+        // Format: "... ON col1, col2 FROM ..."
+        let upper = def.to_uppercase();
+        if let Some(on_pos) = upper.find(" ON ") {
+            let after_on = &def[on_pos + 4..];
+            if let Some(from_pos) = after_on.to_uppercase().find(" FROM ") {
+                let cols_str = &after_on[..from_pos];
+                return cols_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+        Vec::new()
     }
 
     // Read a dump from a file and deserialize it.
@@ -1332,8 +1754,17 @@ impl Dump {
                 }
             }
 
-            // Now drop the tables
+            // Now drop the tables — partitions before their parents
+            let mut partition_children: Vec<&Table> = Vec::new();
+            let mut regular_tables: Vec<&Table> = Vec::new();
             for table in &self.tables {
+                if table.partition_of.is_some() {
+                    partition_children.push(table);
+                } else {
+                    regular_tables.push(table);
+                }
+            }
+            for table in partition_children.iter().chain(regular_tables.iter()) {
                 if use_comments {
                     script.push_str(&format!(
                         "/* Drop table: {}.{} */\n",
@@ -1350,7 +1781,51 @@ impl Dump {
             }
         }
 
-        // 3. Drop routines (functions, procedures, aggregates)
+        // 3. Drop foreign tables
+        if !self.foreign_tables.is_empty() {
+            if use_comments {
+                script.append_block("\n/* ---> Drop Foreign Tables --------------- */");
+            }
+            for ft in &self.foreign_tables {
+                if use_comments {
+                    script.push_str(&format!(
+                        "/* Drop foreign table: {}.{} */\n",
+                        ft.schema, ft.name
+                    ));
+                }
+                script.push_str(
+                    &format!(
+                        "drop foreign table if exists {}.{}{cascade_suffix};",
+                        ft.schema, ft.name
+                    )
+                    .with_empty_lines(),
+                );
+            }
+        }
+
+        // 4. Drop extended statistics
+        if !self.statistics.is_empty() {
+            if use_comments {
+                script.append_block("\n/* ---> Drop Statistics --------------- */");
+            }
+            for stat in &self.statistics {
+                if use_comments {
+                    script.push_str(&format!(
+                        "/* Drop statistics: {}.{} */\n",
+                        stat.schema, stat.name
+                    ));
+                }
+                script.push_str(
+                    &format!(
+                        "drop statistics if exists {}.{}{cascade_suffix};",
+                        stat.schema, stat.name
+                    )
+                    .with_empty_lines(),
+                );
+            }
+        }
+
+        // 5. Drop routines (functions, procedures, aggregates)
         if !self.routines.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Routines --------------- */");
@@ -1384,7 +1859,7 @@ impl Dump {
             }
         }
 
-        // 4. Drop sequences
+        // 6. Drop sequences
         if !self.sequences.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Sequences --------------- */");
@@ -1406,7 +1881,7 @@ impl Dump {
             }
         }
 
-        // 5. Drop types (includes enums, composites, domains, etc.)
+        // 7. Drop types (includes enums, composites, domains, range types, etc.)
         if !self.types.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Types --------------- */");
@@ -1428,7 +1903,7 @@ impl Dump {
             }
         }
 
-        // 6. Drop extensions
+        // 8. Drop extensions
         if !self.extensions.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Extensions --------------- */");
@@ -1444,7 +1919,7 @@ impl Dump {
             }
         }
 
-        // 7. Drop schemas (last, since everything else lives inside them)
+        // 9. Drop schemas (last, since everything else lives inside them)
         if !self.schemas.is_empty() {
             if use_comments {
                 script.append_block("\n/* ---> Drop Schemas --------------- */");
@@ -1528,6 +2003,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         Table::new(
             schema.to_string(),
@@ -1641,6 +2119,12 @@ mod tests {
             enum_labels: Vec::new(),
             domain_constraints: Vec::new(),
             composite_attributes: Vec::new(),
+            range_subtype: None,
+            range_collation: None,
+            range_opclass: None,
+            range_canonical: None,
+            range_subdiff: None,
+            multirange_name: None,
             comment: None,
             hash: None,
         }

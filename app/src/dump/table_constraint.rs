@@ -15,10 +15,21 @@ pub struct TableConstraint {
     pub initially_deferred: bool, // Whether the constraint is initially deferred
     pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
     #[serde(default)]
-    pub coninhcount: i16, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
+    pub coninhcount: i32, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
+    #[serde(default = "TableConstraint::default_enforced")]
+    pub is_enforced: bool, // Whether the constraint is enforced (PG18+ supports NOT ENFORCED)
+    #[serde(default)]
+    pub no_inherit: bool, // Whether the constraint is marked NO INHERIT
+    #[serde(default)]
+    pub nulls_not_distinct: bool, // PG15+: UNIQUE constraint treats NULLs as not distinct
 }
 
 impl TableConstraint {
+    /// Default value for is_enforced (backward compat with old dumps)
+    fn default_enforced() -> bool {
+        true
+    }
+
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.schema.as_bytes());
@@ -27,6 +38,9 @@ impl TableConstraint {
         hasher.update(self.constraint_type.as_bytes());
         hasher.update(self.is_deferrable.to_string().as_bytes());
         hasher.update(self.initially_deferred.to_string().as_bytes());
+        hasher.update(self.is_enforced.to_string().as_bytes());
+        hasher.update(self.no_inherit.to_string().as_bytes());
+        hasher.update(self.nulls_not_distinct.to_string().as_bytes());
         if let Some(definition) = &self.definition {
             hasher.update(Self::normalize_definition(definition).as_bytes());
         }
@@ -74,12 +88,21 @@ impl TableConstraint {
                 }
                 "UNIQUE" => parts.push("unique".to_string()),
                 "CHECK" => parts.push("check".to_string()),
+                "EXCLUDE" => parts.push("exclude".to_string()),
+                "NOT NULL" => parts.push("not null".to_string()),
                 _ => {}
             }
             parts.join(" ")
         };
 
         script.push_str(&format!("{} ", clause));
+        if !self.is_enforced {
+            // Remove trailing space before appending NOT ENFORCED
+            let trimmed = script.trim_end().to_string();
+            script.clear();
+            script.push_str(&trimmed);
+            script.push_str(" not enforced ");
+        }
         script.append_block(";");
         script
     }
@@ -197,7 +220,8 @@ impl TableConstraint {
     /// Get alter script to change this constraint to match the target constraint
     /// Returns None if the constraint needs to be dropped and recreated
     pub fn get_alter_script(&self, target: &TableConstraint) -> Option<String> {
-        // Only FOREIGN KEY constraints can have their deferrable properties altered
+        // FOREIGN KEY constraints can have their deferrable and enforced properties altered
+        // CHECK constraints can have their enforced property altered (PG18+)
         // All other changes require drop/recreate
         if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
             && target.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
@@ -229,6 +253,70 @@ impl TableConstraint {
                 }
             }
 
+            // Handle enforced property changes (PG18+)
+            if self.is_enforced != target.is_enforced {
+                if target.is_enforced {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} enforced;",
+                        self.schema, self.table_name, target.name
+                    ));
+                } else {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} not enforced;",
+                        self.schema, self.table_name, target.name
+                    ));
+                }
+            }
+
+            // Handle no_inherit property changes (PG18+)
+            if self.no_inherit != target.no_inherit {
+                if target.no_inherit {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} no inherit;",
+                        self.schema, self.table_name, target.name
+                    ));
+                } else {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} inherit;",
+                        self.schema, self.table_name, target.name
+                    ));
+                }
+            }
+
+            Some(script)
+        } else if (self.constraint_type.eq_ignore_ascii_case("CHECK")
+            || self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY"))
+            && self.can_be_altered_to(target)
+            && (self.is_enforced != target.is_enforced || self.no_inherit != target.no_inherit)
+        {
+            // CHECK/FK constraint enforced or no_inherit property change (PG18+)
+            let mut script = String::new();
+            if self.is_enforced != target.is_enforced {
+                if target.is_enforced {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} enforced;",
+                        self.schema, self.table_name, target.name
+                    ));
+                } else {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} not enforced;",
+                        self.schema, self.table_name, target.name
+                    ));
+                }
+            }
+            if self.no_inherit != target.no_inherit {
+                if target.no_inherit {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} no inherit;",
+                        self.schema, self.table_name, target.name
+                    ));
+                } else {
+                    script.append_block(&format!(
+                        "alter table {}.{} alter constraint {} inherit;",
+                        self.schema, self.table_name, target.name
+                    ));
+                }
+            }
             Some(script)
         } else {
             None
@@ -238,20 +326,37 @@ impl TableConstraint {
     /// Check if this constraint can be altered to match the target constraint
     /// without dropping and recreating
     pub fn can_be_altered_to(&self, target: &TableConstraint) -> bool {
-        // Only FOREIGN KEY constraints can have their deferrable properties altered
+        // FOREIGN KEY constraints can have deferrable and enforced properties altered
+        // CHECK constraints can have enforced property altered (PG18+)
         // All other changes require drop/recreate
         if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
             && target.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
         {
-            // Check if only deferrable properties changed
+            // Check if only deferrable/enforced properties changed
             self.catalog == target.catalog
                 && self.schema == target.schema
                 && self.name == target.name
                 && self.table_name == target.table_name
                 && self.constraint_type == target.constraint_type
+                && self.nulls_not_distinct == target.nulls_not_distinct
                 && self.definition.as_deref().map(Self::normalize_definition)
                     == target.definition.as_deref().map(Self::normalize_definition)
-            // Only is_deferrable and initially_deferred can differ
+            // is_deferrable, initially_deferred, is_enforced, and no_inherit can differ
+        } else if self.constraint_type.eq_ignore_ascii_case("CHECK")
+            && target.constraint_type.eq_ignore_ascii_case("CHECK")
+        {
+            // CHECK constraints: enforced and no_inherit can be altered (PG18+)
+            self.catalog == target.catalog
+                && self.schema == target.schema
+                && self.name == target.name
+                && self.table_name == target.table_name
+                && self.constraint_type == target.constraint_type
+                && self.is_deferrable == target.is_deferrable
+                && self.initially_deferred == target.initially_deferred
+                && self.nulls_not_distinct == target.nulls_not_distinct
+                && self.definition.as_deref().map(Self::normalize_definition)
+                    == target.definition.as_deref().map(Self::normalize_definition)
+            // is_enforced and no_inherit can differ
         } else {
             false
         }
@@ -275,6 +380,9 @@ impl PartialEq for TableConstraint {
             && self.constraint_type == other.constraint_type
             && self.is_deferrable == other.is_deferrable
             && self.initially_deferred == other.initially_deferred
+            && self.is_enforced == other.is_enforced
+            && self.no_inherit == other.no_inherit
+            && self.nulls_not_distinct == other.nulls_not_distinct
             && self.definition.as_deref().map(Self::normalize_definition)
                 == other.definition.as_deref().map(Self::normalize_definition)
     }
@@ -296,6 +404,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -310,6 +421,9 @@ mod tests {
             initially_deferred: true,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -324,6 +438,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -338,6 +455,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         }
     }
 
@@ -546,6 +666,9 @@ mod tests {
             initially_deferred: true,
             definition: Some("UNIQUE (id)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
 
         let script = constraint.get_script();
@@ -565,6 +688,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("PRIMARY KEY (id)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
 
         let script = constraint.get_script();
@@ -584,6 +710,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
 
         let script = constraint.get_script();
@@ -722,6 +851,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("UNIQUE (column1, column2)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
 
         // Should handle special characters in all fields
@@ -750,6 +882,9 @@ mod tests {
                 initially_deferred: false,
                 definition: Some("PRIMARY KEY (id)".to_string()),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -761,6 +896,9 @@ mod tests {
                 initially_deferred: false,
                 definition: Some("FOREIGN KEY (user_id) REFERENCES users(id)".to_string()),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -772,6 +910,9 @@ mod tests {
                 initially_deferred: false,
                 definition: Some("UNIQUE (column1, column2)".to_string()),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -783,6 +924,9 @@ mod tests {
                 initially_deferred: false,
                 definition: Some("CHECK (age > 0)".to_string()),
                 coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             },
         ];
 
@@ -813,6 +957,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
 
         // Create the same hash as the implementation
@@ -823,6 +970,9 @@ mod tests {
         hasher.update("PK".as_bytes()); // constraint_type
         hasher.update("false".as_bytes()); // is_deferrable
         hasher.update("false".as_bytes()); // initially_deferred
+        hasher.update("true".as_bytes()); // is_enforced
+        hasher.update("false".as_bytes()); // no_inherit
+        hasher.update("false".as_bytes()); // nulls_not_distinct
 
         let expected_hash = format!("{:x}", hasher.finalize());
 
@@ -845,6 +995,9 @@ mod tests {
             initially_deferred: false,
             definition: None,
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
 
         // Create the same hash as the implementation (nulls_distinct=None means no update)
@@ -855,6 +1008,9 @@ mod tests {
         hasher.update("PK".as_bytes()); // constraint_type
         hasher.update("false".as_bytes()); // is_deferrable
         hasher.update("false".as_bytes()); // initially_deferred
+        hasher.update("true".as_bytes()); // is_enforced
+        hasher.update("false".as_bytes()); // no_inherit
+        hasher.update("false".as_bytes()); // nulls_not_distinct
         // No nulls_distinct update for None
 
         let expected_hash = format!("{:x}", hasher.finalize());
@@ -985,6 +1141,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (status = 'Active')".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         let script = constraint.get_script();
         assert!(
@@ -1007,6 +1166,9 @@ mod tests {
                 "CHECK (status IN ('Active', 'Inactive', 'PendingReview'))".to_string(),
             ),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         let script = constraint.get_script();
         assert!(script.contains("'Active'"), "got: {script}");
@@ -1029,6 +1191,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (col <> 'It''s OK')".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         let script = constraint.get_script();
         assert!(
@@ -1049,6 +1214,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (AGE > 0 AND NAME IS NOT NULL)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         let script = constraint.get_script();
         assert!(
@@ -1071,6 +1239,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (AMOUNT >= 0)".to_string()),
             coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
         };
         let script = constraint.get_script();
         assert!(script.contains("check (amount >= 0)"), "got: {script}");
@@ -1183,6 +1354,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))".to_string()),
         coninhcount: 0,
+            is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             };
         let constraint_b = TableConstraint {
             catalog: "db".to_string(),
@@ -1194,6 +1368,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))".to_string()),
         coninhcount: 0,
+            is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             };
         assert_eq!(constraint_a, constraint_b);
     }
@@ -1210,6 +1387,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))".to_string()),
         coninhcount: 0,
+            is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             };
         let constraint_b = TableConstraint {
             catalog: "db".to_string(),
@@ -1221,6 +1401,9 @@ mod tests {
             initially_deferred: false,
             definition: Some("CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))".to_string()),
         coninhcount: 0,
+            is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
             };
 
         let mut hasher_a = Sha256::new();
@@ -1298,5 +1481,414 @@ mod tests {
             norm,
             "check (x::character varying = ']::text[]' and y::character varying = 'ok')"
         );
+    }
+
+    // --- coninhcount i32 compatibility (PG14 INT4 / PG16+ INT2) ---
+
+    #[test]
+    fn test_coninhcount_accepts_i16_range_values() {
+        // PG16+ returns INT2 values, which fit in i32
+        let constraint = TableConstraint {
+            catalog: "db".to_string(),
+            schema: "public".to_string(),
+            name: "pk_test".to_string(),
+            table_name: "test".to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: None,
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        assert_eq!(constraint.coninhcount, 0);
+
+        let mut inherited = constraint.clone();
+        inherited.coninhcount = i16::MAX as i32;
+        assert_eq!(inherited.coninhcount, 32767);
+    }
+
+    #[test]
+    fn test_coninhcount_accepts_i32_range_values() {
+        // PG14 returns INT4 values, which require i32
+        let mut constraint = create_primary_key_constraint();
+        constraint.coninhcount = i32::MAX;
+        assert_eq!(constraint.coninhcount, i32::MAX);
+
+        constraint.coninhcount = 100_000; // exceeds i16::MAX
+        assert_eq!(constraint.coninhcount, 100_000);
+    }
+
+    #[test]
+    fn test_coninhcount_serde_roundtrip_zero() {
+        let constraint = create_primary_key_constraint();
+        let json = serde_json::to_string(&constraint).unwrap();
+        let deserialized: TableConstraint = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.coninhcount, 0);
+    }
+
+    #[test]
+    fn test_coninhcount_serde_roundtrip_large_value() {
+        let mut constraint = create_primary_key_constraint();
+        constraint.coninhcount = 100_000;
+        let json = serde_json::to_string(&constraint).unwrap();
+        let deserialized: TableConstraint = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.coninhcount, 100_000);
+    }
+
+    #[test]
+    fn test_coninhcount_serde_default_when_missing() {
+        // Older dumps may not include the field; #[serde(default)] should yield 0
+        let json = r#"{
+            "catalog": "db",
+            "schema": "public",
+            "name": "pk",
+            "table_name": "t",
+            "constraint_type": "PRIMARY KEY",
+            "is_deferrable": false,
+            "initially_deferred": false,
+            "definition": null
+        }"#;
+        let deserialized: TableConstraint = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.coninhcount, 0);
+    }
+
+    #[test]
+    fn test_coninhcount_not_included_in_equality() {
+        // coninhcount is intentionally excluded from PartialEq
+        let mut a = create_primary_key_constraint();
+        let mut b = create_primary_key_constraint();
+        a.coninhcount = 0;
+        b.coninhcount = 5;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_coninhcount_not_included_in_hash() {
+        // coninhcount is intentionally excluded from the SHA256 hash
+        let mut a = create_primary_key_constraint();
+        let mut b = create_primary_key_constraint();
+        a.coninhcount = 0;
+        b.coninhcount = 42;
+
+        let mut ha = Sha256::new();
+        let mut hb = Sha256::new();
+        a.add_to_hasher(&mut ha);
+        b.add_to_hasher(&mut hb);
+        assert_eq!(
+            format!("{:x}", ha.finalize()),
+            format!("{:x}", hb.finalize()),
+        );
+    }
+
+    // ---- PG18: is_enforced tests ----
+
+    #[test]
+    fn test_get_script_not_enforced_check() {
+        let constraint = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "chk_status".to_string(),
+            table_name: "orders".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (status <> '')".to_string()),
+            coninhcount: 0,
+            is_enforced: false,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let script = constraint.get_script();
+        assert!(
+            script.contains("not enforced"),
+            "expected 'not enforced' in script: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_script_not_enforced_foreign_key() {
+        let constraint = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "fk_order_user".to_string(),
+            table_name: "orders".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("FOREIGN KEY (user_id) REFERENCES public.users(id)".to_string()),
+            coninhcount: 0,
+            is_enforced: false,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let script = constraint.get_script();
+        assert!(
+            script.contains("not enforced"),
+            "expected 'not enforced' in FK script: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_script_enforced_omits_keyword() {
+        let constraint = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "chk_positive".to_string(),
+            table_name: "items".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (qty > 0)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let script = constraint.get_script();
+        assert!(
+            !script.contains("not enforced") && !script.contains("enforced"),
+            "enforced=true should not emit any enforced keyword: {script}"
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_different_is_enforced() {
+        let mut a = create_check_constraint();
+        a.is_enforced = true;
+        let mut b = a.clone();
+        b.is_enforced = false;
+        assert_ne!(
+            a, b,
+            "constraints with different is_enforced should not be equal"
+        );
+    }
+
+    #[test]
+    fn test_add_to_hasher_is_enforced_affects_hash() {
+        let mut a = create_check_constraint();
+        a.is_enforced = true;
+        let mut b = a.clone();
+        b.is_enforced = false;
+
+        let mut ha = Sha256::new();
+        let mut hb = Sha256::new();
+        a.add_to_hasher(&mut ha);
+        b.add_to_hasher(&mut hb);
+        assert_ne!(
+            format!("{:x}", ha.finalize()),
+            format!("{:x}", hb.finalize()),
+            "is_enforced should affect the hash"
+        );
+    }
+
+    #[test]
+    fn test_can_be_altered_to_check_enforced_change() {
+        let a = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "chk_val".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (val > 0)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut b = a.clone();
+        b.is_enforced = false;
+        assert!(
+            a.can_be_altered_to(&b),
+            "CHECK constraint should be alterable when only is_enforced differs"
+        );
+    }
+
+    #[test]
+    fn test_can_be_altered_to_fk_enforced_change() {
+        let a = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "fk_ref".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("FOREIGN KEY (x) REFERENCES public.y(id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut b = a.clone();
+        b.is_enforced = false;
+        assert!(
+            a.can_be_altered_to(&b),
+            "FK constraint should be alterable when only is_enforced differs"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_fk_enforced_to_not_enforced() {
+        let old = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "fk_ref".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("FOREIGN KEY (x) REFERENCES public.y(id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut new_c = old.clone();
+        new_c.is_enforced = false;
+
+        let script = old
+            .get_alter_script(&new_c)
+            .expect("should produce alter script");
+        assert!(
+            script.contains("alter table public.t alter constraint fk_ref not enforced"),
+            "expected NOT ENFORCED alter: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_fk_not_enforced_to_enforced() {
+        let old = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "fk_ref".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("FOREIGN KEY (x) REFERENCES public.y(id)".to_string()),
+            coninhcount: 0,
+            is_enforced: false,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut new_c = old.clone();
+        new_c.is_enforced = true;
+
+        let script = old
+            .get_alter_script(&new_c)
+            .expect("should produce alter script");
+        assert!(
+            script.contains("alter table public.t alter constraint fk_ref enforced"),
+            "expected ENFORCED alter: {script}"
+        );
+        assert!(
+            !script.contains("not enforced"),
+            "should not contain 'not enforced': {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_check_enforced_change() {
+        let old = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "chk_val".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (val > 0)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut new_c = old.clone();
+        new_c.is_enforced = false;
+
+        let script = old
+            .get_alter_script(&new_c)
+            .expect("should produce alter script");
+        assert!(
+            script.contains("alter table public.t alter constraint chk_val not enforced"),
+            "expected NOT ENFORCED for CHECK alter: {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_check_not_enforced_to_enforced() {
+        let old = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "chk_val".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "CHECK".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("CHECK (val > 0)".to_string()),
+            coninhcount: 0,
+            is_enforced: false,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut new_c = old.clone();
+        new_c.is_enforced = true;
+
+        let script = old
+            .get_alter_script(&new_c)
+            .expect("should produce alter script");
+        assert!(
+            script.contains("alter table public.t alter constraint chk_val enforced"),
+            "expected ENFORCED for CHECK alter: {script}"
+        );
+        assert!(
+            !script.contains("not enforced"),
+            "should not contain 'not enforced': {script}"
+        );
+    }
+
+    #[test]
+    fn test_get_alter_script_fk_deferrable_and_enforced_change() {
+        let old = TableConstraint {
+            catalog: "test".to_string(),
+            schema: "public".to_string(),
+            name: "fk_ref".to_string(),
+            table_name: "t".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("FOREIGN KEY (x) REFERENCES public.y(id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+        };
+        let mut new_c = old.clone();
+        new_c.is_deferrable = true;
+        new_c.initially_deferred = true;
+        new_c.is_enforced = false;
+
+        let script = old
+            .get_alter_script(&new_c)
+            .expect("should produce alter script");
+        assert!(
+            script.contains("deferrable initially deferred"),
+            "expected deferrable change: {script}"
+        );
+        assert!(
+            script.contains("not enforced"),
+            "expected enforced change: {script}"
+        );
+    }
+
+    #[test]
+    fn test_serde_default_enforced() {
+        let json = r#"{"catalog":"db","schema":"s","name":"c","table_name":"t","constraint_type":"CHECK","is_deferrable":false,"initially_deferred":false,"definition":null}"#;
+        let c: TableConstraint = serde_json::from_str(json).unwrap();
+        assert!(c.is_enforced, "missing is_enforced should default to true");
     }
 }
