@@ -155,7 +155,7 @@ impl ForeignTable {
     }
 
     /// Returns an ALTER script to transform self into target.
-    pub fn get_alter_script(&self, target: &ForeignTable) -> String {
+    pub fn get_alter_script(&self, target: &ForeignTable, use_drop: bool) -> String {
         let mut statements = Vec::new();
 
         // Owner change
@@ -173,7 +173,22 @@ impl ForeignTable {
         if self.server != target.server {
             let drop = self.get_drop_script();
             let create = target.get_script();
-            return format!("{}{}", drop, create);
+            if use_drop {
+                return format!("{}{}", drop, create);
+            } else {
+                let commented_drop = drop
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>();
+                let commented_create = create
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>();
+                return format!(
+                    "-- use_drop=false: foreign table {}.{} requires drop+recreate; statements commented out\n{}{}",
+                    self.schema, self.name, commented_drop, commented_create
+                );
+            }
         }
 
         // Table options change
@@ -458,7 +473,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.owner = "new_owner".to_string();
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.contains("alter foreign table public.ft_test owner to new_owner;"));
     }
 
@@ -467,7 +482,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.server = "new_server".to_string();
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.contains("drop foreign table if exists public.ft_test;"));
         assert!(script.contains("create foreign table public.ft_test"));
         assert!(script.contains("server new_server"));
@@ -478,7 +493,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.columns.push(make_column("email", "text"));
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.contains("alter foreign table public.ft_test add column email text;"));
     }
 
@@ -487,7 +502,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.columns.retain(|c| c.name != "name");
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.contains("alter foreign table public.ft_test drop column name;"));
     }
 
@@ -496,7 +511,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.columns[0].data_type = "bigint".to_string();
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.contains("alter foreign table public.ft_test alter column id type bigint;"));
     }
 
@@ -505,7 +520,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.columns[0].is_nullable = false;
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(
             script.contains("alter foreign table public.ft_test alter column id set not null;")
         );
@@ -516,7 +531,7 @@ mod tests {
         let mut ft1 = make_foreign_table();
         ft1.columns[0].is_nullable = false;
         let ft2 = make_foreign_table();
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(
             script.contains("alter foreign table public.ft_test alter column id drop not null;")
         );
@@ -527,7 +542,7 @@ mod tests {
         let ft1 = make_foreign_table();
         let mut ft2 = make_foreign_table();
         ft2.comment = Some("new comment".to_string());
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.contains("comment on foreign table public.ft_test is 'new comment';"));
     }
 
@@ -535,7 +550,19 @@ mod tests {
     fn get_alter_script_no_changes() {
         let ft1 = make_foreign_table();
         let ft2 = make_foreign_table();
-        let script = ft1.get_alter_script(&ft2);
+        let script = ft1.get_alter_script(&ft2, true);
         assert!(script.is_empty());
+    }
+
+    #[test]
+    fn get_alter_script_server_change_use_drop_false_comments_out() {
+        let ft1 = make_foreign_table();
+        let mut ft2 = make_foreign_table();
+        ft2.server = "new_server".to_string();
+        let script = ft1.get_alter_script(&ft2, false);
+        assert!(script.contains("-- use_drop=false"));
+        assert!(script.contains("-- drop foreign table"));
+        assert!(script.contains("-- create foreign table"));
+        assert!(!script.contains("\ndrop foreign table"));
     }
 }

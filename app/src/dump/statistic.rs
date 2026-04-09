@@ -124,7 +124,7 @@ impl Statistic {
     /// Returns an ALTER script to transform self into target.
     /// Extended statistics objects can't be altered in place for definition changes;
     /// they must be dropped and recreated.
-    pub fn get_alter_script(&self, target: &Statistic) -> String {
+    pub fn get_alter_script(&self, target: &Statistic, use_drop: bool) -> String {
         let mut statements = Vec::new();
 
         // Owner change
@@ -144,7 +144,24 @@ impl Statistic {
             || self.table_schema != target.table_schema
             || self.table_name != target.table_name
         {
-            return format!("{}{}", self.get_drop_script(), target.get_script());
+            let drop = self.get_drop_script();
+            let create = target.get_script();
+            if use_drop {
+                return format!("{}{}", drop, create);
+            } else {
+                let commented_drop = drop
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>();
+                let commented_create = create
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>();
+                return format!(
+                    "-- use_drop=false: statistics {}.{} requires drop+recreate; statements commented out\n{}{}",
+                    self.schema, self.name, commented_drop, commented_create
+                );
+            }
         }
 
         // Comment change
@@ -250,7 +267,7 @@ mod tests {
         let s1 = make_statistic();
         let mut s2 = make_statistic();
         s2.owner = "new_owner".to_string();
-        let script = s1.get_alter_script(&s2);
+        let script = s1.get_alter_script(&s2, true);
         assert!(script.contains("alter statistics public.my_stat owner to new_owner;"));
     }
 
@@ -263,7 +280,7 @@ mod tests {
                 .to_string();
         s2.kinds = vec!["mcv".to_string()];
         s2.columns = vec!["col1".to_string(), "col2".to_string(), "col3".to_string()];
-        let script = s1.get_alter_script(&s2);
+        let script = s1.get_alter_script(&s2, true);
         assert!(script.contains("drop statistics if exists public.my_stat;"));
         assert!(script.contains("create statistics public.my_stat"));
     }
@@ -273,7 +290,7 @@ mod tests {
         let s1 = make_statistic();
         let mut s2 = make_statistic();
         s2.comment = Some("new comment".to_string());
-        let script = s1.get_alter_script(&s2);
+        let script = s1.get_alter_script(&s2, true);
         assert!(script.contains("comment on statistics public.my_stat is 'new comment';"));
     }
 
@@ -281,7 +298,20 @@ mod tests {
     fn get_alter_script_no_changes() {
         let s1 = make_statistic();
         let s2 = make_statistic();
-        let script = s1.get_alter_script(&s2);
+        let script = s1.get_alter_script(&s2, true);
         assert!(script.is_empty());
+    }
+
+    #[test]
+    fn get_alter_script_definition_change_use_drop_false_comments_out() {
+        let s1 = make_statistic();
+        let mut s2 = make_statistic();
+        s2.kinds = vec!["mcv".to_string()];
+        s2.columns = vec!["col1".to_string(), "col2".to_string(), "col3".to_string()];
+        let script = s1.get_alter_script(&s2, false);
+        assert!(script.contains("-- use_drop=false"));
+        assert!(script.contains("-- drop statistics"));
+        assert!(script.contains("-- create statistics"));
+        assert!(!script.contains("\ndrop statistics"));
     }
 }

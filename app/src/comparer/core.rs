@@ -2090,7 +2090,7 @@ impl Comparer {
             if let Some(existing) = from_map.get(&key) {
                 // Alter if hash differs
                 if existing.hash != ft.hash {
-                    let alter = existing.get_alter_script(ft);
+                    let alter = existing.get_alter_script(ft, self.use_drop);
                     if !alter.is_empty() {
                         self.script.push_str(&alter);
                     }
@@ -2145,7 +2145,7 @@ impl Comparer {
             let key = format!("{}.{}", stat.schema, stat.name);
             if let Some(existing) = from_map.get(&key) {
                 if existing.hash != stat.hash {
-                    let alter = existing.get_alter_script(stat);
+                    let alter = existing.get_alter_script(stat, self.use_drop);
                     if !alter.is_empty() {
                         self.script.push_str(&alter);
                     }
