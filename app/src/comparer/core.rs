@@ -370,8 +370,8 @@ impl Comparer {
         let mut ri = 0;
         while ri < rlen {
             // Detect dollar-quote opener and copy the entire quoted body verbatim
-            if rbytes[ri] == b'$' {
-                if let Some(tag_len) = Self::dollar_tag_at(rbytes, ri) {
+            if rbytes[ri] == b'$'
+                && let Some(tag_len) = Self::dollar_tag_at(rbytes, ri) {
                     let tag = &rbytes[ri..ri + tag_len];
                     // Copy opening tag
                     collapsed.extend_from_slice(tag);
@@ -382,21 +382,18 @@ impl Comparer {
                         if ri >= rlen {
                             break;
                         }
-                        if rbytes[ri] == b'$' {
-                            if let Some(close_len) = Self::dollar_tag_at(rbytes, ri) {
-                                if close_len == tag_len && &rbytes[ri..ri + close_len] == tag {
+                        if rbytes[ri] == b'$'
+                            && let Some(close_len) = Self::dollar_tag_at(rbytes, ri)
+                                && close_len == tag_len && &rbytes[ri..ri + close_len] == tag {
                                     collapsed.extend_from_slice(&rbytes[ri..ri + close_len]);
                                     ri += close_len;
                                     break;
                                 }
-                            }
-                        }
                         collapsed.push(rbytes[ri]);
                         ri += 1;
                     }
                     continue;
                 }
-            }
             if rbytes[ri] == b'\n' {
                 newline_count += 1;
                 if newline_count <= 2 {
