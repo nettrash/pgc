@@ -404,6 +404,27 @@ BEGIN
 END;
 $$;
 
+-- Dollar-quoted body newline preservation test (identical in FROM and TO).
+-- The procedure body contains intentional runs of 3+ consecutive blank lines.
+-- When --use-comments=false is used, the newline-collapsing pass must NOT
+-- alter content inside dollar-quoted strings; otherwise the hash changes and
+-- the comparer reports a false positive diff.
+CREATE OR REPLACE PROCEDURE test_schema.dollar_newline_test()
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE 'block 1';
+
+
+
+    RAISE NOTICE 'block 2';
+
+
+
+
+    RAISE NOTICE 'block 3';
+END;
+$$;
+
 -- =============================================================================
 -- Overloaded routine test: identical overloads in FROM and TO
 -- Two procedures with the same name but different argument signatures.
