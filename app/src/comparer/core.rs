@@ -361,8 +361,10 @@ impl Comparer {
         // so it is guaranteed to be valid UTF-8.
         let result = String::from_utf8(result).expect("output must be valid UTF-8");
 
-        // Collapse runs of 3+ newlines into 2, but skip dollar-quoted bodies
-        // so that blank lines inside procedure/function source code are preserved.
+        // Collapse runs of 3+ newlines into 2, but skip all quoted literals
+        // (dollar-quoted, single-quoted, E-string, double-quoted) so that
+        // blank lines inside procedure/function source code and multi-line
+        // string literals (e.g. COMMENT bodies) are preserved.
         let rbytes = result.as_bytes();
         let rlen = rbytes.len();
         let mut collapsed: Vec<u8> = Vec::with_capacity(rlen);
@@ -395,6 +397,34 @@ impl Comparer {
                     collapsed.push(rbytes[ri]);
                     ri += 1;
                 }
+                continue;
+            }
+            // E-string literal E'...' or e'...' — copy verbatim
+            if (rbytes[ri] == b'E' || rbytes[ri] == b'e')
+                && ri + 1 < rlen
+                && rbytes[ri + 1] == b'\''
+            {
+                collapsed.push(rbytes[ri]); // E / e
+                collapsed.push(b'\'');
+                ri += 2;
+                Self::copy_quoted_literal(rbytes, &mut collapsed, &mut ri, b'\'', true);
+                newline_count = 0;
+                continue;
+            }
+            // Single-quoted string — copy verbatim
+            if rbytes[ri] == b'\'' {
+                collapsed.push(b'\'');
+                ri += 1;
+                Self::copy_quoted_literal(rbytes, &mut collapsed, &mut ri, b'\'', false);
+                newline_count = 0;
+                continue;
+            }
+            // Double-quoted identifier — copy verbatim
+            if rbytes[ri] == b'"' {
+                collapsed.push(b'"');
+                ri += 1;
+                Self::copy_quoted_literal(rbytes, &mut collapsed, &mut ri, b'"', false);
+                newline_count = 0;
                 continue;
             }
             if rbytes[ri] == b'\n' {
@@ -8146,6 +8176,353 @@ mod tests {
         assert!(
             out.contains("\n\n\n\n"),
             "unterminated $$ body newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_preserves_newlines_inside_single_quoted_string() {
+        // Multi-line COMMENT body in a single-quoted literal must not be collapsed.
+        let input = "COMMENT ON TABLE t IS 'line1\n\n\n\nline5';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("'line1\n\n\n\nline5'"),
+            "newlines inside single-quoted string must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_preserves_newlines_inside_e_string() {
+        // E-string literal with multi-line content.
+        let input = "SELECT E'first\n\n\n\nlast';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("E'first\n\n\n\nlast'"),
+            "newlines inside E-string must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_preserves_newlines_inside_double_quoted_identifier() {
+        // Unusual but legal: double-quoted identifiers can contain newlines.
+        let input = "SELECT \"col\n\n\n\nname\";\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("\"col\n\n\n\nname\""),
+            "newlines inside double-quoted identifier must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_collapses_newlines_between_single_quoted_strings() {
+        // Newlines *outside* quoted strings should still be collapsed.
+        let input = "SELECT 'a';\n\n\n\nSELECT 'b';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "SELECT 'a';\n\nSELECT 'b';\n");
+    }
+
+    #[test]
+    fn get_script_e_string_with_escaped_quote_and_newlines() {
+        // E-string with \' inside — must not terminate early.
+        let input = "SELECT E'it\\'s\n\n\n\nfine';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("E'it\\'s\n\n\n\nfine'"),
+            "E-string with escaped quote and newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_single_quoted_doubled_quote_and_newlines() {
+        // Standard single-quoted string with '' escape and embedded newlines.
+        let input = "SELECT 'it''s\n\n\n\nfine';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("'it''s\n\n\n\nfine'"),
+            "single-quoted string with doubled quote and newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_lowercase_e_string_preserves_newlines() {
+        // Lowercase e should be recognised as an E-string opener too.
+        let input = "SELECT e'first\n\n\n\nlast';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("e'first\n\n\n\nlast'"),
+            "newlines inside lowercase e-string must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_unterminated_single_quoted_string_copies_to_end() {
+        let input = "SELECT 'unterminated\n\n\n\nstring\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("\n\n\n\n"),
+            "unterminated single-quoted string newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_unterminated_e_string_copies_to_end() {
+        let input = "SELECT E'unterminated\n\n\n\nstring\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("\n\n\n\n"),
+            "unterminated E-string newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_unterminated_double_quoted_identifier_copies_to_end() {
+        let input = "SELECT \"unterminated\n\n\n\nident\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("\n\n\n\n"),
+            "unterminated double-quoted identifier newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_empty_single_quoted_string_no_corruption() {
+        // Empty string '' should not confuse the scanner.
+        let input = "SELECT '';\n\n\n\nSELECT 1;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "SELECT '';\n\nSELECT 1;\n");
+    }
+
+    #[test]
+    fn get_script_newline_count_resets_after_single_quoted_literal() {
+        // Two newlines before a quoted literal, then two newlines after it —
+        // neither run alone exceeds 2 so nothing should be collapsed.
+        let input = "A;\n\n'inside\n\n\n\ntext';\n\nB;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("'inside\n\n\n\ntext'"),
+            "newlines inside literal must be preserved, got:\n{}",
+            out
+        );
+        // The two newlines before and after the literal should survive.
+        assert!(
+            out.contains("A;\n\n'inside"),
+            "two newlines before literal should survive, got:\n{}",
+            out
+        );
+        assert!(
+            out.contains("';\n\nB;"),
+            "two newlines after literal should survive, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_collapses_after_quoted_literal_with_excess_newlines() {
+        // Excess newlines *after* a quoted literal should still be collapsed.
+        let input = "SELECT 'hello';\n\n\n\nSELECT 'world';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "SELECT 'hello';\n\nSELECT 'world';\n");
+    }
+
+    #[test]
+    fn get_script_mixed_literal_types_with_newlines() {
+        // Mix of dollar-quoted, single-quoted, E-string, and double-quoted
+        // literals each containing newlines that must be preserved, separated
+        // by excessive newlines that should be collapsed.
+        let input = concat!(
+            "COMMENT ON TABLE t IS 'line1\n\n\n\nline5';\n",
+            "\n\n\n\n",
+            "SELECT E'a\n\n\n\nb';\n",
+            "\n\n\n\n",
+            "SELECT \"id\n\n\n\ncol\";\n",
+            "\n\n\n\n",
+            "CREATE FUNCTION f() AS $$\nBEGIN\n\n\n\n  NULL;\nEND;\n$$;\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        // Inside literals: preserved
+        assert!(
+            out.contains("'line1\n\n\n\nline5'"),
+            "single-quoted newlines must be preserved"
+        );
+        assert!(
+            out.contains("E'a\n\n\n\nb'"),
+            "E-string newlines must be preserved"
+        );
+        assert!(
+            out.contains("\"id\n\n\n\ncol\""),
+            "double-quoted newlines must be preserved"
+        );
+        assert!(
+            out.contains("BEGIN\n\n\n\n  NULL;"),
+            "dollar-quoted newlines must be preserved"
+        );
+        // Outside literals: collapsed (no run of 3+ newlines between statements)
+        let between_stmts = out
+            .split("'line1\n\n\n\nline5';")
+            .nth(1)
+            .unwrap()
+            .split("E'a\n\n\n\nb'")
+            .next()
+            .unwrap();
+        assert!(
+            !between_stmts.contains("\n\n\n"),
+            "newlines between statements should be collapsed, got segment: {:?}",
+            between_stmts
+        );
+    }
+
+    #[test]
+    fn get_script_e_string_escaped_backslash_then_newlines() {
+        // E'foo\\' — the \\\\ is an escaped backslash, so the next ' closes
+        // the string.  Newlines outside should be collapsed.
+        let input = "SELECT E'foo\\\\';\n\n\n\nSELECT 1;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "SELECT E'foo\\\\';\n\nSELECT 1;\n");
+    }
+
+    #[test]
+    fn get_script_double_quoted_doubled_escape_and_newlines() {
+        // Double-quoted identifier with "" escape and embedded newlines.
+        let input = "SELECT \"col\"\"\n\n\n\nname\";\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("\"col\"\"\n\n\n\nname\""),
+            "double-quoted identifier with escaped quote and newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_comment_stripped_but_single_quoted_newlines_preserved() {
+        // The comment-stripping pass runs first; the collapsing pass must
+        // still preserve newlines inside single-quoted strings.
+        let input = concat!(
+            "-- strip this\n",
+            "COMMENT ON TABLE t IS 'multi\n\n\n\nline';\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(!out.contains("-- strip this"), "comment should be removed");
+        assert!(
+            out.contains("'multi\n\n\n\nline'"),
+            "single-quoted newlines must survive comment stripping + collapsing, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_block_comment_stripped_but_e_string_newlines_preserved() {
+        let input = concat!("/* block comment */\n", "SELECT E'keep\n\n\n\nme';\n",);
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            !out.contains("block comment"),
+            "block comment should be removed"
+        );
+        assert!(
+            out.contains("E'keep\n\n\n\nme'"),
+            "E-string newlines must survive after block comment stripping, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_adjacent_single_quoted_strings_both_preserved() {
+        // Two single-quoted strings back-to-back, each with internal newlines.
+        let input = "SELECT 'a\n\n\n\nb' || 'c\n\n\n\nd';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("'a\n\n\n\nb'"),
+            "first literal newlines must be preserved, got:\n{}",
+            out
+        );
+        assert!(
+            out.contains("'c\n\n\n\nd'"),
+            "second literal newlines must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_dollar_body_containing_single_quoted_newlines() {
+        // A dollar-quoted body that itself contains a single-quoted string
+        // with many newlines — everything inside $$ is already copied verbatim
+        // by the dollar-quote branch, so the inner literal is preserved too.
+        let input = concat!(
+            "CREATE FUNCTION f() AS $$\n",
+            "BEGIN\n",
+            "  RAISE NOTICE 'msg\n\n\n\nend';\n",
+            "END;\n",
+            "$$;\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("'msg\n\n\n\nend'"),
+            "single-quoted literal inside dollar body must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_single_quoted_string_without_excess_newlines_unchanged() {
+        // A single-quoted string with exactly 2 newlines (not excess) — should
+        // pass through without any modification.
+        let input = "SELECT 'a\n\nb';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "SELECT 'a\n\nb';\n");
+    }
+
+    #[test]
+    fn get_script_e_identifier_not_confused_with_e_string() {
+        // A column named "E" followed by a comparison — the E is followed by
+        // a space, not a quote, so it must not be mistaken for an E-string.
+        let input = "SELECT E = 1;\n\n\n\nSELECT 2;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "SELECT E = 1;\n\nSELECT 2;\n");
+    }
+
+    #[test]
+    fn get_script_multiple_e_strings_on_same_line() {
+        let input = "SELECT E'x\n\n\n\ny', E'a\n\n\n\nb';\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("E'x\n\n\n\ny'"),
+            "first E-string newlines must be preserved, got:\n{}",
+            out
+        );
+        assert!(
+            out.contains("E'a\n\n\n\nb'"),
+            "second E-string newlines must be preserved, got:\n{}",
             out
         );
     }
