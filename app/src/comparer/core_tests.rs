@@ -5511,3 +5511,204 @@ fn get_script_multiple_e_strings_on_same_line() {
         out
     );
 }
+
+#[tokio::test]
+async fn compare_routines_procedure_with_config_params() {
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_proc".to_string(),
+        "plpgsql".to_string(),
+        "PROCEDURE".to_string(),
+        "void".to_string(),
+        "IN pvalue text".to_string(),
+        None,
+        None,
+        "\nBEGIN\n    RAISE NOTICE 'value: %', pvalue;\nEND;\n".to_string(),
+    );
+    routine.config = vec![
+        "search_path=public, pg_temp".to_string(),
+        "lock_timeout=5s".to_string(),
+    ];
+    routine.hash();
+    to_dump.routines.push(routine);
+
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("SET search_path = 'public, pg_temp'"),
+        "script must contain SET search_path, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("SET lock_timeout = '5s'"),
+        "script must contain SET lock_timeout, got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_function_with_config_params() {
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "my_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "\nBEGIN\n    RETURN 1;\nEND;\n".to_string(),
+    );
+    routine.config = vec!["work_mem=256MB".to_string()];
+    routine.hash();
+    to_dump.routines.push(routine);
+
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("SET work_mem = '256MB'"),
+        "script must contain SET work_mem, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("VOLATILE"),
+        "function flags must still be present, got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_config_change_triggers_update() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+    from_routine.config = vec!["search_path=public".to_string()];
+    from_routine.hash();
+
+    let mut to_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+    to_routine.config = vec![
+        "search_path=public".to_string(),
+        "lock_timeout=5s".to_string(),
+    ];
+    to_routine.hash();
+
+    assert_ne!(
+        from_routine.hash, to_routine.hash,
+        "hashes must differ when config changes"
+    );
+
+    from_dump.routines.push(from_routine);
+    to_dump.routines.push(to_routine);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("create or replace function"),
+        "config change must trigger CREATE OR REPLACE, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("SET search_path = 'public'"),
+        "script must contain SET search_path, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("SET lock_timeout = '5s'"),
+        "script must contain SET lock_timeout, got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_config_removal_triggers_update() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+    from_routine.config = vec!["search_path=public".to_string()];
+    from_routine.hash();
+
+    let to_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+
+    assert_ne!(
+        from_routine.hash, to_routine.hash,
+        "hashes must differ when config is removed"
+    );
+
+    from_dump.routines.push(from_routine);
+    to_dump.routines.push(to_routine);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("create or replace function"),
+        "config removal must trigger CREATE OR REPLACE, got:\n{}",
+        script
+    );
+    assert!(
+        !script.contains("SET search_path"),
+        "removed config must not appear in script, got:\n{}",
+        script
+    );
+}

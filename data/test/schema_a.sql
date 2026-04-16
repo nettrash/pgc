@@ -653,6 +653,37 @@ AS $$
     SELECT CASE WHEN rate > 0.2 THEN 'high' ELSE 'low' END;
 $$;
 
+-- =============================================================================
+-- Routine SET configuration parameters (proconfig) test
+-- =============================================================================
+
+-- Function with SET params (unchanged between FROM and TO)
+CREATE OR REPLACE FUNCTION test_schema.get_session_user_safe()
+RETURNS text
+LANGUAGE plpgsql
+STABLE SECURITY DEFINER
+SET search_path = 'public, pg_temp'
+AS $$
+BEGIN
+    RETURN session_user;
+END;
+$$;
+
+-- Function with SET params (FROM)
+-- TO changes search_path and adds lock_timeout → config-only diff
+CREATE OR REPLACE FUNCTION test_schema.secure_lookup(key text)
+RETURNS text
+LANGUAGE plpgsql
+STABLE SECURITY DEFINER
+SET search_path = 'public'
+AS $$
+BEGIN
+    RETURN current_setting(key, true);
+END;
+$$;
+
+-- apply_secure_settings procedure does not exist in FROM → TO creates it with SET params
+
 -- AGGREGATE function (unchanged between FROM and TO)
 CREATE OR REPLACE FUNCTION test_schema.running_sum_sfunc(state bigint, val integer)
 RETURNS bigint

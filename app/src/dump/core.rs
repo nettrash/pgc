@@ -833,6 +833,7 @@ impl Dump {
                 r.proparallel::text as proparallel,
                 r.prosecdef,
                 r.proacl::text[] as routine_acl,
+                r.proconfig::text[] as proconfig,
                 agg.aggtransfn::regproc::text as agg_sfunc,
                 format_type(agg.aggtranstype, null) as agg_stype,
                 agg.aggtransspace as agg_sspace,
@@ -968,6 +969,9 @@ impl Dump {
                     is_leakproof: row.get("proleakproof"),
                     parallel,
                     security_definer: row.get("prosecdef"),
+                    config: row
+                        .get::<Option<Vec<String>>, _>("proconfig")
+                        .unwrap_or_default(),
                     aggregate_info,
                     hash: None,
                     acl: row

@@ -140,7 +140,10 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **product_agg_sfunc()**: support function for `weighted_sum` aggregate
 
 #### Unchanged Functions
-- **update_timestamp()**, **audit_trigger()**, **get_secure_setting()**, **running_sum_sfunc()**, **new_entity_id()**
+- **update_timestamp()**, **audit_trigger()**, **get_secure_setting()**, **running_sum_sfunc()**, **new_entity_id()**, **get_session_user_safe()** (with SET search_path)
+
+#### Modified Function Configuration Parameters (SET / proconfig)
+- **secure_lookup()**: FROM has `SET search_path = 'public'`; TO changes to `SET search_path = 'public, pg_temp'` and adds `SET lock_timeout = '5s'` → config-only diff triggers `CREATE OR REPLACE`
 
 ### 10. Aggregate Functions
 - **Added**: `test_schema.weighted_sum(numeric, numeric)` — with support function and comment
@@ -159,6 +162,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **cleanup_old_reviews()**: cleans old reviews (730-day threshold)
 - **print_user_stats()**: reads `v_user_stats` view
 - **z_final_report()**: calls `a_middle_layer()` (dependency chain)
+- **apply_secure_settings(text)**: procedure with `SET search_path = 'public, pg_temp'` and `SET lock_timeout = '5s'` (tests new routine with configuration parameters)
 
 #### Unchanged Procedures
 - **notify_event(uuid, varchar, jsonb)**: 3-param overload, identical in both schemas
@@ -313,6 +317,12 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 - The comma inside the quoted string literal must not be treated as a delimiter when splitting the defaults string
 - The comparer must produce no diff for this procedure, confirming the round-trip is correct
 
+#### Routine SET Configuration Parameters (proconfig)
+- **Unchanged**: `get_session_user_safe()` has `SET search_path = 'public, pg_temp'` in both schemas — no diff expected
+- **Modified config**: `secure_lookup(key text)` has `SET search_path = 'public'` in FROM; TO changes to `SET search_path = 'public, pg_temp'` and adds `SET lock_timeout = '5s'` — `CREATE OR REPLACE` with new SET clauses expected
+- **New with config**: `apply_secure_settings(IN pvalue text)` exists only in TO with `SET search_path = 'public, pg_temp'` and `SET lock_timeout = '5s'` — `CREATE OR REPLACE` with SET clauses expected
+- PostgreSQL stores these in `pg_proc.proconfig` as an array (e.g. `{search_path=public\, pg_temp,lock_timeout=5s}`)
+
 ---
 
 ## Clear Command Test (`clear_test.sql`)
@@ -456,6 +466,7 @@ The comparison should detect and generate SQL for:
 - Detecting column STORAGE and COMPRESSION changes (PG14+)
 - Handling SECURITY INVOKER view option changes (PG15+)
 - Handling range type changes via drop+recreate (ranges cannot be altered in-place)
+- Detecting routine SET configuration parameter (proconfig) changes, additions, and removals
 - Creating, dropping, and altering foreign tables (column add/drop/alter, server changes, options)
 - Creating, dropping, and altering extended statistics (kind changes via drop+recreate)
 - Detecting NOT ENFORCED constraint flag changes (PG18+)
