@@ -361,20 +361,54 @@ impl Comparer {
         // so it is guaranteed to be valid UTF-8.
         let result = String::from_utf8(result).expect("output must be valid UTF-8");
 
-        // Collapse runs of 3+ newlines into 2
-        let mut collapsed = String::with_capacity(result.len());
+        // Collapse runs of 3+ newlines into 2, but skip dollar-quoted bodies
+        // so that blank lines inside procedure/function source code are preserved.
+        let rbytes = result.as_bytes();
+        let rlen = rbytes.len();
+        let mut collapsed: Vec<u8> = Vec::with_capacity(rlen);
         let mut newline_count = 0u32;
-        for c in result.chars() {
-            if c == '\n' {
+        let mut ri = 0;
+        while ri < rlen {
+            // Detect dollar-quote opener and copy the entire quoted body verbatim
+            if rbytes[ri] == b'$' {
+                if let Some(tag_len) = Self::dollar_tag_at(rbytes, ri) {
+                    let tag = &rbytes[ri..ri + tag_len];
+                    // Copy opening tag
+                    collapsed.extend_from_slice(tag);
+                    ri += tag_len;
+                    newline_count = 0;
+                    // Copy body until matching closing tag
+                    loop {
+                        if ri >= rlen {
+                            break;
+                        }
+                        if rbytes[ri] == b'$' {
+                            if let Some(close_len) = Self::dollar_tag_at(rbytes, ri) {
+                                if close_len == tag_len && &rbytes[ri..ri + close_len] == tag {
+                                    collapsed.extend_from_slice(&rbytes[ri..ri + close_len]);
+                                    ri += close_len;
+                                    break;
+                                }
+                            }
+                        }
+                        collapsed.push(rbytes[ri]);
+                        ri += 1;
+                    }
+                    continue;
+                }
+            }
+            if rbytes[ri] == b'\n' {
                 newline_count += 1;
                 if newline_count <= 2 {
-                    collapsed.push('\n');
+                    collapsed.push(b'\n');
                 }
             } else {
                 newline_count = 0;
-                collapsed.push(c);
+                collapsed.push(rbytes[ri]);
             }
+            ri += 1;
         }
+        let collapsed = String::from_utf8(collapsed).expect("output must be valid UTF-8");
         let trimmed = collapsed.trim();
         if trimmed.is_empty() {
             return String::new();
@@ -7947,6 +7981,172 @@ mod tests {
             has_active_drop,
             "FROM-only view DROP should be active SQL when use_drop=true, script:\n{}",
             script
+        );
+    }
+
+    // --- Tests for get_script() newline collapsing vs dollar-quoted bodies ---
+
+    /// Helper: build a Comparer with use_comments=false and a given script body.
+    fn comparer_with_script(script: &str) -> Comparer {
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut c = Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+        c.script = script.to_string();
+        c
+    }
+
+    #[test]
+    fn get_script_collapses_triple_newlines_outside_dollar_quotes() {
+        let input = "SELECT 1;\n\n\n\nSELECT 2;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        // 4 newlines should be collapsed to 2
+        assert_eq!(out, "SELECT 1;\n\nSELECT 2;\n");
+    }
+
+    #[test]
+    fn get_script_preserves_triple_newlines_inside_dollar_quotes() {
+        let input = concat!(
+            "CREATE OR REPLACE PROCEDURE public.test_proc() LANGUAGE plpgsql AS $$\n",
+            "BEGIN\n",
+            "  RAISE NOTICE 'block 1';\n",
+            "\n",
+            "\n",
+            "\n",
+            "  RAISE NOTICE 'block 2';\n",
+            "END;\n",
+            "$$;\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        // The three consecutive newlines inside $$ must survive
+        assert!(
+            out.contains("'block 1';\n\n\n\n  RAISE NOTICE 'block 2'"),
+            "blank lines inside $$ body must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_preserves_newlines_inside_tagged_dollar_quotes() {
+        let input = concat!(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $body$\n",
+            "BEGIN\n",
+            "\n",
+            "\n",
+            "\n",
+            "  NULL;\n",
+            "END;\n",
+            "$body$;\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("BEGIN\n\n\n\n  NULL;"),
+            "blank lines inside $body$ must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_collapses_newlines_between_dollar_quoted_blocks() {
+        // Newlines *outside* dollar-quoted blocks should still be collapsed
+        let input = "$$body1$$;\n\n\n\n$$body2$$;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert_eq!(out, "$$body1$$;\n\n$$body2$$;\n");
+    }
+
+    #[test]
+    fn get_script_mixed_dollar_quote_and_outside_newlines() {
+        let input = concat!(
+            "SELECT 1;\n\n\n\n",
+            "CREATE FUNCTION f() RETURNS void AS $$\n",
+            "BEGIN\n",
+            "\n\n\n",
+            "  NULL;\n",
+            "END;\n",
+            "$$;\n",
+            "\n\n\n\n",
+            "SELECT 2;\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+
+        // Outside: collapsed
+        assert!(
+            !out.contains("SELECT 1;\n\n\n"),
+            "newlines before $$ block should be collapsed"
+        );
+        assert!(
+            !out.contains("$$;\n\n\n"),
+            "newlines after $$ block should be collapsed"
+        );
+        // Inside: preserved
+        assert!(
+            out.contains("BEGIN\n\n\n\n  NULL;"),
+            "blank lines inside $$ must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_with_use_comments_true_returns_verbatim() {
+        let input = "SELECT 1;\n\n\n\nSELECT 2;\n";
+        let from_dump = Dump::new(DumpConfig::default());
+        let to_dump = Dump::new(DumpConfig::default());
+        let mut c = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+        c.script = input.to_string();
+        let out = c.get_script();
+        // With use_comments=true, script is returned as-is
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn get_script_strips_comments_but_preserves_dollar_body_newlines() {
+        let input = concat!(
+            "-- a comment\n",
+            "CREATE FUNCTION f() RETURNS void AS $$\n",
+            "BEGIN\n",
+            "\n\n\n",
+            "  NULL;\n",
+            "END;\n",
+            "$$;\n",
+        );
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        // Comment removed
+        assert!(
+            !out.contains("-- a comment"),
+            "line comment should be removed"
+        );
+        // Dollar body preserved
+        assert!(
+            out.contains("BEGIN\n\n\n\n  NULL;"),
+            "blank lines inside $$ body must be preserved, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn get_script_empty_dollar_body_not_corrupted() {
+        let input = "CREATE FUNCTION f() AS $$$$;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(out.contains("$$$$"), "empty dollar body must be preserved");
+    }
+
+    #[test]
+    fn get_script_unterminated_dollar_quote_copies_to_end() {
+        // Unterminated dollar-quote: everything after opening tag should be
+        // copied verbatim (same as the comment-stripping pass behaviour).
+        let input = "CREATE FUNCTION f() AS $$\nBEGIN\n\n\n\n  NULL;\n";
+        let c = comparer_with_script(input);
+        let out = c.get_script();
+        assert!(
+            out.contains("\n\n\n\n"),
+            "unterminated $$ body newlines must be preserved, got:\n{}",
+            out
         );
     }
 }
