@@ -371,29 +371,32 @@ impl Comparer {
         while ri < rlen {
             // Detect dollar-quote opener and copy the entire quoted body verbatim
             if rbytes[ri] == b'$'
-                && let Some(tag_len) = Self::dollar_tag_at(rbytes, ri) {
-                    let tag = &rbytes[ri..ri + tag_len];
-                    // Copy opening tag
-                    collapsed.extend_from_slice(tag);
-                    ri += tag_len;
-                    newline_count = 0;
-                    // Copy body until matching closing tag
-                    loop {
-                        if ri >= rlen {
-                            break;
-                        }
-                        if rbytes[ri] == b'$'
-                            && let Some(close_len) = Self::dollar_tag_at(rbytes, ri)
-                                && close_len == tag_len && &rbytes[ri..ri + close_len] == tag {
-                                    collapsed.extend_from_slice(&rbytes[ri..ri + close_len]);
-                                    ri += close_len;
-                                    break;
-                                }
-                        collapsed.push(rbytes[ri]);
-                        ri += 1;
+                && let Some(tag_len) = Self::dollar_tag_at(rbytes, ri)
+            {
+                let tag = &rbytes[ri..ri + tag_len];
+                // Copy opening tag
+                collapsed.extend_from_slice(tag);
+                ri += tag_len;
+                newline_count = 0;
+                // Copy body until matching closing tag
+                loop {
+                    if ri >= rlen {
+                        break;
                     }
-                    continue;
+                    if rbytes[ri] == b'$'
+                        && let Some(close_len) = Self::dollar_tag_at(rbytes, ri)
+                        && close_len == tag_len
+                        && &rbytes[ri..ri + close_len] == tag
+                    {
+                        collapsed.extend_from_slice(&rbytes[ri..ri + close_len]);
+                        ri += close_len;
+                        break;
+                    }
+                    collapsed.push(rbytes[ri]);
+                    ri += 1;
                 }
+                continue;
+            }
             if rbytes[ri] == b'\n' {
                 newline_count += 1;
                 if newline_count <= 2 {
