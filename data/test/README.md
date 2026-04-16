@@ -164,6 +164,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **notify_event(uuid, varchar, jsonb)**: 3-param overload, identical in both schemas
 - **notify_event(uuid, varchar, varchar, jsonb, jsonb)**: 5-param overload, identical in both schemas (tests overloaded routine matching by argument signature)
 - **format_csv_line(varchar, varchar)**: procedure with a comma-in-string default (`DEFAULT ','`) - identical in both schemas; no diff should be emitted (Issue #154 regression test)
+- **dollar_newline_test()**: procedure body contains intentional runs of 3+ consecutive blank lines inside `$$`; identical in both schemas. Tests that `--use-comments=false` newline collapsing does not corrupt dollar-quoted content (false-positive diff regression test)
 
 ### 12. Triggers
 - **Added**: `trigger_reviews_update_timestamp`, `trigger_reviews_audit` on `reviews` table
@@ -448,6 +449,7 @@ The comparison should detect and generate SQL for:
 - Not emitting extension-owned objects as individual creates/drops
 - Using serial/bigserial types instead of separate sequences where appropriate
 - Stripping SQL comments from output when `--use-comments false` is specified (preserving comments inside function bodies)
+- Preserving blank lines inside dollar-quoted bodies when `--use-comments false` is specified (no false-positive diffs)
 - Handling exclusion constraints (create, drop, alter via table changes)
 - Detecting NULLS NOT DISTINCT changes on unique constraints (PG15+)
 - Detecting NO INHERIT flag changes on CHECK constraints

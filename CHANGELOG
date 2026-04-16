@@ -1,3 +1,8 @@
+2026-04-16      v1.0.14
+                
+                Features:
+                    - Fixed multiline handling inside code blocks when comments are disabled.
+
 2026-04-09      v1.0.13
 
                 Features:
