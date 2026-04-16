@@ -251,18 +251,21 @@ impl Comparer {
         if self.use_comments {
             return self.script.clone();
         }
-        // Strip SQL comments (-- line comments and /* block comments */) from the
-        // script, passing through all other content verbatim.  Four token types are
-        // recognised and copied byte-for-byte without interpretation so that
-        // comment-like sequences inside them are never stripped:
+        // Single-pass scanner: strip SQL comments (-- line and /* block */),
+        // collapse runs of 3+ newlines into 2, and pass all quoted literals
+        // through verbatim so that their content is never altered.
+        //
+        // Recognised token types (copied byte-for-byte without interpretation):
         //   • dollar-quoted strings:      $$ … $$ or $tag$ … $tag$
         //   • single-quoted literals:     ' … '   ('' is the escape for a literal quote)
         //   • E-string literals:          E' … '  (backslash sequences and '' are handled)
         //   • double-quoted identifiers:  " … "   ("" is the escape for a literal quote)
+        //
         // Operates on bytes to avoid corrupting multi-byte UTF-8 sequences.
         let src = self.script.as_bytes();
         let len = src.len();
         let mut result: Vec<u8> = Vec::with_capacity(len);
+        let mut newline_count = 0u32;
         let mut i = 0;
 
         while i < len {
@@ -271,10 +274,9 @@ impl Comparer {
                 && let Some(tag_len) = Self::dollar_tag_at(src, i)
             {
                 let tag = &src[i..i + tag_len];
-                // Copy opening tag
                 result.extend_from_slice(tag);
                 i += tag_len;
-                // Copy everything until closing tag
+                newline_count = 0;
                 loop {
                     if i >= len {
                         break;
@@ -294,17 +296,12 @@ impl Comparer {
                 continue;
             }
             // E-string literal E'...' or e'...' — pass through verbatim.
-            // PostgreSQL escape strings allow both \' and '' to embed a single quote.
-            // This scanner does not interpret escape sequences; it copies every \X pair
-            // as two raw bytes so that the character following a backslash is never
-            // mistaken for a string terminator or a comment starter.
-            // Must be handled before the plain single-quote branch so that \'
-            // inside the literal does not terminate the scanner prematurely.
             if (src[i] == b'E' || src[i] == b'e') && i + 1 < len && src[i + 1] == b'\'' {
-                result.push(src[i]); // E / e
+                result.push(src[i]);
                 result.push(b'\'');
                 i += 2;
                 Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', true);
+                newline_count = 0;
                 continue;
             }
             // Single-quoted string — pass through verbatim (handle '' escapes)
@@ -312,6 +309,7 @@ impl Comparer {
                 result.push(b'\'');
                 i += 1;
                 Self::copy_quoted_literal(src, &mut result, &mut i, b'\'', false);
+                newline_count = 0;
                 continue;
             }
             // Double-quoted identifier — pass through verbatim (handle "" escapes)
@@ -319,12 +317,11 @@ impl Comparer {
                 result.push(b'"');
                 i += 1;
                 Self::copy_quoted_literal(src, &mut result, &mut i, b'"', false);
+                newline_count = 0;
                 continue;
             }
             // Block comment /* ... */ — strip.
-            // PostgreSQL allows arbitrarily nested block comments
-            // (/* outer /* inner */ still outer */); track a depth counter so
-            // every nesting level is consumed before resuming normal scanning.
+            // PostgreSQL allows arbitrarily nested block comments; track depth.
             if i + 1 < len && src[i] == b'/' && src[i + 1] == b'*' {
                 i += 2;
                 let mut depth: usize = 1;
@@ -340,7 +337,6 @@ impl Comparer {
                     }
                 }
                 if depth > 0 {
-                    // Unterminated comment — consumed to end of input.
                     i = len;
                 }
                 continue;
@@ -353,93 +349,23 @@ impl Comparer {
                 }
                 continue;
             }
-            result.push(src[i]);
+            // Regular byte — apply newline collapsing
+            if src[i] == b'\n' {
+                newline_count += 1;
+                if newline_count <= 2 {
+                    result.push(b'\n');
+                }
+            } else {
+                newline_count = 0;
+                result.push(src[i]);
+            }
             i += 1;
         }
 
         // Safety: result is built entirely from slices of self.script (valid UTF-8),
         // so it is guaranteed to be valid UTF-8.
         let result = String::from_utf8(result).expect("output must be valid UTF-8");
-
-        // Collapse runs of 3+ newlines into 2, but skip all quoted literals
-        // (dollar-quoted, single-quoted, E-string, double-quoted) so that
-        // blank lines inside procedure/function source code and multi-line
-        // string literals (e.g. COMMENT bodies) are preserved.
-        let rbytes = result.as_bytes();
-        let rlen = rbytes.len();
-        let mut collapsed: Vec<u8> = Vec::with_capacity(rlen);
-        let mut newline_count = 0u32;
-        let mut ri = 0;
-        while ri < rlen {
-            // Detect dollar-quote opener and copy the entire quoted body verbatim
-            if rbytes[ri] == b'$'
-                && let Some(tag_len) = Self::dollar_tag_at(rbytes, ri)
-            {
-                let tag = &rbytes[ri..ri + tag_len];
-                // Copy opening tag
-                collapsed.extend_from_slice(tag);
-                ri += tag_len;
-                newline_count = 0;
-                // Copy body until matching closing tag
-                loop {
-                    if ri >= rlen {
-                        break;
-                    }
-                    if rbytes[ri] == b'$'
-                        && let Some(close_len) = Self::dollar_tag_at(rbytes, ri)
-                        && close_len == tag_len
-                        && &rbytes[ri..ri + close_len] == tag
-                    {
-                        collapsed.extend_from_slice(&rbytes[ri..ri + close_len]);
-                        ri += close_len;
-                        break;
-                    }
-                    collapsed.push(rbytes[ri]);
-                    ri += 1;
-                }
-                continue;
-            }
-            // E-string literal E'...' or e'...' — copy verbatim
-            if (rbytes[ri] == b'E' || rbytes[ri] == b'e')
-                && ri + 1 < rlen
-                && rbytes[ri + 1] == b'\''
-            {
-                collapsed.push(rbytes[ri]); // E / e
-                collapsed.push(b'\'');
-                ri += 2;
-                Self::copy_quoted_literal(rbytes, &mut collapsed, &mut ri, b'\'', true);
-                newline_count = 0;
-                continue;
-            }
-            // Single-quoted string — copy verbatim
-            if rbytes[ri] == b'\'' {
-                collapsed.push(b'\'');
-                ri += 1;
-                Self::copy_quoted_literal(rbytes, &mut collapsed, &mut ri, b'\'', false);
-                newline_count = 0;
-                continue;
-            }
-            // Double-quoted identifier — copy verbatim
-            if rbytes[ri] == b'"' {
-                collapsed.push(b'"');
-                ri += 1;
-                Self::copy_quoted_literal(rbytes, &mut collapsed, &mut ri, b'"', false);
-                newline_count = 0;
-                continue;
-            }
-            if rbytes[ri] == b'\n' {
-                newline_count += 1;
-                if newline_count <= 2 {
-                    collapsed.push(b'\n');
-                }
-            } else {
-                newline_count = 0;
-                collapsed.push(rbytes[ri]);
-            }
-            ri += 1;
-        }
-        let collapsed = String::from_utf8(collapsed).expect("output must be valid UTF-8");
-        let trimmed = collapsed.trim();
+        let trimmed = result.trim();
         if trimmed.is_empty() {
             return String::new();
         }
