@@ -1,7 +1,7 @@
 2026-04-16      v1.0.14
                 
                 Features:
-                    - Bug: multiline inside code block with no commens flag fixed.
+                    - Fixed multiline handling inside code blocks when comments are disabled.
 
 2026-04-09      v1.0.13
 
