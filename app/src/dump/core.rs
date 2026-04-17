@@ -954,11 +954,18 @@ impl Dump {
                     None
                 };
 
+                let routine_lang: String = row.get("prolang");
+                let default_cost: f64 = match routine_lang.as_str() {
+                    "c" | "internal" => 1.0,
+                    _ => 100.0,
+                };
+                let is_procedure = prokind == "procedure";
+
                 let mut routine = Routine {
                     schema: row.get("nspname"),
                     oid: row.get("oid"),
                     name: row.get("proname"),
-                    lang: row.get("prolang"),
+                    lang: routine_lang,
                     kind: prokind,
                     return_type: row
                         .get::<Option<String>, _>("prorettype")
@@ -984,10 +991,11 @@ impl Dump {
                     cost: {
                         let c: Option<f32> = row.get("procost");
                         c.map(|v| v as f64)
+                            .filter(|v| !is_procedure && (*v - default_cost).abs() > f64::EPSILON)
                     },
                     rows: {
                         let r: Option<f32> = row.get("prorows");
-                        r.map(|v| v as f64).filter(|v| *v > 0.0)
+                        r.map(|v| v as f64).filter(|v| !is_procedure && *v > 0.0)
                     },
                     support_function: row.get("prosupport"),
                     transform_types: row

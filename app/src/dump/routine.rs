@@ -358,21 +358,26 @@ impl Routine {
             flags.push("WINDOW".to_string());
         }
 
-        // COST
-        if let Some(cost) = self.cost {
+        // COST (not valid for procedures)
+        if kind != "procedure"
+            && let Some(cost) = self.cost
+        {
             // Default cost is 1 for C/internal, 100 for others; always emit if set
             flags.push(format!("COST {cost}"));
         }
 
-        // ROWS (only for set-returning functions)
-        if let Some(rows) = self.rows
+        // ROWS (only for set-returning functions, not procedures)
+        if kind != "procedure"
+            && let Some(rows) = self.rows
             && rows > 0.0
         {
             flags.push(format!("ROWS {rows}"));
         }
 
-        // SUPPORT function
-        if let Some(ref support) = self.support_function {
+        // SUPPORT function (not valid for procedures)
+        if kind != "procedure"
+            && let Some(ref support) = self.support_function
+        {
             flags.push(format!("SUPPORT {support}"));
         }
 
@@ -393,7 +398,18 @@ impl Routine {
             if let Some(pos) = entry.find('=') {
                 let name = entry[..pos].trim();
                 let value = entry[pos + 1..].trim();
-                parts.push(format!(" SET {} = '{}'", name, value.replace('\'', "''")));
+                // For list-valued GUCs (e.g. search_path), proconfig stores values
+                // with double-quote delimiters (e.g. "public, pg_temp"). These must
+                // NOT be wrapped in single quotes because that would turn them into
+                // a string literal, changing the semantics (the comma becomes part of
+                // a single identifier instead of separating list elements).
+                // Use the value verbatim when it contains double quotes; otherwise
+                // wrap in single quotes as a safe string literal.
+                if value.contains('"') {
+                    parts.push(format!(" SET {name} = {value}"));
+                } else {
+                    parts.push(format!(" SET {name} = '{}'", value.replace('\'', "''")));
+                }
             }
         }
         parts.join("")
@@ -1408,12 +1424,12 @@ mod tests {
     fn get_config_clause_multiple_params() {
         let mut routine = build_function_routine();
         routine.config = vec![
-            "search_path=public, pg_temp".to_string(),
+            "search_path=\"public, pg_temp\"".to_string(),
             "lock_timeout=5s".to_string(),
         ];
         assert_eq!(
             routine.get_config_clause(),
-            " SET search_path = 'public, pg_temp' SET lock_timeout = '5s'"
+            " SET search_path = \"public, pg_temp\" SET lock_timeout = '5s'"
         );
     }
 

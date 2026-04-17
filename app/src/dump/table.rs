@@ -468,8 +468,8 @@ impl Table {
                         None
                     },
                     statistics_target: {
-                        let st: i32 = row.get("col_stattarget");
-                        if st >= 0 { Some(st) } else { None }
+                        let st: Option<i16> = row.get("col_stattarget");
+                        st.filter(|&v| v >= 0).map(|v| v as i32)
                     },
                     serial_type: None,
                 };
