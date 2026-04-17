@@ -4,33 +4,150 @@ use sqlx::postgres::types::Oid;
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL table.
+// This is an information about a PostgreSQL table trigger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableTrigger {
     pub oid: Oid,           // Object identifier of the trigger
     pub name: String,       // Name of the trigger
     pub definition: String, // Definition of the trigger
+    /// Trigger enabled state from pg_trigger.tgenabled:
+    /// 'O' = fires in "origin" and "local" modes (the default),
+    /// 'D' = disabled,
+    /// 'R' = fires in "replica" mode only,
+    /// 'A' = fires always.
+    #[serde(default = "TableTrigger::default_enabled")]
+    pub enabled: String,
+    /// Optional comment on the trigger
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl TableTrigger {
+    fn default_enabled() -> String {
+        "O".to_string()
+    }
+
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.name.as_bytes());
         hasher.update(self.definition.as_bytes());
+        hasher.update(self.enabled.as_bytes());
+        if let Some(ref comment) = self.comment {
+            hasher.update((comment.len() as u64).to_le_bytes());
+            hasher.update(comment.as_bytes());
+        }
     }
 
     /// Returns a string representation of the trigger
-    pub fn get_script(&self) -> String {
+    pub fn get_script(&self, schema: &str, table: &str) -> String {
         let mut script = String::new();
         script.push_str(&self.definition);
         script.append_block(";");
+        // Emit enable/disable state if not the default 'O'
+        match self.enabled.as_str() {
+            "D" => {
+                script.append_block(&format!(
+                    "alter table {schema}.{table} disable trigger {};",
+                    self.name
+                ));
+            }
+            "R" => {
+                script.append_block(&format!(
+                    "alter table {schema}.{table} enable replica trigger {};",
+                    self.name
+                ));
+            }
+            "A" => {
+                script.append_block(&format!(
+                    "alter table {schema}.{table} enable always trigger {};",
+                    self.name
+                ));
+            }
+            _ => {} // 'O' is the default, no extra statement needed
+        }
+        // Emit comment if present
+        if let Some(ref comment) = self.comment {
+            script.append_block(&format!(
+                "comment on trigger {} on {schema}.{table} is '{}';",
+                self.name,
+                comment.replace('\'', "''")
+            ));
+        }
+        script
+    }
+
+    /// Returns ALTER statements for changes between two trigger versions
+    pub fn get_alter_script(
+        &self,
+        target: &TableTrigger,
+        schema: &str,
+        table: &str,
+        use_drop: bool,
+    ) -> String {
+        let mut script = String::new();
+
+        // If the definition changed, drop and recreate
+        if self.definition != target.definition {
+            let drop_cmd = format!("drop trigger if exists {} on {schema}.{table};", self.name)
+                .with_empty_lines();
+            if use_drop {
+                script.push_str(&drop_cmd);
+            } else {
+                script.push_str(&format!("-- {}", drop_cmd));
+            }
+            script.push_str(&target.definition);
+            script.append_block(";");
+        }
+
+        // Handle enabled state change
+        if self.enabled != target.enabled {
+            let stmt = match target.enabled.as_str() {
+                "D" => format!(
+                    "alter table {schema}.{table} disable trigger {};",
+                    target.name
+                ),
+                "R" => format!(
+                    "alter table {schema}.{table} enable replica trigger {};",
+                    target.name
+                ),
+                "A" => format!(
+                    "alter table {schema}.{table} enable always trigger {};",
+                    target.name
+                ),
+                _ => format!(
+                    "alter table {schema}.{table} enable trigger {};",
+                    target.name
+                ),
+            };
+            script.append_block(&stmt);
+        }
+
+        // Handle comment change
+        if self.comment != target.comment {
+            if let Some(ref comment) = target.comment {
+                script.append_block(&format!(
+                    "comment on trigger {} on {schema}.{table} is '{}';",
+                    target.name,
+                    comment.replace('\'', "''")
+                ));
+            } else {
+                script.append_block(&format!(
+                    "comment on trigger {} on {schema}.{table} is null;",
+                    target.name
+                ));
+            }
+        }
+
         script
     }
 }
 
 impl PartialEq for TableTrigger {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.definition == other.definition
+        self.name == other.name
+            && self.definition == other.definition
+            && self.enabled == other.enabled
+            && self.comment == other.comment
     }
 }
 
@@ -44,6 +161,8 @@ mod tests {
             oid: Oid(12345),
             name: "test_trigger".to_string(),
             definition: "before insert or update on test_table for each row execute function test_function()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }
     }
 
@@ -53,6 +172,8 @@ mod tests {
             name: "simple_trigger".to_string(),
             definition: "after delete on users for each row execute function audit_delete()"
                 .to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }
     }
 
@@ -61,6 +182,8 @@ mod tests {
             oid: Oid(11111),
             name: "complex_trigger".to_string(),
             definition: "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }
     }
 
@@ -173,7 +296,7 @@ mod tests {
     #[test]
     fn test_get_script_simple() {
         let trigger = create_test_trigger();
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "test_table");
 
         let expected = "before insert or update on test_table for each row execute function test_function();\n\n";
         assert_eq!(script, expected);
@@ -182,7 +305,7 @@ mod tests {
     #[test]
     fn test_get_script_after_delete() {
         let trigger = create_simple_trigger();
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "users");
 
         let expected = "after delete on users for each row execute function audit_delete();\n\n";
         assert_eq!(script, expected);
@@ -191,7 +314,7 @@ mod tests {
     #[test]
     fn test_get_script_complex() {
         let trigger = create_complex_trigger();
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "users");
 
         let expected = "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user();\n\n";
         assert_eq!(script, expected);
@@ -203,9 +326,11 @@ mod tests {
             oid: Oid(22222),
             name: "test_trigger$name".to_string(),
             definition: "before insert on \"special-table\" for each row execute function \"validate_data\"()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         };
 
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "\"special-table\"");
         let expected = "before insert on \"special-table\" for each row execute function \"validate_data\"();\n\n";
         assert_eq!(script, expected);
     }
@@ -216,11 +341,84 @@ mod tests {
             oid: Oid(33333),
             name: "empty_trigger".to_string(),
             definition: "".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         };
 
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "test");
         let expected = ";\n\n";
         assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn test_get_script_disabled_trigger() {
+        let trigger = TableTrigger {
+            oid: Oid(44444),
+            name: "disabled_trigger".to_string(),
+            definition: "before insert on public.test for each row execute function func()"
+                .to_string(),
+            enabled: "D".to_string(),
+            comment: None,
+        };
+
+        let script = trigger.get_script("public", "test");
+        assert!(script.contains("alter table public.test disable trigger disabled_trigger;"));
+    }
+
+    #[test]
+    fn test_get_script_always_trigger() {
+        let trigger = TableTrigger {
+            oid: Oid(55555),
+            name: "always_trigger".to_string(),
+            definition: "before insert on public.test for each row execute function func()"
+                .to_string(),
+            enabled: "A".to_string(),
+            comment: None,
+        };
+
+        let script = trigger.get_script("public", "test");
+        assert!(script.contains("alter table public.test enable always trigger always_trigger;"));
+    }
+
+    #[test]
+    fn test_get_script_with_comment() {
+        let trigger = TableTrigger {
+            oid: Oid(66666),
+            name: "commented_trigger".to_string(),
+            definition: "before insert on public.test for each row execute function func()"
+                .to_string(),
+            enabled: "O".to_string(),
+            comment: Some("Audit trigger".to_string()),
+        };
+
+        let script = trigger.get_script("public", "test");
+        assert!(
+            script.contains(
+                "comment on trigger commented_trigger on public.test is 'Audit trigger';"
+            )
+        );
+    }
+
+    #[test]
+    fn test_alter_script_enabled_change() {
+        let from = TableTrigger {
+            oid: Oid(1),
+            name: "trg".to_string(),
+            definition: "before insert on public.t for each row execute function f()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
+        };
+        let to = TableTrigger {
+            oid: Oid(1),
+            name: "trg".to_string(),
+            definition: "before insert on public.t for each row execute function f()".to_string(),
+            enabled: "D".to_string(),
+            comment: None,
+        };
+
+        let script = from.get_alter_script(&to, "public", "t", true);
+        assert!(script.contains("disable trigger"));
+        assert!(!script.contains("drop trigger"));
     }
 
     #[test]
@@ -315,6 +513,8 @@ mod tests {
             oid: Oid(0),
             name: "".to_string(),
             definition: "".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         };
 
         // Should handle empty strings gracefully
@@ -329,7 +529,7 @@ mod tests {
         assert_eq!(hash.len(), 64);
 
         // Script should work with empty strings
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "t");
         assert_eq!(script, ";\n\n");
 
         // Equality should work
@@ -337,6 +537,8 @@ mod tests {
             oid: Oid(0),
             name: "".to_string(),
             definition: "".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         };
         assert_eq!(trigger, trigger2);
     }
@@ -347,9 +549,11 @@ mod tests {
             oid: Oid(44444),
             name: "multiline_trigger".to_string(),
             definition: "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         };
 
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "users");
         let expected = "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email();\n\n";
         assert_eq!(script, expected);
 
@@ -369,14 +573,16 @@ mod tests {
             + "()";
 
         let trigger = TableTrigger {
-            oid: Oid(55555),
+            oid: Oid(55556),
             name: "long_trigger".to_string(),
             definition: long_definition.clone(),
+            enabled: "O".to_string(),
+            comment: None,
         };
 
         assert_eq!(trigger.definition, long_definition);
 
-        let script = trigger.get_script();
+        let script = trigger.get_script("public", "t");
         assert_eq!(script, format!("{};\n\n", long_definition));
 
         // Hash should work with very long definitions
@@ -392,12 +598,15 @@ mod tests {
             oid: Oid(1),
             name: "test".to_string(),
             definition: "definition".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         };
 
         // Create the same hash as the implementation
         let mut hasher = Sha256::new();
         hasher.update("test".as_bytes()); // name
         hasher.update("definition".as_bytes()); // definition
+        hasher.update("O".as_bytes()); // enabled
 
         let expected_hash = format!("{:x}", hasher.finalize());
 
@@ -417,31 +626,39 @@ mod tests {
                 name: "before_insert_trigger".to_string(),
                 definition: "before insert on table1 for each row execute function func1()"
                     .to_string(),
+                enabled: "O".to_string(),
+                comment: None,
             },
             TableTrigger {
                 oid: Oid(1002),
                 name: "after_update_trigger".to_string(),
                 definition: "after update on table2 for each row execute function func2()"
                     .to_string(),
+                enabled: "O".to_string(),
+                comment: None,
             },
             TableTrigger {
                 oid: Oid(1003),
                 name: "instead_of_trigger".to_string(),
                 definition: "instead of delete on view1 for each row execute function func3()"
                     .to_string(),
+                enabled: "O".to_string(),
+                comment: None,
             },
             TableTrigger {
                 oid: Oid(1004),
                 name: "statement_trigger".to_string(),
                 definition: "after truncate on table3 for each statement execute function func4()"
                     .to_string(),
+                enabled: "O".to_string(),
+                comment: None,
             },
         ];
 
         for trigger in triggers {
             // Each should produce a valid script (definition + semicolon)
-            let script = trigger.get_script();
-            assert_eq!(script, format!("{};\n\n", trigger.definition));
+            let script = trigger.get_script("public", "t");
+            assert!(script.starts_with(&trigger.definition));
 
             // Each should produce a valid hash
             let mut hasher = Sha256::new();

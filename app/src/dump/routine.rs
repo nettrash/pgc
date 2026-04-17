@@ -707,7 +707,7 @@ impl Routine {
             other => other.to_string(),
         };
         format!(
-            "drop {} if exists {}.{} ({});",
+            "drop {} if exists {}.{} ({}) cascade;",
             drop_kind,
             self.schema,
             self.name,
@@ -985,7 +985,7 @@ mod tests {
         let routine = build_function_routine();
         let drop_script = routine.get_drop_script();
 
-        let expected = "drop function if exists public.add (a integer);\n\n";
+        let expected = "drop function if exists public.add (a integer) cascade;\n\n";
         assert_eq!(drop_script, expected);
     }
 

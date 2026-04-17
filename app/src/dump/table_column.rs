@@ -61,6 +61,8 @@ pub struct TableColumn {
     pub compression: Option<String>, // Column compression method (pglz, lz4; PG14+)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statistics_target: Option<i32>, // Per-column statistics target (attstattarget; -1 = use default)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>, // Column-level ACL entries (attacl)
     #[serde(skip)]
     pub serial_type: Option<String>, // Transient: set at comparison time to "serial", "bigserial", or "smallserial"
 }
@@ -899,6 +901,7 @@ mod tests {
             storage: None,
             compression: None,
             statistics_target: None,
+            acl: vec![],
             serial_type: None,
         }
     }

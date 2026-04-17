@@ -125,7 +125,7 @@ async fn compare_routines_drops_and_recreates_on_return_type_change() {
     comparer.compare_routines().await.unwrap();
     let script = comparer.get_script();
 
-    assert!(script.contains("drop function if exists public.test_func ();"));
+    assert!(script.contains("drop function if exists public.test_func () cascade;"));
     assert!(script.contains("create or replace function public.test_func() returns text"));
 }
 
@@ -167,7 +167,7 @@ async fn compare_routines_drops_and_recreates_on_argument_change() {
     comparer.compare_routines().await.unwrap();
     let script = comparer.get_script();
 
-    assert!(script.contains("drop function if exists public.test_func (a integer);"));
+    assert!(script.contains("drop function if exists public.test_func (a integer) cascade;"));
     assert!(script.contains("create or replace function public.test_func(a text) returns integer"));
 }
 
@@ -250,7 +250,7 @@ async fn compare_drops_types_after_routines() {
         .find("drop function if exists test_schema.get_users_by_status")
         .expect("routine drop script not found");
     let type_drop_pos = script
-        .find("drop type if exists test_schema.status_type;")
+        .find("drop type if exists test_schema.status_type cascade;")
         .expect("type drop script not found");
 
     assert!(
@@ -294,7 +294,7 @@ async fn compare_drops_enums_after_routines() {
         .find("drop function if exists test_schema.get_users_by_status_enum")
         .expect("routine drop script not found");
     let enum_drop_pos = script
-        .find("drop type if exists test_schema.status_enum;")
+        .find("drop type if exists test_schema.status_enum cascade;")
         .expect("enum drop script not found");
 
     assert!(
@@ -331,7 +331,7 @@ async fn compare_composite_types_drops_removed_and_creates_new() {
     assert!(script.contains("create type test_schema.test_type_B as ("));
     assert!(script.contains("\"street\" varchar(255)"));
     assert!(script.contains("\"city\" varchar(100)"));
-    assert!(script.contains("drop type if exists test_schema.test_type_A;"));
+    assert!(script.contains("drop type if exists test_schema.test_type_A cascade;"));
 }
 
 #[tokio::test]
@@ -768,6 +768,7 @@ fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColum
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     }
 }
@@ -848,6 +849,7 @@ async fn compare_sequences_skips_owned_by_serial_column() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -952,6 +954,7 @@ async fn compare_sequences_skips_owned_by_identity_column() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1313,6 +1316,7 @@ async fn compare_sequences_skips_drop_if_owned_by_dropped_table() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1414,6 +1418,7 @@ async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1486,6 +1491,7 @@ async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1576,6 +1582,7 @@ async fn tables_create_parent_before_partition_and_fk_after_tables() {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }],
         vec![],
         vec![],
@@ -2144,6 +2151,7 @@ async fn serial_column_uses_serial_type_in_table_script() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
     let serial_table = Table::new(
@@ -2231,6 +2239,7 @@ async fn serial_column_uses_serial_type_in_table_script() {
         storage: None,
         compression: None,
         statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
     let bigserial_table = Table::new(
@@ -4334,7 +4343,7 @@ async fn compare_routines_overloaded_drop_only_removed_overload() {
     let script = comparer.get_script();
 
     assert!(
-        script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb);"),
+        script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb) cascade;"),
         "Removed overload must be dropped, got: {script}"
     );
     assert!(
@@ -4529,6 +4538,7 @@ async fn fk_pre_drop_commented_when_use_drop_false() {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }],
         vec![],
         vec![],
@@ -4610,6 +4620,7 @@ async fn fk_pre_drop_active_when_use_drop_true() {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }],
         vec![],
         vec![],
@@ -4655,6 +4666,8 @@ async fn trigger_pre_drop_commented_when_use_drop_false() {
             oid: Oid(9999),
             name: "trg_events_audit".to_string(),
             definition: "before insert on events for each row execute function audit()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }],
         None,
     );
@@ -4704,6 +4717,8 @@ async fn trigger_pre_drop_active_when_use_drop_true() {
             oid: Oid(9999),
             name: "trg_events_audit".to_string(),
             definition: "before insert on events for each row execute function audit()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }],
         None,
     );

@@ -1516,3 +1516,164 @@ GRANT SELECT ON test_schema.product_inventory TO pgc_grant_writer;
 
 -- Function grants (update_timestamp grant removed; new function grant added)
 GRANT EXECUTE ON FUNCTION test_schema.calculate_average_rating(UUID) TO pgc_grant_reader;
+
+-- =============================================================================
+-- Rules comparison test (TO side)
+-- =============================================================================
+-- test_products_no_delete: same as FROM (no diff)
+-- test_users_soft_delete:  removed (FROM-only)
+-- test_reviews_audit:      added (TO-only)
+CREATE RULE rule_products_no_delete AS ON DELETE TO test_schema.products DO INSTEAD NOTHING;
+
+CREATE RULE rule_reviews_audit AS ON INSERT TO test_schema.reviews
+    DO ALSO
+        INSERT INTO shared_schema.audit_logs (table_name, operation, new_values)
+        VALUES ('reviews', 'INSERT', row_to_json(NEW)::jsonb);
+
+-- =============================================================================
+-- Event triggers comparison test (TO side)
+-- =============================================================================
+-- test_etrig_unchanged: same as FROM (no diff)
+-- test_etrig_from_only: removed (FROM-only)
+-- test_etrig_to_only:   added (TO-only)
+CREATE OR REPLACE FUNCTION test_schema.etrig_log_ddl() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE 'DDL event: % on %', TG_EVENT, TG_TAG;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION test_schema.etrig_to_only_fn() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NULL;
+END;
+$$;
+
+CREATE EVENT TRIGGER test_etrig_unchanged
+    ON ddl_command_start
+    EXECUTE FUNCTION test_schema.etrig_log_ddl();
+
+CREATE EVENT TRIGGER test_etrig_to_only
+    ON ddl_command_end
+    EXECUTE FUNCTION test_schema.etrig_to_only_fn();
+
+-- =============================================================================
+-- Collations comparison test (TO side)
+-- =============================================================================
+-- test_coll_unchanged: same as FROM (no diff); test_coll_from_only: removed; test_coll_to_only: added
+CREATE COLLATION test_schema.test_coll_unchanged (provider = libc, lc_collate = 'C', lc_ctype = 'C');
+CREATE COLLATION test_schema.test_coll_to_only (provider = libc, lc_collate = 'C', lc_ctype = 'C');
+
+-- =============================================================================
+-- Text search dictionary comparison test (TO side)
+-- =============================================================================
+-- test_dict_unchanged: same; test_dict_from_only: removed; test_dict_modified: stopwords removed; test_dict_to_only: added
+CREATE TEXT SEARCH DICTIONARY test_schema.test_dict_unchanged (
+    TEMPLATE = pg_catalog.simple,
+    STOPWORDS = english
+);
+CREATE TEXT SEARCH DICTIONARY test_schema.test_dict_modified (  -- MODIFIED: STOPWORDS removed
+    TEMPLATE = pg_catalog.simple
+);
+CREATE TEXT SEARCH DICTIONARY test_schema.test_dict_to_only (
+    TEMPLATE = pg_catalog.simple
+);
+
+-- =============================================================================
+-- Text search configuration comparison test (TO side)
+-- =============================================================================
+-- test_tsconfig_unchanged: same; test_tsconfig_from_only: removed; test_tsconfig_to_only: added
+CREATE TEXT SEARCH CONFIGURATION test_schema.test_tsconfig_unchanged (
+    PARSER = pg_catalog.default
+);
+CREATE TEXT SEARCH CONFIGURATION test_schema.test_tsconfig_to_only (
+    PARSER = pg_catalog.default
+);
+
+-- =============================================================================
+-- Cast comparison test (TO side)
+-- =============================================================================
+-- FROM-only cast (test_type_A → text) removed (test_type_A doesn't exist in TO)
+-- Shared cast unchanged: user_profile → text
+-- TO-only cast added: test_type_B → text
+CREATE OR REPLACE FUNCTION test_schema.user_profile_to_text(test_schema.user_profile) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT ($1).first_name || ' ' || ($1).last_name; $$;
+
+CREATE CAST (test_schema.user_profile AS text)
+    WITH FUNCTION test_schema.user_profile_to_text(test_schema.user_profile);
+
+CREATE OR REPLACE FUNCTION test_schema.test_type_b_to_text(test_schema.test_type_B) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT ($1).street || ', ' || ($1).city; $$;
+
+CREATE CAST (test_schema.test_type_B AS text)
+    WITH FUNCTION test_schema.test_type_b_to_text(test_schema.test_type_B);
+
+-- =============================================================================
+-- Operator comparison test (TO side)
+-- =============================================================================
+-- Unchanged: ~< (text, int) → bool (same as FROM)
+-- FROM-only ~> dropped (text_longer_than and ~> not present in TO)
+-- TO-only added: ~= (text, int) → bool — length($1) = $2
+CREATE OR REPLACE FUNCTION test_schema.text_shorter_than(text, integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT length($1) < $2; $$;
+
+CREATE OPERATOR test_schema.~< (
+    LEFTARG = text,
+    RIGHTARG = integer,
+    FUNCTION = test_schema.text_shorter_than
+);
+
+CREATE OR REPLACE FUNCTION test_schema.text_equals_length(text, integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT length($1) = $2; $$;
+
+CREATE OPERATOR test_schema.~= (
+    LEFTARG = text,
+    RIGHTARG = integer,
+    FUNCTION = test_schema.text_equals_length
+);
+
+-- =============================================================================
+-- Default privileges comparison test (TO side)
+-- =============================================================================
+-- reader SELECT on new tables in test_schema: unchanged
+-- writer INSERT only: MODIFIED to SELECT, INSERT, UPDATE
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_schema
+    GRANT SELECT ON TABLES TO pgc_grant_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_schema
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO pgc_grant_writer;  -- MODIFIED: was INSERT only
+
+-- =============================================================================
+-- Foreign server and user mapping comparison test (TO side)
+-- =============================================================================
+-- test_server_modified: host and dbname changed; test_server_from_only: removed; test_server_to_only: added
+CREATE SERVER test_server_modified
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'server-host-b', dbname 'db_b', port '5432');  -- MODIFIED: host and dbname changed
+
+CREATE SERVER test_server_to_only
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'new-host', dbname 'new_db');
+
+-- User mapping unchanged: PUBLIC on test_foreign_server
+-- User mapping dropped:   PUBLIC on test_server_from_only (server removed)
+-- User mapping added:     PUBLIC on test_server_to_only (server added)
+CREATE USER MAPPING FOR PUBLIC
+    SERVER test_foreign_server
+    OPTIONS (user 'readonly_user');
+
+CREATE USER MAPPING FOR PUBLIC
+    SERVER test_server_to_only
+    OPTIONS (user 'new_readonly_user');
+
+-- =============================================================================
+-- Publications comparison test (TO side)
+-- =============================================================================
+-- Requires wal_level = logical.
+-- test_pub_from_only: removed; test_pub_unchanged: same as FROM; test_pub_to_only: added
+CREATE PUBLICATION test_pub_unchanged FOR TABLE test_schema.users, test_schema.products;
+CREATE PUBLICATION test_pub_to_only FOR ALL TABLES;

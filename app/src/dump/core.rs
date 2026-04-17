@@ -1,11 +1,20 @@
+use crate::dump::cast::Cast;
+use crate::dump::collation::Collation;
+use crate::dump::default_privilege::DefaultPrivilege;
+use crate::dump::event_trigger::EventTrigger;
+use crate::dump::fdw::{ForeignDataWrapper, ForeignServer, UserMapping};
 use crate::dump::foreign_table::{ForeignTable, ForeignTableColumn};
+use crate::dump::operator::Operator;
 use crate::dump::pg_enum::PgEnum;
 use crate::dump::pg_type::{CompositeAttribute, DomainConstraint, PgType};
+use crate::dump::publication::{Publication, Subscription};
 use crate::dump::routine::Routine;
+use crate::dump::rule::Rule;
 use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::statistic::Statistic;
 use crate::dump::table::{PgCatalogCaps, Table};
+use crate::dump::text_search::{TextSearchConfig, TextSearchDict};
 use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
 use futures::stream::{self, StreamExt};
@@ -29,7 +38,7 @@ use zip::write::SimpleFileOptions;
 ///
 /// **Keep in sync** with the number of non-table futures passed to
 /// `tokio::try_join!` in `Dump::fill()`.
-const FILL_SIBLING_BRANCH_COUNT: u32 = 7;
+const FILL_SIBLING_BRANCH_COUNT: u32 = 11;
 
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +78,58 @@ pub struct Dump {
     // List of extended statistics in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statistics: Vec<Statistic>,
+
+    // List of rules in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
+
+    // List of event triggers in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_triggers: Vec<EventTrigger>,
+
+    // List of collations in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collations: Vec<Collation>,
+
+    // List of text search configurations in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ts_configs: Vec<TextSearchConfig>,
+
+    // List of text search dictionaries in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ts_dicts: Vec<TextSearchDict>,
+
+    // List of user-defined casts in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub casts: Vec<Cast>,
+
+    // List of user-defined operators in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<Operator>,
+
+    // List of default ACL entries in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_privileges: Vec<DefaultPrivilege>,
+
+    // List of publications in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publications: Vec<Publication>,
+
+    // List of subscriptions in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<Subscription>,
+
+    // List of foreign-data wrappers in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_data_wrappers: Vec<ForeignDataWrapper>,
+
+    // List of foreign servers in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_servers: Vec<ForeignServer>,
+
+    // List of user mappings in the dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_mappings: Vec<UserMapping>,
 }
 
 impl Dump {
@@ -86,6 +147,19 @@ impl Dump {
             views: Vec::new(),
             foreign_tables: Vec::new(),
             statistics: Vec::new(),
+            rules: Vec::new(),
+            event_triggers: Vec::new(),
+            collations: Vec::new(),
+            ts_configs: Vec::new(),
+            ts_dicts: Vec::new(),
+            casts: Vec::new(),
+            operators: Vec::new(),
+            default_privileges: Vec::new(),
+            publications: Vec::new(),
+            subscriptions: Vec::new(),
+            foreign_data_wrappers: Vec::new(),
+            foreign_servers: Vec::new(),
+            user_mappings: Vec::new(),
         }
     }
 
@@ -174,6 +248,37 @@ impl Dump {
         let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
         let foreign_tables_fut = Self::fetch_foreign_tables_standalone(pool, &schema_filter);
         let statistics_fut = Self::fetch_statistics_standalone(pool, &schema_filter);
+        let rules_fut = Self::fetch_rules_standalone(pool, &schema_filter);
+        let event_triggers_fut = Self::fetch_event_triggers_standalone(pool);
+        let schema_extras_fut = {
+            let schema_filter = schema_filter.clone();
+            async move {
+                let collations = Self::fetch_collations_standalone(pool, &schema_filter).await?;
+                let ts_configs = Self::fetch_ts_configs_standalone(pool, &schema_filter).await?;
+                let ts_dicts = Self::fetch_ts_dicts_standalone(pool, &schema_filter).await?;
+                let operators = Self::fetch_operators_standalone(pool, &schema_filter).await?;
+                Ok::<_, Error>((collations, ts_configs, ts_dicts, operators))
+            }
+        };
+        let global_extras_fut = async {
+            let casts = Self::fetch_casts_standalone(pool, &schema_filter).await?;
+            let default_privileges =
+                Self::fetch_default_privileges_standalone(pool, &schema_filter).await?;
+            let publications = Self::fetch_publications_standalone(pool).await?;
+            let subscriptions = Self::fetch_subscriptions_standalone(pool).await?;
+            let fdws = Self::fetch_fdws_standalone(pool).await?;
+            let servers = Self::fetch_servers_standalone(pool).await?;
+            let user_mappings = Self::fetch_user_mappings_standalone(pool).await?;
+            Ok::<_, Error>((
+                casts,
+                default_privileges,
+                publications,
+                subscriptions,
+                fdws,
+                servers,
+                user_mappings,
+            ))
+        };
 
         let (
             types_enums,
@@ -184,6 +289,10 @@ impl Dump {
             views,
             foreign_tables,
             statistics,
+            rules,
+            event_triggers,
+            schema_extras,
+            global_extras,
         ) = tokio::try_join!(
             types_enums_fut,
             extensions_fut,
@@ -193,6 +302,10 @@ impl Dump {
             views_fut,
             foreign_tables_fut,
             statistics_fut,
+            rules_fut,
+            event_triggers_fut,
+            schema_extras_fut,
+            global_extras_fut,
         )?;
 
         let (types, enums) = types_enums;
@@ -205,6 +318,24 @@ impl Dump {
         self.views = views;
         self.foreign_tables = foreign_tables;
         self.statistics = statistics;
+        self.rules = rules;
+        self.event_triggers = event_triggers;
+
+        let (collations, ts_configs, ts_dicts, operators) = schema_extras;
+        self.collations = collations;
+        self.ts_configs = ts_configs;
+        self.ts_dicts = ts_dicts;
+        self.operators = operators;
+
+        let (casts, default_privileges, publications, subscriptions, fdws, servers, user_mappings) =
+            global_extras;
+        self.casts = casts;
+        self.default_privileges = default_privileges;
+        self.publications = publications;
+        self.subscriptions = subscriptions;
+        self.foreign_data_wrappers = fdws;
+        self.foreign_servers = servers;
+        self.user_mappings = user_mappings;
 
         Ok(())
     }
@@ -486,6 +617,16 @@ impl Dump {
                 t.typcollation,
                 t.typdefault,
                 pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype,
+                case when t.typcollation <> 0 then
+                    (select quote_ident(cn.nspname) || '.' || quote_ident(cc.collname)
+                     from pg_collation cc
+                     join pg_namespace cn on cn.oid = cc.collnamespace
+                     where cc.oid = t.typcollation)
+                else null end as domain_collation_name,
+                coalesce(
+                    (select array_agg(acl_item::text) from unnest(t.typacl) as acl_item),
+                    '{{}}'::text[]
+                ) as typacl,
                 d.description as comment
             from 
                 pg_type t 
@@ -556,7 +697,9 @@ impl Dump {
                     typcollation: row.get::<Option<Oid>, _>("typcollation"),
                     typdefault: row.get::<Option<String>, _>("typdefault"),
                     formatted_basetype: row.get::<Option<String>, _>("formatted_basetype"),
+                    domain_collation_name: row.get::<Option<String>, _>("domain_collation_name"),
                     comment: row.get::<Option<String>, _>("comment"),
+                    acl: row.get::<Vec<String>, _>("typacl"),
                     enum_labels: Vec::new(),
                     domain_constraints: Vec::new(),
                     composite_attributes: composite_attributes_map
@@ -1216,7 +1359,8 @@ impl Dump {
                     array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
                     d.description as view_comment,
                     (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
-                    coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker
+                    coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker,
+                    v.check_option
             from information_schema.views v
             join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
             left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
@@ -1230,7 +1374,7 @@ impl Dump {
                     where ext_dep.objid = c.oid
                     and ext_dep.deptype = 'e'
                 )
-            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions;",
+            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
             schema_filter
         );
 
@@ -1250,7 +1394,9 @@ impl Dump {
                           and dc.relkind in ('r', 'v', 'm')
                     ) as table_relation,
                     d.description as view_comment,
-                    c.relacl::text[] as view_acl
+                    c.relacl::text[] as view_acl,
+                    c.reloptions as storage_options,
+                    (select spcname from pg_tablespace where oid = c.reltablespace) as tablespace_name
             from pg_matviews mv
             join pg_class c on c.relname = mv.matviewname
                 and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
@@ -1265,7 +1411,25 @@ impl Dump {
             schema_filter
         );
 
-        let (regular_rows, mat_rows) = tokio::try_join!(
+        // Column comments query (works for both regular and materialized views)
+        let col_comments_query = format!(
+            "select
+                quote_ident(n.nspname) as schema_name,
+                quote_ident(c.relname) as view_name,
+                quote_ident(a.attname) as column_name,
+                d.description as col_comment
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+            join pg_description d on d.objoid = c.oid and d.objsubid = a.attnum
+            where c.relkind in ('v', 'm')
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname in {}
+            order by n.nspname, c.relname, a.attnum;",
+            schema_filter
+        );
+
+        let (regular_rows, mat_rows, col_comment_rows) = tokio::try_join!(
             async {
                 sqlx::query(regular_query.as_str())
                     .fetch_all(pool)
@@ -1278,7 +1442,28 @@ impl Dump {
                     .await
                     .map_err(|e| Error::other(format!("Failed to fetch materialized views: {e}.")))
             },
+            async {
+                sqlx::query(col_comments_query.as_str())
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| {
+                        Error::other(format!("Failed to fetch view column comments: {e}."))
+                    })
+            },
         )?;
+
+        // Build column comments map: (schema, view_name) -> Vec<(col, comment)>
+        let mut col_comments_map: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        for row in &col_comment_rows {
+            let schema: String = row.get("schema_name");
+            let view_name: String = row.get("view_name");
+            let col: String = row.get("column_name");
+            let comment: String = row.get("col_comment");
+            col_comments_map
+                .entry((schema, view_name))
+                .or_default()
+                .push((col, comment));
+        }
 
         let mut views = Vec::new();
 
@@ -1287,9 +1472,22 @@ impl Dump {
         } else {
             println!("Views found:");
             for row in regular_rows {
+                let check_opt: Option<String> = row.get("check_option");
+                let check_option = check_opt.and_then(|v| {
+                    if v.eq_ignore_ascii_case("NONE") {
+                        None
+                    } else {
+                        Some(v.to_lowercase())
+                    }
+                });
+                let schema: String = row.get("table_schema");
+                let name: String = row.get("table_name");
+                let column_comments = col_comments_map
+                    .remove(&(schema.clone(), name.clone()))
+                    .unwrap_or_default();
                 let mut view = View {
-                    schema: row.get("table_schema"),
-                    name: row.get("table_name"),
+                    schema,
+                    name,
                     definition: row.get("view_definition"),
                     table_relation: row.get("table_relation"),
                     owner: row
@@ -1302,6 +1500,10 @@ impl Dump {
                         .get::<Option<Vec<String>>, _>("view_acl")
                         .unwrap_or_default(),
                     security_invoker: row.get("security_invoker"),
+                    check_option,
+                    column_comments,
+                    storage_parameters: None,
+                    tablespace: None,
                 };
                 view.hash();
                 println!(
@@ -1319,9 +1521,28 @@ impl Dump {
         } else {
             println!("Materialized views found:");
             for row in mat_rows {
+                let schema: String = row.get("table_schema");
+                let name: String = row.get("table_name");
+                let column_comments = col_comments_map
+                    .remove(&(schema.clone(), name.clone()))
+                    .unwrap_or_default();
+                let storage_opts: Option<Vec<String>> = row.get("storage_options");
+                let storage_parameters = storage_opts.and_then(|v| {
+                    // Filter out security_invoker from reloptions (it's handled separately)
+                    let filtered: Vec<String> = v
+                        .into_iter()
+                        .filter(|o| !o.starts_with("security_invoker="))
+                        .collect();
+                    if filtered.is_empty() {
+                        None
+                    } else {
+                        Some(filtered)
+                    }
+                });
+                let tablespace: Option<String> = row.get("tablespace_name");
                 let mut view = View {
-                    schema: row.get("table_schema"),
-                    name: row.get("table_name"),
+                    schema,
+                    name,
                     definition: row.get("view_definition"),
                     table_relation: row.get("table_relation"),
                     owner: row
@@ -1334,6 +1555,10 @@ impl Dump {
                         .get::<Option<Vec<String>>, _>("view_acl")
                         .unwrap_or_default(),
                     security_invoker: false,
+                    check_option: None,
+                    column_comments,
+                    storage_parameters,
+                    tablespace,
                 };
                 view.hash();
                 println!(
@@ -1512,7 +1737,8 @@ impl Dump {
                     quote_ident(tc.relname) as table_name,
                     s.stxkind::text[] as stat_kinds,
                     pg_get_statisticsobjdef(s.oid) as stat_def,
-                    d.description as stat_comment
+                    d.description as stat_comment,
+                    s.stxstattarget as stat_target
                 from pg_statistic_ext s
                 join pg_namespace n on n.oid = s.stxnamespace
                 join pg_class tc on tc.oid = s.stxrelid
@@ -1577,6 +1803,11 @@ impl Dump {
                     columns,
                     definition: stat_def,
                     comment: row.get::<Option<String>, _>("stat_comment"),
+                    stxstattarget: row
+                        .try_get::<Option<i32>, _>("stat_target")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| if v < 0 { None } else { Some(v) }),
                     hash: None,
                 };
                 stat.hash();
@@ -1609,6 +1840,900 @@ impl Dump {
             }
         }
         Vec::new()
+    }
+
+    async fn fetch_rules_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Rule>, Error> {
+        let rows = sqlx::query(
+            format!(
+                "select
+                    quote_ident(n.nspname) as rule_schema,
+                    quote_ident(c.relname) as rule_table,
+                    quote_ident(r.rulename) as rule_name,
+                    pg_get_ruledef(r.oid, true) as rule_definition,
+                    d.description as rule_comment
+                from pg_rewrite r
+                join pg_class c on c.oid = r.ev_class
+                join pg_namespace n on n.oid = c.relnamespace
+                left join pg_description d on d.objoid = r.oid
+                    and d.classoid = 'pg_rewrite'::regclass
+                    and d.objsubid = 0
+                where
+                    n.nspname in {}
+                    and r.rulename <> '_RETURN'
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = c.oid
+                        and ext_dep.deptype = 'e'
+                    )
+                order by n.nspname, c.relname, r.rulename",
+                schema_filter
+            )
+            .as_str(),
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch rules: {e}.")))?;
+
+        let mut rules = Vec::new();
+
+        if rows.is_empty() {
+            println!("No rules found.");
+        } else {
+            println!("Rules found:");
+            for row in rows {
+                let mut rule = Rule::new(
+                    row.get("rule_schema"),
+                    row.get("rule_table"),
+                    row.get("rule_name"),
+                    row.get("rule_definition"),
+                    row.get("rule_comment"),
+                );
+                rule.hash();
+                println!(
+                    " - {}.{}.{} (hash: {})",
+                    rule.schema,
+                    rule.table_name,
+                    rule.rule_name,
+                    rule.hash.as_deref().unwrap_or("None")
+                );
+                rules.push(rule);
+            }
+        }
+
+        Ok(rules)
+    }
+
+    async fn fetch_event_triggers_standalone(pool: &PgPool) -> Result<Vec<EventTrigger>, Error> {
+        let rows = sqlx::query(
+            "select
+                quote_ident(e.evtname) as evtname,
+                e.evtevent as evtevent,
+                quote_ident(n.nspname) || '.' || quote_ident(p.proname) as evtfuncname,
+                coalesce(e.evttags, '{}'::text[]) as evttags,
+                e.evtenabled::text as evtenabled,
+                quote_ident(r.rolname) as evtowner,
+                d.description as evt_comment
+            from pg_event_trigger e
+            join pg_proc p on p.oid = e.evtfoid
+            join pg_namespace n on n.oid = p.pronamespace
+            left join pg_roles r on r.oid = e.evtowner
+            left join pg_description d on d.objoid = e.oid
+                and d.classoid = 'pg_event_trigger'::regclass
+                and d.objsubid = 0
+            order by e.evtname",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch event triggers: {e}.")))?;
+
+        let mut event_triggers = Vec::new();
+
+        if rows.is_empty() {
+            println!("No event triggers found.");
+        } else {
+            println!("Event triggers found:");
+            for row in rows {
+                let mut et = EventTrigger::new(
+                    row.get("evtname"),
+                    row.get("evtevent"),
+                    row.get("evtfuncname"),
+                    row.get::<Vec<String>, _>("evttags"),
+                    row.get("evtenabled"),
+                    row.get("evtowner"),
+                    row.get("evt_comment"),
+                );
+                et.hash();
+                println!(
+                    " - {} (event: {}, hash: {})",
+                    et.name,
+                    et.event,
+                    et.hash.as_deref().unwrap_or("None")
+                );
+                event_triggers.push(et);
+            }
+        }
+
+        Ok(event_triggers)
+    }
+
+    async fn fetch_collations_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Collation>, Error> {
+        // Check which catalog columns actually exist (varies by PG version and managed services)
+        let col_check: (bool, bool, bool) = sqlx::query_as(
+            "SELECT
+                EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                        WHERE attrelid = 'pg_catalog.pg_collation'::regclass
+                          AND attname = 'colliculocale' AND NOT attisdropped) AS has_icu_locale,
+                EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                        WHERE attrelid = 'pg_catalog.pg_collation'::regclass
+                          AND attname = 'collicurules' AND NOT attisdropped) AS has_icu_rules,
+                EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                        WHERE attrelid = 'pg_catalog.pg_collation'::regclass
+                          AND attname = 'colllocale' AND NOT attisdropped) AS has_coll_locale",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to check collation catalog columns: {e}.")))?;
+
+        let (has_icu_locale, has_icu_rules, has_coll_locale) = col_check;
+
+        let icu_locale_col = if has_icu_locale {
+            "c.colliculocale"
+        } else {
+            "NULL::text"
+        };
+        let icu_rules_col = if has_icu_rules {
+            "c.collicurules"
+        } else {
+            "NULL::text"
+        };
+        let coll_locale_col = if has_coll_locale {
+            "c.colllocale"
+        } else {
+            "NULL::text"
+        };
+
+        let query = format!(
+            "SELECT
+                quote_ident(n.nspname) as coll_schema,
+                quote_ident(c.collname) as coll_name,
+                COALESCE(quote_ident(r.rolname), '') as coll_owner,
+                c.collprovider::text as coll_provider,
+                {} as coll_locale,
+                c.collcollate as coll_collate,
+                c.collctype as coll_ctype,
+                {} as coll_icu_locale,
+                {} as coll_icu_rules,
+                c.collisdeterministic as coll_deterministic,
+                d.description as coll_comment
+             FROM pg_collation c
+             JOIN pg_namespace n ON n.oid = c.collnamespace
+             LEFT JOIN pg_roles r ON r.oid = c.collowner
+             LEFT JOIN pg_description d ON d.objoid = c.oid
+                 AND d.classoid = 'pg_collation'::regclass AND d.objsubid = 0
+             WHERE n.nspname IN {}
+               AND c.collencoding IN (-1, (SELECT encoding FROM pg_database WHERE datname = current_database()))
+               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
+             ORDER BY n.nspname, c.collname",
+            coll_locale_col,
+            icu_locale_col,
+            icu_rules_col,
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch collations: {e}.")))?;
+
+        let mut collations = Vec::new();
+        if rows.is_empty() {
+            println!("No user-defined collations found.");
+        } else {
+            println!("Collations found:");
+            for row in rows {
+                let mut coll = Collation {
+                    schema: row.get("coll_schema"),
+                    name: row.get("coll_name"),
+                    owner: row.get("coll_owner"),
+                    provider: row.get("coll_provider"),
+                    locale: row.get("coll_locale"),
+                    lc_collate: row.get("coll_collate"),
+                    lc_ctype: row.get("coll_ctype"),
+                    icu_locale: row.get("coll_icu_locale"),
+                    icu_rules: row.get("coll_icu_rules"),
+                    deterministic: row.get("coll_deterministic"),
+                    comment: row.get("coll_comment"),
+                    hash: None,
+                };
+                coll.hash();
+                println!(
+                    " - {}.{} (provider: {})",
+                    coll.schema, coll.name, coll.provider
+                );
+                collations.push(coll);
+            }
+        }
+
+        Ok(collations)
+    }
+
+    async fn fetch_ts_configs_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<TextSearchConfig>, Error> {
+        let query = format!(
+            "SELECT
+                quote_ident(n.nspname) as cfg_schema,
+                quote_ident(c.cfgname) as cfg_name,
+                COALESCE(quote_ident(r.rolname), '') as cfg_owner,
+                quote_ident(pn.nspname) || '.' || quote_ident(p.prsname) as cfg_parser,
+                d.description as cfg_comment
+             FROM pg_ts_config c
+             JOIN pg_namespace n ON n.oid = c.cfgnamespace
+             LEFT JOIN pg_roles r ON r.oid = c.cfgowner
+             JOIN pg_ts_parser p ON p.oid = c.cfgparser
+             JOIN pg_namespace pn ON pn.oid = p.prsnamespace
+             LEFT JOIN pg_description d ON d.objoid = c.oid
+                 AND d.classoid = 'pg_ts_config'::regclass AND d.objsubid = 0
+             WHERE n.nspname IN {}
+               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
+             ORDER BY n.nspname, c.cfgname",
+            schema_filter
+        );
+
+        let config_rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch text search configs: {e}.")))?;
+
+        if config_rows.is_empty() {
+            println!("No user-defined text search configurations found.");
+            return Ok(Vec::new());
+        }
+
+        // Fetch mappings for each config using pg_ts_config_map
+        let mapping_query = format!(
+            "SELECT
+                c.cfgnamespace as cfg_ns,
+                c.oid as cfg_oid,
+                c.cfgname as cfg_name_raw,
+                t.alias as token_type,
+                string_agg(
+                    quote_ident(dn.nspname) || '.' || quote_ident(d.dictname),
+                    ',' ORDER BY m.mapseqno
+                ) as dicts
+             FROM pg_ts_config c
+             JOIN pg_namespace n ON n.oid = c.cfgnamespace
+             JOIN pg_ts_config_map m ON m.mapcfg = c.oid
+             JOIN pg_catalog.ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype
+             JOIN pg_ts_dict d ON d.oid = m.mapdict
+             JOIN pg_namespace dn ON dn.oid = d.dictnamespace
+             WHERE n.nspname IN {}
+               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
+             GROUP BY c.cfgnamespace, c.oid, c.cfgname, t.alias
+             ORDER BY c.oid, t.alias",
+            schema_filter
+        );
+
+        let mapping_rows = sqlx::query(mapping_query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                Error::other(format!("Failed to fetch text search config mappings: {e}."))
+            })?;
+
+        // Build a map from cfg_oid to list of "token_type:dict1,dict2" strings
+        let mut mapping_map: HashMap<Oid, Vec<String>> = HashMap::new();
+        for row in mapping_rows {
+            let cfg_oid: Oid = row.get("cfg_oid");
+            let token_type: String = row.get("token_type");
+            let dicts: String = row.get("dicts");
+            mapping_map
+                .entry(cfg_oid)
+                .or_default()
+                .push(format!("{}:{}", token_type, dicts));
+        }
+
+        let mut ts_configs = Vec::new();
+        println!("Text search configurations found:");
+        for row in config_rows {
+            // We need the raw OID to look up mappings — fetch it again
+            let cfg_name_raw: String = row.get("cfg_name");
+            let schema: String = row.get("cfg_schema");
+            let owner: String = row.get("cfg_owner");
+            let parser: String = row.get("cfg_parser");
+            let comment: Option<String> = row.get("cfg_comment");
+
+            // Find mappings via a separate lookup using name match
+            // (we don't have oid in the config_rows; use a separate mapping lookup below)
+            let mappings: Vec<String> = Vec::new();
+
+            let mut cfg = TextSearchConfig {
+                schema,
+                name: cfg_name_raw.clone(),
+                owner,
+                parser,
+                mappings,
+                comment,
+                hash: None,
+            };
+            cfg.hash();
+            println!(" - {}.{}", cfg.schema, cfg.name);
+            ts_configs.push(cfg);
+        }
+
+        // Re-run a combined query to get configs with their OIDs for mapping association
+        let combined_query = format!(
+            "SELECT
+                c.oid as cfg_oid,
+                quote_ident(n.nspname) as cfg_schema,
+                quote_ident(c.cfgname) as cfg_name
+             FROM pg_ts_config c
+             JOIN pg_namespace n ON n.oid = c.cfgnamespace
+             WHERE n.nspname IN {}
+               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
+             ORDER BY n.nspname, c.cfgname",
+            schema_filter
+        );
+
+        let oid_rows = sqlx::query(combined_query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch text search config OIDs: {e}.")))?;
+
+        // Match OIDs to ts_configs and set mappings
+        for oid_row in &oid_rows {
+            let cfg_oid: Oid = oid_row.get("cfg_oid");
+            let cfg_schema: String = oid_row.get("cfg_schema");
+            let cfg_name: String = oid_row.get("cfg_name");
+            if let Some(mappings) = mapping_map.get(&cfg_oid)
+                && let Some(cfg) = ts_configs
+                    .iter_mut()
+                    .find(|c| c.schema == cfg_schema && c.name == cfg_name)
+                {
+                    cfg.mappings = mappings.clone();
+                    cfg.hash();
+                }
+        }
+
+        Ok(ts_configs)
+    }
+
+    async fn fetch_ts_dicts_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<TextSearchDict>, Error> {
+        let query = format!(
+            "SELECT
+                quote_ident(n.nspname) as dict_schema,
+                quote_ident(d.dictname) as dict_name,
+                COALESCE(quote_ident(r.rolname), '') as dict_owner,
+                quote_ident(tn.nspname) || '.' || quote_ident(t.tmplname) as dict_template,
+                COALESCE(d.dictinitoption, '') as dict_options,
+                desc2.description as dict_comment
+             FROM pg_ts_dict d
+             JOIN pg_namespace n ON n.oid = d.dictnamespace
+             LEFT JOIN pg_roles r ON r.oid = d.dictowner
+             JOIN pg_ts_template t ON t.oid = d.dicttemplate
+             JOIN pg_namespace tn ON tn.oid = t.tmplnamespace
+             LEFT JOIN pg_description desc2 ON desc2.objoid = d.oid
+                 AND desc2.classoid = 'pg_ts_dict'::regclass AND desc2.objsubid = 0
+             WHERE n.nspname IN {}
+               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = d.oid AND ext.deptype = 'e')
+             ORDER BY n.nspname, d.dictname",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch text search dicts: {e}.")))?;
+
+        let mut ts_dicts = Vec::new();
+        if rows.is_empty() {
+            println!("No user-defined text search dictionaries found.");
+        } else {
+            println!("Text search dictionaries found:");
+            for row in rows {
+                let options_raw: String = row.get("dict_options");
+                let options: Vec<String> = if options_raw.is_empty() {
+                    Vec::new()
+                } else {
+                    options_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                let mut d = TextSearchDict {
+                    schema: row.get("dict_schema"),
+                    name: row.get("dict_name"),
+                    owner: row.get("dict_owner"),
+                    template: row.get("dict_template"),
+                    options,
+                    comment: row.get("dict_comment"),
+                    hash: None,
+                };
+                d.hash();
+                println!(" - {}.{}", d.schema, d.name);
+                ts_dicts.push(d);
+            }
+        }
+
+        Ok(ts_dicts)
+    }
+
+    async fn fetch_casts_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Cast>, Error> {
+        let query = format!(
+            "WITH user_types AS (
+                SELECT t.oid
+                FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                WHERE n.nspname IN {}
+            )
+            SELECT
+                pg_catalog.format_type(c.castsource, NULL) as source_type,
+                pg_catalog.format_type(c.casttarget, NULL) as target_type,
+                c.castmethod::text as cast_method,
+                CASE WHEN c.castfunc != 0 THEN
+                    quote_ident(fn2.nspname) || '.' || quote_ident(p.proname) ||
+                    '(' || pg_get_function_identity_arguments(p.oid) || ')'
+                ELSE NULL END as function_name,
+                c.castcontext::text as cast_context,
+                d.description as cast_comment
+            FROM pg_cast c
+            LEFT JOIN pg_proc p ON p.oid = c.castfunc
+            LEFT JOIN pg_namespace fn2 ON fn2.oid = p.pronamespace
+            LEFT JOIN pg_description d ON d.objoid = c.oid
+                AND d.classoid = 'pg_cast'::regclass AND d.objsubid = 0
+            WHERE NOT EXISTS (SELECT 1 FROM pg_depend pd WHERE pd.objid = c.oid AND pd.deptype IN ('e', 'i'))
+              AND (c.castsource IN (SELECT oid FROM user_types)
+                   OR c.casttarget IN (SELECT oid FROM user_types))
+            ORDER BY source_type, target_type",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch casts: {e}.")))?;
+
+        let mut casts = Vec::new();
+        if rows.is_empty() {
+            println!("No user-defined casts found.");
+        } else {
+            println!("Casts found:");
+            for row in rows {
+                let mut cast = Cast {
+                    source_type: row.get("source_type"),
+                    target_type: row.get("target_type"),
+                    cast_method: row.get("cast_method"),
+                    function_name: row.get("function_name"),
+                    cast_context: row.get("cast_context"),
+                    comment: row.get("cast_comment"),
+                    hash: None,
+                };
+                cast.hash();
+                println!(
+                    " - {} -> {} (method: {})",
+                    cast.source_type, cast.target_type, cast.cast_method
+                );
+                casts.push(cast);
+            }
+        }
+
+        Ok(casts)
+    }
+
+    async fn fetch_operators_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Operator>, Error> {
+        let query = format!(
+            "SELECT
+                quote_ident(n.nspname) as op_schema,
+                o.oprname as op_name,
+                COALESCE(quote_ident(r.rolname), '') as op_owner,
+                CASE WHEN o.oprleft != 0 THEN pg_catalog.format_type(o.oprleft, NULL) ELSE NULL END as left_type,
+                CASE WHEN o.oprright != 0 THEN pg_catalog.format_type(o.oprright, NULL) ELSE NULL END as right_type,
+                pg_catalog.format_type(o.oprresult, NULL) as result_type,
+                quote_ident(pn.nspname) || '.' || quote_ident(p.proname) as procedure,
+                CASE WHEN o.oprcom != 0 THEN
+                    quote_ident(cn.nspname) || '.' || co.oprname ELSE NULL END as commutator,
+                CASE WHEN o.oprnegate != 0 THEN
+                    quote_ident(nn2.nspname) || '.' || no2.oprname ELSE NULL END as negator,
+                CASE WHEN o.oprrest != 0 THEN
+                    quote_ident(rn.nspname) || '.' || quote_ident(rp.proname) ELSE NULL END as restrict_fn,
+                CASE WHEN o.oprjoin != 0 THEN
+                    quote_ident(jn.nspname) || '.' || quote_ident(jp.proname) ELSE NULL END as join_fn,
+                o.oprcanhash as is_hashes,
+                o.oprcanmerge as is_merges,
+                d.description as op_comment
+             FROM pg_operator o
+             JOIN pg_namespace n ON n.oid = o.oprnamespace
+             LEFT JOIN pg_roles r ON r.oid = o.oprowner
+             JOIN pg_proc p ON p.oid = o.oprcode
+             JOIN pg_namespace pn ON pn.oid = p.pronamespace
+             LEFT JOIN pg_operator co ON co.oid = o.oprcom
+             LEFT JOIN pg_namespace cn ON cn.oid = co.oprnamespace
+             LEFT JOIN pg_operator no2 ON no2.oid = o.oprnegate
+             LEFT JOIN pg_namespace nn2 ON nn2.oid = no2.oprnamespace
+             LEFT JOIN pg_proc rp ON rp.oid = o.oprrest
+             LEFT JOIN pg_namespace rn ON rn.oid = rp.pronamespace
+             LEFT JOIN pg_proc jp ON jp.oid = o.oprjoin
+             LEFT JOIN pg_namespace jn ON jn.oid = jp.pronamespace
+             LEFT JOIN pg_description d ON d.objoid = o.oid
+                 AND d.classoid = 'pg_operator'::regclass AND d.objsubid = 0
+             WHERE n.nspname IN {}
+               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = o.oid AND ext.deptype = 'e')
+             ORDER BY n.nspname, o.oprname",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch operators: {e}.")))?;
+
+        let mut operators = Vec::new();
+        if rows.is_empty() {
+            println!("No user-defined operators found.");
+        } else {
+            println!("Operators found:");
+            for row in rows {
+                let mut op = Operator {
+                    schema: row.get("op_schema"),
+                    name: row.get("op_name"),
+                    owner: row.get("op_owner"),
+                    left_type: row.get("left_type"),
+                    right_type: row.get("right_type"),
+                    result_type: row.get("result_type"),
+                    procedure: row.get("procedure"),
+                    commutator: row.get("commutator"),
+                    negator: row.get("negator"),
+                    restrict: row.get("restrict_fn"),
+                    join: row.get("join_fn"),
+                    is_hashes: row.get("is_hashes"),
+                    is_merges: row.get("is_merges"),
+                    comment: row.get("op_comment"),
+                    hash: None,
+                };
+                op.hash();
+                println!(
+                    " - {}.{} ({:?}, {:?})",
+                    op.schema, op.name, op.left_type, op.right_type
+                );
+                operators.push(op);
+            }
+        }
+
+        Ok(operators)
+    }
+
+    async fn fetch_default_privileges_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<DefaultPrivilege>, Error> {
+        let query = format!(
+            "SELECT
+                quote_ident(r.rolname) as role_name,
+                COALESCE(quote_ident(n.nspname), '') as schema_name,
+                da.defaclobjtype::text as object_type,
+                COALESCE(da.defaclacl::text[], '{{}}'::text[]) as acl
+             FROM pg_default_acl da
+             JOIN pg_roles r ON r.oid = da.defaclrole
+             LEFT JOIN pg_namespace n ON n.oid = da.defaclnamespace
+             WHERE da.defaclnamespace = 0 OR n.nspname IN {}
+             ORDER BY r.rolname, COALESCE(n.nspname, ''), da.defaclobjtype",
+            schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch default privileges: {e}.")))?;
+
+        let mut default_privileges = Vec::new();
+        if rows.is_empty() {
+            println!("No default ACL entries found.");
+        } else {
+            println!("Default ACL entries found:");
+            for row in rows {
+                let mut dp = DefaultPrivilege {
+                    role_name: row.get("role_name"),
+                    schema_name: row.get("schema_name"),
+                    object_type: row.get("object_type"),
+                    acl: row.get("acl"),
+                    hash: None,
+                };
+                dp.hash();
+                println!(
+                    " - {} IN {} ON {}",
+                    dp.role_name, dp.schema_name, dp.object_type
+                );
+                default_privileges.push(dp);
+            }
+        }
+
+        Ok(default_privileges)
+    }
+
+    async fn fetch_publications_standalone(pool: &PgPool) -> Result<Vec<Publication>, Error> {
+        let pub_rows = sqlx::query(
+            "SELECT
+                quote_ident(p.pubname) as pub_name,
+                COALESCE(quote_ident(r.rolname), '') as pub_owner,
+                p.puballtables as all_tables,
+                CONCAT_WS(',',
+                    CASE WHEN p.pubinsert THEN 'insert' ELSE NULL END,
+                    CASE WHEN p.pubupdate THEN 'update' ELSE NULL END,
+                    CASE WHEN p.pubdelete THEN 'delete' ELSE NULL END,
+                    CASE WHEN p.pubtruncate THEN 'truncate' ELSE NULL END
+                ) as publish,
+                d.description as pub_comment
+             FROM pg_publication p
+             LEFT JOIN pg_roles r ON r.oid = p.pubowner
+             LEFT JOIN pg_description d ON d.objoid = p.oid
+                 AND d.classoid = 'pg_publication'::regclass AND d.objsubid = 0
+             ORDER BY p.pubname",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch publications: {e}.")))?;
+
+        if pub_rows.is_empty() {
+            println!("No publications found.");
+            return Ok(Vec::new());
+        }
+
+        // Fetch table memberships
+        let table_rows = sqlx::query(
+            "SELECT
+                quote_ident(p.pubname) as pub_name,
+                quote_ident(n.nspname) || '.' || quote_ident(c.relname) as table_name
+             FROM pg_publication p
+             JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+             JOIN pg_class c ON c.oid = pr.prrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE NOT p.puballtables
+             ORDER BY p.pubname, n.nspname, c.relname",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch publication tables: {e}.")))?;
+
+        let mut table_map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in table_rows {
+            let pub_name: String = row.get("pub_name");
+            let table_name: String = row.get("table_name");
+            table_map.entry(pub_name).or_default().push(table_name);
+        }
+
+        let mut publications = Vec::new();
+        println!("Publications found:");
+        for row in pub_rows {
+            let pub_name: String = row.get("pub_name");
+            let tables = table_map.remove(&pub_name).unwrap_or_default();
+            let mut pub_ = Publication {
+                name: pub_name.clone(),
+                owner: row.get("pub_owner"),
+                all_tables: row.get("all_tables"),
+                publish: row.get("publish"),
+                tables,
+                comment: row.get("pub_comment"),
+                hash: None,
+            };
+            pub_.hash();
+            println!(" - {}", pub_.name);
+            publications.push(pub_);
+        }
+
+        Ok(publications)
+    }
+
+    async fn fetch_subscriptions_standalone(pool: &PgPool) -> Result<Vec<Subscription>, Error> {
+        // pg_subscription is only accessible to superusers or pg_monitor members.
+        // If the query fails due to permissions, return an empty list with a warning.
+        let result = sqlx::query(
+            "SELECT
+                quote_ident(s.subname) as sub_name,
+                COALESCE(quote_ident(r.rolname), '') as sub_owner,
+                s.subconninfo as sub_conninfo,
+                COALESCE(s.subpublications, '{}'::text[]) as sub_publications,
+                s.subenabled as sub_enabled,
+                d.description as sub_comment
+             FROM pg_subscription s
+             LEFT JOIN pg_roles r ON r.oid = s.subowner
+             LEFT JOIN pg_description d ON d.objoid = s.oid
+                 AND d.classoid = 'pg_subscription'::regclass AND d.objsubid = 0
+             ORDER BY s.subname",
+        )
+        .fetch_all(pool)
+        .await;
+
+        match result {
+            Err(e) => {
+                println!("Warning: could not fetch subscriptions (insufficient privileges): {e}.");
+                Ok(Vec::new())
+            }
+            Ok(rows) => {
+                let mut subscriptions = Vec::new();
+                if rows.is_empty() {
+                    println!("No subscriptions found.");
+                } else {
+                    println!("Subscriptions found:");
+                    for row in rows {
+                        let mut sub = Subscription {
+                            name: row.get("sub_name"),
+                            owner: row.get("sub_owner"),
+                            connection: row.get("sub_conninfo"),
+                            publications: row.get("sub_publications"),
+                            enabled: row.get("sub_enabled"),
+                            comment: row.get("sub_comment"),
+                            hash: None,
+                        };
+                        sub.hash();
+                        println!(" - {}", sub.name);
+                        subscriptions.push(sub);
+                    }
+                }
+                Ok(subscriptions)
+            }
+        }
+    }
+
+    async fn fetch_fdws_standalone(pool: &PgPool) -> Result<Vec<ForeignDataWrapper>, Error> {
+        let rows = sqlx::query(
+            "SELECT
+                quote_ident(fdw.fdwname) as fdw_name,
+                COALESCE(quote_ident(r.rolname), '') as fdw_owner,
+                CASE WHEN fdw.fdwhandler != 0 THEN
+                    quote_ident(hn.nspname) || '.' || quote_ident(hp.proname)
+                ELSE NULL END as handler_func,
+                CASE WHEN fdw.fdwvalidator != 0 THEN
+                    quote_ident(vn.nspname) || '.' || quote_ident(vp.proname)
+                ELSE NULL END as validator_func,
+                COALESCE(fdw.fdwoptions, '{}'::text[]) as fdw_options,
+                d.description as fdw_comment
+             FROM pg_foreign_data_wrapper fdw
+             LEFT JOIN pg_roles r ON r.oid = fdw.fdwowner
+             LEFT JOIN pg_proc hp ON hp.oid = fdw.fdwhandler
+             LEFT JOIN pg_namespace hn ON hn.oid = hp.pronamespace
+             LEFT JOIN pg_proc vp ON vp.oid = fdw.fdwvalidator
+             LEFT JOIN pg_namespace vn ON vn.oid = vp.pronamespace
+             LEFT JOIN pg_description d ON d.objoid = fdw.oid
+                 AND d.classoid = 'pg_foreign_data_wrapper'::regclass AND d.objsubid = 0
+             WHERE NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = fdw.oid AND ext.deptype = 'e')
+             ORDER BY fdw.fdwname",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch foreign data wrappers: {e}.")))?;
+
+        let mut fdws = Vec::new();
+        if rows.is_empty() {
+            println!("No user-defined foreign data wrappers found.");
+        } else {
+            println!("Foreign data wrappers found:");
+            for row in rows {
+                let options: Vec<String> = row.get("fdw_options");
+                let mut fdw = ForeignDataWrapper {
+                    name: row.get("fdw_name"),
+                    owner: row.get("fdw_owner"),
+                    handler_func: row.get("handler_func"),
+                    validator_func: row.get("validator_func"),
+                    options,
+                    comment: row.get("fdw_comment"),
+                    hash: None,
+                };
+                fdw.hash();
+                println!(" - {}", fdw.name);
+                fdws.push(fdw);
+            }
+        }
+
+        Ok(fdws)
+    }
+
+    async fn fetch_servers_standalone(pool: &PgPool) -> Result<Vec<ForeignServer>, Error> {
+        let rows = sqlx::query(
+            "SELECT
+                quote_ident(s.srvname) as srv_name,
+                COALESCE(quote_ident(r.rolname), '') as srv_owner,
+                quote_ident(fdw.fdwname) as fdw_name,
+                s.srvtype as srv_type,
+                s.srvversion as srv_version,
+                COALESCE(s.srvoptions, '{}'::text[]) as srv_options,
+                d.description as srv_comment
+             FROM pg_foreign_server s
+             JOIN pg_foreign_data_wrapper fdw ON fdw.oid = s.srvfdw
+             LEFT JOIN pg_roles r ON r.oid = s.srvowner
+             LEFT JOIN pg_description d ON d.objoid = s.oid
+                 AND d.classoid = 'pg_foreign_server'::regclass AND d.objsubid = 0
+             WHERE NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = s.oid AND ext.deptype = 'e')
+             ORDER BY s.srvname",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch foreign servers: {e}.")))?;
+
+        let mut servers = Vec::new();
+        if rows.is_empty() {
+            println!("No foreign servers found.");
+        } else {
+            println!("Foreign servers found:");
+            for row in rows {
+                let options: Vec<String> = row.get("srv_options");
+                let mut srv = ForeignServer {
+                    name: row.get("srv_name"),
+                    owner: row.get("srv_owner"),
+                    fdw_name: row.get("fdw_name"),
+                    server_type: row.get("srv_type"),
+                    server_version: row.get("srv_version"),
+                    options,
+                    comment: row.get("srv_comment"),
+                    hash: None,
+                };
+                srv.hash();
+                println!(" - {} (fdw: {})", srv.name, srv.fdw_name);
+                servers.push(srv);
+            }
+        }
+
+        Ok(servers)
+    }
+
+    async fn fetch_user_mappings_standalone(pool: &PgPool) -> Result<Vec<UserMapping>, Error> {
+        let result = sqlx::query(
+            "SELECT
+                quote_ident(s.srvname) as server_name,
+                CASE WHEN um.umuser = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END as username,
+                COALESCE(um.umoptions, '{}'::text[]) as um_options
+             FROM pg_user_mapping um
+             JOIN pg_foreign_server s ON s.oid = um.umserver
+             LEFT JOIN pg_roles r ON r.oid = um.umuser
+             ORDER BY s.srvname, username",
+        )
+        .fetch_all(pool)
+        .await;
+
+        match result {
+            Err(e) => {
+                println!("Warning: could not fetch user mappings (insufficient privileges): {e}.");
+                Ok(Vec::new())
+            }
+            Ok(rows) => {
+                let mut user_mappings = Vec::new();
+                if rows.is_empty() {
+                    println!("No user mappings found.");
+                } else {
+                    println!("User mappings found:");
+                    for row in rows {
+                        let options: Vec<String> = row.get("um_options");
+                        let mut um = UserMapping {
+                            server_name: row.get("server_name"),
+                            username: row.get("username"),
+                            options,
+                            hash: None,
+                        };
+                        um.hash();
+                        println!(" - {} on {}", um.username, um.server_name);
+                        user_mappings.push(um);
+                    }
+                }
+                Ok(user_mappings)
+            }
+        }
     }
 
     // Read a dump from a file and deserialize it.
@@ -2073,6 +3198,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         Table::new(
             schema.to_string(),
@@ -2192,7 +3318,9 @@ mod tests {
             range_canonical: None,
             range_subdiff: None,
             multirange_name: None,
+            domain_collation_name: None,
             comment: None,
+            acl: Vec::new(),
             hash: None,
         }
     }

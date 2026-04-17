@@ -22,6 +22,9 @@ pub struct TableConstraint {
     pub no_inherit: bool, // Whether the constraint is marked NO INHERIT
     #[serde(default)]
     pub nulls_not_distinct: bool, // PG15+: UNIQUE constraint treats NULLs as not distinct
+    /// Optional comment on the constraint
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl TableConstraint {
@@ -43,6 +46,10 @@ impl TableConstraint {
         hasher.update(self.nulls_not_distinct.to_string().as_bytes());
         if let Some(definition) = &self.definition {
             hasher.update(Self::normalize_definition(definition).as_bytes());
+        }
+        if let Some(ref comment) = self.comment {
+            hasher.update((comment.len() as u32).to_be_bytes());
+            hasher.update(comment.as_bytes());
         }
     }
 
@@ -104,6 +111,15 @@ impl TableConstraint {
             script.push_str(" not enforced ");
         }
         script.append_block(";");
+        if let Some(ref comment) = self.comment {
+            script.append_block(&format!(
+                "comment on constraint {} on {}.{} is '{}';",
+                self.name,
+                self.schema,
+                self.table_name,
+                comment.replace('\'', "''")
+            ));
+        }
         script
     }
 
@@ -220,6 +236,26 @@ impl TableConstraint {
     /// Get alter script to change this constraint to match the target constraint
     /// Returns None if the constraint needs to be dropped and recreated
     pub fn get_alter_script(&self, target: &TableConstraint) -> Option<String> {
+        // Helper: emit comment change SQL if needed
+        let comment_script = |s: &mut String| {
+            if self.comment != target.comment {
+                if let Some(ref cmt) = target.comment {
+                    s.append_block(&format!(
+                        "comment on constraint {} on {}.{} is '{}';",
+                        target.name,
+                        target.schema,
+                        target.table_name,
+                        cmt.replace('\'', "''")
+                    ));
+                } else {
+                    s.append_block(&format!(
+                        "comment on constraint {} on {}.{} is null;",
+                        target.name, target.schema, target.table_name
+                    ));
+                }
+            }
+        };
+
         // FOREIGN KEY constraints can have their deferrable and enforced properties altered
         // CHECK constraints can have their enforced property altered (PG18+)
         // All other changes require drop/recreate
@@ -283,11 +319,14 @@ impl TableConstraint {
                 }
             }
 
+            comment_script(&mut script);
             Some(script)
         } else if (self.constraint_type.eq_ignore_ascii_case("CHECK")
             || self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY"))
             && self.can_be_altered_to(target)
-            && (self.is_enforced != target.is_enforced || self.no_inherit != target.no_inherit)
+            && (self.is_enforced != target.is_enforced
+                || self.no_inherit != target.no_inherit
+                || self.comment != target.comment)
         {
             // CHECK/FK constraint enforced or no_inherit property change (PG18+)
             let mut script = String::new();
@@ -317,6 +356,24 @@ impl TableConstraint {
                     ));
                 }
             }
+            comment_script(&mut script);
+            Some(script)
+        } else if self.comment != target.comment
+            && self.schema == target.schema
+            && self.name == target.name
+            && self.table_name == target.table_name
+            && self.constraint_type == target.constraint_type
+            && self.is_deferrable == target.is_deferrable
+            && self.initially_deferred == target.initially_deferred
+            && self.is_enforced == target.is_enforced
+            && self.no_inherit == target.no_inherit
+            && self.nulls_not_distinct == target.nulls_not_distinct
+            && self.definition.as_deref().map(Self::normalize_definition)
+                == target.definition.as_deref().map(Self::normalize_definition)
+        {
+            // Only comment changed - any constraint type
+            let mut script = String::new();
+            comment_script(&mut script);
             Some(script)
         } else {
             None
@@ -383,6 +440,7 @@ impl PartialEq for TableConstraint {
             && self.is_enforced == other.is_enforced
             && self.no_inherit == other.no_inherit
             && self.nulls_not_distinct == other.nulls_not_distinct
+            && self.comment == other.comment
             && self.definition.as_deref().map(Self::normalize_definition)
                 == other.definition.as_deref().map(Self::normalize_definition)
     }
@@ -407,6 +465,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -424,6 +483,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -441,6 +501,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -458,6 +519,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -669,6 +731,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
 
         let script = constraint.get_script();
@@ -691,6 +754,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
 
         let script = constraint.get_script();
@@ -713,6 +777,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
 
         let script = constraint.get_script();
@@ -854,6 +919,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
 
         // Should handle special characters in all fields
@@ -885,6 +951,7 @@ mod tests {
                 is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -899,6 +966,7 @@ mod tests {
                 is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -913,6 +981,7 @@ mod tests {
                 is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             },
             TableConstraint {
                 catalog: "db".to_string(),
@@ -927,6 +996,7 @@ mod tests {
                 is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             },
         ];
 
@@ -960,6 +1030,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
 
         // Create the same hash as the implementation
@@ -998,6 +1069,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
 
         // Create the same hash as the implementation (nulls_distinct=None means no update)
@@ -1144,6 +1216,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(
@@ -1169,6 +1242,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(script.contains("'Active'"), "got: {script}");
@@ -1194,6 +1268,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(
@@ -1217,6 +1292,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(
@@ -1242,6 +1318,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(script.contains("check (amount >= 0)"), "got: {script}");
@@ -1357,6 +1434,7 @@ mod tests {
             is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+            comment: None,
             };
         let constraint_b = TableConstraint {
             catalog: "db".to_string(),
@@ -1371,6 +1449,7 @@ mod tests {
             is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+            comment: None,
             };
         assert_eq!(constraint_a, constraint_b);
     }
@@ -1390,6 +1469,7 @@ mod tests {
             is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+            comment: None,
             };
         let constraint_b = TableConstraint {
             catalog: "db".to_string(),
@@ -1404,6 +1484,7 @@ mod tests {
             is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+            comment: None,
             };
 
         let mut hasher_a = Sha256::new();
@@ -1501,6 +1582,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         assert_eq!(constraint.coninhcount, 0);
 
@@ -1599,6 +1681,7 @@ mod tests {
             is_enforced: false,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(
@@ -1622,6 +1705,7 @@ mod tests {
             is_enforced: false,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(
@@ -1645,6 +1729,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let script = constraint.get_script();
         assert!(
@@ -1698,6 +1783,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut b = a.clone();
         b.is_enforced = false;
@@ -1722,6 +1808,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut b = a.clone();
         b.is_enforced = false;
@@ -1746,6 +1833,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut new_c = old.clone();
         new_c.is_enforced = false;
@@ -1774,6 +1862,7 @@ mod tests {
             is_enforced: false,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut new_c = old.clone();
         new_c.is_enforced = true;
@@ -1806,6 +1895,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut new_c = old.clone();
         new_c.is_enforced = false;
@@ -1834,6 +1924,7 @@ mod tests {
             is_enforced: false,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut new_c = old.clone();
         new_c.is_enforced = true;
@@ -1866,6 +1957,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let mut new_c = old.clone();
         new_c.is_deferrable = true;

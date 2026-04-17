@@ -303,7 +303,78 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 - **Modified**: `test_schema.cost_rows_test` — COST 100 ROWS 1000 in FROM; COST 200 ROWS 500 in TO
 - Verifies COST/ROWS clause changes in function CREATE OR REPLACE
 
-### 36. Special Test Scenarios
+### 36. Table Rules
+- **Unchanged**: `test_schema.rule_products_no_delete` — `ON DELETE DO INSTEAD NOTHING` identical in both schemas; no diff expected
+- **Removed**: `test_schema.rule_users_soft_delete` — FROM-only rule on users DELETE (INSTEAD UPDATE)
+- **Added**: `test_schema.rule_reviews_audit` — TO-only rule on reviews INSERT (DO ALSO audit log insert)
+
+### 37. Event Triggers
+Event triggers are global (not schema-scoped). Require superuser to create.
+- **Unchanged**: `test_etrig_unchanged` — fires on `ddl_command_start` via `etrig_log_ddl()`; identical in both schemas
+- **Removed**: `test_etrig_from_only` — FROM-only, fires on `ddl_command_end` via `etrig_from_only_fn()`
+- **Added**: `test_etrig_to_only` — TO-only, fires on `ddl_command_end` via `etrig_to_only_fn()`
+
+### 38. Collations
+- **Unchanged**: `test_schema.test_coll_unchanged` — `libc` provider, locale `C`; identical in both schemas
+- **Removed**: `test_schema.test_coll_from_only` — FROM-only collation
+- **Added**: `test_schema.test_coll_to_only` — TO-only collation
+
+### 39. Text Search Objects
+
+#### Text Search Dictionaries
+- **Unchanged**: `test_schema.test_dict_unchanged` — `pg_catalog.simple` template with `STOPWORDS = english`; same in both schemas
+- **Removed**: `test_schema.test_dict_from_only` — FROM-only dictionary
+- **Modified**: `test_schema.test_dict_modified` — FROM has `STOPWORDS = english`; TO removes the stopwords option
+- **Added**: `test_schema.test_dict_to_only` — TO-only dictionary
+
+#### Text Search Configurations
+- **Unchanged**: `test_schema.test_tsconfig_unchanged` — `pg_catalog.default` parser; same in both schemas
+- **Removed**: `test_schema.test_tsconfig_from_only` — FROM-only configuration
+- **Added**: `test_schema.test_tsconfig_to_only` — TO-only configuration
+
+### 40. Casts
+User-defined casts involve a source type, target type, and optionally a function.
+- **Removed**: `test_schema.test_type_A → text` — FROM-only (cast disappears because `test_type_A` is FROM-only); implemented via `test_type_a_to_text()` function
+- **Unchanged**: `test_schema.user_profile → text` — explicit cast using `user_profile_to_text()`; same function name and signature in both schemas
+- **Added**: `test_schema.test_type_B → text` — TO-only (cast created because `test_type_B` is TO-only); implemented via `test_type_b_to_text()` function
+
+### 41. Operators
+User-defined binary operators on `(text, integer)` returning `boolean`.
+- **Unchanged**: `test_schema.~<(text, integer)` — `text_shorter_than()` backing function; same in both schemas
+- **Removed**: `test_schema.~>(text, integer)` — FROM-only, backed by `text_longer_than()`
+- **Added**: `test_schema.~=(text, integer)` — TO-only, backed by `text_equals_length()`
+
+### 42. Default Privileges
+Default ACL entries in `test_schema` using the existing test roles.
+- **Unchanged**: `pgc_grant_reader` gets `SELECT` on new tables — same in both schemas
+- **Modified**: `pgc_grant_writer` gets `INSERT` only in FROM; gets `SELECT, INSERT, UPDATE` in TO
+
+### 43. Foreign Servers and User Mappings
+These test cases complement the foreign table tests (Section 24) which already use `test_foreign_server`.
+The `postgres_fdw` extension and `test_foreign_server` created for Section 24 are reused here.
+
+#### Foreign Servers
+- **Unchanged**: `test_foreign_server` — same definition in both schemas (used for foreign table tests)
+- **Modified**: `test_server_modified` — `host 'server-host-a', dbname 'db_a'` in FROM; `host 'server-host-b', dbname 'db_b'` in TO
+- **Removed**: `test_server_from_only` — FROM-only server (`host 'legacy-host', dbname 'legacy_db'`)
+- **Added**: `test_server_to_only` — TO-only server (`host 'new-host', dbname 'new_db'`)
+
+#### User Mappings
+- **Unchanged**: `PUBLIC` on `test_foreign_server` with `user 'readonly_user'` — same in both schemas
+- **Removed**: `PUBLIC` on `test_server_from_only` — dropped when server is removed
+- **Added**: `PUBLIC` on `test_server_to_only` with `user 'new_readonly_user'` — created with new server
+
+### 44. Publications
+Requires `wal_level = logical`. Comment out these statements if the test server does not have logical replication enabled.
+- **Removed**: `test_pub_from_only` — FROM-only publication on `test_schema.users`
+- **Unchanged**: `test_pub_unchanged` — publication for `test_schema.users, test_schema.products`; same in both schemas
+- **Added**: `test_pub_to_only` — TO-only publication `FOR ALL TABLES`
+
+> **Note**: Subscriptions require a logical replication slot on a source server and are not included in the test schemas.
+
+> **Note**: Foreign data wrappers (`CREATE FOREIGN DATA WRAPPER`) require a shared library and are not testable via pure SQL. The `postgres_fdw` extension-owned FDW is excluded from comparison. Only user-created FDWs would appear, which require C-level code.
+
+### 46. Special Test Scenarios
 
 #### CHECK Constraint String Literal Case Preservation
 - `chk_category_values` contains mixed-case string literals (`'Electronics'`, `'Home & Garden'`, `'Books'`) identical in both schemas
@@ -512,3 +583,13 @@ The comparison should detect and generate SQL for:
 - Detecting per-column statistics target changes (SET STATISTICS)
 - Detecting function/procedure COST and ROWS clause changes
 - Handling SUPPORT function and TRANSFORM FOR TYPE clauses on routines
+- Creating, dropping, and altering table rules (ON INSERT/UPDATE/DELETE, DO INSTEAD / DO ALSO)
+- Creating, dropping, and altering event triggers (global scope, ddl_command_start/end/sql_drop)
+- Creating, dropping, and altering collations (libc/icu provider, locale, deterministic flag)
+- Creating, dropping, and altering text search dictionaries (template, options)
+- Creating, dropping, and altering text search configurations (parser, token mappings)
+- Creating and dropping user-defined casts (function-based, binary-coercible, I/O conversion)
+- Creating and dropping user-defined operators (binary infix, backing function, operand types)
+- Creating, modifying, and revoking default privileges (ALTER DEFAULT PRIVILEGES per role/schema/object type)
+- Creating, modifying, and dropping foreign servers and user mappings (OPTIONS changes, add/remove entries)
+- Creating, modifying, and dropping publications (FOR TABLE list, FOR ALL TABLES, publish operations)
