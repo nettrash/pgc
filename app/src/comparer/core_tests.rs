@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
+use crate::dump::default_privilege::DefaultPrivilege;
 use crate::dump::extension::Extension;
 use crate::dump::pg_type::{CompositeAttribute, PgType};
 use crate::dump::routine::Routine;
@@ -125,7 +126,7 @@ async fn compare_routines_drops_and_recreates_on_return_type_change() {
     comparer.compare_routines().await.unwrap();
     let script = comparer.get_script();
 
-    assert!(script.contains("drop function if exists public.test_func ();"));
+    assert!(script.contains("drop function if exists public.test_func () cascade;"));
     assert!(script.contains("create or replace function public.test_func() returns text"));
 }
 
@@ -167,7 +168,7 @@ async fn compare_routines_drops_and_recreates_on_argument_change() {
     comparer.compare_routines().await.unwrap();
     let script = comparer.get_script();
 
-    assert!(script.contains("drop function if exists public.test_func (a integer);"));
+    assert!(script.contains("drop function if exists public.test_func (a integer) cascade;"));
     assert!(script.contains("create or replace function public.test_func(a text) returns integer"));
 }
 
@@ -250,7 +251,7 @@ async fn compare_drops_types_after_routines() {
         .find("drop function if exists test_schema.get_users_by_status")
         .expect("routine drop script not found");
     let type_drop_pos = script
-        .find("drop type if exists test_schema.status_type;")
+        .find("drop type if exists test_schema.status_type cascade;")
         .expect("type drop script not found");
 
     assert!(
@@ -294,7 +295,7 @@ async fn compare_drops_enums_after_routines() {
         .find("drop function if exists test_schema.get_users_by_status_enum")
         .expect("routine drop script not found");
     let enum_drop_pos = script
-        .find("drop type if exists test_schema.status_enum;")
+        .find("drop type if exists test_schema.status_enum cascade;")
         .expect("enum drop script not found");
 
     assert!(
@@ -331,7 +332,7 @@ async fn compare_composite_types_drops_removed_and_creates_new() {
     assert!(script.contains("create type test_schema.test_type_B as ("));
     assert!(script.contains("\"street\" varchar(255)"));
     assert!(script.contains("\"city\" varchar(100)"));
-    assert!(script.contains("drop type if exists test_schema.test_type_A;"));
+    assert!(script.contains("drop type if exists test_schema.test_type_A cascade;"));
 }
 
 #[tokio::test]
@@ -767,6 +768,8 @@ fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColum
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     }
 }
@@ -846,6 +849,8 @@ async fn compare_sequences_skips_owned_by_serial_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -949,6 +954,8 @@ async fn compare_sequences_skips_owned_by_identity_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1309,6 +1316,8 @@ async fn compare_sequences_skips_drop_if_owned_by_dropped_table() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1409,6 +1418,8 @@ async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1480,6 +1491,8 @@ async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
 
@@ -1570,6 +1583,7 @@ async fn tables_create_parent_before_partition_and_fk_after_tables() {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }],
         vec![],
         vec![],
@@ -2137,6 +2151,8 @@ async fn serial_column_uses_serial_type_in_table_script() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
     let serial_table = Table::new(
@@ -2223,6 +2239,8 @@ async fn serial_column_uses_serial_type_in_table_script() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
+        acl: vec![],
         serial_type: None,
     };
     let bigserial_table = Table::new(
@@ -4326,7 +4344,7 @@ async fn compare_routines_overloaded_drop_only_removed_overload() {
     let script = comparer.get_script();
 
     assert!(
-        script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb);"),
+        script.contains("drop procedure if exists myschema.notify_event (pjobid uuid, pattributes jsonb, pseed jsonb) cascade;"),
         "Removed overload must be dropped, got: {script}"
     );
     assert!(
@@ -4521,6 +4539,7 @@ async fn fk_pre_drop_commented_when_use_drop_false() {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }],
         vec![],
         vec![],
@@ -4602,6 +4621,7 @@ async fn fk_pre_drop_active_when_use_drop_true() {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }],
         vec![],
         vec![],
@@ -4647,6 +4667,8 @@ async fn trigger_pre_drop_commented_when_use_drop_false() {
             oid: Oid(9999),
             name: "trg_events_audit".to_string(),
             definition: "before insert on events for each row execute function audit()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }],
         None,
     );
@@ -4696,6 +4718,8 @@ async fn trigger_pre_drop_active_when_use_drop_true() {
             oid: Oid(9999),
             name: "trg_events_audit".to_string(),
             definition: "before insert on events for each row execute function audit()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }],
         None,
     );
@@ -5509,5 +5533,617 @@ fn get_script_multiple_e_strings_on_same_line() {
         out.contains("E'a\n\n\n\nb'"),
         "second E-string newlines must be preserved, got:\n{}",
         out
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_procedure_with_config_params() {
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_proc".to_string(),
+        "plpgsql".to_string(),
+        "PROCEDURE".to_string(),
+        "void".to_string(),
+        "IN pvalue text".to_string(),
+        None,
+        None,
+        "\nBEGIN\n    RAISE NOTICE 'value: %', pvalue;\nEND;\n".to_string(),
+    );
+    routine.config = vec![
+        "search_path=public, pg_temp".to_string(),
+        "lock_timeout=5s".to_string(),
+    ];
+    routine.hash();
+    to_dump.routines.push(routine);
+
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("SET search_path = 'public, pg_temp'"),
+        "script must contain SET search_path, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("SET lock_timeout = '5s'"),
+        "script must contain SET lock_timeout, got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_function_with_config_params() {
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "my_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "\nBEGIN\n    RETURN 1;\nEND;\n".to_string(),
+    );
+    routine.config = vec!["work_mem=256MB".to_string()];
+    routine.hash();
+    to_dump.routines.push(routine);
+
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("SET work_mem = '256MB'"),
+        "script must contain SET work_mem, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("VOLATILE"),
+        "function flags must still be present, got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_config_change_triggers_update() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+    from_routine.config = vec!["search_path=public".to_string()];
+    from_routine.hash();
+
+    let mut to_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+    to_routine.config = vec![
+        "search_path=public".to_string(),
+        "lock_timeout=5s".to_string(),
+    ];
+    to_routine.hash();
+
+    assert_ne!(
+        from_routine.hash, to_routine.hash,
+        "hashes must differ when config changes"
+    );
+
+    from_dump.routines.push(from_routine);
+    to_dump.routines.push(to_routine);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("create or replace function"),
+        "config change must trigger CREATE OR REPLACE, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("SET search_path = 'public'"),
+        "script must contain SET search_path, got:\n{}",
+        script
+    );
+    assert!(
+        script.contains("SET lock_timeout = '5s'"),
+        "script must contain SET lock_timeout, got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_config_removal_triggers_update() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+    from_routine.config = vec!["search_path=public".to_string()];
+    from_routine.hash();
+
+    let to_routine = Routine::new(
+        "public".to_string(),
+        Oid(1),
+        "test_func".to_string(),
+        "plpgsql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "".to_string(),
+        None,
+        None,
+        "BEGIN RETURN 1; END".to_string(),
+    );
+
+    assert_ne!(
+        from_routine.hash, to_routine.hash,
+        "hashes must differ when config is removed"
+    );
+
+    from_dump.routines.push(from_routine);
+    to_dump.routines.push(to_routine);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("create or replace function"),
+        "config removal must trigger CREATE OR REPLACE, got:\n{}",
+        script
+    );
+    assert!(
+        !script.contains("SET search_path"),
+        "removed config must not appear in script, got:\n{}",
+        script
+    );
+}
+
+/// A table tracked in `recreated_tables` (e.g. due to partition key change)
+/// must use the FROM default privilege ACL as its effective from_acl in full
+/// grants mode, so that no spurious REVOKEs appear on repeated runs.
+#[tokio::test]
+async fn compare_grants_recreated_table_uses_default_acl() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // Both FROM and TO have the same table with the same ACL.
+    let mut from_table = Table::new(
+        "public".to_string(),
+        "orders".to_string(),
+        "public".to_string(),
+        "orders".to_string(),
+        "owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    from_table.acl = vec!["reader=r/owner".to_string()];
+
+    let mut to_table = Table::new(
+        "public".to_string(),
+        "orders".to_string(),
+        "public".to_string(),
+        "orders".to_string(),
+        "owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_table.acl = vec!["reader=r/owner".to_string()];
+
+    // Default privilege that auto-grants SELECT to reader on new tables.
+    from_dump.default_privileges.push(DefaultPrivilege {
+        role_name: "owner".to_string(),
+        schema_name: "public".to_string(),
+        object_type: "r".to_string(),
+        acl: vec!["reader=r/owner".to_string()],
+        hash: None,
+    });
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    // Simulate that the table was recreated (e.g. partition key change).
+    comparer
+        .recreated_tables
+        .insert(Comparer::table_key("public", "orders"));
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // The default privilege matches the TO ACL, so no GRANT or REVOKE needed.
+    let has_grant = script
+        .lines()
+        .any(|l| l.trim_start().to_lowercase().starts_with("grant "));
+    let has_revoke = script
+        .lines()
+        .any(|l| l.trim_start().to_lowercase().starts_with("revoke "));
+    assert!(
+        !has_grant && !has_revoke,
+        "Recreated table with matching default ACL must produce no GRANT/REVOKE, got: {script}"
+    );
+}
+
+/// A recreated table whose TO ACL differs from the default privilege ACL
+/// must produce the correct GRANT to bridge the gap.
+#[tokio::test]
+async fn compare_grants_recreated_table_grants_extra_over_default() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_table = Table::new(
+        "public".to_string(),
+        "orders".to_string(),
+        "public".to_string(),
+        "orders".to_string(),
+        "owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    from_table.acl = vec!["reader=r/owner".to_string(), "writer=rw/owner".to_string()];
+
+    let mut to_table = Table::new(
+        "public".to_string(),
+        "orders".to_string(),
+        "public".to_string(),
+        "orders".to_string(),
+        "owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_table.acl = vec!["reader=r/owner".to_string(), "writer=rw/owner".to_string()];
+
+    // Default privilege only grants SELECT to reader (no writer grant).
+    from_dump.default_privileges.push(DefaultPrivilege {
+        role_name: "owner".to_string(),
+        schema_name: "public".to_string(),
+        object_type: "r".to_string(),
+        acl: vec!["reader=r/owner".to_string()],
+        hash: None,
+    });
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer
+        .recreated_tables
+        .insert(Comparer::table_key("public", "orders"));
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("GRANT SELECT, UPDATE ON TABLE public.orders TO writer;"),
+        "Must grant writer privileges beyond default ACL, got: {script}"
+    );
+    // reader already has SELECT via default, so no GRANT for reader.
+    let reader_grant = script.lines().any(|l| l.contains("TO reader"));
+    assert!(
+        !reader_grant,
+        "reader grant already covered by default ACL, got: {script}"
+    );
+}
+
+/// A non-recreated table that exists in both FROM and TO must use the
+/// original FROM ACL, not the default privilege ACL.
+#[tokio::test]
+async fn compare_grants_non_recreated_table_uses_from_acl() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_table = Table::new(
+        "public".to_string(),
+        "orders".to_string(),
+        "public".to_string(),
+        "orders".to_string(),
+        "owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    from_table.acl = vec!["reader=r/owner".to_string()];
+
+    let mut to_table = Table::new(
+        "public".to_string(),
+        "orders".to_string(),
+        "public".to_string(),
+        "orders".to_string(),
+        "owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_table.acl = vec!["reader=r/owner".to_string()];
+
+    // Even though default privilege differs, we must use FROM ACL.
+    from_dump.default_privileges.push(DefaultPrivilege {
+        role_name: "owner".to_string(),
+        schema_name: "public".to_string(),
+        object_type: "r".to_string(),
+        acl: vec![],
+        hash: None,
+    });
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    // Do NOT insert into recreated_tables — table is not recreated.
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // FROM and TO ACLs match, so no diff should be produced.
+    let has_grant = script
+        .lines()
+        .any(|l| l.trim_start().to_lowercase().starts_with("grant "));
+    let has_revoke = script
+        .lines()
+        .any(|l| l.trim_start().to_lowercase().starts_with("revoke "));
+    assert!(
+        !has_grant && !has_revoke,
+        "Non-recreated table with identical ACLs must produce no GRANT/REVOKE, got: {script}"
+    );
+}
+
+/// A dropped+recreated view (use_drop=true) in full grants mode must use
+/// the default privilege ACL as the effective from_acl, matching the table
+/// recreated-object logic.
+#[tokio::test]
+async fn compare_grants_dropped_view_uses_default_acl_full_mode() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_view = View::new(
+        "my_view".to_string(),
+        "SELECT 1".to_string(),
+        "public".to_string(),
+        Vec::new(),
+    );
+    from_view.acl = vec!["reader=r/owner".to_string()];
+
+    let mut to_view = View::new(
+        "my_view".to_string(),
+        "SELECT 1".to_string(),
+        "public".to_string(),
+        Vec::new(),
+    );
+    to_view.acl = vec!["reader=r/owner".to_string()];
+
+    // Default privilege auto-grants SELECT to reader on new tables/views.
+    from_dump.default_privileges.push(DefaultPrivilege {
+        role_name: "owner".to_string(),
+        schema_name: "public".to_string(),
+        object_type: "r".to_string(),
+        acl: vec!["reader=r/owner".to_string()],
+        hash: None,
+    });
+
+    from_dump.views.push(from_view);
+    to_dump.views.push(to_view);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    // Simulate that the view was actually dropped (use_drop=true).
+    comparer
+        .dropped_views
+        .insert(Comparer::normalized_view_key("public", "my_view"), true);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // Default ACL matches TO ACL, so no diff needed.
+    let has_grant = script
+        .lines()
+        .any(|l| l.trim_start().to_lowercase().starts_with("grant "));
+    let has_revoke = script
+        .lines()
+        .any(|l| l.trim_start().to_lowercase().starts_with("revoke "));
+    assert!(
+        !has_grant && !has_revoke,
+        "Dropped view with matching default ACL must produce no GRANT/REVOKE, got: {script}"
+    );
+}
+
+/// A dropped view (use_drop=true) in full mode whose TO ACL has more
+/// privileges than the default must produce GRANTs to bridge the gap.
+#[tokio::test]
+async fn compare_grants_dropped_view_grants_extra_over_default() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_view = View::new(
+        "my_view".to_string(),
+        "SELECT 1".to_string(),
+        "public".to_string(),
+        Vec::new(),
+    );
+    from_view.acl = vec!["reader=r/owner".to_string(), "writer=rw/owner".to_string()];
+
+    let mut to_view = View::new(
+        "my_view".to_string(),
+        "SELECT 1".to_string(),
+        "public".to_string(),
+        Vec::new(),
+    );
+    to_view.acl = vec!["reader=r/owner".to_string(), "writer=rw/owner".to_string()];
+
+    // Default only gives reader SELECT.
+    from_dump.default_privileges.push(DefaultPrivilege {
+        role_name: "owner".to_string(),
+        schema_name: "public".to_string(),
+        object_type: "r".to_string(),
+        acl: vec!["reader=r/owner".to_string()],
+        hash: None,
+    });
+
+    from_dump.views.push(from_view);
+    to_dump.views.push(to_view);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer
+        .dropped_views
+        .insert(Comparer::normalized_view_key("public", "my_view"), true);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("GRANT SELECT, UPDATE ON TABLE public.my_view TO writer;"),
+        "Must grant writer privileges beyond default ACL for dropped view, got: {script}"
+    );
+}
+
+/// When table ownership changes between FROM and TO, column-level ACL
+/// diffing must exclude both old and new owners from the diff so that
+/// implicit-privilege entries do not produce spurious GRANT/REVOKE.
+#[tokio::test]
+async fn compare_column_grants_excludes_both_old_and_new_owner() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM table owned by old_owner with column ACL for old_owner
+    let mut from_col = int_column("public", "users", "secret", 1);
+    from_col.acl = vec!["old_owner=r/old_owner".to_string()];
+    let from_table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "old_owner".to_string(),
+        None,
+        vec![from_col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    // TO table owned by new_owner with column ACL for new_owner
+    let mut to_col = int_column("public", "users", "secret", 1);
+    to_col.acl = vec!["new_owner=r/new_owner".to_string()];
+    let to_table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "new_owner".to_string(),
+        None,
+        vec![to_col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // Both old_owner and new_owner have implicit privileges as owners,
+    // so no GRANT or REVOKE should appear for them on the column.
+    let has_col_grant = script
+        .lines()
+        .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("grant "));
+    let has_col_revoke = script
+        .lines()
+        .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("revoke "));
+    assert!(
+        !has_col_grant && !has_col_revoke,
+        "Owner ACL entries must be excluded for both old and new owner, got: {script}"
+    );
+}
+
+/// Multirange types are auto-dropped when their associated range type is
+/// dropped.  The comparer must NOT emit a separate DROP for the multirange,
+/// otherwise PostgreSQL rejects it ("cannot drop type … because type …
+/// requires it").
+#[tokio::test]
+async fn compare_types_multirange_not_dropped_independently() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let to_dump = Dump::new(DumpConfig::default());
+
+    // Range type present only in FROM → will be dropped.
+    let mut range_type = make_domain_type("test_schema", "old_range", 600);
+    range_type.typtype = 'r' as i8;
+    range_type.range_subtype = Some("integer".to_string());
+
+    // Associated multirange type present only in FROM.
+    let mut mr_type = make_domain_type("test_schema", "old_multirange", 601);
+    mr_type.typtype = 'm' as i8;
+
+    from_dump.types.push(range_type);
+    from_dump.types.push(mr_type);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, true, true, GrantsMode::Full);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("drop type if exists test_schema.old_range cascade;"),
+        "Range type must be dropped, got: {script}"
+    );
+    let has_mr_drop = script.contains("drop type if exists test_schema.old_multirange");
+    assert!(
+        !has_mr_drop,
+        "Multirange type must NOT be dropped independently, got: {script}"
     );
 }

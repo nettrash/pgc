@@ -1,3 +1,49 @@
+2026-04-17      v1.0.15
+
+                Features:
+                    - UNLOGGED tables support with CREATE UNLOGGED TABLE and ALTER TABLE SET LOGGED/UNLOGGED.
+                    - Storage parameters (reloptions) support with WITH (...) and ALTER TABLE SET/RESET.
+                    - REPLICA IDENTITY support (DEFAULT, NOTHING, FULL) with ALTER TABLE.
+                    - FORCE ROW LEVEL SECURITY support with ALTER TABLE FORCE/NO FORCE ROW LEVEL SECURITY.
+                    - Classical table inheritance (INHERITS) support.
+                    - Typed tables (OF type) support.
+                    - Per-column statistics target (SET STATISTICS) with ALTER support.
+                    - Function/procedure COST and ROWS clauses.
+                    - Function SUPPORT clause.
+                    - Function TRANSFORM FOR TYPE clause.
+                    - New object types with full CREATE/ALTER/DROP/compare support:
+                        - Rules (`CREATE OR REPLACE RULE`, `DROP RULE`, comparison by definition hash).
+                        - Collations (libc/ICU/default providers, locale, deterministic flag).
+                        - Text search configurations (parser, token-to-dictionary mappings).
+                        - Text search dictionaries (template and options).
+                        - Foreign data wrappers (handler/validator functions, options).
+                        - Foreign servers (type, version, FDW reference, options).
+                        - User mappings (user-to-server with options).
+                        - Publications (`FOR ALL TABLES` or per-table, publish operations).
+                        - Subscriptions (connection string, publication list, enable/disable).
+                        - Operators (procedure, left/right types, commutator, negator, HASHES/MERGES).
+                        - Casts (function/binary-coercible/I-O, assignment/implicit context).
+                        - Event triggers (ddl_command_start/end, sql_drop, table_rewrite, filter tags, enable states).
+                    - Default privileges comparison (`ALTER DEFAULT PRIVILEGES`) with per-role
+                      and per-schema scoping, GRANT/REVOKE diff generation.
+                    - Column-level ACLs: per-column GRANT/REVOKE (SELECT, INSERT, UPDATE, REFERENCES).
+
+                Bug fixes:
+                    - Removed `has_rules` from table hash computation. Rules are compared
+                      independently; including them in the hash caused spurious view drops
+                      when a rule was added or removed.
+                    - Added CASCADE to DROP TYPE statements. Dependent objects (e.g.
+                      multirange types) could prevent type drops without it.
+                    - Fixed idempotency of grants for recreated objects. Tables that are
+                      dropped and recreated during migration (e.g. partition key change)
+                      now use the default privilege ACL as the effective source ACL in
+                      `compare_grants`, so auto-applied grants are properly revoked in a
+                      single diff run.
+                    - Fixed idempotency of grants for dropped and recreated views. Views
+                      dropped as dependencies and then recreated now use the default
+                      privilege ACL instead of an empty ACL, preventing persistent REVOKE
+                      statements on subsequent runs.
+
 2026-04-16      v1.0.14
                 
                 Features:

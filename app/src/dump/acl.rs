@@ -79,6 +79,8 @@ impl AclEntry {
             "SEQUENCE" => &["USAGE", "SELECT", "UPDATE"],
             "FUNCTION" | "PROCEDURE" => &["EXECUTE"],
             "SCHEMA" => &["USAGE", "CREATE"],
+            "TYPE" => &["USAGE"],
+            "COLUMN" => &["SELECT", "INSERT", "UPDATE", "REFERENCES"],
             _ => &[],
         }
     }
@@ -409,6 +411,64 @@ pub fn generate_new_object_grants(
     owners: &[&str],
 ) -> String {
     generate_grants_script(&[], to_acl, false, object_kind, object_name, owners)
+}
+
+/// Generate column-level GRANT/REVOKE statements.
+///
+/// Column privileges use the format:
+///   `GRANT SELECT (col) ON TABLE schema.table TO grantee;`
+pub fn generate_column_grants_script(
+    from_acl: &[String],
+    to_acl: &[String],
+    full: bool,
+    table_name: &str,
+    column_name: &str,
+    owners: &[&str],
+) -> String {
+    let diffs = diff_acls(from_acl, to_acl, full, "COLUMN", owners);
+    let mut script = String::new();
+
+    for entry in &diffs {
+        let grantee = AclEntry::format_grantee(&entry.grantee);
+        if !entry.revoke_option_for.is_empty() {
+            script.append_block(&format!(
+                "REVOKE GRANT OPTION FOR {} ({}) ON TABLE {} FROM {};",
+                entry.revoke_option_for.join(", "),
+                column_name,
+                table_name,
+                grantee
+            ));
+        }
+        if !entry.revokes.is_empty() {
+            script.append_block(&format!(
+                "REVOKE {} ({}) ON TABLE {} FROM {};",
+                entry.revokes.join(", "),
+                column_name,
+                table_name,
+                grantee
+            ));
+        }
+        if !entry.grants_plain.is_empty() {
+            script.append_block(&format!(
+                "GRANT {} ({}) ON TABLE {} TO {};",
+                entry.grants_plain.join(", "),
+                column_name,
+                table_name,
+                grantee
+            ));
+        }
+        if !entry.grants_with_option.is_empty() {
+            script.append_block(&format!(
+                "GRANT {} ({}) ON TABLE {} TO {} WITH GRANT OPTION;",
+                entry.grants_with_option.join(", "),
+                column_name,
+                table_name,
+                grantee
+            ));
+        }
+    }
+
+    script
 }
 
 #[cfg(test)]

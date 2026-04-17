@@ -82,7 +82,11 @@ pub struct PgType {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multirange_name: Option<String>, // Multirange type name (for range types)
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_collation_name: Option<String>, // Resolved collation name for domain types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>, // Optional comment on the type
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>, // ACL entries for GRANT/REVOKE
     pub hash: Option<String>, // SHA256 hash of the type definition
 }
 
@@ -170,7 +174,9 @@ impl PgType {
             range_canonical: None,
             range_subdiff: None,
             multirange_name: None,
+            domain_collation_name: None,
             comment,
+            acl: Vec::new(),
             hash: None,
         };
         pg_type.hash();
@@ -276,10 +282,19 @@ impl PgType {
         update_option(&mut hasher, &self.multirange_name, |hasher, value| {
             hasher.update(value.as_bytes());
         });
+        update_option(&mut hasher, &self.domain_collation_name, |hasher, value| {
+            hasher.update(value.as_bytes());
+        });
 
         if let Some(comment) = &self.comment {
             hasher.update((comment.len() as u32).to_be_bytes());
             hasher.update(comment.as_bytes());
+        }
+
+        hasher.update((self.acl.len() as u32).to_be_bytes());
+        for entry in &self.acl {
+            hasher.update((entry.len() as u32).to_be_bytes());
+            hasher.update(entry.as_bytes());
         }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
@@ -326,6 +341,10 @@ impl PgType {
                 let base_type = self.formatted_basetype.as_deref().unwrap_or("text");
 
                 let mut clauses = Vec::new();
+
+                if let Some(collation) = &self.domain_collation_name {
+                    clauses.push(format!("collate {}", collation));
+                }
 
                 if let Some(default) = &self.typdefault
                     && !default.trim().is_empty()
@@ -475,7 +494,11 @@ impl PgType {
 
     /// Returns a statement to drop the user-defined type if it exists.
     pub fn get_drop_script(&self) -> String {
-        format!("drop type if exists {}.{};", self.schema, self.typname).with_empty_lines()
+        format!(
+            "drop type if exists {}.{} cascade;",
+            self.schema, self.typname
+        )
+        .with_empty_lines()
     }
 
     /// Returns a string to alter the existing user-defined type to match the target definition.
@@ -833,7 +856,9 @@ mod tests {
             range_canonical: None,
             range_subdiff: None,
             multirange_name: None,
+            domain_collation_name: None,
             comment: None,
+            acl: Vec::new(),
             hash: None,
         }
     }
@@ -1012,7 +1037,7 @@ alter domain public.amount add constraint \"FreshConstraint\" check (value <> 0)
 
         assert_eq!(
             pg_type.get_drop_script(),
-            "drop type if exists public.my_type;\n\n"
+            "drop type if exists public.my_type cascade;\n\n"
         );
     }
 

@@ -31,15 +31,18 @@ impl Extension {
     pub fn hash(&self) -> String {
         format!(
             "{:x}",
-            md5::compute(format!("{}.{}.{}", self.schema, self.name, self.owner))
+            md5::compute(format!(
+                "{}.{}.{}.{}",
+                self.schema, self.name, self.version, self.owner
+            ))
         )
     }
 
     /// Returns a string to create the extension.
     pub fn get_script(&self) -> String {
         format!(
-            "create extension if not exists {} with schema {};",
-            self.name, self.schema
+            "create extension if not exists {} with schema {} version '{}';",
+            self.name, self.schema, self.version
         )
         .with_empty_lines()
     }
@@ -47,6 +50,24 @@ impl Extension {
     /// Returns a string to drop the extension.
     pub fn get_drop_script(&self) -> String {
         format!("drop extension if exists {};", self.name).with_empty_lines()
+    }
+
+    /// Returns a script to alter this extension to match the target.
+    pub fn get_alter_script(&self, target: &Extension) -> String {
+        let mut script = String::new();
+        if self.version != target.version {
+            script.append_block(&format!(
+                "alter extension {} update to '{}';",
+                target.name, target.version
+            ));
+        }
+        if self.schema != target.schema {
+            script.append_block(&format!(
+                "alter extension {} set schema {};",
+                target.name, target.schema
+            ));
+        }
+        script
     }
 }
 
@@ -101,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extension_hash_consistency() {
+    fn test_extension_hash_includes_version() {
         let extension1 = Extension::new(
             "test_ext".to_string(),
             "1.0".to_string(),
@@ -114,8 +135,8 @@ mod tests {
             "test_schema".to_string(),
         );
 
-        // Hash should be the same for same name and schema, regardless of version
-        assert_eq!(extension1.hash(), extension2.hash());
+        // Hash should be different when versions differ
+        assert_ne!(extension1.hash(), extension2.hash());
     }
 
     #[test]
@@ -157,7 +178,8 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists \"uuid-ossp\" with schema public;\n\n";
+        let expected =
+            "create extension if not exists \"uuid-ossp\" with schema public version '1.1';\n\n";
 
         assert_eq!(script, expected);
     }
@@ -171,7 +193,8 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected = "create extension if not exists postgis with schema extensions;\n\n";
+        let expected =
+            "create extension if not exists postgis with schema extensions version '3.3.2';\n\n";
 
         assert_eq!(script, expected);
     }
@@ -185,8 +208,7 @@ mod tests {
         );
 
         let script = extension.get_script();
-        let expected =
-            "create extension if not exists \"test-ext_name\" with schema custom_schema;\n\n";
+        let expected = "create extension if not exists \"test-ext_name\" with schema custom_schema version '1.0.0';\n\n";
 
         assert_eq!(script, expected);
     }
@@ -305,7 +327,10 @@ mod tests {
 
         // Scripts should work with empty strings
         let script = extension.get_script();
-        assert_eq!(script, "create extension if not exists  with schema ;\n\n");
+        assert_eq!(
+            script,
+            "create extension if not exists  with schema  version '';\n\n"
+        );
 
         let drop_script = extension.get_drop_script();
         assert_eq!(drop_script, "drop extension if exists ;\n\n");
@@ -335,9 +360,9 @@ mod tests {
     fn test_known_md5_hash() {
         let extension = Extension::new("test".to_string(), "1.0".to_string(), "public".to_string());
 
-        // The hash is computed from "public.test." (schema.name.owner)
+        // The hash is computed from "public.test.1.0." (schema.name.version.owner)
         // We can verify this produces a consistent MD5 hash
-        let expected_hash = format!("{:x}", md5::compute("public.test."));
+        let expected_hash = format!("{:x}", md5::compute("public.test.1.0."));
         assert_eq!(extension.hash(), expected_hash);
     }
 

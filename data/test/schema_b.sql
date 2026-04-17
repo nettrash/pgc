@@ -746,6 +746,48 @@ AS $$
     SELECT CASE WHEN rate > 0.2 THEN 'high' ELSE 'low' END;
 $$;
 
+-- =============================================================================
+-- Routine SET configuration parameters (proconfig) test
+-- =============================================================================
+
+-- Function with SET params (unchanged between FROM and TO)
+CREATE OR REPLACE FUNCTION test_schema.get_session_user_safe()
+RETURNS text
+LANGUAGE plpgsql
+STABLE SECURITY DEFINER
+SET search_path = 'public, pg_temp'
+AS $$
+BEGIN
+    RETURN session_user;
+END;
+$$;
+
+-- Function with SET params (TO)
+-- FROM had only SET search_path = 'public' → config modified + added
+CREATE OR REPLACE FUNCTION test_schema.secure_lookup(key text)
+RETURNS text
+LANGUAGE plpgsql
+STABLE SECURITY DEFINER
+SET search_path = 'public, pg_temp'
+SET lock_timeout = '5s'
+AS $$
+BEGIN
+    RETURN current_setting(key, true);
+END;
+$$;
+
+-- Procedure with SET params (TO only → should be created with SET clauses)
+CREATE OR REPLACE PROCEDURE test_schema.apply_secure_settings(IN pvalue text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = 'public, pg_temp'
+SET lock_timeout = '5s'
+AS $$
+BEGIN
+    RAISE NOTICE 'value: %', pvalue;
+END;
+$$;
+
 -- AGGREGATE function (unchanged between FROM and TO)
 CREATE OR REPLACE FUNCTION test_schema.running_sum_sfunc(state bigint, val integer)
 RETURNS bigint
@@ -1353,6 +1395,95 @@ CREATE TABLE test_schema.virtual_gen_test (
 );
 
 -- =============================================================================
+-- UNLOGGED tables test (TO side)
+-- =============================================================================
+-- TO: UNLOGGED table (was regular/logged)
+CREATE UNLOGGED TABLE test_schema.unlogged_test (
+    id SERIAL PRIMARY KEY,
+    data TEXT
+);
+
+-- =============================================================================
+-- Storage parameters (reloptions) test (TO side)
+-- =============================================================================
+-- TO: table with fillfactor=90 and autovacuum_enabled=false (was fillfactor=70)
+CREATE TABLE test_schema.storage_params_test (
+    id SERIAL PRIMARY KEY,
+    value TEXT
+) WITH (fillfactor = 90, autovacuum_enabled = false);
+
+-- =============================================================================
+-- REPLICA IDENTITY test (TO side)
+-- =============================================================================
+-- TO: table with REPLICA IDENTITY FULL (was DEFAULT)
+CREATE TABLE test_schema.replica_identity_test (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+);
+ALTER TABLE test_schema.replica_identity_test REPLICA IDENTITY FULL;
+
+-- =============================================================================
+-- FORCE ROW LEVEL SECURITY test (TO side)
+-- =============================================================================
+-- TO: table with RLS enabled AND forced (was enabled but not forced)
+CREATE TABLE test_schema.force_rls_test (
+    id SERIAL PRIMARY KEY,
+    tenant_id INT NOT NULL,
+    data TEXT
+);
+ALTER TABLE test_schema.force_rls_test ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_schema.force_rls_test FORCE ROW LEVEL SECURITY;
+CREATE POLICY force_rls_policy ON test_schema.force_rls_test
+    FOR ALL
+    USING (tenant_id = current_setting('app.tenant_id')::int);
+
+-- =============================================================================
+-- Classical inheritance test (TO side)
+-- =============================================================================
+-- TO: parent table with child (child_data type changed)
+CREATE TABLE test_schema.inheritance_parent (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+);
+CREATE TABLE test_schema.inheritance_child (
+    child_data VARCHAR(255)
+) INHERITS (test_schema.inheritance_parent);
+
+-- =============================================================================
+-- Typed table (OF type) test (TO side)
+-- =============================================================================
+-- TO: same typed table
+CREATE TYPE test_schema.address_type AS (
+    street VARCHAR(200),
+    city VARCHAR(100),
+    zip VARCHAR(20)
+);
+CREATE TABLE test_schema.typed_table_test OF test_schema.address_type;
+
+-- =============================================================================
+-- Per-column statistics target test (TO side)
+-- =============================================================================
+-- TO: column with statistics target 500 (was 100)
+CREATE TABLE test_schema.col_stats_test (
+    id SERIAL PRIMARY KEY,
+    searchable_data TEXT
+);
+ALTER TABLE test_schema.col_stats_test ALTER COLUMN searchable_data SET STATISTICS 500;
+
+-- =============================================================================
+-- Function COST/ROWS test (TO side)
+-- =============================================================================
+-- TO: function with COST 200 and ROWS 500 (was COST 100, ROWS 1000)
+CREATE OR REPLACE FUNCTION test_schema.cost_rows_test(n INT)
+RETURNS SETOF INT
+LANGUAGE sql
+COST 200
+ROWS 500
+AS $$
+    SELECT generate_series(1, n);
+$$;
+
+-- =============================================================================
 -- Grants comparison test (TO side)
 -- =============================================================================
 -- These GRANT statements establish the TO target for grant comparison.
@@ -1385,3 +1516,164 @@ GRANT SELECT ON test_schema.product_inventory TO pgc_grant_writer;
 
 -- Function grants (update_timestamp grant removed; new function grant added)
 GRANT EXECUTE ON FUNCTION test_schema.calculate_average_rating(UUID) TO pgc_grant_reader;
+
+-- =============================================================================
+-- Rules comparison test (TO side)
+-- =============================================================================
+-- test_products_no_delete: same as FROM (no diff)
+-- test_users_soft_delete:  removed (FROM-only)
+-- test_reviews_audit:      added (TO-only)
+CREATE RULE rule_products_no_delete AS ON DELETE TO test_schema.products DO INSTEAD NOTHING;
+
+CREATE RULE rule_reviews_audit AS ON INSERT TO test_schema.reviews
+    DO ALSO
+        INSERT INTO shared_schema.audit_logs (table_name, operation, new_values)
+        VALUES ('reviews', 'INSERT', row_to_json(NEW)::jsonb);
+
+-- =============================================================================
+-- Event triggers comparison test (TO side)
+-- =============================================================================
+-- test_etrig_unchanged: same as FROM (no diff)
+-- test_etrig_from_only: removed (FROM-only)
+-- test_etrig_to_only:   added (TO-only)
+CREATE OR REPLACE FUNCTION test_schema.etrig_log_ddl() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE 'DDL event: % on %', TG_EVENT, TG_TAG;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION test_schema.etrig_to_only_fn() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NULL;
+END;
+$$;
+
+CREATE EVENT TRIGGER test_etrig_unchanged
+    ON ddl_command_start
+    EXECUTE FUNCTION test_schema.etrig_log_ddl();
+
+CREATE EVENT TRIGGER test_etrig_to_only
+    ON ddl_command_end
+    EXECUTE FUNCTION test_schema.etrig_to_only_fn();
+
+-- =============================================================================
+-- Collations comparison test (TO side)
+-- =============================================================================
+-- test_coll_unchanged: same as FROM (no diff); test_coll_from_only: removed; test_coll_to_only: added
+CREATE COLLATION test_schema.test_coll_unchanged (provider = libc, lc_collate = 'C', lc_ctype = 'C');
+CREATE COLLATION test_schema.test_coll_to_only (provider = libc, lc_collate = 'C', lc_ctype = 'C');
+
+-- =============================================================================
+-- Text search dictionary comparison test (TO side)
+-- =============================================================================
+-- test_dict_unchanged: same; test_dict_from_only: removed; test_dict_modified: stopwords removed; test_dict_to_only: added
+CREATE TEXT SEARCH DICTIONARY test_schema.test_dict_unchanged (
+    TEMPLATE = pg_catalog.simple,
+    STOPWORDS = english
+);
+CREATE TEXT SEARCH DICTIONARY test_schema.test_dict_modified (  -- MODIFIED: STOPWORDS removed
+    TEMPLATE = pg_catalog.simple
+);
+CREATE TEXT SEARCH DICTIONARY test_schema.test_dict_to_only (
+    TEMPLATE = pg_catalog.simple
+);
+
+-- =============================================================================
+-- Text search configuration comparison test (TO side)
+-- =============================================================================
+-- test_tsconfig_unchanged: same; test_tsconfig_from_only: removed; test_tsconfig_to_only: added
+CREATE TEXT SEARCH CONFIGURATION test_schema.test_tsconfig_unchanged (
+    PARSER = pg_catalog.default
+);
+CREATE TEXT SEARCH CONFIGURATION test_schema.test_tsconfig_to_only (
+    PARSER = pg_catalog.default
+);
+
+-- =============================================================================
+-- Cast comparison test (TO side)
+-- =============================================================================
+-- FROM-only cast (test_type_A → text) removed (test_type_A doesn't exist in TO)
+-- Shared cast unchanged: user_profile → text
+-- TO-only cast added: test_type_B → text
+CREATE OR REPLACE FUNCTION test_schema.user_profile_to_text(test_schema.user_profile) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT ($1).first_name || ' ' || ($1).last_name; $$;
+
+CREATE CAST (test_schema.user_profile AS text)
+    WITH FUNCTION test_schema.user_profile_to_text(test_schema.user_profile);
+
+CREATE OR REPLACE FUNCTION test_schema.test_type_b_to_text(test_schema.test_type_B) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT ($1).street || ', ' || ($1).city; $$;
+
+CREATE CAST (test_schema.test_type_B AS text)
+    WITH FUNCTION test_schema.test_type_b_to_text(test_schema.test_type_B);
+
+-- =============================================================================
+-- Operator comparison test (TO side)
+-- =============================================================================
+-- Unchanged: ~< (text, int) → bool (same as FROM)
+-- FROM-only ~> dropped (text_longer_than and ~> not present in TO)
+-- TO-only added: ~= (text, int) → bool — length($1) = $2
+CREATE OR REPLACE FUNCTION test_schema.text_shorter_than(text, integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT length($1) < $2; $$;
+
+CREATE OPERATOR test_schema.~< (
+    LEFTARG = text,
+    RIGHTARG = integer,
+    FUNCTION = test_schema.text_shorter_than
+);
+
+CREATE OR REPLACE FUNCTION test_schema.text_equals_length(text, integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT
+AS $$ SELECT length($1) = $2; $$;
+
+CREATE OPERATOR test_schema.~= (
+    LEFTARG = text,
+    RIGHTARG = integer,
+    FUNCTION = test_schema.text_equals_length
+);
+
+-- =============================================================================
+-- Default privileges comparison test (TO side)
+-- =============================================================================
+-- reader SELECT on new tables in test_schema: unchanged
+-- writer INSERT only: MODIFIED to SELECT, INSERT, UPDATE
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_schema
+    GRANT SELECT ON TABLES TO pgc_grant_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_schema
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO pgc_grant_writer;  -- MODIFIED: was INSERT only
+
+-- =============================================================================
+-- Foreign server and user mapping comparison test (TO side)
+-- =============================================================================
+-- test_server_modified: host and dbname changed; test_server_from_only: removed; test_server_to_only: added
+CREATE SERVER test_server_modified
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'server-host-b', dbname 'db_b', port '5432');  -- MODIFIED: host and dbname changed
+
+CREATE SERVER test_server_to_only
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'new-host', dbname 'new_db');
+
+-- User mapping unchanged: PUBLIC on test_foreign_server
+-- User mapping dropped:   PUBLIC on test_server_from_only (server removed)
+-- User mapping added:     PUBLIC on test_server_to_only (server added)
+CREATE USER MAPPING FOR PUBLIC
+    SERVER test_foreign_server
+    OPTIONS (user 'readonly_user');
+
+CREATE USER MAPPING FOR PUBLIC
+    SERVER test_server_to_only
+    OPTIONS (user 'new_readonly_user');
+
+-- =============================================================================
+-- Publications comparison test (TO side)
+-- =============================================================================
+-- Requires wal_level = logical.
+-- test_pub_from_only: removed; test_pub_unchanged: same as FROM; test_pub_to_only: added
+CREATE PUBLICATION test_pub_unchanged FOR TABLE test_schema.users, test_schema.products;
+CREATE PUBLICATION test_pub_to_only FOR ALL TABLES;
