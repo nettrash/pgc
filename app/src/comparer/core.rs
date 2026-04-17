@@ -32,6 +32,10 @@ pub struct Comparer {
     sequence_post_script: String,
     trigger_post_script: String,
     dropped_views: HashMap<String, bool>,
+    // Tracks tables that are dropped and recreated during the migration
+    // (e.g. partition key change).  These will receive auto-grants from
+    // default privileges and must be accounted for in compare_grants.
+    recreated_tables: HashSet<String>,
     // Tracks columns that should use serial/bigserial/smallserial type.
     // Key: "schema.table.column", Value: "serial", "bigserial", or "smallserial".
     serial_columns: HashMap<String, String>,
@@ -61,6 +65,7 @@ impl Comparer {
             sequence_post_script: String::new(),
             trigger_post_script: String::new(),
             dropped_views: HashMap::new(),
+            recreated_tables: HashSet::new(),
             serial_columns: HashMap::new(),
         };
 
@@ -107,11 +112,24 @@ impl Comparer {
         self.compare_foreign_keys().await?;
         self.compare_foreign_tables().await?;
         self.compare_statistics().await?;
+        self.compare_rules().await?;
+        self.compare_collations().await?;
+        self.compare_ts_dicts().await?;
+        self.compare_ts_configs().await?;
+        self.compare_fdws().await?;
+        self.compare_servers().await?;
+        self.compare_user_mappings().await?;
+        self.compare_publications().await?;
+        self.compare_subscriptions().await?;
         if !self.sequence_post_script.is_empty() {
             self.script.push_str(&self.sequence_post_script);
             self.sequence_post_script.clear();
         }
         self.compare_routines_and_views().await?;
+        // Operators, casts, and event triggers must come after routines, as they reference functions
+        self.compare_operators().await?;
+        self.compare_casts().await?;
+        self.compare_event_triggers().await?;
         if !self.type_post_script.is_empty() {
             self.script.push_str(&self.type_post_script);
             self.type_post_script.clear();
@@ -126,6 +144,7 @@ impl Comparer {
         }
 
         self.compare_grants().await?;
+        self.compare_default_privileges().await?;
 
         if self.use_single_transaction {
             self.script.push_str("\ncommit;");
@@ -664,6 +683,13 @@ impl Comparer {
         for ext in &self.to.extensions {
             if let Some(&idx) = from_ext_map.get(&(ext.schema.as_str(), ext.name.as_str())) {
                 let from_ext = &self.from.extensions[idx];
+                let alter = from_ext.get_alter_script(ext);
+                if !alter.is_empty() {
+                    self.script.push_str(
+                        format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
+                    );
+                    self.script.push_str(alter.as_str());
+                }
                 if from_ext.owner != ext.owner {
                     self.script.push_str(
                         format!("/* Extension: {}.{}*/\n", ext.schema, ext.name).as_str(),
@@ -767,6 +793,10 @@ impl Comparer {
         {
             for from_type in &self.from.types {
                 if (from_type.typtype as u8 as char) == 'e' {
+                    continue;
+                }
+                // Multirange types are auto-dropped when their range type is dropped.
+                if (from_type.typtype as u8 as char) == 'm' {
                     continue;
                 }
                 if to_type_keys.contains(&(from_type.schema.as_str(), from_type.typname.as_str())) {
@@ -1491,6 +1521,8 @@ impl Comparer {
                 let to_table = &self.to.tables[tidx];
                 if table.partition_key != to_table.partition_key {
                     recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+                    self.recreated_tables
+                        .insert(Self::table_key(&table.schema, &table.name));
                 }
             }
         }
@@ -1593,6 +1625,8 @@ impl Comparer {
                     );
 
                     if parent_recreated {
+                        self.recreated_tables
+                            .insert(Self::table_key(&table.schema, &table.name));
                         self.script
                             .push_str(to_table.get_script_without_triggers().as_str());
                         self.trigger_post_script
@@ -1604,10 +1638,13 @@ impl Comparer {
                         // If the generated alter script dropped + recreated this table
                         // and the table is a partitioned parent, record it so its
                         // children will be recreated instead of altered.
-                        if table.partition_key.is_some()
-                            && alter_script.to_lowercase().contains("drop table if exists")
-                        {
-                            recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+                        if alter_script.to_lowercase().contains("drop table if exists") {
+                            self.recreated_tables
+                                .insert(Self::table_key(&table.schema, &table.name));
+                            if table.partition_key.is_some() {
+                                recreated_parents
+                                    .insert(Self::table_key(&table.schema, &table.name));
+                            }
                         }
 
                         self.script.push_str(alter_script.as_str());
@@ -2086,6 +2123,600 @@ impl Comparer {
         Ok(())
     }
 
+    async fn compare_rules(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Rules --------------- */");
+
+        let from_map: HashMap<(&str, &str, &str), &crate::dump::rule::Rule> = self
+            .from
+            .rules
+            .iter()
+            .map(|r| {
+                (
+                    (
+                        r.schema.as_str(),
+                        r.table_name.as_str(),
+                        r.rule_name.as_str(),
+                    ),
+                    r,
+                )
+            })
+            .collect();
+
+        let to_map: HashMap<(&str, &str, &str), &crate::dump::rule::Rule> = self
+            .to
+            .rules
+            .iter()
+            .map(|r| {
+                (
+                    (
+                        r.schema.as_str(),
+                        r.table_name.as_str(),
+                        r.rule_name.as_str(),
+                    ),
+                    r,
+                )
+            })
+            .collect();
+
+        // Drop rules that only exist in FROM
+        for (key, rule) in &from_map {
+            if !to_map.contains_key(key) {
+                if self.use_drop {
+                    self.script.push_str(&rule.get_drop_script());
+                } else {
+                    let drop = rule.get_drop_script();
+                    self.script.push_str(
+                        &drop
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                }
+            }
+        }
+
+        // Create or alter rules in TO
+        for rule in &self.to.rules {
+            let key = (
+                rule.schema.as_str(),
+                rule.table_name.as_str(),
+                rule.rule_name.as_str(),
+            );
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != rule.hash {
+                    let alter = existing.get_alter_script(rule, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&rule.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_event_triggers(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Event Triggers --------------- */");
+
+        let from_map: HashMap<&str, &crate::dump::event_trigger::EventTrigger> = self
+            .from
+            .event_triggers
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
+
+        let to_map: HashMap<&str, &crate::dump::event_trigger::EventTrigger> = self
+            .to
+            .event_triggers
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
+
+        // Drop event triggers that only exist in FROM
+        for (name, et) in &from_map {
+            if !to_map.contains_key(name) {
+                if self.use_drop {
+                    self.script.push_str(&et.get_drop_script());
+                } else {
+                    let drop = et.get_drop_script();
+                    self.script.push_str(
+                        &drop
+                            .lines()
+                            .map(|l| format!("-- {}\n", l))
+                            .collect::<String>(),
+                    );
+                }
+            }
+        }
+
+        // Create or alter event triggers in TO
+        for et in &self.to.event_triggers {
+            if let Some(existing) = from_map.get(et.name.as_str()) {
+                if existing.hash != et.hash {
+                    let alter = existing.get_alter_script(et, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&et.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_collations(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Collations ------------------- */");
+
+        let from_map: HashMap<String, &crate::dump::collation::Collation> = self
+            .from
+            .collations
+            .iter()
+            .map(|c| (format!("{}.{}", c.schema, c.name), c))
+            .collect();
+
+        let to_map: HashMap<String, &crate::dump::collation::Collation> = self
+            .to
+            .collations
+            .iter()
+            .map(|c| (format!("{}.{}", c.schema, c.name), c))
+            .collect();
+
+        if self.use_drop {
+            for (key, coll) in &from_map {
+                if !to_map.contains_key(key) {
+                    self.script.push_str(&coll.get_drop_script());
+                }
+            }
+        }
+
+        for coll in &self.to.collations {
+            let key = format!("{}.{}", coll.schema, coll.name);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != coll.hash {
+                    let alter = existing.get_alter_script(coll, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&coll.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_ts_configs(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Text Search Configurations --- */");
+
+        let from_map: HashMap<String, &crate::dump::text_search::TextSearchConfig> = self
+            .from
+            .ts_configs
+            .iter()
+            .map(|c| (format!("{}.{}", c.schema, c.name), c))
+            .collect();
+
+        if self.use_drop {
+            for cfg in &self.from.ts_configs {
+                let key = format!("{}.{}", cfg.schema, cfg.name);
+                if !self
+                    .to
+                    .ts_configs
+                    .iter()
+                    .any(|c| format!("{}.{}", c.schema, c.name) == key)
+                {
+                    self.script.push_str(&cfg.get_drop_script());
+                }
+            }
+        }
+
+        for cfg in &self.to.ts_configs {
+            let key = format!("{}.{}", cfg.schema, cfg.name);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != cfg.hash {
+                    let alter = existing.get_alter_script(cfg, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&cfg.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_ts_dicts(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Text Search Dictionaries ----- */");
+
+        let from_map: HashMap<String, &crate::dump::text_search::TextSearchDict> = self
+            .from
+            .ts_dicts
+            .iter()
+            .map(|d| (format!("{}.{}", d.schema, d.name), d))
+            .collect();
+
+        if self.use_drop {
+            for d in &self.from.ts_dicts {
+                let key = format!("{}.{}", d.schema, d.name);
+                if !self
+                    .to
+                    .ts_dicts
+                    .iter()
+                    .any(|td| format!("{}.{}", td.schema, td.name) == key)
+                {
+                    self.script.push_str(&d.get_drop_script());
+                }
+            }
+        }
+
+        for d in &self.to.ts_dicts {
+            let key = format!("{}.{}", d.schema, d.name);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != d.hash {
+                    let alter = existing.get_alter_script(d, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&d.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_casts(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Casts ------------------------ */");
+
+        let from_map: HashMap<String, &crate::dump::cast::Cast> = self
+            .from
+            .casts
+            .iter()
+            .map(|c| (format!("{} AS {}", c.source_type, c.target_type), c))
+            .collect();
+
+        // Build sets of user-defined type names present in each dump.
+        // format_type() returns "schema.typname" for user types, matching how
+        // PgType stores schema (nspname, unquoted) and typname.
+        let to_type_names: HashSet<String> = self
+            .to
+            .types
+            .iter()
+            .map(|t| format!("{}.{}", t.schema, t.typname))
+            .collect();
+        let from_type_names: HashSet<String> = self
+            .from
+            .types
+            .iter()
+            .map(|t| format!("{}.{}", t.schema, t.typname))
+            .collect();
+
+        if self.use_drop {
+            for cast in &self.from.casts {
+                let key = format!("{} AS {}", cast.source_type, cast.target_type);
+                if !self
+                    .to
+                    .casts
+                    .iter()
+                    .any(|c| format!("{} AS {}", c.source_type, c.target_type) == key)
+                {
+                    // If either the source or target type is a user-defined type being
+                    // removed in this migration, skip the explicit DROP CAST — it will
+                    // be handled automatically by DROP TYPE … CASCADE.
+                    let src_dropped = from_type_names.contains(&cast.source_type)
+                        && !to_type_names.contains(&cast.source_type);
+                    let tgt_dropped = from_type_names.contains(&cast.target_type)
+                        && !to_type_names.contains(&cast.target_type);
+                    if src_dropped || tgt_dropped {
+                        continue;
+                    }
+                    self.script.push_str(&cast.get_drop_script());
+                }
+            }
+        }
+
+        for cast in &self.to.casts {
+            let key = format!("{} AS {}", cast.source_type, cast.target_type);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != cast.hash {
+                    let alter = existing.get_alter_script(cast, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&cast.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_operators(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Operators -------------------- */");
+
+        let op_key = |op: &crate::dump::operator::Operator| {
+            format!(
+                "{}.{}({}, {})",
+                op.schema,
+                op.name,
+                op.left_type.as_deref().unwrap_or("NONE"),
+                op.right_type.as_deref().unwrap_or("NONE")
+            )
+        };
+
+        let from_map: HashMap<String, &crate::dump::operator::Operator> = self
+            .from
+            .operators
+            .iter()
+            .map(|op| (op_key(op), op))
+            .collect();
+
+        if self.use_drop {
+            for op in &self.from.operators {
+                let key = op_key(op);
+                if !self.to.operators.iter().any(|o| op_key(o) == key) {
+                    self.script.push_str(&op.get_drop_script());
+                }
+            }
+        }
+
+        for op in &self.to.operators {
+            let key = op_key(op);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != op.hash {
+                    let alter = existing.get_alter_script(op, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&op.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_default_privileges(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Default Privileges ----------- */");
+
+        let dp_key = |dp: &crate::dump::default_privilege::DefaultPrivilege| {
+            format!("{}|{}|{}", dp.role_name, dp.schema_name, dp.object_type)
+        };
+
+        let from_map: HashMap<String, &crate::dump::default_privilege::DefaultPrivilege> = self
+            .from
+            .default_privileges
+            .iter()
+            .map(|dp| (dp_key(dp), dp))
+            .collect();
+
+        if self.use_drop {
+            for dp in &self.from.default_privileges {
+                let key = dp_key(dp);
+                if !self.to.default_privileges.iter().any(|d| dp_key(d) == key) {
+                    self.script.push_str(&dp.get_revoke_script());
+                }
+            }
+        }
+
+        for dp in &self.to.default_privileges {
+            let key = dp_key(dp);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != dp.hash {
+                    // Revoke old, grant new
+                    self.script.push_str(&existing.get_revoke_script());
+                    self.script.push_str(&dp.get_script());
+                }
+            } else {
+                self.script.push_str(&dp.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_publications(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Publications ----------------- */");
+
+        let from_map: HashMap<&str, &crate::dump::publication::Publication> = self
+            .from
+            .publications
+            .iter()
+            .map(|p| (p.name.as_str(), p))
+            .collect();
+
+        if self.use_drop {
+            for pub_ in &self.from.publications {
+                if !self.to.publications.iter().any(|p| p.name == pub_.name) {
+                    self.script.push_str(&pub_.get_drop_script());
+                }
+            }
+        }
+
+        for pub_ in &self.to.publications {
+            if let Some(existing) = from_map.get(pub_.name.as_str()) {
+                if existing.hash != pub_.hash {
+                    let alter = existing.get_alter_script(pub_, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&pub_.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_subscriptions(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Subscriptions ---------------- */");
+
+        let from_map: HashMap<&str, &crate::dump::publication::Subscription> = self
+            .from
+            .subscriptions
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+
+        if self.use_drop {
+            for sub in &self.from.subscriptions {
+                if !self.to.subscriptions.iter().any(|s| s.name == sub.name) {
+                    self.script.push_str(&sub.get_drop_script());
+                }
+            }
+        }
+
+        for sub in &self.to.subscriptions {
+            if let Some(existing) = from_map.get(sub.name.as_str()) {
+                if existing.hash != sub.hash {
+                    let alter = existing.get_alter_script(sub, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&sub.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_fdws(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Foreign Data Wrappers -------- */");
+
+        let from_map: HashMap<&str, &crate::dump::fdw::ForeignDataWrapper> = self
+            .from
+            .foreign_data_wrappers
+            .iter()
+            .map(|f| (f.name.as_str(), f))
+            .collect();
+
+        if self.use_drop {
+            for fdw in &self.from.foreign_data_wrappers {
+                if !self
+                    .to
+                    .foreign_data_wrappers
+                    .iter()
+                    .any(|f| f.name == fdw.name)
+                {
+                    self.script.push_str(&fdw.get_drop_script());
+                }
+            }
+        }
+
+        for fdw in &self.to.foreign_data_wrappers {
+            if let Some(existing) = from_map.get(fdw.name.as_str()) {
+                if existing.hash != fdw.hash {
+                    let alter = existing.get_alter_script(fdw, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&fdw.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_servers(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare Foreign Servers -------------- */");
+
+        let from_map: HashMap<&str, &crate::dump::fdw::ForeignServer> = self
+            .from
+            .foreign_servers
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+
+        if self.use_drop {
+            for srv in &self.from.foreign_servers {
+                if !self.to.foreign_servers.iter().any(|s| s.name == srv.name) {
+                    self.script.push_str(&srv.get_drop_script());
+                }
+            }
+        }
+
+        for srv in &self.to.foreign_servers {
+            if let Some(existing) = from_map.get(srv.name.as_str()) {
+                if existing.hash != srv.hash {
+                    let alter = existing.get_alter_script(srv, self.use_drop);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&srv.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn compare_user_mappings(&mut self) -> Result<(), Error> {
+        self.script
+            .append_block("/* ---> Compare User Mappings ---------------- */");
+
+        let um_key =
+            |um: &crate::dump::fdw::UserMapping| format!("{}@{}", um.username, um.server_name);
+
+        let from_map: HashMap<String, &crate::dump::fdw::UserMapping> = self
+            .from
+            .user_mappings
+            .iter()
+            .map(|um| (um_key(um), um))
+            .collect();
+
+        if self.use_drop {
+            for um in &self.from.user_mappings {
+                let key = um_key(um);
+                if !self.to.user_mappings.iter().any(|u| um_key(u) == key) {
+                    self.script.push_str(&um.get_drop_script());
+                }
+            }
+        }
+
+        for um in &self.to.user_mappings {
+            let key = um_key(um);
+            if let Some(existing) = from_map.get(&key) {
+                if existing.hash != um.hash {
+                    let alter = existing.get_alter_script(um);
+                    if !alter.is_empty() {
+                        self.script.push_str(&alter);
+                    }
+                }
+            } else {
+                self.script.push_str(&um.get_script());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compare routines and views together, respecting cross-dependencies.
     ///
     /// Instead of processing all routines before all views (which breaks when
@@ -2502,12 +3133,74 @@ impl Comparer {
             }
         }
 
+        // Build a map of FROM-database default privileges for tables and sequences.
+        // When a new table/sequence is created during migration, PostgreSQL automatically
+        // applies the source database's ALTER DEFAULT PRIVILEGES grants to it.
+        // In full grants mode we use these as the effective "from" ACL for new objects
+        // so that any needed REVOKEs are emitted in the first diff run, making
+        // subsequent runs idempotent.
+        let from_default_table_acl: HashMap<String, Vec<String>> = if full {
+            let mut map: HashMap<String, Vec<String>> = HashMap::new();
+            for dp in &self.from.default_privileges {
+                if dp.object_type == "r" {
+                    // object_type 'r' covers tables AND views in pg_default_acl
+                    map.entry(dp.schema_name.clone())
+                        .or_default()
+                        .extend(dp.acl.iter().cloned());
+                }
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
+        let from_default_seq_acl: HashMap<String, Vec<String>> = if full {
+            let mut map: HashMap<String, Vec<String>> = HashMap::new();
+            for dp in &self.from.default_privileges {
+                if dp.object_type == "S" {
+                    map.entry(dp.schema_name.clone())
+                        .or_default()
+                        .extend(dp.acl.iter().cloned());
+                }
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
         // --- Tables ---
         for table in &self.to.tables {
-            let (from_acl, from_owner) = from_table_map
-                .get(&(table.schema.as_str(), table.name.as_str()))
-                .copied()
-                .unwrap_or((&[], ""));
+            // For new tables (not present in the FROM dump) in full grants mode,
+            // the source DB's default privileges will be automatically applied on
+            // creation.  Use those as the effective from_acl so that REVOKEs for
+            // auto-granted privileges are included in this diff run.
+            //
+            // For tables that are dropped and recreated during this migration
+            // (e.g. partition key change), PostgreSQL will also auto-apply default
+            // privileges on the new table.  Use default privilege ACL as the
+            // effective from_acl for these tables as well.
+            let table_key = Self::table_key(&table.schema, &table.name);
+            let is_recreated = self.recreated_tables.contains(&table_key);
+            let use_default = (is_recreated
+                || !from_table_map.contains_key(&(table.schema.as_str(), table.name.as_str())))
+                && full;
+            let default_acl_storage = if use_default {
+                from_default_table_acl
+                    .get(&table.schema)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (from_acl, from_owner): (&[String], &str) = if use_default {
+                (default_acl_storage.as_slice(), "")
+            } else if let Some(&(acl, owner)) =
+                from_table_map.get(&(table.schema.as_str(), table.name.as_str()))
+            {
+                (acl, owner)
+            } else {
+                (&[], "")
+            };
             let owners: Vec<&str> = [from_owner, table.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
@@ -2532,10 +3225,25 @@ impl Comparer {
 
         // --- Sequences ---
         for seq in &self.to.sequences {
-            let (from_acl, from_owner) = from_seq_map
-                .get(&(seq.schema.as_str(), seq.name.as_str()))
-                .copied()
-                .unwrap_or((&[], ""));
+            // Same treatment as tables: new sequences get auto-grants from default privileges.
+            let is_new_seq = !from_seq_map.contains_key(&(seq.schema.as_str(), seq.name.as_str()));
+            let default_seq_acl_storage = if is_new_seq && full {
+                from_default_seq_acl
+                    .get(&seq.schema)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (from_acl, from_owner): (&[String], &str) = if is_new_seq && full {
+                (default_seq_acl_storage.as_slice(), "")
+            } else if let Some(&(acl, owner)) =
+                from_seq_map.get(&(seq.schema.as_str(), seq.name.as_str()))
+            {
+                (acl, owner)
+            } else {
+                (&[], "")
+            };
             let owners: Vec<&str> = [from_owner, seq.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
@@ -2563,17 +3271,39 @@ impl Comparer {
             let normalized_key = Self::normalized_view_key(&view.schema, &view.name);
             // When a view was actively dropped earlier in the script (e.g. as
             // a dependency of an altered table), its ACL will be lost after
-            // the DROP.  Treat from_acl as empty so that all required
-            // grants are emitted in the migration script.  When the drop
-            // was only commented out (use_drop=false), the view still
-            // exists so we must keep the original ACL for correct diffs.
-            let (from_acl, from_owner) = if self.dropped_views.get(&normalized_key) == Some(&true) {
-                (&[] as &[String], "")
+            // the DROP and default privileges will be auto-applied on
+            // recreation.  In full grants mode, use the default privilege ACL
+            // as the effective from_acl so that any needed REVOKEs are emitted.
+            // When the drop was only commented out (use_drop=false), the view
+            // still exists so we must keep the original ACL for correct diffs.
+            //
+            // For new views (not present in FROM at all) in full grants mode,
+            // the source DB's default privileges for tables (which also apply to
+            // views in PostgreSQL) will be auto-applied on creation.  Use those
+            // as the effective from_acl so that any needed REVOKEs are emitted.
+            let is_dropped = self.dropped_views.get(&normalized_key) == Some(&true);
+            let is_new_view =
+                !from_view_map.contains_key(&(view.schema.as_str(), view.name.as_str()));
+            let use_view_default = (is_dropped || is_new_view) && full;
+            let view_default_acl_storage = if use_view_default {
+                from_default_table_acl
+                    .get(&view.schema)
+                    .cloned()
+                    .unwrap_or_default()
             } else {
-                from_view_map
-                    .get(&(view.schema.as_str(), view.name.as_str()))
-                    .copied()
-                    .unwrap_or((&[], ""))
+                Vec::new()
+            };
+            let (from_acl, from_owner): (&[String], &str) = if use_view_default {
+                (view_default_acl_storage.as_slice(), "")
+            } else if is_dropped {
+                // use_drop=false: view wasn't actually dropped
+                (&[], "")
+            } else if let Some(&(acl, owner)) =
+                from_view_map.get(&(view.schema.as_str(), view.name.as_str()))
+            {
+                (acl, owner)
+            } else {
+                (&[], "")
             };
             let owners: Vec<&str> = [from_owner, view.owner.as_str()]
                 .into_iter()
@@ -2672,6 +3402,112 @@ impl Comparer {
                     );
                 }
                 self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Types ---
+        let from_type_map: HashMap<(&str, &str), (&[String], &str)> = self
+            .from
+            .types
+            .iter()
+            .map(|t| {
+                (
+                    (t.schema.as_str(), t.typname.as_str()),
+                    (t.acl.as_slice(), t.owner.as_str()),
+                )
+            })
+            .collect();
+
+        for pg_type in &self.to.types {
+            let (from_acl, from_owner) = from_type_map
+                .get(&(pg_type.schema.as_str(), pg_type.typname.as_str()))
+                .copied()
+                .unwrap_or((&[], ""));
+            let owners: Vec<&str> = [from_owner, pg_type.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_name = format!("{}.{}", pg_type.schema, pg_type.typname);
+            let grants_script = acl::generate_grants_script(
+                from_acl,
+                &pg_type.acl,
+                full,
+                "TYPE",
+                &object_name,
+                &owners,
+            );
+            if !grants_script.is_empty() {
+                if self.use_comments {
+                    self.script
+                        .push_str(format!("/* Grants for type: {} */\n", object_name).as_str());
+                }
+                self.script.push_str(&grants_script);
+            }
+        }
+
+        // --- Column-level ACLs ---
+        // Build from-table column map for O(1) lookup
+        let from_table_cols: std::collections::HashMap<
+            (&str, &str),
+            &[crate::dump::table_column::TableColumn],
+        > = self
+            .from
+            .tables
+            .iter()
+            .map(|t| ((t.schema.as_str(), t.name.as_str()), t.columns.as_slice()))
+            .collect();
+
+        for table in &self.to.tables {
+            let from_owner = from_table_map
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .map(|&(_, o)| o)
+                .unwrap_or("");
+            let table_owners: Vec<&str> = [from_owner, table.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
+            let object_table_name = format!("{}.{}", table.schema, table.name);
+            let from_cols = from_table_cols
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .copied()
+                .unwrap_or(&[]);
+
+            for col in &table.columns {
+                if col.acl.is_empty() {
+                    let from_col_acl: &[String] = from_cols
+                        .iter()
+                        .find(|c| c.name == col.name)
+                        .map(|c| c.acl.as_slice())
+                        .unwrap_or(&[]);
+                    if from_col_acl.is_empty() {
+                        continue;
+                    }
+                }
+                let from_col_acl: &[String] = from_cols
+                    .iter()
+                    .find(|c| c.name == col.name)
+                    .map(|c| c.acl.as_slice())
+                    .unwrap_or(&[]);
+                let col_grants = acl::generate_column_grants_script(
+                    from_col_acl,
+                    &col.acl,
+                    full,
+                    &object_table_name,
+                    &col.name,
+                    &table_owners,
+                );
+                if !col_grants.is_empty() {
+                    if self.use_comments {
+                        self.script.push_str(
+                            format!(
+                                "/* Column grants for {}.{} */\n",
+                                object_table_name, col.name
+                            )
+                            .as_str(),
+                        );
+                    }
+                    self.script.push_str(&col_grants);
+                }
             }
         }
 

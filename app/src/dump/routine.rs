@@ -194,9 +194,25 @@ pub struct Routine {
     /// Whether the routine runs with definer's privileges (SECURITY DEFINER).
     #[serde(default)]
     pub security_definer: bool,
+    /// Configuration parameters set via SET (e.g. search_path, lock_timeout).
+    /// Each entry is in "name=value" format, matching pg_proc.proconfig.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<String>,
     /// For aggregate functions: the aggregate definition details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate_info: Option<AggregateInfo>,
+    /// Estimated execution cost (per row) — COST clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// Estimated number of result rows — ROWS clause (set-returning functions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<f64>,
+    /// Planner support function — SUPPORT clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_function: Option<String>,
+    /// Transform types — TRANSFORM FOR TYPE clause.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transform_types: Vec<String>,
     /// The hash of the routine.
     pub hash: Option<String>,
     /// ACL (grant) entries for this routine
@@ -244,7 +260,12 @@ impl Routine {
             is_leakproof: false,
             parallel: "unsafe".to_string(),
             security_definer: false,
+            config: Vec::new(),
             aggregate_info: None,
+            cost: None,
+            rows: None,
+            support_function: None,
+            transform_types: Vec::new(),
             hash: None,
             acl: Vec::new(),
         };
@@ -263,8 +284,13 @@ impl Routine {
             ),
             None => String::new(),
         };
+        let config_repr = self.config.join(",");
+        let cost_repr = self.cost.map_or(String::new(), |c| c.to_string());
+        let rows_repr = self.rows.map_or(String::new(), |r| r.to_string());
+        let support_repr = self.support_function.clone().unwrap_or_default();
+        let transform_repr = self.transform_types.join(",");
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
@@ -279,7 +305,12 @@ impl Routine {
             self.is_leakproof,
             self.parallel,
             self.security_definer,
+            config_repr,
             agg_repr,
+            cost_repr,
+            rows_repr,
+            support_repr,
+            transform_repr,
         );
         self.hash = Some(format!("{:x}", md5::compute(src)));
     }
@@ -327,11 +358,61 @@ impl Routine {
             flags.push("WINDOW".to_string());
         }
 
+        // COST (not valid for procedures)
+        if kind != "procedure"
+            && let Some(cost) = self.cost
+        {
+            // Default cost is 1 for C/internal, 100 for others; always emit if set
+            flags.push(format!("COST {cost}"));
+        }
+
+        // ROWS (only for set-returning functions, not procedures)
+        if kind != "procedure"
+            && let Some(rows) = self.rows
+            && rows > 0.0
+        {
+            flags.push(format!("ROWS {rows}"));
+        }
+
+        // SUPPORT function (not valid for procedures)
+        if kind != "procedure"
+            && let Some(ref support) = self.support_function
+        {
+            flags.push(format!("SUPPORT {support}"));
+        }
+
         if flags.is_empty() {
             String::new()
         } else {
             format!(" {}", flags.join(" "))
         }
+    }
+
+    /// Builds the SET configuration clauses from proconfig entries.
+    fn get_config_clause(&self) -> String {
+        if self.config.is_empty() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        for entry in &self.config {
+            if let Some(pos) = entry.find('=') {
+                let name = entry[..pos].trim();
+                let value = entry[pos + 1..].trim();
+                // For list-valued GUCs (e.g. search_path), proconfig stores values
+                // with double-quote delimiters (e.g. "public, pg_temp"). These must
+                // NOT be wrapped in single quotes because that would turn them into
+                // a string literal, changing the semantics (the comma becomes part of
+                // a single identifier instead of separating list elements).
+                // Use the value verbatim when it contains double quotes; otherwise
+                // wrap in single quotes as a safe string literal.
+                if value.contains('"') {
+                    parts.push(format!(" SET {name} = {value}"));
+                } else {
+                    parts.push(format!(" SET {name} = '{}'", value.replace('\'', "''")));
+                }
+            }
+        }
+        parts.join("")
     }
 
     /// Returns a string to create the routine.
@@ -351,30 +432,47 @@ impl Routine {
 
         let arguments_with_defaults = self.arguments_with_defaults();
         let flags = self.get_flags_clause();
+        let config = self.get_config_clause();
+        let transform = if self.transform_types.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " TRANSFORM {}",
+                self.transform_types
+                    .iter()
+                    .map(|t| format!("FOR TYPE {t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
 
         // For window functions, use CREATE FUNCTION (WINDOW is a flag, not a kind)
         let create_kind = if kind == "window" { "function" } else { &kind };
 
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure {}.{}({}) language {}{flags} as {d}{body}{d};",
+                "create or replace procedure {}.{}({}) language {}{transform}{flags}{config} as {d}{body}{d};",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
                 self.lang,
+                transform = transform,
                 flags = flags,
+                config = config,
                 d = delimiter,
                 body = self.source_code
             ).with_empty_lines(),
             _ => format!(
-                "create or replace {create_kind} {}.{}({}) returns {} language {}{flags} as {d}{body}{d};",
+                "create or replace {create_kind} {}.{}({}) returns {} language {}{transform}{flags}{config} as {d}{body}{d};",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
                 self.return_type,
                 self.lang,
                 create_kind = create_kind,
+                transform = transform,
                 flags = flags,
+                config = config,
                 d = delimiter,
                 body = self.source_code
             ).with_empty_lines(),
@@ -609,7 +707,7 @@ impl Routine {
             other => other.to_string(),
         };
         format!(
-            "drop {} if exists {}.{} ({});",
+            "drop {} if exists {}.{} ({}) cascade;",
             drop_kind,
             self.schema,
             self.name,
@@ -753,7 +851,7 @@ mod tests {
         assert!(routine.aggregate_info.is_none());
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             schema,
             name,
             lang,
@@ -768,6 +866,11 @@ mod tests {
             false,
             "unsafe",
             false,
+            "",
+            "",
+            "",
+            "",
+            "",
             "",
         );
         let expected_hash = format!("{:x}", md5::compute(expected_src));
@@ -882,7 +985,7 @@ mod tests {
         let routine = build_function_routine();
         let drop_script = routine.get_drop_script();
 
-        let expected = "drop function if exists public.add (a integer);\n\n";
+        let expected = "drop function if exists public.add (a integer) cascade;\n\n";
         assert_eq!(drop_script, expected);
     }
 
@@ -1292,5 +1395,214 @@ mod tests {
             result,
             "p_value character varying, p_delimiter character varying DEFAULT ','::character varying"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // config (proconfig / SET parameters)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn new_has_empty_config_by_default() {
+        let routine = build_function_routine();
+        assert!(routine.config.is_empty());
+    }
+
+    #[test]
+    fn get_config_clause_empty_when_no_config() {
+        let routine = build_function_routine();
+        assert_eq!(routine.get_config_clause(), "");
+    }
+
+    #[test]
+    fn get_config_clause_single_param() {
+        let mut routine = build_function_routine();
+        routine.config = vec!["search_path=public".to_string()];
+        assert_eq!(routine.get_config_clause(), " SET search_path = 'public'");
+    }
+
+    #[test]
+    fn get_config_clause_multiple_params() {
+        let mut routine = build_function_routine();
+        routine.config = vec![
+            "search_path=\"public, pg_temp\"".to_string(),
+            "lock_timeout=5s".to_string(),
+        ];
+        assert_eq!(
+            routine.get_config_clause(),
+            " SET search_path = \"public, pg_temp\" SET lock_timeout = '5s'"
+        );
+    }
+
+    #[test]
+    fn get_config_clause_value_with_single_quote() {
+        let mut routine = build_function_routine();
+        routine.config = vec!["search_path=it's_schema".to_string()];
+        assert_eq!(
+            routine.get_config_clause(),
+            " SET search_path = 'it''s_schema'"
+        );
+    }
+
+    #[test]
+    fn get_config_clause_skips_malformed_entry() {
+        let mut routine = build_function_routine();
+        routine.config = vec![
+            "no_equals_sign".to_string(),
+            "search_path=public".to_string(),
+        ];
+        // The malformed entry (no '=') is skipped; only the valid one is emitted.
+        assert_eq!(routine.get_config_clause(), " SET search_path = 'public'");
+    }
+
+    #[test]
+    fn get_config_clause_value_with_equals_sign() {
+        // Values can contain '=' (e.g. an expression); only split on the first '='.
+        let mut routine = build_function_routine();
+        routine.config = vec!["extra_float_digits=3=yes".to_string()];
+        assert_eq!(
+            routine.get_config_clause(),
+            " SET extra_float_digits = '3=yes'"
+        );
+    }
+
+    #[test]
+    fn get_config_clause_empty_value() {
+        let mut routine = build_function_routine();
+        routine.config = vec!["search_path=".to_string()];
+        assert_eq!(routine.get_config_clause(), " SET search_path = ''");
+    }
+
+    #[test]
+    fn hash_changes_when_config_changes() {
+        let mut r1 = build_function_routine();
+        let h1 = r1.hash.clone();
+
+        r1.config = vec!["search_path=public".to_string()];
+        r1.hash();
+        let h2 = r1.hash.clone();
+
+        assert_ne!(h1, h2, "adding config must change the hash");
+    }
+
+    #[test]
+    fn hash_differs_for_different_config_values() {
+        let mut r1 = build_function_routine();
+        r1.config = vec!["search_path=public".to_string()];
+        r1.hash();
+
+        let mut r2 = build_function_routine();
+        r2.config = vec!["search_path=pg_catalog".to_string()];
+        r2.hash();
+
+        assert_ne!(r1.hash, r2.hash);
+    }
+
+    #[test]
+    fn hash_differs_for_different_config_order() {
+        let mut r1 = build_function_routine();
+        r1.config = vec![
+            "search_path=public".to_string(),
+            "lock_timeout=5s".to_string(),
+        ];
+        r1.hash();
+
+        let mut r2 = build_function_routine();
+        r2.config = vec![
+            "lock_timeout=5s".to_string(),
+            "search_path=public".to_string(),
+        ];
+        r2.hash();
+
+        assert_ne!(r1.hash, r2.hash, "config order matters for hash");
+    }
+
+    #[test]
+    fn hash_identical_for_same_config() {
+        let mut r1 = build_function_routine();
+        r1.config = vec!["search_path=public".to_string()];
+        r1.hash();
+
+        let mut r2 = build_function_routine();
+        r2.config = vec!["search_path=public".to_string()];
+        r2.hash();
+
+        assert_eq!(r1.hash, r2.hash);
+    }
+
+    #[test]
+    fn get_script_function_with_config() {
+        let mut routine = build_function_routine();
+        routine.config = vec!["work_mem=256MB".to_string()];
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("PARALLEL UNSAFE SET work_mem = '256MB' as $$"),
+            "SET clause must appear between flags and AS, got:\n{}",
+            script
+        );
+    }
+
+    #[test]
+    fn get_script_function_with_multiple_config() {
+        let mut routine = build_function_routine();
+        routine.config = vec![
+            "search_path=public, pg_temp".to_string(),
+            "statement_timeout=30s".to_string(),
+        ];
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("SET search_path = 'public, pg_temp' SET statement_timeout = '30s'"),
+            "all SET clauses must appear in order, got:\n{}",
+            script
+        );
+    }
+
+    #[test]
+    fn get_script_procedure_with_config() {
+        let mut routine = build_procedure_routine();
+        routine.security_definer = true;
+        routine.config = vec![
+            "search_path=public, pg_temp".to_string(),
+            "lock_timeout=5s".to_string(),
+        ];
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains(
+                "SECURITY DEFINER SET search_path = 'public, pg_temp' SET lock_timeout = '5s' as $$"
+            ),
+            "procedure SET clauses must appear after SECURITY DEFINER and before AS, got:\n{}",
+            script
+        );
+        // Must not contain function-only flags
+        assert!(!script.contains("VOLATILE"));
+        assert!(!script.contains("PARALLEL"));
+    }
+
+    #[test]
+    fn get_script_procedure_config_only_no_security_definer() {
+        let mut routine = build_procedure_routine();
+        routine.config = vec!["search_path=public".to_string()];
+        routine.hash();
+
+        let script = routine.get_script();
+        assert!(
+            script.contains("language sql SET search_path = 'public' as $$"),
+            "config must appear even without SECURITY DEFINER, got:\n{}",
+            script
+        );
+    }
+
+    #[test]
+    fn get_script_function_no_config_unchanged() {
+        // Ensure functions without config still generate the same output as before.
+        let routine = build_function_routine();
+        let script = routine.get_script();
+        assert!(!script.contains("SET "));
+        assert!(script.contains("VOLATILE PARALLEL UNSAFE as $$"));
     }
 }

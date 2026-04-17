@@ -21,6 +21,9 @@ pub struct Statistic {
     pub definition: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Statistics target (number of most-common-values entries)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stxstattarget: Option<i32>,
     pub hash: Option<String>,
 }
 
@@ -46,6 +49,7 @@ impl Statistic {
             columns,
             definition,
             comment: None,
+            stxstattarget: None,
             hash: None,
         };
         stat.hash();
@@ -75,6 +79,12 @@ impl Statistic {
             hasher.update(comment.as_bytes());
         }
 
+        hasher.update(self.definition.as_bytes());
+
+        if let Some(target) = self.stxstattarget {
+            hasher.update(target.to_be_bytes());
+        }
+
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
@@ -96,6 +106,18 @@ impl Statistic {
                 &format!(
                     "alter statistics {}.{} owner to {};",
                     self.schema, self.name, self.owner
+                )
+                .with_empty_lines(),
+            );
+        }
+
+        if let Some(target) = self.stxstattarget
+            && target >= 0
+        {
+            result.push_str(
+                &format!(
+                    "alter statistics {}.{} set statistics {};",
+                    self.schema, self.name, target
                 )
                 .with_empty_lines(),
             );
@@ -180,6 +202,30 @@ impl Statistic {
                 statements.push(
                     format!(
                         "comment on statistics {}.{} is null;",
+                        target.schema, target.name
+                    )
+                    .with_empty_lines(),
+                );
+            }
+        }
+
+        // Statistics target change
+        if self.stxstattarget != target.stxstattarget {
+            if let Some(t) = target.stxstattarget {
+                if t >= 0 {
+                    statements.push(
+                        format!(
+                            "alter statistics {}.{} set statistics {};",
+                            target.schema, target.name, t
+                        )
+                        .with_empty_lines(),
+                    );
+                }
+            } else {
+                // Reset to default (-1)
+                statements.push(
+                    format!(
+                        "alter statistics {}.{} set statistics -1;",
                         target.schema, target.name
                     )
                     .with_empty_lines(),

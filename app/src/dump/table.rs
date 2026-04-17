@@ -161,6 +161,18 @@ pub struct Table {
     pub acl: Vec<String>, // ACL (grant) entries for this table
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_method: Option<String>, // Table access method (e.g., "heap", custom AM)
+    #[serde(default)]
+    pub is_unlogged: bool, // Whether the table is UNLOGGED (relpersistence = 'u')
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_parameters: Option<Vec<String>>, // Table-level storage parameters (reloptions)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_identity: Option<String>, // REPLICA IDENTITY setting (d=default, n=nothing, f=full, i=index)
+    #[serde(default)]
+    pub force_rowsecurity: bool, // Whether FORCE ROW LEVEL SECURITY is enabled
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherits_from: Vec<String>, // Classical inheritance parents (non-partition)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_table_type: Option<String>, // OF type name for typed tables
 }
 
 impl Table {
@@ -203,6 +215,12 @@ impl Table {
             hash: None,
             acl: Vec::new(),
             access_method: None,
+            is_unlogged: false,
+            storage_parameters: None,
+            replica_identity: None,
+            force_rowsecurity: false,
+            inherits_from: Vec::new(),
+            typed_table_type: None,
         };
         table.hash();
         table
@@ -321,8 +339,13 @@ impl Table {
                                 c.generation_expression,
                                 a.attgenerated::text as attgenerated,
                                 a.attstorage::text as col_storage,
+                                a.attstattarget as col_stattarget,
                                 c.is_updatable,
                                 pd.description as column_comment{compression_col},
+                                coalesce(
+                                        (select array_agg(acl_item::text) from unnest(a.attacl) as acl_item),
+                                        '{{}}'::text[]
+                                ) as col_acl,
                                 (
                                         SELECT string_agg(DISTINCT rel, ', ')
                                         FROM (
@@ -448,6 +471,11 @@ impl Table {
                     } else {
                         None
                     },
+                    statistics_target: {
+                        let st: Option<i16> = row.get("col_stattarget");
+                        st.filter(|&v| v >= 0).map(|v| v as i32)
+                    },
+                    acl: row.get::<Vec<String>, _>("col_acl"),
                     serial_type: None,
                 };
 
@@ -473,12 +501,14 @@ impl Table {
                                 quote_ident(i.indexname) as indexname,
                                 i.tablespace,
                                 i.indexdef,
-                                EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index
+                                EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index,
+                                d.description as index_comment
                          FROM pg_indexes i
                          JOIN pg_class ic ON ic.relname = i.indexname
                          JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
                          JOIN pg_index idx ON idx.indexrelid = ic.oid
                          LEFT JOIN pg_constraint puc ON puc.conindid = ic.oid AND puc.contype IN ('p', 'u')
+                         LEFT JOIN pg_description d ON d.objoid = ic.oid AND d.objsubid = 0
                          WHERE idx.indisprimary = false
                              AND (idx.indisunique = false OR puc.oid IS NULL)
                              AND NOT EXISTS (SELECT 1 FROM pg_constraint xc WHERE xc.conindid = ic.oid AND xc.contype = 'x')
@@ -499,6 +529,7 @@ impl Table {
                     catalog: row.get("tablespace"),
                     indexdef: row.get("indexdef"),
                     is_partition_index: row.get("is_partition_index"),
+                    comment: row.get("index_comment"),
                 };
 
                 indexes.push(table_index);
@@ -552,11 +583,12 @@ impl Table {
                 c.condeferrable AS is_deferrable,
                 c.condeferred AS initially_deferred,
                 pg_get_constraintdef(c.oid, true) AS definition,
-                c.coninhcount::int4 AS coninhcount,\n                c.connoinherit AS no_inherit{conenforced_col}{connullsnotdistinct_col}
+                c.coninhcount::int4 AS coninhcount,\n                c.connoinherit AS no_inherit,\n                d.description AS constraint_comment{conenforced_col}{connullsnotdistinct_col}
             FROM
                 pg_constraint c
                 JOIN pg_class t ON t.oid = c.conrelid
                 JOIN pg_namespace n ON n.oid = t.relnamespace
+                LEFT JOIN pg_description d ON d.objoid = c.oid AND d.classoid = 'pg_constraint'::regclass AND d.objsubid = 0
                 WHERE
                     n.nspname = '{}' AND
                     t.relname = '{}' AND
@@ -587,6 +619,7 @@ impl Table {
                 is_enforced: row.try_get("is_enforced").unwrap_or(true),
                 no_inherit: row.get("no_inherit"),
                 nulls_not_distinct: row.try_get("nulls_not_distinct").unwrap_or(false),
+                comment: row.get("constraint_comment"),
             });
         }
 
@@ -601,16 +634,19 @@ impl Table {
     ) -> Result<Vec<TableTrigger>, Error> {
         let query = format!(
             "select
-                oid,
-                quote_ident(tgname) as tgname,
-                pg_get_triggerdef(oid) as tgdef
+                t.oid,
+                quote_ident(t.tgname) as tgname,
+                pg_get_triggerdef(t.oid) as tgdef,
+                t.tgenabled::text as tgenabled,
+                d.description as tgcomment
             from
-                pg_trigger
+                pg_trigger t
+            left join pg_description d on d.objoid = t.oid and d.classoid = 'pg_trigger'::regclass
             where
-                tgrelid = format('%I.%I', '{}', '{}')::regclass and
-                tgisinternal = false
+                t.tgrelid = format('%I.%I', '{}', '{}')::regclass and
+                t.tgisinternal = false
             order by
-                tgname",
+                t.tgname",
             escape_single_quotes(schema),
             escape_single_quotes(name)
         );
@@ -622,6 +658,8 @@ impl Table {
                 oid: row.get("oid"),
                 name: row.get("tgname"),
                 definition: row.get("tgdef"),
+                enabled: row.get("tgenabled"),
+                comment: row.try_get("tgcomment").ok().flatten(),
             });
         }
         triggers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -775,7 +813,9 @@ impl Table {
         hasher.update(self.owner.as_bytes());
         hasher.update(self.has_indexes.to_string().as_bytes());
         hasher.update(self.has_triggers.to_string().as_bytes());
-        hasher.update(self.has_rules.to_string().as_bytes());
+        // has_rules is intentionally excluded from the hash: rules are compared
+        // separately via compare_rules() and should not influence view dependency
+        // detection or trigger unnecessary table processing.
         hasher.update(self.has_rowsecurity.to_string().as_bytes());
 
         for column in &self.columns {
@@ -816,6 +856,22 @@ impl Table {
         if let Some(am) = &self.access_method {
             hasher.update(am.as_bytes());
         }
+        hasher.update(self.is_unlogged.to_string().as_bytes());
+        if let Some(params) = &self.storage_parameters {
+            for p in params {
+                hasher.update(p.as_bytes());
+            }
+        }
+        if let Some(ri) = &self.replica_identity {
+            hasher.update(ri.as_bytes());
+        }
+        hasher.update(self.force_rowsecurity.to_string().as_bytes());
+        for parent in &self.inherits_from {
+            hasher.update(parent.as_bytes());
+        }
+        if let Some(tt) = &self.typed_table_type {
+            hasher.update(tt.as_bytes());
+        }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
@@ -823,10 +879,12 @@ impl Table {
     fn build_script(&self, include_triggers: bool) -> String {
         let mut script = String::new();
 
+        let unlogged_prefix = if self.is_unlogged { "unlogged " } else { "" };
+
         if let Some(parent) = &self.partition_of {
             script.push_str(&format!(
-                "create table {}.{} partition of {}",
-                self.schema, self.name, parent
+                "create {}table {}.{} partition of {}",
+                unlogged_prefix, self.schema, self.name, parent
             ));
             if let Some(bound) = &self.partition_bound {
                 script.push_str(&format!("\n    {}", bound));
@@ -844,7 +902,17 @@ impl Table {
             script.append_block(";");
         } else {
             // 1. Build CREATE TABLE statement
-            script.push_str(&format!("create table {}.{} (\n", self.schema, self.name));
+            script.push_str(&format!(
+                "create {}table {}.{}",
+                unlogged_prefix, self.schema, self.name
+            ));
+
+            // OF type for typed tables
+            if let Some(ref type_name) = self.typed_table_type {
+                script.push_str(&format!(" of {} (\n", type_name));
+            } else {
+                script.push_str(" (\n");
+            }
 
             // 2. Add column definitions
             // Build a map from column name (lowered) to named NOT NULL constraint.
@@ -1016,12 +1084,24 @@ impl Table {
             script.push_str(&column_definitions.join(",\n"));
             script.push_str("\n)");
 
+            // Classical inheritance
+            if !self.inherits_from.is_empty() {
+                script.push_str(&format!("\ninherits ({})", self.inherits_from.join(", ")));
+            }
+
             if let Some(partition_key) = &self.partition_key {
                 script.push_str(&format!("\npartition by {}", partition_key));
             }
 
             if let Some(am) = &self.access_method {
                 script.push_str(&format!("\nusing {}", quote_ident(am)));
+            }
+
+            // Storage parameters
+            if let Some(params) = &self.storage_parameters
+                && !params.is_empty()
+            {
+                script.push_str(&format!("\nwith ({})", params.join(", ")));
             }
 
             if let Some(space) = &self.space {
@@ -1056,6 +1136,12 @@ impl Table {
                     self.schema, self.name, column.name, compression
                 ));
             }
+            if let Some(stats) = column.statistics_target {
+                script.append_block(&format!(
+                    "alter table {}.{} alter column {} set statistics {};",
+                    self.schema, self.name, column.name, stats
+                ));
+            }
         }
 
         // 6. Add indexes (excluding primary key indexes and partition-inherited indexes)
@@ -1068,7 +1154,7 @@ impl Table {
         // 7. Add triggers
         if include_triggers {
             for trigger in &self.triggers {
-                script.push_str(&trigger.get_script());
+                script.push_str(&trigger.get_script(&self.schema, &self.name));
             }
         }
 
@@ -1083,6 +1169,30 @@ impl Table {
         // 9. Add row-level security policies
         for policy in &self.policies {
             script.push_str(&policy.get_script());
+        }
+
+        // 9a. Force row-level security
+        if self.force_rowsecurity {
+            script.append_block(&format!(
+                "alter table {}.{} force row level security;",
+                self.schema, self.name
+            ));
+        }
+
+        // 9b. Replica identity
+        if let Some(ri) = &self.replica_identity {
+            match ri.as_str() {
+                "n" => script.append_block(&format!(
+                    "alter table {}.{} replica identity nothing;",
+                    self.schema, self.name
+                )),
+                "f" => script.append_block(&format!(
+                    "alter table {}.{} replica identity full;",
+                    self.schema, self.name
+                )),
+                // "d" is default, "i" requires USING INDEX which we don't track yet
+                _ => {}
+            }
         }
 
         // 10. Add table comment (if any) and column comments
@@ -1120,7 +1230,7 @@ impl Table {
     pub fn get_trigger_script(&self) -> String {
         let mut script = String::new();
         for trigger in &self.triggers {
-            script.push_str(&trigger.get_script());
+            script.push_str(&trigger.get_script(&self.schema, &self.name));
         }
         script
     }
@@ -1429,17 +1539,36 @@ impl Table {
             }
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
-                    let drop_cmd = format!(
-                        "drop index if exists {}.{};",
-                        new_index.schema, new_index.name
-                    )
-                    .with_empty_lines();
-                    if use_drop {
-                        index_drop_script.push_str(&drop_cmd);
+                    // Check if only the comment changed (no need to drop+recreate)
+                    let def_changed = old_index.indexdef != new_index.indexdef;
+                    if def_changed {
+                        let drop_cmd = format!(
+                            "drop index if exists {}.{};",
+                            new_index.schema, new_index.name
+                        )
+                        .with_empty_lines();
+                        if use_drop {
+                            index_drop_script.push_str(&drop_cmd);
+                        } else {
+                            index_drop_script.push_str(&format!("-- {}", drop_cmd));
+                        }
+                        index_script.push_str(&new_index.get_script());
                     } else {
-                        index_drop_script.push_str(&format!("-- {}", drop_cmd));
+                        // Only comment changed
+                        if let Some(ref cmt) = new_index.comment {
+                            index_script.append_block(&format!(
+                                "comment on index {}.{} is '{}';",
+                                new_index.schema,
+                                new_index.name,
+                                cmt.replace('\'', "''")
+                            ));
+                        } else if old_index.comment.is_some() {
+                            index_script.append_block(&format!(
+                                "comment on index {}.{} is null;",
+                                new_index.schema, new_index.name
+                            ));
+                        }
                     }
-                    index_script.push_str(&new_index.get_script());
                 }
             } else {
                 index_script.push_str(&new_index.get_script());
@@ -1578,6 +1707,89 @@ impl Table {
             ));
         }
 
+        // UNLOGGED / LOGGED change
+        if self.is_unlogged != to_table.is_unlogged {
+            let stmt = if to_table.is_unlogged {
+                format!(
+                    "alter table {}.{} set unlogged;",
+                    to_table.schema, to_table.name
+                )
+            } else {
+                format!(
+                    "alter table {}.{} set logged;",
+                    to_table.schema, to_table.name
+                )
+            };
+            script.append_block(&stmt);
+        }
+
+        // Storage parameters change
+        if self.storage_parameters != to_table.storage_parameters {
+            // Reset old parameters
+            if let Some(old_params) = &self.storage_parameters
+                && !old_params.is_empty()
+            {
+                let param_names: Vec<&str> = old_params
+                    .iter()
+                    .filter_map(|p| p.split('=').next())
+                    .collect();
+                if !param_names.is_empty() {
+                    script.append_block(&format!(
+                        "alter table {}.{} reset ({});",
+                        to_table.schema,
+                        to_table.name,
+                        param_names.join(", ")
+                    ));
+                }
+            }
+            // Set new parameters
+            if let Some(new_params) = &to_table.storage_parameters
+                && !new_params.is_empty()
+            {
+                script.append_block(&format!(
+                    "alter table {}.{} set ({});",
+                    to_table.schema,
+                    to_table.name,
+                    new_params.join(", ")
+                ));
+            }
+        }
+
+        // Replica identity change
+        if self.replica_identity != to_table.replica_identity {
+            let stmt = match to_table.replica_identity.as_deref() {
+                Some("n") => format!(
+                    "alter table {}.{} replica identity nothing;",
+                    to_table.schema, to_table.name
+                ),
+                Some("f") => format!(
+                    "alter table {}.{} replica identity full;",
+                    to_table.schema, to_table.name
+                ),
+                _ => format!(
+                    "alter table {}.{} replica identity default;",
+                    to_table.schema, to_table.name
+                ),
+            };
+            script.append_block(&stmt);
+        }
+
+        // Force row-level security change
+        if self.force_rowsecurity != to_table.force_rowsecurity {
+            let stmt = if to_table.force_rowsecurity {
+                format!(
+                    "alter table {}.{} force row level security;",
+                    to_table.schema, to_table.name
+                )
+            } else {
+                format!(
+                    "alter table {}.{} no force row level security;",
+                    to_table.schema, to_table.name
+                )
+            };
+            script.append_block(&stmt);
+        }
+
         script
     }
 
@@ -1598,20 +1810,82 @@ impl Table {
         for new_trigger in &to_table.triggers {
             if let Some(old_trigger) = self.triggers.iter().find(|t| t.name == new_trigger.name) {
                 if old_trigger != new_trigger {
-                    let drop_cmd = format!(
-                        "drop trigger if exists {} on {}.{};",
-                        old_trigger.name, self.schema, self.name
-                    )
-                    .with_empty_lines();
-                    if use_drop {
-                        trigger_drop_script.push_str(&drop_cmd);
+                    if old_trigger.definition != new_trigger.definition {
+                        // Definition changed: emit drop in drop section, new trigger in create section
+                        let drop_cmd = format!(
+                            "drop trigger if exists {} on {}.{};",
+                            old_trigger.name, self.schema, self.name
+                        )
+                        .with_empty_lines();
+                        if use_drop {
+                            trigger_drop_script.push_str(&drop_cmd);
+                        } else {
+                            trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
+                        }
+                        trigger_script
+                            .push_str(&new_trigger.get_script(&to_table.schema, &to_table.name));
+                        // Handle enabled/comment changes too
+                        let alter = old_trigger.get_alter_script(
+                            new_trigger,
+                            &self.schema,
+                            &self.name,
+                            use_drop,
+                        );
+                        // get_alter_script already emitted drop + definition; skip those lines,
+                        // only take the enable/comment parts (lines after the new definition)
+                        // by using a fresh get_alter_script call that ignores definition changes:
+                        // Actually, easier: only emit enabled/comment changes here
+                        let _ = alter; // already handled above
+                        if old_trigger.enabled != new_trigger.enabled {
+                            let stmt = match new_trigger.enabled.as_str() {
+                                "D" => format!(
+                                    "alter table {}.{} disable trigger {};",
+                                    to_table.schema, to_table.name, new_trigger.name
+                                ),
+                                "R" => format!(
+                                    "alter table {}.{} enable replica trigger {};",
+                                    to_table.schema, to_table.name, new_trigger.name
+                                ),
+                                "A" => format!(
+                                    "alter table {}.{} enable always trigger {};",
+                                    to_table.schema, to_table.name, new_trigger.name
+                                ),
+                                _ => format!(
+                                    "alter table {}.{} enable trigger {};",
+                                    to_table.schema, to_table.name, new_trigger.name
+                                ),
+                            };
+                            trigger_script.append_block(&stmt);
+                        }
+                        if old_trigger.comment != new_trigger.comment {
+                            if let Some(ref comment) = new_trigger.comment {
+                                trigger_script.append_block(&format!(
+                                    "comment on trigger {} on {}.{} is '{}';",
+                                    new_trigger.name,
+                                    to_table.schema,
+                                    to_table.name,
+                                    comment.replace('\'', "''")
+                                ));
+                            } else {
+                                trigger_script.append_block(&format!(
+                                    "comment on trigger {} on {}.{} is null;",
+                                    new_trigger.name, to_table.schema, to_table.name
+                                ));
+                            }
+                        }
                     } else {
-                        trigger_drop_script.push_str(&format!("-- {}", drop_cmd));
+                        // Only enabled/comment changed — no drop needed
+                        let alter = old_trigger.get_alter_script(
+                            new_trigger,
+                            &self.schema,
+                            &self.name,
+                            use_drop,
+                        );
+                        trigger_script.push_str(&alter);
                     }
-                    trigger_script.push_str(&new_trigger.get_script());
                 }
             } else {
-                trigger_script.push_str(&new_trigger.get_script());
+                trigger_script.push_str(&new_trigger.get_script(&to_table.schema, &to_table.name));
             }
         }
 
@@ -1696,6 +1970,8 @@ mod tests {
             comment: None,
             storage: None,
             compression: None,
+            statistics_target: None,
+            acl: vec![],
             serial_type: None,
         }
     }
@@ -1747,6 +2023,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -1764,6 +2041,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -1781,6 +2059,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -1798,6 +2077,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -1811,6 +2091,7 @@ mod tests {
                 "create unique index users_pkey on public.users using btree (\"id\") primary key (\"id\")"
                     .to_string(),
             is_partition_index: false,
+            comment: None,
         }
     }
 
@@ -1822,6 +2103,7 @@ mod tests {
             catalog: None,
             indexdef: definition.to_string(),
             is_partition_index: false,
+            comment: None,
         }
     }
 
@@ -1833,6 +2115,7 @@ mod tests {
             catalog: None,
             indexdef: "create index idx_users_old on public.users using btree (legacy)".to_string(),
             is_partition_index: false,
+            comment: None,
         }
     }
 
@@ -1845,6 +2128,7 @@ mod tests {
             indexdef: "create index idx_users_email on public.users using btree (email)"
                 .to_string(),
             is_partition_index: false,
+            comment: None,
         }
     }
 
@@ -1857,6 +2141,7 @@ mod tests {
             indexdef: "create unique index idx_users_email on public.users using btree (email)"
                 .to_string(),
             is_partition_index: false,
+            comment: None,
         }
     }
 
@@ -1865,6 +2150,8 @@ mod tests {
             oid: Oid(oid),
             name: name.to_string(),
             definition: definition.to_string(),
+            enabled: "O".to_string(),
+            comment: None,
         }
     }
 
@@ -2237,6 +2524,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -2536,6 +2824,8 @@ mod tests {
             comment: None,
             storage: None,
             compression: None,
+            statistics_target: None,
+            acl: vec![],
             serial_type: None,
         }
     }
@@ -2974,6 +3264,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -3231,6 +3522,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         };
         let to = partition_child_table(
             vec![partition_child_identity_column("id", 1, "integer")],
@@ -3293,6 +3585,7 @@ mod tests {
             indexdef: "create index idx_users_p1_name on public.users_p1 using btree (name)"
                 .to_string(),
             is_partition_index: false,
+            comment: None,
         };
         let from = partition_child_table(
             vec![partition_child_identity_column("id", 1, "integer")],
@@ -3398,6 +3691,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
@@ -3828,6 +4122,7 @@ mod tests {
                 is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             }],
             vec![],
             vec![],
@@ -3878,6 +4173,7 @@ mod tests {
                 is_enforced: true,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             }],
             vec![],
             vec![],
@@ -3927,6 +4223,7 @@ mod tests {
                 is_enforced: false,
                 no_inherit: false,
                 nulls_not_distinct: false,
+                comment: None,
             }],
             vec![],
             vec![],
@@ -4000,6 +4297,7 @@ mod tests {
             is_enforced: true,
             no_inherit: false,
             nulls_not_distinct: false,
+            comment: None,
         }
     }
 
