@@ -59,6 +59,8 @@ pub struct TableColumn {
     pub storage: Option<String>, // TOAST storage strategy (PLAIN, EXTERNAL, MAIN, EXTENDED)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<String>, // Column compression method (pglz, lz4; PG14+)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics_target: Option<i32>, // Per-column statistics target (attstattarget; -1 = use default)
     #[serde(skip)]
     pub serial_type: Option<String>, // Transient: set at comparison time to "serial", "bigserial", or "smallserial"
 }
@@ -304,6 +306,9 @@ impl TableColumn {
         }
         if let Some(compression) = &self.compression {
             hasher.update(compression.as_bytes());
+        }
+        if let Some(stats) = self.statistics_target {
+            hasher.update(stats.to_string().as_bytes());
         }
         // skip catalog/charset/related_views and other descriptive-only fields
     }
@@ -643,6 +648,28 @@ impl TableColumn {
             }
         }
 
+        if self.statistics_target != existing.statistics_target {
+            if let Some(stats) = self.statistics_target
+                && stats >= 0
+            {
+                statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} set statistics {};",
+                        self.schema, self.table, self.name, stats
+                    )
+                    .with_empty_lines(),
+                );
+            } else {
+                statements.push(
+                    format!(
+                        "alter table {}.{} alter column {} set statistics -1;",
+                        self.schema, self.table, self.name
+                    )
+                    .with_empty_lines(),
+                );
+            }
+        }
+
         if statements.is_empty() {
             None
         } else {
@@ -810,6 +837,7 @@ impl PartialEq for TableColumn {
             && self.comment == other.comment
             && self.storage == other.storage
             && self.compression == other.compression
+            && self.statistics_target == other.statistics_target
     }
 }
 
@@ -870,6 +898,7 @@ mod tests {
             comment: None,
             storage: None,
             compression: None,
+            statistics_target: None,
             serial_type: None,
         }
     }

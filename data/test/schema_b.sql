@@ -1395,6 +1395,95 @@ CREATE TABLE test_schema.virtual_gen_test (
 );
 
 -- =============================================================================
+-- UNLOGGED tables test (TO side)
+-- =============================================================================
+-- TO: UNLOGGED table (was regular/logged)
+CREATE UNLOGGED TABLE test_schema.unlogged_test (
+    id SERIAL PRIMARY KEY,
+    data TEXT
+);
+
+-- =============================================================================
+-- Storage parameters (reloptions) test (TO side)
+-- =============================================================================
+-- TO: table with fillfactor=90 and autovacuum_enabled=false (was fillfactor=70)
+CREATE TABLE test_schema.storage_params_test (
+    id SERIAL PRIMARY KEY,
+    value TEXT
+) WITH (fillfactor = 90, autovacuum_enabled = false);
+
+-- =============================================================================
+-- REPLICA IDENTITY test (TO side)
+-- =============================================================================
+-- TO: table with REPLICA IDENTITY FULL (was DEFAULT)
+CREATE TABLE test_schema.replica_identity_test (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+);
+ALTER TABLE test_schema.replica_identity_test REPLICA IDENTITY FULL;
+
+-- =============================================================================
+-- FORCE ROW LEVEL SECURITY test (TO side)
+-- =============================================================================
+-- TO: table with RLS enabled AND forced (was enabled but not forced)
+CREATE TABLE test_schema.force_rls_test (
+    id SERIAL PRIMARY KEY,
+    tenant_id INT NOT NULL,
+    data TEXT
+);
+ALTER TABLE test_schema.force_rls_test ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_schema.force_rls_test FORCE ROW LEVEL SECURITY;
+CREATE POLICY force_rls_policy ON test_schema.force_rls_test
+    FOR ALL
+    USING (tenant_id = current_setting('app.tenant_id')::int);
+
+-- =============================================================================
+-- Classical inheritance test (TO side)
+-- =============================================================================
+-- TO: parent table with child (child_data type changed)
+CREATE TABLE test_schema.inheritance_parent (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+);
+CREATE TABLE test_schema.inheritance_child (
+    child_data VARCHAR(255)
+) INHERITS (test_schema.inheritance_parent);
+
+-- =============================================================================
+-- Typed table (OF type) test (TO side)
+-- =============================================================================
+-- TO: same typed table
+CREATE TYPE test_schema.address_type AS (
+    street VARCHAR(200),
+    city VARCHAR(100),
+    zip VARCHAR(20)
+);
+CREATE TABLE test_schema.typed_table_test OF test_schema.address_type;
+
+-- =============================================================================
+-- Per-column statistics target test (TO side)
+-- =============================================================================
+-- TO: column with statistics target 500 (was 100)
+CREATE TABLE test_schema.col_stats_test (
+    id SERIAL PRIMARY KEY,
+    searchable_data TEXT
+);
+ALTER TABLE test_schema.col_stats_test ALTER COLUMN searchable_data SET STATISTICS 500;
+
+-- =============================================================================
+-- Function COST/ROWS test (TO side)
+-- =============================================================================
+-- TO: function with COST 200 and ROWS 500 (was COST 100, ROWS 1000)
+CREATE OR REPLACE FUNCTION test_schema.cost_rows_test(n INT)
+RETURNS SETOF INT
+LANGUAGE sql
+COST 200
+ROWS 500
+AS $$
+    SELECT generate_series(1, n);
+$$;
+
+-- =============================================================================
 -- Grants comparison test (TO side)
 -- =============================================================================
 -- These GRANT statements establish the TO target for grant comparison.

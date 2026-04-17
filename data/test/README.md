@@ -271,7 +271,39 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 ### 27. Virtual Generated Columns (PG18+)
 - **Modified**: `test_schema.virtual_gen_test` — column `full_name` is a plain NOT NULL column in FROM; becomes `GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED` in TO. On PG18+ this can test VIRTUAL generation; on earlier versions, STORED is used
 
-### 28. Special Test Scenarios
+### 28. UNLOGGED Tables
+- **Modified**: `test_schema.unlogged_test` — regular (logged) table in FROM; UNLOGGED in TO
+- Verifies `ALTER TABLE SET UNLOGGED` / `SET LOGGED` generation
+
+### 29. Storage Parameters (reloptions)
+- **Modified**: `test_schema.storage_params_test` — `fillfactor=70` in FROM; `fillfactor=90, autovacuum_enabled=false` in TO
+- Verifies `ALTER TABLE RESET (...)` + `SET (...)` generation for storage parameter changes
+
+### 30. REPLICA IDENTITY
+- **Modified**: `test_schema.replica_identity_test` — REPLICA IDENTITY DEFAULT in FROM; REPLICA IDENTITY FULL in TO
+- Verifies `ALTER TABLE REPLICA IDENTITY FULL/NOTHING/DEFAULT` generation
+
+### 31. FORCE ROW LEVEL SECURITY
+- **Modified**: `test_schema.force_rls_test` — RLS enabled but not forced in FROM; RLS enabled and forced in TO
+- Verifies `ALTER TABLE FORCE ROW LEVEL SECURITY` / `NO FORCE ROW LEVEL SECURITY` generation
+
+### 32. Classical Inheritance (INHERITS)
+- **Tables**: `test_schema.inheritance_parent` (parent), `test_schema.inheritance_child` (child INHERITS parent)
+- FROM has `child_data TEXT`; TO has `child_data VARCHAR(255)` — column type change on inherited child
+
+### 33. Typed Tables (OF type)
+- **Tables**: `test_schema.typed_table_test OF test_schema.address_type`
+- Same typed table in both FROM and TO; verifies OF type clause in CREATE TABLE
+
+### 34. Per-Column Statistics Target
+- **Modified**: `test_schema.col_stats_test` — column `searchable_data` has STATISTICS 100 in FROM; STATISTICS 500 in TO
+- Verifies `ALTER COLUMN SET STATISTICS` generation
+
+### 35. Function COST and ROWS
+- **Modified**: `test_schema.cost_rows_test` — COST 100 ROWS 1000 in FROM; COST 200 ROWS 500 in TO
+- Verifies COST/ROWS clause changes in function CREATE OR REPLACE
+
+### 36. Special Test Scenarios
 
 #### CHECK Constraint String Literal Case Preservation
 - `chk_category_values` contains mixed-case string literals (`'Electronics'`, `'Home & Garden'`, `'Books'`) identical in both schemas
@@ -471,3 +503,12 @@ The comparison should detect and generate SQL for:
 - Creating, dropping, and altering extended statistics (kind changes via drop+recreate)
 - Detecting NOT ENFORCED constraint flag changes (PG18+)
 - Handling virtual/stored generated column transitions (PG18+)
+- Detecting UNLOGGED ↔ LOGGED table persistence changes
+- Detecting storage parameters (reloptions/WITH clause) changes (fillfactor, autovacuum settings, etc.)
+- Detecting REPLICA IDENTITY changes (DEFAULT, NOTHING, FULL)
+- Detecting FORCE ROW LEVEL SECURITY changes
+- Handling classical inheritance (INHERITS) in table creation
+- Handling typed tables (OF type) in table creation
+- Detecting per-column statistics target changes (SET STATISTICS)
+- Detecting function/procedure COST and ROWS clause changes
+- Handling SUPPORT function and TRANSFORM FOR TYPE clauses on routines

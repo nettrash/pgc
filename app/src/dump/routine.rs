@@ -201,6 +201,18 @@ pub struct Routine {
     /// For aggregate functions: the aggregate definition details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate_info: Option<AggregateInfo>,
+    /// Estimated execution cost (per row) — COST clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// Estimated number of result rows — ROWS clause (set-returning functions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<f64>,
+    /// Planner support function — SUPPORT clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_function: Option<String>,
+    /// Transform types — TRANSFORM FOR TYPE clause.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transform_types: Vec<String>,
     /// The hash of the routine.
     pub hash: Option<String>,
     /// ACL (grant) entries for this routine
@@ -250,6 +262,10 @@ impl Routine {
             security_definer: false,
             config: Vec::new(),
             aggregate_info: None,
+            cost: None,
+            rows: None,
+            support_function: None,
+            transform_types: Vec::new(),
             hash: None,
             acl: Vec::new(),
         };
@@ -269,8 +285,12 @@ impl Routine {
             None => String::new(),
         };
         let config_repr = self.config.join(",");
+        let cost_repr = self.cost.map_or(String::new(), |c| c.to_string());
+        let rows_repr = self.rows.map_or(String::new(), |r| r.to_string());
+        let support_repr = self.support_function.clone().unwrap_or_default();
+        let transform_repr = self.transform_types.join(",");
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
@@ -287,6 +307,10 @@ impl Routine {
             self.security_definer,
             config_repr,
             agg_repr,
+            cost_repr,
+            rows_repr,
+            support_repr,
+            transform_repr,
         );
         self.hash = Some(format!("{:x}", md5::compute(src)));
     }
@@ -334,6 +358,24 @@ impl Routine {
             flags.push("WINDOW".to_string());
         }
 
+        // COST
+        if let Some(cost) = self.cost {
+            // Default cost is 1 for C/internal, 100 for others; always emit if set
+            flags.push(format!("COST {cost}"));
+        }
+
+        // ROWS (only for set-returning functions)
+        if let Some(rows) = self.rows
+            && rows > 0.0
+        {
+            flags.push(format!("ROWS {rows}"));
+        }
+
+        // SUPPORT function
+        if let Some(ref support) = self.support_function {
+            flags.push(format!("SUPPORT {support}"));
+        }
+
         if flags.is_empty() {
             String::new()
         } else {
@@ -375,30 +417,44 @@ impl Routine {
         let arguments_with_defaults = self.arguments_with_defaults();
         let flags = self.get_flags_clause();
         let config = self.get_config_clause();
+        let transform = if self.transform_types.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " TRANSFORM {}",
+                self.transform_types
+                    .iter()
+                    .map(|t| format!("FOR TYPE {t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
 
         // For window functions, use CREATE FUNCTION (WINDOW is a flag, not a kind)
         let create_kind = if kind == "window" { "function" } else { &kind };
 
         let script_body = match kind.as_str() {
             "procedure" => format!(
-                "create or replace procedure {}.{}({}) language {}{flags}{config} as {d}{body}{d};",
+                "create or replace procedure {}.{}({}) language {}{transform}{flags}{config} as {d}{body}{d};",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
                 self.lang,
+                transform = transform,
                 flags = flags,
                 config = config,
                 d = delimiter,
                 body = self.source_code
             ).with_empty_lines(),
             _ => format!(
-                "create or replace {create_kind} {}.{}({}) returns {} language {}{flags}{config} as {d}{body}{d};",
+                "create or replace {create_kind} {}.{}({}) returns {} language {}{transform}{flags}{config} as {d}{body}{d};",
                 self.schema,
                 self.name,
                 arguments_with_defaults,
                 self.return_type,
                 self.lang,
                 create_kind = create_kind,
+                transform = transform,
                 flags = flags,
                 config = config,
                 d = delimiter,
@@ -779,7 +835,7 @@ mod tests {
         assert!(routine.aggregate_info.is_none());
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             schema,
             name,
             lang,
@@ -794,6 +850,10 @@ mod tests {
             false,
             "unsafe",
             false,
+            "",
+            "",
+            "",
+            "",
             "",
             "",
         );

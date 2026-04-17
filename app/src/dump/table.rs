@@ -161,6 +161,18 @@ pub struct Table {
     pub acl: Vec<String>, // ACL (grant) entries for this table
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_method: Option<String>, // Table access method (e.g., "heap", custom AM)
+    #[serde(default)]
+    pub is_unlogged: bool, // Whether the table is UNLOGGED (relpersistence = 'u')
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_parameters: Option<Vec<String>>, // Table-level storage parameters (reloptions)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_identity: Option<String>, // REPLICA IDENTITY setting (d=default, n=nothing, f=full, i=index)
+    #[serde(default)]
+    pub force_rowsecurity: bool, // Whether FORCE ROW LEVEL SECURITY is enabled
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherits_from: Vec<String>, // Classical inheritance parents (non-partition)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_table_type: Option<String>, // OF type name for typed tables
 }
 
 impl Table {
@@ -203,6 +215,12 @@ impl Table {
             hash: None,
             acl: Vec::new(),
             access_method: None,
+            is_unlogged: false,
+            storage_parameters: None,
+            replica_identity: None,
+            force_rowsecurity: false,
+            inherits_from: Vec::new(),
+            typed_table_type: None,
         };
         table.hash();
         table
@@ -321,6 +339,7 @@ impl Table {
                                 c.generation_expression,
                                 a.attgenerated::text as attgenerated,
                                 a.attstorage::text as col_storage,
+                                a.attstattarget as col_stattarget,
                                 c.is_updatable,
                                 pd.description as column_comment{compression_col},
                                 (
@@ -447,6 +466,10 @@ impl Table {
                         }
                     } else {
                         None
+                    },
+                    statistics_target: {
+                        let st: i32 = row.get("col_stattarget");
+                        if st >= 0 { Some(st) } else { None }
                     },
                     serial_type: None,
                 };
@@ -816,6 +839,22 @@ impl Table {
         if let Some(am) = &self.access_method {
             hasher.update(am.as_bytes());
         }
+        hasher.update(self.is_unlogged.to_string().as_bytes());
+        if let Some(params) = &self.storage_parameters {
+            for p in params {
+                hasher.update(p.as_bytes());
+            }
+        }
+        if let Some(ri) = &self.replica_identity {
+            hasher.update(ri.as_bytes());
+        }
+        hasher.update(self.force_rowsecurity.to_string().as_bytes());
+        for parent in &self.inherits_from {
+            hasher.update(parent.as_bytes());
+        }
+        if let Some(tt) = &self.typed_table_type {
+            hasher.update(tt.as_bytes());
+        }
 
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
@@ -823,10 +862,12 @@ impl Table {
     fn build_script(&self, include_triggers: bool) -> String {
         let mut script = String::new();
 
+        let unlogged_prefix = if self.is_unlogged { "unlogged " } else { "" };
+
         if let Some(parent) = &self.partition_of {
             script.push_str(&format!(
-                "create table {}.{} partition of {}",
-                self.schema, self.name, parent
+                "create {}table {}.{} partition of {}",
+                unlogged_prefix, self.schema, self.name, parent
             ));
             if let Some(bound) = &self.partition_bound {
                 script.push_str(&format!("\n    {}", bound));
@@ -844,7 +885,14 @@ impl Table {
             script.append_block(";");
         } else {
             // 1. Build CREATE TABLE statement
-            script.push_str(&format!("create table {}.{} (\n", self.schema, self.name));
+            script.push_str(&format!("create {}table {}.{}", unlogged_prefix, self.schema, self.name));
+
+            // OF type for typed tables
+            if let Some(ref type_name) = self.typed_table_type {
+                script.push_str(&format!(" of {} (\n", type_name));
+            } else {
+                script.push_str(" (\n");
+            }
 
             // 2. Add column definitions
             // Build a map from column name (lowered) to named NOT NULL constraint.
@@ -1016,12 +1064,24 @@ impl Table {
             script.push_str(&column_definitions.join(",\n"));
             script.push_str("\n)");
 
+            // Classical inheritance
+            if !self.inherits_from.is_empty() {
+                script.push_str(&format!("\ninherits ({})", self.inherits_from.join(", ")));
+            }
+
             if let Some(partition_key) = &self.partition_key {
                 script.push_str(&format!("\npartition by {}", partition_key));
             }
 
             if let Some(am) = &self.access_method {
                 script.push_str(&format!("\nusing {}", quote_ident(am)));
+            }
+
+            // Storage parameters
+            if let Some(params) = &self.storage_parameters
+                && !params.is_empty()
+            {
+                script.push_str(&format!("\nwith ({})", params.join(", ")));
             }
 
             if let Some(space) = &self.space {
@@ -1056,6 +1116,12 @@ impl Table {
                     self.schema, self.name, column.name, compression
                 ));
             }
+            if let Some(stats) = column.statistics_target {
+                script.append_block(&format!(
+                    "alter table {}.{} alter column {} set statistics {};",
+                    self.schema, self.name, column.name, stats
+                ));
+            }
         }
 
         // 6. Add indexes (excluding primary key indexes and partition-inherited indexes)
@@ -1083,6 +1149,30 @@ impl Table {
         // 9. Add row-level security policies
         for policy in &self.policies {
             script.push_str(&policy.get_script());
+        }
+
+        // 9a. Force row-level security
+        if self.force_rowsecurity {
+            script.append_block(&format!(
+                "alter table {}.{} force row level security;",
+                self.schema, self.name
+            ));
+        }
+
+        // 9b. Replica identity
+        if let Some(ri) = &self.replica_identity {
+            match ri.as_str() {
+                "n" => script.append_block(&format!(
+                    "alter table {}.{} replica identity nothing;",
+                    self.schema, self.name
+                )),
+                "f" => script.append_block(&format!(
+                    "alter table {}.{} replica identity full;",
+                    self.schema, self.name
+                )),
+                // "d" is default, "i" requires USING INDEX which we don't track yet
+                _ => {}
+            }
         }
 
         // 10. Add table comment (if any) and column comments
@@ -1578,6 +1668,89 @@ impl Table {
             ));
         }
 
+        // UNLOGGED / LOGGED change
+        if self.is_unlogged != to_table.is_unlogged {
+            let stmt = if to_table.is_unlogged {
+                format!(
+                    "alter table {}.{} set unlogged;",
+                    to_table.schema, to_table.name
+                )
+            } else {
+                format!(
+                    "alter table {}.{} set logged;",
+                    to_table.schema, to_table.name
+                )
+            };
+            script.append_block(&stmt);
+        }
+
+        // Storage parameters change
+        if self.storage_parameters != to_table.storage_parameters {
+            // Reset old parameters
+            if let Some(old_params) = &self.storage_parameters
+                && !old_params.is_empty()
+            {
+                let param_names: Vec<&str> = old_params
+                    .iter()
+                    .filter_map(|p| p.split('=').next())
+                    .collect();
+                if !param_names.is_empty() {
+                    script.append_block(&format!(
+                        "alter table {}.{} reset ({});",
+                        to_table.schema,
+                        to_table.name,
+                        param_names.join(", ")
+                    ));
+                }
+            }
+            // Set new parameters
+            if let Some(new_params) = &to_table.storage_parameters
+                && !new_params.is_empty()
+            {
+                script.append_block(&format!(
+                    "alter table {}.{} set ({});",
+                    to_table.schema,
+                    to_table.name,
+                    new_params.join(", ")
+                ));
+            }
+        }
+
+        // Replica identity change
+        if self.replica_identity != to_table.replica_identity {
+            let stmt = match to_table.replica_identity.as_deref() {
+                Some("n") => format!(
+                    "alter table {}.{} replica identity nothing;",
+                    to_table.schema, to_table.name
+                ),
+                Some("f") => format!(
+                    "alter table {}.{} replica identity full;",
+                    to_table.schema, to_table.name
+                ),
+                _ => format!(
+                    "alter table {}.{} replica identity default;",
+                    to_table.schema, to_table.name
+                ),
+            };
+            script.append_block(&stmt);
+        }
+
+        // Force row-level security change
+        if self.force_rowsecurity != to_table.force_rowsecurity {
+            let stmt = if to_table.force_rowsecurity {
+                format!(
+                    "alter table {}.{} force row level security;",
+                    to_table.schema, to_table.name
+                )
+            } else {
+                format!(
+                    "alter table {}.{} no force row level security;",
+                    to_table.schema, to_table.name
+                )
+            };
+            script.append_block(&stmt);
+        }
+
         script
     }
 
@@ -1696,6 +1869,7 @@ mod tests {
             comment: None,
             storage: None,
             compression: None,
+            statistics_target: None,
             serial_type: None,
         }
     }
@@ -2536,6 +2710,7 @@ mod tests {
             comment: None,
             storage: None,
             compression: None,
+            statistics_target: None,
             serial_type: None,
         }
     }

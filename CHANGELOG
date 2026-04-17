@@ -1,6 +1,16 @@
-                v1.0.15
+2026-04-17      v1.0.15
 
                 Features:
+                    - UNLOGGED tables support with CREATE UNLOGGED TABLE and ALTER TABLE SET LOGGED/UNLOGGED.
+                    - Storage parameters (reloptions) support with WITH (...) and ALTER TABLE SET/RESET.
+                    - REPLICA IDENTITY support (DEFAULT, NOTHING, FULL) with ALTER TABLE.
+                    - FORCE ROW LEVEL SECURITY support with ALTER TABLE FORCE/NO FORCE ROW LEVEL SECURITY.
+                    - Classical table inheritance (INHERITS) support.
+                    - Typed tables (OF type) support.
+                    - Per-column statistics target (SET STATISTICS) with ALTER support.
+                    - Function/procedure COST and ROWS clauses.
+                    - Function SUPPORT clause.
+                    - Function TRANSFORM FOR TYPE clause.
                     - Configuration parameters for routines.
 
 2026-04-16      v1.0.14

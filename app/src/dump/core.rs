@@ -854,7 +854,15 @@ impl Dump {
                 agg.aggminitval as agg_minitcond,
                 case when agg.aggsortop != 0 then agg.aggsortop::regoper::text end as agg_sortop,
                 agg.aggkind::text as agg_kind,
-                agg.aggnumdirectargs as agg_numdirectargs
+                agg.aggnumdirectargs as agg_numdirectargs,
+                r.procost,
+                r.prorows,
+                case when r.prosupport != 0 then r.prosupport::regproc::text else null end as prosupport,
+                (
+                    select array_agg(format_type(t.oid, null) order by ordinality)
+                    from unnest(r.protrftypes) with ordinality as u(typid, ordinality)
+                    join pg_type t on t.oid = u.typid
+                ) as protrftypes
             from
                 pg_proc r
                 join pg_namespace n on r.pronamespace = n.oid
@@ -973,6 +981,16 @@ impl Dump {
                         .get::<Option<Vec<String>>, _>("proconfig")
                         .unwrap_or_default(),
                     aggregate_info,
+                    cost: {
+                        let c: Option<f32> = row.get("procost");
+                        c.map(|v| v as f64)
+                    },
+                    rows: {
+                        let r: Option<f32> = row.get("prorows");
+                        r.map(|v| v as f64).filter(|v| *v > 0.0)
+                    },
+                    support_function: row.get("prosupport"),
+                    transform_types: row.get::<Option<Vec<String>>, _>("protrftypes").unwrap_or_default(),
                     hash: None,
                     acl: row
                         .get::<Option<Vec<String>>, _>("routine_acl")
@@ -1036,7 +1054,23 @@ impl Dump {
                     t.rowsecurity,
                     d.description as table_comment,
                     c.relacl::text[] as table_acl,
-                    am.amname as access_method
+                    am.amname as access_method,
+                    c.relpersistence as relpersistence,
+                    c.reloptions as reloptions,
+                    c.relreplident as relreplident,
+                    c.relforcerowsecurity as relforcerowsecurity,
+                    case when c.reloftype <> 0 then c.reloftype::regtype::text else null end as typed_table_type,
+                    array(
+                        select quote_ident(pn.nspname) || '.' || quote_ident(pc.relname)
+                        from pg_inherits pi2
+                        join pg_class pc on pc.oid = pi2.inhparent
+                        join pg_namespace pn on pn.oid = pc.relnamespace
+                        where pi2.inhrelid = c.oid
+                        and not exists (
+                            select 1 from pg_partitioned_table pt where pt.partrelid = pi2.inhparent
+                        )
+                        order by pi2.inhseqno
+                    ) as inherits_from
                 from pg_tables t
                 left join pg_class c on c.relname = t.tablename
                     and c.relkind in ('r','p')
@@ -1070,6 +1104,8 @@ impl Dump {
         // Build lightweight table structs from the catalog rows.
         let mut shell_tables: Vec<Table> = Vec::with_capacity(rows.len());
         for row in rows {
+            let relpersistence: Option<i8> = row.get("relpersistence");
+            let relreplident: Option<i8> = row.get("relreplident");
             shell_tables.push(Table {
                 schema: row.get("schemaname"),
                 name: row.get("tablename"),
@@ -1094,6 +1130,19 @@ impl Dump {
                 access_method: row
                     .get::<Option<String>, _>("access_method")
                     .filter(|am| am != "heap"),
+                is_unlogged: relpersistence == Some(b'u' as i8),
+                storage_parameters: row.get::<Option<Vec<String>>, _>("reloptions"),
+                replica_identity: relreplident.map(|r| {
+                    String::from(match r as u8 as char {
+                        'n' => "n",
+                        'f' => "f",
+                        'i' => "i",
+                        _ => "d",
+                    })
+                }),
+                force_rowsecurity: row.get::<Option<bool>, _>("relforcerowsecurity").unwrap_or(false),
+                inherits_from: row.get::<Option<Vec<String>>, _>("inherits_from").unwrap_or_default(),
+                typed_table_type: row.get("typed_table_type"),
                 hash: None,
                 acl: row
                     .get::<Option<Vec<String>>, _>("table_acl")

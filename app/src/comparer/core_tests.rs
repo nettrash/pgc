@@ -767,6 +767,7 @@ fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableColum
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     }
 }
@@ -846,6 +847,7 @@ async fn compare_sequences_skips_owned_by_serial_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
 
@@ -949,6 +951,7 @@ async fn compare_sequences_skips_owned_by_identity_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
 
@@ -1309,6 +1312,7 @@ async fn compare_sequences_skips_drop_if_owned_by_dropped_table() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
 
@@ -1409,6 +1413,7 @@ async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
 
@@ -1480,6 +1485,7 @@ async fn compare_sequences_skips_drop_if_owned_by_identity_column() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
 
@@ -2137,6 +2143,7 @@ async fn serial_column_uses_serial_type_in_table_script() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
     let serial_table = Table::new(
@@ -2223,6 +2230,7 @@ async fn serial_column_uses_serial_type_in_table_script() {
         comment: None,
         storage: None,
         compression: None,
+        statistics_target: None,
         serial_type: None,
     };
     let bigserial_table = Table::new(
