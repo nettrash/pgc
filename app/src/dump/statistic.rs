@@ -112,15 +112,16 @@ impl Statistic {
         }
 
         if let Some(target) = self.stxstattarget
-            && target >= 0 {
-                result.push_str(
-                    &format!(
-                        "alter statistics {}.{} set statistics {};",
-                        self.schema, self.name, target
-                    )
-                    .with_empty_lines(),
-                );
-            }
+            && target >= 0
+        {
+            result.push_str(
+                &format!(
+                    "alter statistics {}.{} set statistics {};",
+                    self.schema, self.name, target
+                )
+                .with_empty_lines(),
+            );
+        }
 
         if let Some(comment) = &self.comment {
             result.push_str(

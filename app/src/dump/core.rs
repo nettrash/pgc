@@ -2196,10 +2196,10 @@ impl Dump {
                 && let Some(cfg) = ts_configs
                     .iter_mut()
                     .find(|c| c.schema == cfg_schema && c.name == cfg_name)
-                {
-                    cfg.mappings = mappings.clone();
-                    cfg.hash();
-                }
+            {
+                cfg.mappings = mappings.clone();
+                cfg.hash();
+            }
         }
 
         Ok(ts_configs)

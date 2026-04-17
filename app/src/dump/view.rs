@@ -134,26 +134,28 @@ impl View {
 
         // WITH CHECK OPTION (regular views only)
         if !self.is_materialized
-            && let Some(ref co) = self.check_option {
-                match co.to_lowercase().as_str() {
-                    "local" => create_stmt.push_str("\nwith local check option"),
-                    _ => create_stmt.push_str("\nwith cascaded check option"),
-                }
+            && let Some(ref co) = self.check_option
+        {
+            match co.to_lowercase().as_str() {
+                "local" => create_stmt.push_str("\nwith local check option"),
+                _ => create_stmt.push_str("\nwith cascaded check option"),
             }
+        }
 
         let mut script = create_stmt.with_empty_lines();
 
         // Storage parameters and tablespace for materialized views
         if self.is_materialized {
             if let Some(ref params) = self.storage_parameters
-                && !params.is_empty() {
-                    script.append_block(&format!(
-                        "alter materialized view {}.{} set ({});",
-                        self.schema,
-                        self.name,
-                        params.join(", ")
-                    ));
-                }
+                && !params.is_empty()
+            {
+                script.append_block(&format!(
+                    "alter materialized view {}.{} set ({});",
+                    self.schema,
+                    self.name,
+                    params.join(", ")
+                ));
+            }
             if let Some(ref space) = self.tablespace {
                 script.append_block(&format!(
                     "alter materialized view {}.{} set tablespace {};",

@@ -3177,28 +3177,24 @@ impl Comparer {
             // effective from_acl for these tables as well.
             let table_key = Self::table_key(&table.schema, &table.name);
             let is_recreated = self.recreated_tables.contains(&table_key);
-            let default_acl_storage: Option<Vec<String>>;
-            let (from_acl, from_owner): (&[String], &str) = if is_recreated && full {
-                let storage = from_default_table_acl
+            let use_default = (is_recreated
+                || !from_table_map.contains_key(&(table.schema.as_str(), table.name.as_str())))
+                && full;
+            let default_acl_storage = if use_default {
+                from_default_table_acl
                     .get(&table.schema)
                     .cloned()
-                    .unwrap_or_default();
-                default_acl_storage = Some(storage);
-                (default_acl_storage.as_ref().unwrap().as_slice(), "")
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (from_acl, from_owner): (&[String], &str) = if use_default {
+                (default_acl_storage.as_slice(), "")
             } else if let Some(&(acl, owner)) =
                 from_table_map.get(&(table.schema.as_str(), table.name.as_str()))
             {
-                default_acl_storage = None;
                 (acl, owner)
-            } else if full {
-                let storage = from_default_table_acl
-                    .get(&table.schema)
-                    .cloned()
-                    .unwrap_or_default();
-                default_acl_storage = Some(storage);
-                (default_acl_storage.as_ref().unwrap().as_slice(), "")
             } else {
-                default_acl_storage = None;
                 (&[], "")
             };
             let owners: Vec<&str> = [from_owner, table.owner.as_str()]
@@ -3226,21 +3222,22 @@ impl Comparer {
         // --- Sequences ---
         for seq in &self.to.sequences {
             // Same treatment as tables: new sequences get auto-grants from default privileges.
-            let default_seq_acl_storage: Option<Vec<String>>;
-            let (from_acl, from_owner): (&[String], &str) = if let Some(&(acl, owner)) =
-                from_seq_map.get(&(seq.schema.as_str(), seq.name.as_str()))
-            {
-                default_seq_acl_storage = None;
-                (acl, owner)
-            } else if full {
-                let storage = from_default_seq_acl
+            let is_new_seq = !from_seq_map.contains_key(&(seq.schema.as_str(), seq.name.as_str()));
+            let default_seq_acl_storage = if is_new_seq && full {
+                from_default_seq_acl
                     .get(&seq.schema)
                     .cloned()
-                    .unwrap_or_default();
-                default_seq_acl_storage = Some(storage);
-                (default_seq_acl_storage.as_ref().unwrap().as_slice(), "")
+                    .unwrap_or_default()
             } else {
-                default_seq_acl_storage = None;
+                Vec::new()
+            };
+            let (from_acl, from_owner): (&[String], &str) = if is_new_seq && full {
+                (default_seq_acl_storage.as_slice(), "")
+            } else if let Some(&(acl, owner)) =
+                from_seq_map.get(&(seq.schema.as_str(), seq.name.as_str()))
+            {
+                (acl, owner)
+            } else {
                 (&[], "")
             };
             let owners: Vec<&str> = [from_owner, seq.owner.as_str()]
@@ -3280,39 +3277,30 @@ impl Comparer {
             // the source DB's default privileges for tables (which also apply to
             // views in PostgreSQL) will be auto-applied on creation.  Use those
             // as the effective from_acl so that any needed REVOKEs are emitted.
-            let view_default_acl_storage: Option<Vec<String>>;
-            let (from_acl, from_owner): (&[String], &str) =
-                if self.dropped_views.get(&normalized_key) == Some(&true) {
-                    if full {
-                        // View is dropped and will be recreated: default
-                        // privileges auto-apply on the new view.
-                        let storage = from_default_table_acl
-                            .get(&view.schema)
-                            .cloned()
-                            .unwrap_or_default();
-                        view_default_acl_storage = Some(storage);
-                        (view_default_acl_storage.as_ref().unwrap().as_slice(), "")
-                    } else {
-                        view_default_acl_storage = None;
-                        (&[], "")
-                    }
-                } else if let Some(&(acl, owner)) =
-                    from_view_map.get(&(view.schema.as_str(), view.name.as_str()))
-                {
-                    view_default_acl_storage = None;
-                    (acl, owner)
-                } else if full {
-                    // New view: will auto-receive table default privileges on creation.
-                    let storage = from_default_table_acl
-                        .get(&view.schema)
-                        .cloned()
-                        .unwrap_or_default();
-                    view_default_acl_storage = Some(storage);
-                    (view_default_acl_storage.as_ref().unwrap().as_slice(), "")
-                } else {
-                    view_default_acl_storage = None;
-                    (&[], "")
-                };
+            let is_dropped = self.dropped_views.get(&normalized_key) == Some(&true);
+            let is_new_view =
+                !from_view_map.contains_key(&(view.schema.as_str(), view.name.as_str()));
+            let use_view_default = (is_dropped || is_new_view) && full;
+            let view_default_acl_storage = if use_view_default {
+                from_default_table_acl
+                    .get(&view.schema)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (from_acl, from_owner): (&[String], &str) = if use_view_default {
+                (view_default_acl_storage.as_slice(), "")
+            } else if is_dropped {
+                // use_drop=false: view wasn't actually dropped
+                (&[], "")
+            } else if let Some(&(acl, owner)) =
+                from_view_map.get(&(view.schema.as_str(), view.name.as_str()))
+            {
+                (acl, owner)
+            } else {
+                (&[], "")
+            };
             let owners: Vec<&str> = [from_owner, view.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
