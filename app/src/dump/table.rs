@@ -885,7 +885,10 @@ impl Table {
             script.append_block(";");
         } else {
             // 1. Build CREATE TABLE statement
-            script.push_str(&format!("create {}table {}.{}", unlogged_prefix, self.schema, self.name));
+            script.push_str(&format!(
+                "create {}table {}.{}",
+                unlogged_prefix, self.schema, self.name
+            ));
 
             // OF type for typed tables
             if let Some(ref type_name) = self.typed_table_type {

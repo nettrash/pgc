@@ -990,7 +990,9 @@ impl Dump {
                         r.map(|v| v as f64).filter(|v| *v > 0.0)
                     },
                     support_function: row.get("prosupport"),
-                    transform_types: row.get::<Option<Vec<String>>, _>("protrftypes").unwrap_or_default(),
+                    transform_types: row
+                        .get::<Option<Vec<String>>, _>("protrftypes")
+                        .unwrap_or_default(),
                     hash: None,
                     acl: row
                         .get::<Option<Vec<String>>, _>("routine_acl")
@@ -1140,8 +1142,12 @@ impl Dump {
                         _ => "d",
                     })
                 }),
-                force_rowsecurity: row.get::<Option<bool>, _>("relforcerowsecurity").unwrap_or(false),
-                inherits_from: row.get::<Option<Vec<String>>, _>("inherits_from").unwrap_or_default(),
+                force_rowsecurity: row
+                    .get::<Option<bool>, _>("relforcerowsecurity")
+                    .unwrap_or(false),
+                inherits_from: row
+                    .get::<Option<Vec<String>>, _>("inherits_from")
+                    .unwrap_or_default(),
                 typed_table_type: row.get("typed_table_type"),
                 hash: None,
                 acl: row
