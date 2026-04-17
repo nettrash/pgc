@@ -795,6 +795,10 @@ impl Comparer {
                 if (from_type.typtype as u8 as char) == 'e' {
                     continue;
                 }
+                // Multirange types are auto-dropped when their range type is dropped.
+                if (from_type.typtype as u8 as char) == 'm' {
+                    continue;
+                }
                 if to_type_keys.contains(&(from_type.schema.as_str(), from_type.typname.as_str())) {
                     continue;
                 }

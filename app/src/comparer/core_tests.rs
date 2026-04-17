@@ -6111,3 +6111,39 @@ async fn compare_column_grants_excludes_both_old_and_new_owner() {
         "Owner ACL entries must be excluded for both old and new owner, got: {script}"
     );
 }
+
+/// Multirange types are auto-dropped when their associated range type is
+/// dropped.  The comparer must NOT emit a separate DROP for the multirange,
+/// otherwise PostgreSQL rejects it ("cannot drop type … because type …
+/// requires it").
+#[tokio::test]
+async fn compare_types_multirange_not_dropped_independently() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let to_dump = Dump::new(DumpConfig::default());
+
+    // Range type present only in FROM → will be dropped.
+    let mut range_type = make_domain_type("test_schema", "old_range", 600);
+    range_type.typtype = 'r' as i8;
+    range_type.range_subtype = Some("integer".to_string());
+
+    // Associated multirange type present only in FROM.
+    let mut mr_type = make_domain_type("test_schema", "old_multirange", 601);
+    mr_type.typtype = 'm' as i8;
+
+    from_dump.types.push(range_type);
+    from_dump.types.push(mr_type);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, true, true, GrantsMode::Full);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("drop type if exists test_schema.old_range cascade;"),
+        "Range type must be dropped, got: {script}"
+    );
+    let has_mr_drop = script.contains("drop type if exists test_schema.old_multirange");
+    assert!(
+        !has_mr_drop,
+        "Multirange type must NOT be dropped independently, got: {script}"
+    );
+}
