@@ -95,8 +95,8 @@ impl TableTrigger {
             } else {
                 script.push_str(&format!("-- {}", drop_cmd));
             }
-            script.push_str(&target.definition);
-            script.append_block(";");
+            script.push_str(&target.get_script(schema, table));
+            return script;
         }
 
         // Handle enabled state change
@@ -666,5 +666,47 @@ mod tests {
             let hash = format!("{:x}", hasher.finalize());
             assert_eq!(hash.len(), 64);
         }
+    }
+
+    #[test]
+    fn test_alter_script_definition_change_includes_enabled_and_comment() {
+        let from = TableTrigger {
+            oid: Oid(1),
+            name: "trg".to_string(),
+            definition: "before insert on public.t for each row execute function f()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
+        };
+        let to = TableTrigger {
+            oid: Oid(1),
+            name: "trg".to_string(),
+            definition: "after insert on public.t for each row execute function g()".to_string(),
+            enabled: "D".to_string(),
+            comment: Some("audit trigger".to_string()),
+        };
+
+        let script = from.get_alter_script(&to, "public", "t", true);
+        assert!(
+            script.contains("drop trigger if exists trg on public.t;"),
+            "must drop old trigger, got: {script}"
+        );
+        assert!(
+            script.contains("after insert on public.t for each row execute function g();"),
+            "must recreate with new definition, got: {script}"
+        );
+        assert!(
+            script.contains("disable trigger trg"),
+            "must include enabled state from get_script, got: {script}"
+        );
+        assert!(
+            script.contains("comment on trigger trg on public.t is 'audit trigger';"),
+            "must include comment from get_script, got: {script}"
+        );
+        // Must not have duplicate disable statements
+        let disable_count = script.matches("disable trigger").count();
+        assert_eq!(
+            disable_count, 1,
+            "must not duplicate disable statement, got {disable_count} in: {script}"
+        );
     }
 }

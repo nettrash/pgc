@@ -3454,7 +3454,14 @@ impl Comparer {
             .collect();
 
         for table in &self.to.tables {
-            let table_owners: Vec<&str> = [table.owner.as_str()].into_iter().collect();
+            let from_owner = from_table_map
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .map(|&(_, o)| o)
+                .unwrap_or("");
+            let table_owners: Vec<&str> = [from_owner, table.owner.as_str()]
+                .into_iter()
+                .filter(|o| !o.is_empty())
+                .collect();
             let object_table_name = format!("{}.{}", table.schema, table.name);
             let from_cols = from_table_cols
                 .get(&(table.schema.as_str(), table.name.as_str()))

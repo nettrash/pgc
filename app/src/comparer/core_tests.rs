@@ -6048,3 +6048,66 @@ async fn compare_grants_dropped_view_grants_extra_over_default() {
         "Must grant writer privileges beyond default ACL for dropped view, got: {script}"
     );
 }
+
+/// When table ownership changes between FROM and TO, column-level ACL
+/// diffing must exclude both old and new owners from the diff so that
+/// implicit-privilege entries do not produce spurious GRANT/REVOKE.
+#[tokio::test]
+async fn compare_column_grants_excludes_both_old_and_new_owner() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM table owned by old_owner with column ACL for old_owner
+    let mut from_col = int_column("public", "users", "secret", 1);
+    from_col.acl = vec!["old_owner=r/old_owner".to_string()];
+    let from_table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "old_owner".to_string(),
+        None,
+        vec![from_col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    // TO table owned by new_owner with column ACL for new_owner
+    let mut to_col = int_column("public", "users", "secret", 1);
+    to_col.acl = vec!["new_owner=r/new_owner".to_string()];
+    let to_table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "new_owner".to_string(),
+        None,
+        vec![to_col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // Both old_owner and new_owner have implicit privileges as owners,
+    // so no GRANT or REVOKE should appear for them on the column.
+    let has_col_grant = script
+        .lines()
+        .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("grant "));
+    let has_col_revoke = script
+        .lines()
+        .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("revoke "));
+    assert!(
+        !has_col_grant && !has_col_revoke,
+        "Owner ACL entries must be excluded for both old and new owner, got: {script}"
+    );
+}
