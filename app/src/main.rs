@@ -87,7 +87,7 @@ struct Args {
     grants_mode: GrantsMode,
 
     /// Maximum number of connections in the PostgreSQL connection pool
-    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value = "16", value_parser = clap::value_parser!(u32).range(1..))]
     max_connections: u32,
 
     /// Use CASCADE in DROP statements for the clear command. WARNING: CASCADE can drop
@@ -199,7 +199,13 @@ async fn run_by_config(config: String) -> Result<(), Error> {
     // For now, we just print the config file name.
     if Path::new(&config).exists() {
         println!("Running with config: {config}");
-        let cfg: Config = Config::new(config.clone());
+        let cfg: Config = match Config::load(&config) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                return Err(Error::new(std::io::ErrorKind::InvalidData, e));
+            }
+        };
 
         let from_file = cfg.from.file.clone();
         let to_file = cfg.to.file.clone();

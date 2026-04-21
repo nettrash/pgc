@@ -17,7 +17,6 @@ use crate::dump::table::{PgCatalogCaps, Table};
 use crate::dump::text_search::{TextSearchConfig, TextSearchDict};
 use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
-use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::Row;
@@ -30,15 +29,6 @@ use std::io::Write;
 use std::io::{Error, Read};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
-
-/// Number of sibling branches in `fill()` that run concurrently with the
-/// table-fetching stream via `tokio::try_join!`: types/enums, extensions,
-/// sequences, routines, and views.  We reserve this many pool connections so
-/// the `buffer_unordered` table stream doesn't starve them.
-///
-/// **Keep in sync** with the number of non-table futures passed to
-/// `tokio::try_join!` in `Dump::fill()`.
-const FILL_SIBLING_BRANCH_COUNT: u32 = 11;
 
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +168,7 @@ impl Dump {
             })?;
 
         // Fill the dump.
-        self.fill(&pool, max_connections).await?;
+        self.fill(&pool).await?;
 
         pool.close().await;
 
@@ -218,7 +208,7 @@ impl Dump {
         format!("({})", names.join(", "))
     }
 
-    async fn fill(&mut self, pool: &PgPool, max_connections: u32) -> Result<(), Error> {
+    async fn fill(&mut self, pool: &PgPool) -> Result<(), Error> {
         self.get_schemas(pool).await?;
         if self.schemas.is_empty() {
             println!("No accessible schemas to dump.");
@@ -244,7 +234,7 @@ impl Dump {
         let extensions_fut = Self::fetch_extensions_standalone(pool, &schema_filter);
         let sequences_fut = Self::fetch_sequences_standalone(pool, &schema_filter);
         let routines_fut = Self::fetch_routines_standalone(pool, &schema_filter);
-        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter, max_connections);
+        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter);
         let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
         let foreign_tables_fut = Self::fetch_foreign_tables_standalone(pool, &schema_filter);
         let statistics_fut = Self::fetch_statistics_standalone(pool, &schema_filter);
@@ -1167,12 +1157,13 @@ impl Dump {
 
     /// Fetch all tables with bounded-parallel fills.
     ///
-    /// Tables are filled concurrently so that per-table sub-queries
-    /// overlap, drastically reducing wall-clock time on remote connections.
+    /// Fetch every table in the accessible schemas, then fill per-table
+    /// metadata (columns, indexes, constraints, triggers, policies,
+    /// partitioning info, definitions) via schema-wide bulk queries rather
+    /// than a per-table fan-out.
     async fn fetch_tables_standalone(
         pool: &PgPool,
         schema_filter: &str,
-        max_connections: u32,
     ) -> Result<Vec<Table>, Error> {
         // Check once whether the pg_get_tabledef extension function exists.
         let has_tabledef_fn =
@@ -1307,42 +1298,34 @@ impl Dump {
             });
         }
 
-        // Fill all tables concurrently, reserving FILL_SIBLING_BRANCH_COUNT
-        // connections for the sibling branches (extensions, sequences, routines,
-        // types/enums, views) that run in parallel via tokio::try_join! in fill().
-        let pool_ref = pool;
-        let tables: Vec<Result<Table, Error>> = stream::iter(shell_tables)
-            .map(|mut table| async move {
-                table
-                    .fill(pool_ref, has_tabledef_fn, pg_version, caps)
-                    .await
-                    .map_err(|e| {
-                        Error::other(format!("Failed to fill table {}: {}.", table.name, e))
-                    })?;
-                table.hash();
-                println!(
-                    " - {}.{} (hash: {})",
-                    table.schema,
-                    table.name,
-                    table.hash.as_deref().unwrap_or("None")
-                );
-                Ok(table)
-            })
-            .buffer_unordered(
-                max_connections
-                    .saturating_sub(FILL_SIBLING_BRANCH_COUNT)
-                    .max(1) as usize,
-            )
-            .collect()
-            .await;
+        // Fill every table using schema-wide queries (one per sub-resource)
+        // rather than a per-table fan-out. This turns what was previously
+        // `7 × N` round-trips into 7 total, dramatically shrinking dump time
+        // on high-latency connections.
+        Table::fill_all(
+            &mut shell_tables,
+            pool,
+            has_tabledef_fn,
+            pg_version,
+            caps,
+            schema_filter,
+        )
+        .await
+        .map_err(|e| Error::other(format!("Failed to fill tables: {e}.")))?;
 
-        let mut result = Vec::with_capacity(tables.len());
-        for t in tables {
-            result.push(t?);
+        for table in &mut shell_tables {
+            table.hash();
+            println!(
+                " - {}.{} (hash: {})",
+                table.schema,
+                table.name,
+                table.hash.as_deref().unwrap_or("None")
+            );
         }
-        // Re-sort to ensure deterministic output regardless of completion order.
-        result.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
-        Ok(result)
+
+        // Ensure deterministic output order.
+        shell_tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+        Ok(shell_tables)
     }
 
     async fn fetch_views_standalone(
@@ -2788,7 +2771,7 @@ impl Dump {
                 ))
             })?;
 
-        self.fill(&pool, max_connections).await?;
+        self.fill(&pool).await?;
 
         pool.close().await;
         Ok(())

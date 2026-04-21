@@ -1,3 +1,40 @@
+2026-04-20      v1.0.16
+
+                Performance:
+                    - Eliminated N+1 query pattern in the dump path. Per-table
+                      metadata (columns, indexes, constraints, triggers, policies,
+                      partition info, definitions) is now fetched via seven
+                      schema-wide queries instead of seven queries per table,
+                      collapsing `7 × N` round-trips into 7 on remote connections.
+                    - Prelower routine source code once per routine in O(n²)
+                      dependency scans inside the comparer (three routine loops
+                      plus the routine-and-view phase). Previously each inner
+                      iteration re-lowercased the full source text.
+                    - Prelower view definitions once per view in the view-drop
+                      dependency scan for the same reason.
+                    - Precompute foreign-key constraint definitions (lowercase
+                      plus quote-stripped-lowercase) once across the FROM dump
+                      before scanning dropped tables, removing repeated
+                      `to_lowercase()` / `chars().filter()` work from the
+                      O(T × T × C) inner loop.
+
+                Bug fixes:
+                    - Config file values containing `=` (e.g. passwords with
+                      base64 `=` padding) no longer cause `Invalid configuration
+                      line` panics. The parser now splits on the first `=` only.
+                    - `Config::new` now has a non-panicking counterpart,
+                      `Config::load(&str) -> Result<Config, String>`, which
+                      `main.rs` uses to report malformed configs cleanly instead
+                      of aborting with a Rust panic.
+
+                Changes:
+                    - Default `MAX_CONNECTIONS` / `--max-connections` raised from
+                      8 to 16. With the new bulk-query dump path the tool fires
+                      up to ~18 concurrent introspection queries; the previous
+                      default starved the pool on high-latency links.
+                    - README documentation for `MAX_CONNECTIONS` updated to
+                      reflect the new bulk-query model.
+
 2026-04-17      v1.0.15
 
                 Features:

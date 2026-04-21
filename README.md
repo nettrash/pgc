@@ -71,7 +71,7 @@ Command line arguments can be used to execute just one function in one time.
 
 `--grants-mode {ignore|addonly|full}` - controls how grants (privileges) are handled during comparison. `ignore` (default) skips grants entirely; `addonly` adds grants that exist in TO but not in FROM; `full` makes grants identical by adding missing and revoking extra.
 
-`--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `8`.
+`--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `16`. Used by all concurrent introspection queries; table metadata is pulled schema-wide in one query per resource kind (columns, indexes, constraints, triggers, policies, partition info, definitions) so connection count mostly matters for the sibling queries (extensions, sequences, routines, views, etc.) running in parallel.
 
 `--use-cascade` - add `CASCADE` to every `DROP` statement in the clear script. **Warning:** `CASCADE` can silently drop dependent objects that live outside the selected schema(s) (e.g., foreign keys or views in other schemas referencing the dropped objects). Use only when you are certain no cross-schema dependencies should survive. Without this flag the generated drops rely on the explicit dependency ordering and will fail cleanly if unresolved dependencies exist.
 
@@ -152,46 +152,26 @@ USE_DROP=true
 USE_SINGLE_TRANSACTION=true
 USE_COMMENTS=false
 GRANTS_MODE=ignore
-MAX_CONNECTIONS=8
+MAX_CONNECTIONS=16
 ```
 
 ## Choosing `MAX_CONNECTIONS`
 
-The `MAX_CONNECTIONS` setting controls how many concurrent PostgreSQL connections the tool opens per dump. During a dump the tool runs several independent queries in parallel (extensions, sequences, routines, types, views) and additionally fills each table concurrently — so the connection count directly affects wall-clock time on remote or high-latency servers.
+`MAX_CONNECTIONS` caps the connection pool the tool opens per dump. Independent introspection queries (extensions, sequences, routines, views, types, tables, etc.) are fired concurrently via `tokio::try_join!`, and the table-level data (columns, indexes, constraints, triggers, policies, partition info, definitions) is pulled with **schema-wide** queries — one query per sub-resource, independent of table count. So the connection count mostly bounds how many of the ~18 concurrent sibling queries run without queueing.
 
 ### Key constraints
 
 - **Server budget** — never exceed half of the server's `max_connections` (check with `SHOW max_connections;`). The PostgreSQL default is 100.
 - **Two pools** — when dumping both `FROM` and `TO` against the same server the combined usage is `2 × MAX_CONNECTIONS`; halve your budget per pool.
 - **Memory overhead** — each PostgreSQL connection costs roughly 5–10 MB of RAM on the server.
-- **Diminishing returns** — beyond ~24–32 connections, query planner contention and lock overhead typically negate the parallelism gains.
+- **Diminishing returns** — beyond ~24 connections there is nothing left to parallelize; the dump runs at most ~18 queries concurrently.
 
 ### Recommended values
 
-| Tables in schema | Suggested `MAX_CONNECTIONS` |
-|------------------|-----------------------------|
-| < 20             | 8 (default)                 |
-| 20 – 50          | 12 – 16                     |
-| 50 – 200         | 16 – 24                     |
-| 200+             | 24 – 32                     |
+| Schema size                 | Suggested `MAX_CONNECTIONS` |
+|-----------------------------|-----------------------------|
+| Local or low-latency server | 16 (default)                |
+| High-latency / remote       | 20 – 24                     |
+| Extremely small schema      | 8 – 12 (still fine)         |
 
-### Formula
-
-As a rule of thumb:
-
-```math
-\text{max\_connections} = \min\!\Big(\max\!\big(\lceil T / 2 \rceil + 5,\; 8\big),\; \lfloor PG_{max} / 2 \rfloor,\; 32\Big)
-```
-
-Where $T$ is the number of tables in the target schema(s) and $PG_{max}$ is the server's `max_connections` value.
-
-You can query both values at connect time:
-
-```sql
--- Server limit
-SHOW max_connections;
-
--- Table count for the target schema(s)
-SELECT count(*) FROM pg_tables
-WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
-```
+The default of 16 is comfortable for most workloads. Raising it above ~24 rarely helps: the tool only has a small fixed set of sibling query batches to run.

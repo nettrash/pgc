@@ -309,19 +309,35 @@ impl Comparer {
         result
     }
 
-    /// Check whether `text` contains an occurrence of the qualified name
-    /// `schema.name` as a whole identifier (not as a substring of a longer
-    /// identifier).  Both quoted (`"schema"."name"`) and unquoted forms are
-    /// recognised.
-    fn text_references_qualified_name(text: &str, schema: &str, name: &str) -> bool {
-        let pattern = format!("{}.{}", schema.to_lowercase(), name.to_lowercase());
-        let lower = text.to_lowercase();
-        if Self::has_whole_qualified_name(&lower, &pattern) {
+    /// Check whether `lowered` / `unquoted_lowered` (both prelowered flavors
+    /// of the haystack text — the second with `"` stripped) contain an
+    /// occurrence of `schema_lc.name_lc` as a whole identifier (not as a
+    /// substring of a longer identifier). Call sites in quadratic loops
+    /// should prelower the haystack once via `prelower_pair` and reuse it
+    /// across inner iterations.
+    #[inline]
+    fn text_references_qualified_name_pre(
+        lowered: &str,
+        unquoted_lowered: &str,
+        schema_lc: &str,
+        name_lc: &str,
+    ) -> bool {
+        let mut pattern = String::with_capacity(schema_lc.len() + 1 + name_lc.len());
+        pattern.push_str(schema_lc);
+        pattern.push('.');
+        pattern.push_str(name_lc);
+        if Self::has_whole_qualified_name(lowered, &pattern) {
             return true;
         }
-        // Also try with all double-quotes stripped (handles quoted identifiers).
+        Self::has_whole_qualified_name(unquoted_lowered, &pattern)
+    }
+
+    /// Build `(lowercase, lowercase_with_quotes_stripped)` from `text` in a
+    /// single lowercase pass.
+    fn prelower_pair(text: &str) -> (String, String) {
+        let lower = text.to_lowercase();
         let unquoted: String = lower.chars().filter(|c| *c != '"').collect();
-        Self::has_whole_qualified_name(&unquoted, &pattern)
+        (lower, unquoted)
     }
 
     /// Check whether a routine's `aggregate_info` references a function
@@ -1238,11 +1254,21 @@ impl Comparer {
                 })
                 .collect();
 
+            // Precompute `(lower, unquoted_lower)` of each routine's source once
+            // — the inner loop below is O(n²) over routine count, and without
+            // this the haystack would be re-lowered on every iteration.
+            let drop_sources: Vec<(String, String)> = routines_to_drop
+                .iter()
+                .map(|r| Self::prelower_pair(&r.source_code))
+                .collect();
+
             for (i, routine) in routines_to_drop.iter().enumerate() {
+                let (src_lower, src_unquoted) = &drop_sources[i];
                 for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
-                        && (Self::text_references_qualified_name(
-                            &routine.source_code,
+                        && (Self::text_references_qualified_name_pre(
+                            src_lower,
+                            src_unquoted,
                             schema,
                             name,
                         ) || Self::aggregate_references_function(routine, schema, name))
@@ -1307,11 +1333,19 @@ impl Comparer {
                 .collect();
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+            // Same optimisation as in the drop loop above: prelower each
+            // routine's source_code once so the quadratic scan doesn't.
+            let create_sources: Vec<(String, String)> = create_routines
+                .iter()
+                .map(|(_, r)| Self::prelower_pair(&r.source_code))
+                .collect();
             for (i, (_, routine)) in create_routines.iter().enumerate() {
+                let (src_lower, src_unquoted) = &create_sources[i];
                 for (j, (schema, name, _)) in names.iter().enumerate() {
                     if i != j
-                        && (Self::text_references_qualified_name(
-                            &routine.source_code,
+                        && (Self::text_references_qualified_name_pre(
+                            src_lower,
+                            src_unquoted,
                             schema,
                             name,
                         ) || Self::aggregate_references_function(routine, schema, name))
@@ -1382,6 +1416,44 @@ impl Comparer {
             .collect();
 
         // Pass 1: collect FK drops for all tables that will be removed.
+        //
+        // Precompute every foreign-key constraint in the FROM dump once,
+        // along with prelowered definition / quote-stripped-definition strings.
+        // The original implementation re-lowered each constraint definition
+        // inside the (dropped-table × all-tables × all-constraints) loop.
+        struct FkRef<'a> {
+            owner_schema: &'a str,
+            owner_name: &'a str,
+            def_lower: String,
+            def_unquoted_lower: String,
+            constraint: &'a crate::dump::table_constraint::TableConstraint,
+        }
+        let from_fk_refs: Vec<FkRef<'_>> = self
+            .from
+            .tables
+            .iter()
+            .flat_map(|t| {
+                t.constraints.iter().filter_map(move |c| {
+                    if !c.constraint_type.eq_ignore_ascii_case("foreign key") {
+                        return None;
+                    }
+                    let def = c.definition.as_deref()?;
+                    let def_lower = def.to_lowercase();
+                    let def_unquoted_lower: String = def_lower
+                        .chars()
+                        .filter(|ch| !matches!(ch, '"' | '\'' | '`'))
+                        .collect();
+                    Some(FkRef {
+                        owner_schema: t.schema.as_str(),
+                        owner_name: t.name.as_str(),
+                        def_lower,
+                        def_unquoted_lower,
+                        constraint: c,
+                    })
+                })
+            })
+            .collect();
+
         let mut fk_pre_drop = String::new();
         let mut dropped_fk_keys: HashSet<String> = HashSet::new();
         for table in ordered_from_drop.iter() {
@@ -1416,44 +1488,29 @@ impl Comparer {
                 target_refs.push(table.name.to_lowercase());
             }
 
-            for other in &self.from.tables {
-                if other.schema == table.schema && other.name == table.name {
+            for fk in &from_fk_refs {
+                if fk.owner_schema == table.schema && fk.owner_name == table.name {
                     continue;
                 }
-                for constraint in &other.constraints {
-                    if constraint
-                        .constraint_type
-                        .eq_ignore_ascii_case("foreign key")
-                    {
-                        let matches_target = constraint.definition.as_deref().is_some_and(|d| {
-                            let def = d.to_lowercase();
-                            let def_normalized: String = def
-                                .chars()
-                                .filter(|c| !matches!(c, '"' | '\'' | '`'))
-                                .collect();
-                            target_refs
-                                .iter()
-                                .any(|r| def.contains(r) || def_normalized.contains(r))
-                        });
-
-                        if matches_target {
-                            let key = format!(
-                                "{}.{}.{}",
-                                constraint.schema, constraint.table_name, constraint.name
+                let matches_target = target_refs
+                    .iter()
+                    .any(|r| fk.def_lower.contains(r) || fk.def_unquoted_lower.contains(r));
+                if matches_target {
+                    let key = format!(
+                        "{}.{}.{}",
+                        fk.constraint.schema, fk.constraint.table_name, fk.constraint.name
+                    );
+                    if dropped_fk_keys.insert(key) {
+                        let drop_cmd = fk.constraint.get_drop_script();
+                        if self.use_drop {
+                            fk_pre_drop.push_str(&drop_cmd);
+                        } else {
+                            fk_pre_drop.push_str(
+                                &drop_cmd
+                                    .lines()
+                                    .map(|l| format!("-- {}\n", l))
+                                    .collect::<String>(),
                             );
-                            if dropped_fk_keys.insert(key) {
-                                let drop_cmd = constraint.get_drop_script();
-                                if self.use_drop {
-                                    fk_pre_drop.push_str(&drop_cmd);
-                                } else {
-                                    fk_pre_drop.push_str(
-                                        &drop_cmd
-                                            .lines()
-                                            .map(|l| format!("-- {}\n", l))
-                                            .collect::<String>(),
-                                    );
-                                }
-                            }
                         }
                     }
                 }
@@ -1777,6 +1834,21 @@ impl Comparer {
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); candidates.len()];
 
+            // Precompute per-view: prelowered definition + lowered
+            // (schema, name) of the other-view key. Avoids re-lowering the
+            // full view definition on every inner-loop iteration.
+            let candidate_defs: Vec<(String, String)> = candidates
+                .iter()
+                .map(|(idx, _, _)| Self::prelower_pair(&self.from.views[*idx].definition))
+                .collect();
+            let candidate_names_lc: Vec<(String, String)> = candidates
+                .iter()
+                .map(|(idx, _, _)| {
+                    let v = &self.from.views[*idx];
+                    (v.schema.to_lowercase(), v.name.to_lowercase())
+                })
+                .collect();
+
             for (i, (view_idx, _, _)) in candidates.iter().enumerate() {
                 let view = &self.from.views[*view_idx];
                 // Check table_relation
@@ -1789,16 +1861,17 @@ impl Comparer {
                     }
                 }
                 // Check definition text for references to other dropping views
-                for (j, (other_idx, _, _)) in candidates.iter().enumerate() {
-                    if i != j {
-                        let other = &self.from.views[*other_idx];
-                        if Self::text_references_qualified_name(
-                            &view.definition,
-                            &other.schema,
-                            &other.name,
-                        ) {
-                            depends_on[i].insert(j);
-                        }
+                let (def_lower, def_unquoted) = &candidate_defs[i];
+                for (j, (schema_lc, name_lc)) in candidate_names_lc.iter().enumerate() {
+                    if i != j
+                        && Self::text_references_qualified_name_pre(
+                            def_lower,
+                            def_unquoted,
+                            schema_lc,
+                            name_lc,
+                        )
+                    {
+                        depends_on[i].insert(j);
                     }
                 }
             }
@@ -2783,11 +2856,20 @@ impl Comparer {
                 })
                 .collect();
 
+            // Prelower each source_code once; the scan below is O(n²) in routine
+            // count and previously re-lowered the full source on every call.
+            let drop_sources: Vec<(String, String)> = routines_to_drop
+                .iter()
+                .map(|r| Self::prelower_pair(&r.source_code))
+                .collect();
+
             for (i, routine) in routines_to_drop.iter().enumerate() {
+                let (src_lower, src_unquoted) = &drop_sources[i];
                 for (j, (schema, name, _)) in drop_names.iter().enumerate() {
                     if i != j
-                        && (Self::text_references_qualified_name(
-                            &routine.source_code,
+                        && (Self::text_references_qualified_name_pre(
+                            src_lower,
+                            src_unquoted,
                             schema,
                             name,
                         ) || Self::aggregate_references_function(routine, schema, name))
@@ -2877,8 +2959,11 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         // Precompute info we need for each action item so we don't
         // hold any reference to `self` while building the graph.
+        // `text_lower` / `text_unquoted_lower` are prelowered once and reused
+        // in the O(n²) reference scan below.
         struct ItemInfo {
-            text: String,
+            text_lower: String,
+            text_unquoted_lower: String,
             schema_lower: String,
             name_lower: String,
             is_view: bool,
@@ -2897,8 +2982,10 @@ impl Comparer {
                         .iter()
                         .map(|rel| Self::normalized_view_reference(rel))
                         .collect();
+                    let (text_lower, text_unquoted_lower) = Self::prelower_pair(&v.definition);
                     ItemInfo {
-                        text: v.definition.clone(),
+                        text_lower,
+                        text_unquoted_lower,
                         schema_lower: v.schema.to_lowercase(),
                         name_lower: v.name.to_lowercase(),
                         is_view: true,
@@ -2913,8 +3000,10 @@ impl Comparer {
                     } else {
                         0
                     };
+                    let (text_lower, text_unquoted_lower) = Self::prelower_pair(&r.source_code);
                     ItemInfo {
-                        text: r.source_code.clone(),
+                        text_lower,
+                        text_unquoted_lower,
                         schema_lower: r.schema.to_lowercase(),
                         name_lower: r.name.to_lowercase(),
                         is_view: false,
@@ -2941,7 +3030,12 @@ impl Comparer {
         for (i, item) in items.iter().enumerate() {
             // Scan the object body for qualified references to other action items.
             for ((schema, name), targets) in &name_to_items {
-                if Self::text_references_qualified_name(&item.text, schema, name) {
+                if Self::text_references_qualified_name_pre(
+                    &item.text_lower,
+                    &item.text_unquoted_lower,
+                    schema,
+                    name,
+                ) {
                     for &j in targets {
                         if j != i {
                             depends_on[i].insert(j);

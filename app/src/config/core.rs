@@ -23,17 +23,11 @@ pub struct Config {
 }
 
 impl Config {
-    // Create a new configuration instance.
-    pub fn new(file: String) -> Self {
-        // Load the configuration from the file.
-        let config_data = std::fs::read_to_string(file);
-        if config_data.is_err() {
-            panic!(
-                "Error reading configuration file: {}",
-                config_data.err().unwrap()
-            );
-        }
-        let binding = config_data.unwrap();
+    /// Load configuration from `file`. Returns a descriptive error instead of
+    /// panicking on malformed input so callers can format it however they want.
+    pub fn load(file: &str) -> Result<Self, String> {
+        let binding = std::fs::read_to_string(file)
+            .map_err(|e| format!("Error reading configuration file {file}: {e}"))?;
         let config_data = binding
             .split('\n')
             .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
@@ -60,21 +54,19 @@ impl Config {
         let mut use_single_transaction = false;
         let mut use_comments = true;
         let mut grants_mode = GrantsMode::Ignore;
-        let mut max_connections: u32 = 8;
+        let mut max_connections: u32 = 16;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
                 continue; // Skip empty lines and comments
             }
-            if line.split('=').count() != 2 {
-                panic!("Invalid configuration line: {line}");
-            }
-            let parts: Vec<&str> = line.split('=').collect();
-            if parts[0].trim().is_empty() || parts[1].trim().is_empty() {
-                panic!("Invalid configuration line: {line}");
+            let parts: Vec<&str> = line.splitn(2, '=').collect();
+            if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+                return Err(format!("Invalid configuration line: {line}"));
             }
             let key = parts[0].trim().to_uppercase();
             let value = parts[1].trim().to_uppercase();
+            let raw_value = parts[1].trim();
             if key != "FROM_HOST"
                 && key != "FROM_PORT"
                 && key != "FROM_USER"
@@ -98,55 +90,51 @@ impl Config {
                 && key != "GRANTS_MODE"
                 && key != "MAX_CONNECTIONS"
             {
-                panic!("Unknown configuration key: {}", parts[0]);
+                return Err(format!("Unknown configuration key: {}", parts[0]));
             }
             if key == "FROM_SSL" && value != "TRUE" && value != "FALSE" {
-                panic!("Invalid value for FROM_SSL: {}", parts[1]);
+                return Err(format!("Invalid value for FROM_SSL: {raw_value}"));
             }
             if key == "TO_SSL" && value != "TRUE" && value != "FALSE" {
-                panic!("Invalid value for TO_SSL: {}", parts[1]);
+                return Err(format!("Invalid value for TO_SSL: {raw_value}"));
             }
 
             match key.as_str() {
-                "FROM_HOST" => from_host = parts[1].trim().to_string(),
-                "FROM_PORT" => from_port = parts[1].trim().to_string(),
-                "FROM_USER" => from_user = parts[1].trim().to_string(),
-                "FROM_PASSWORD" => from_password = parts[1].trim().to_string(),
-                "FROM_DATABASE" => from_database = parts[1].trim().to_string(),
-                "FROM_SCHEME" => from_scheme = parts[1].trim().to_string(),
+                "FROM_HOST" => from_host = raw_value.to_string(),
+                "FROM_PORT" => from_port = raw_value.to_string(),
+                "FROM_USER" => from_user = raw_value.to_string(),
+                "FROM_PASSWORD" => from_password = raw_value.to_string(),
+                "FROM_DATABASE" => from_database = raw_value.to_string(),
+                "FROM_SCHEME" => from_scheme = raw_value.to_string(),
                 "FROM_SSL" => from_ssl = value == "TRUE",
-                "FROM_DUMP" => from_dump = parts[1].trim().to_string(),
-                "TO_HOST" => to_host = parts[1].trim().to_string(),
-                "TO_PORT" => to_port = parts[1].trim().to_string(),
-                "TO_USER" => to_user = parts[1].trim().to_string(),
-                "TO_PASSWORD" => to_password = parts[1].trim().to_string(),
-                "TO_DATABASE" => to_database = parts[1].trim().to_string(),
-                "TO_SCHEME" => to_scheme = parts[1].trim().to_string(),
+                "FROM_DUMP" => from_dump = raw_value.to_string(),
+                "TO_HOST" => to_host = raw_value.to_string(),
+                "TO_PORT" => to_port = raw_value.to_string(),
+                "TO_USER" => to_user = raw_value.to_string(),
+                "TO_PASSWORD" => to_password = raw_value.to_string(),
+                "TO_DATABASE" => to_database = raw_value.to_string(),
+                "TO_SCHEME" => to_scheme = raw_value.to_string(),
                 "TO_SSL" => to_ssl = value == "TRUE",
-                "TO_DUMP" => to_dump = parts[1].trim().to_string(),
-                "OUTPUT" => output = parts[1].trim().to_string(),
+                "TO_DUMP" => to_dump = raw_value.to_string(),
+                "OUTPUT" => output = raw_value.to_string(),
                 "USE_DROP" => use_drop = value == "TRUE",
                 "USE_SINGLE_TRANSACTION" => use_single_transaction = value == "TRUE",
                 "USE_COMMENTS" => {
                     use_comments = match value.as_str() {
                         "TRUE" => true,
                         "FALSE" => false,
-                        _ => panic!("Invalid value for USE_COMMENTS: {}", parts[1].trim()),
+                        _ => return Err(format!("Invalid value for USE_COMMENTS: {raw_value}")),
                     };
                 }
                 "GRANTS_MODE" => {
-                    grants_mode = parts[1]
-                        .trim()
-                        .parse::<GrantsMode>()
-                        .unwrap_or_else(|e| panic!("{e}"));
+                    grants_mode = raw_value.parse::<GrantsMode>().map_err(|e| e.to_string())?;
                 }
                 "MAX_CONNECTIONS" => {
-                    let v = parts[1]
-                        .trim()
+                    let v = raw_value
                         .parse::<u32>()
-                        .unwrap_or_else(|e| panic!("Invalid value for MAX_CONNECTIONS: {e}"));
+                        .map_err(|e| format!("Invalid value for MAX_CONNECTIONS: {e}"))?;
                     if v < 1 {
-                        panic!("MAX_CONNECTIONS must be at least 1, got {v}");
+                        return Err(format!("MAX_CONNECTIONS must be at least 1, got {v}"));
                     }
                     max_connections = v;
                 }
@@ -173,7 +161,7 @@ impl Config {
             ssl: to_ssl,
             file: to_dump,
         };
-        Config {
+        Ok(Config {
             from,
             to,
             output,
@@ -182,6 +170,15 @@ impl Config {
             use_comments,
             grants_mode,
             max_connections,
+        })
+    }
+
+    /// Back-compat shim for existing call sites that expect a panicking constructor.
+    /// New code should prefer `Config::load`.
+    pub fn new(file: String) -> Self {
+        match Self::load(&file) {
+            Ok(cfg) => cfg,
+            Err(e) => panic!("{e}"),
         }
     }
 }
@@ -554,6 +551,27 @@ mod tests {
         let _ = std::fs::remove_file(file);
     }
 
+    // --- Values that legitimately contain `=` (e.g. passwords) ---
+
+    #[test]
+    fn test_password_with_equals_sign_is_preserved() {
+        let config_content = "FROM_PASSWORD=abc=def=ghi\n";
+        let file = write_temp_config(config_content, "test_password_with_equals.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.from.password, "abc=def=ghi");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn test_password_with_trailing_equals_is_preserved() {
+        // base64-style trailing padding
+        let config_content = "TO_PASSWORD=c29tZXBhc3M=\n";
+        let file = write_temp_config(config_content, "test_password_trailing_equals.cfg");
+        let config = Config::new(file.clone());
+        assert_eq!(config.to.password, "c29tZXBhc3M=");
+        let _ = std::fs::remove_file(file);
+    }
+
     // --- MAX_CONNECTIONS validation ---
 
     #[test]
@@ -570,7 +588,7 @@ mod tests {
         let config_content = "FROM_HOST=localhost\n";
         let file = write_temp_config(config_content, "test_max_connections_default.cfg");
         let config = Config::new(file.clone());
-        assert_eq!(config.max_connections, 8);
+        assert_eq!(config.max_connections, 16);
         let _ = std::fs::remove_file(file);
     }
 

@@ -225,64 +225,109 @@ impl Table {
         table.hash();
         table
     }
-    /// Fill information about table.
+    /// Fill metadata for every table in `tables` using **schema-wide** queries.
     ///
-    /// All sub-queries (columns, indexes, constraints, triggers, policies,
-    /// partition info, definition) are fired **concurrently** via
-    /// `tokio::try_join!` so that the total wall-clock time is dominated by
-    /// the single slowest query rather than the sum of all seven.
+    /// Previously each table fired seven `WHERE schema='X' AND name='Y'` queries,
+    /// yielding `7 × N` round-trips for `N` tables. This variant fires seven
+    /// queries total (one per sub-resource), filtered by the same accessible-
+    /// schema list that was used to collect the shell tables, and distributes
+    /// rows into the matching `Table` in memory. On high-latency connections
+    /// this reduces dump time dramatically.
     ///
-    /// `has_tabledef_fn` should be pre-checked once per dump run so we don't
-    /// repeat the `pg_proc` lookup for every table.
-    ///
-    /// `caps` carries pre-computed catalog capability flags so that per-table
-    /// fetches never issue redundant `EXISTS` probes.
-    pub async fn fill(
-        &mut self,
+    /// `has_tabledef_fn` and `caps` are pre-probed once per dump run so this
+    /// function avoids redundant catalog checks.
+    pub async fn fill_all(
+        tables: &mut [Table],
         pool: &PgPool,
         has_tabledef_fn: bool,
         pg_version: i32,
         caps: PgCatalogCaps,
+        schema_filter: &str,
     ) -> Result<(), Error> {
-        let raw_schema = self.raw_schema.clone();
-        let raw_name = self.raw_name.clone();
+        if tables.is_empty() {
+            return Ok(());
+        }
 
-        let (columns, indexes, constraints, triggers, policies_data, partition, definition) = tokio::try_join!(
-            Self::fetch_columns(pool, &raw_schema, &raw_name, caps),
-            Self::fetch_indexes(pool, &raw_schema, &raw_name),
-            Self::fetch_constraints(pool, &raw_schema, &raw_name, pg_version, caps),
-            Self::fetch_triggers(pool, &raw_schema, &raw_name),
-            Self::fetch_policies(pool, &raw_schema, &raw_name),
-            Self::fetch_partition_info(pool, &raw_schema, &raw_name),
-            Self::fetch_definition(pool, &raw_schema, &raw_name, has_tabledef_fn),
+        // (raw_schema, raw_name) -> index into `tables`
+        let table_idx: HashMap<(String, String), usize> = tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.raw_schema.clone(), t.raw_name.clone()), i))
+            .collect();
+
+        let (
+            columns_by_key,
+            indexes_by_key,
+            constraints_by_key,
+            triggers_by_key,
+            (policies_by_key, rowsecurity_by_key),
+            partitions_by_key,
+            definitions_by_key,
+        ) = tokio::try_join!(
+            Self::fetch_columns_bulk(pool, schema_filter, caps),
+            Self::fetch_indexes_bulk(pool, schema_filter),
+            Self::fetch_constraints_bulk(pool, schema_filter, pg_version, caps),
+            Self::fetch_triggers_bulk(pool, schema_filter),
+            Self::fetch_policies_bulk(pool, schema_filter),
+            Self::fetch_partition_info_bulk(pool, schema_filter),
+            Self::fetch_definitions_bulk(pool, schema_filter, has_tabledef_fn),
         )?;
 
-        self.columns = columns;
-        self.indexes = indexes;
-        self.constraints = constraints;
-        self.triggers = triggers;
-
-        let (policies, rowsecurity) = policies_data;
-        self.policies = policies;
-        self.has_rowsecurity = rowsecurity;
-
-        let (partition_key, partition_of, partition_bound) = partition;
-        self.partition_key = partition_key;
-        self.partition_of = partition_of;
-        self.partition_bound = partition_bound;
-
-        self.definition = definition;
+        for (key, mut cols) in columns_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                cols.sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
+                tables[i].columns = cols;
+            }
+        }
+        for (key, mut idxs) in indexes_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                idxs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                tables[i].indexes = idxs;
+            }
+        }
+        for (key, cons) in constraints_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                tables[i].constraints = cons;
+            }
+        }
+        for (key, mut trigs) in triggers_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                trigs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                tables[i].triggers = trigs;
+            }
+        }
+        for (key, pols) in policies_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                tables[i].policies = pols;
+            }
+        }
+        for (key, rs) in rowsecurity_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                tables[i].has_rowsecurity = rs;
+            }
+        }
+        for (key, (partition_key, partition_of, partition_bound)) in partitions_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                tables[i].partition_key = partition_key;
+                tables[i].partition_of = partition_of;
+                tables[i].partition_bound = partition_bound;
+            }
+        }
+        for (key, def) in definitions_by_key {
+            if let Some(&i) = table_idx.get(&key) {
+                tables[i].definition = def;
+            }
+        }
 
         Ok(())
     }
 
-    /// Fetch columns for the given table.
-    async fn fetch_columns(
+    /// Fetch columns for every table in the accessible schemas in one query.
+    async fn fetch_columns_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
+        schema_filter: &str,
         caps: PgCatalogCaps,
-    ) -> Result<Vec<TableColumn>, Error> {
+    ) -> Result<HashMap<(String, String), Vec<TableColumn>>, Error> {
         let compression_col = if caps.has_attcompression {
             ",\n                                a.attcompression::text as col_compression"
         } else {
@@ -293,6 +338,8 @@ impl Table {
                                 c.table_catalog,
                                 quote_ident(c.table_schema) as table_schema,
                                 quote_ident(c.table_name) as table_name,
+                                c.table_schema as raw_table_schema,
+                                c.table_name as raw_table_name,
                                 quote_ident(c.column_name) as column_name,
                                 c.ordinal_position,
                                 c.column_default,
@@ -385,16 +432,16 @@ impl Table {
                          LEFT JOIN pg_description pd
                              ON pd.objoid = cls.oid
                             AND pd.objsubid = a.attnum
-                        WHERE c.table_schema = '{}' AND c.table_name = '{}'
-                        ORDER BY c.table_schema, c.table_name, c.ordinal_position",
-                        escape_single_quotes(schema),
-                        escape_single_quotes(name)
+                        WHERE c.table_schema IN {schema_filter}
+                        ORDER BY c.table_schema, c.table_name, c.ordinal_position"
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        let mut columns = Vec::new();
+        let mut columns_by_key: HashMap<(String, String), Vec<TableColumn>> = HashMap::new();
         if !rows.is_empty() {
             for row in rows {
+                let raw_schema: String = row.get("raw_table_schema");
+                let raw_name: String = row.get("raw_table_name");
                 let table_column = TableColumn {
                     catalog: row.get("table_catalog"),
                     schema: row.get("table_schema"),
@@ -479,25 +526,27 @@ impl Table {
                     serial_type: None,
                 };
 
-                columns.push(table_column);
+                columns_by_key
+                    .entry((raw_schema, raw_name))
+                    .or_default()
+                    .push(table_column);
             }
-
-            columns.sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
         }
 
-        Ok(columns)
+        Ok(columns_by_key)
     }
 
-    /// Fetch indexes for the given table.
-    async fn fetch_indexes(
+    /// Fetch indexes for every table in the accessible schemas in one query.
+    async fn fetch_indexes_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
-    ) -> Result<Vec<TableIndex>, Error> {
+        schema_filter: &str,
+    ) -> Result<HashMap<(String, String), Vec<TableIndex>>, Error> {
         let query = format!(
                         "SELECT
                                 quote_ident(i.schemaname) as schemaname,
                                 quote_ident(i.tablename) as tablename,
+                                i.schemaname as raw_schemaname,
+                                i.tablename as raw_tablename,
                                 quote_ident(i.indexname) as indexname,
                                 i.tablespace,
                                 i.indexdef,
@@ -512,43 +561,40 @@ impl Table {
                          WHERE idx.indisprimary = false
                              AND (idx.indisunique = false OR puc.oid IS NULL)
                              AND NOT EXISTS (SELECT 1 FROM pg_constraint xc WHERE xc.conindid = ic.oid AND xc.contype = 'x')
-                             AND i.schemaname = '{}' AND i.tablename = '{}'
-                         ORDER BY i.schemaname, i.tablename, i.indexname",
-                        escape_single_quotes(schema),
-                        escape_single_quotes(name)
+                             AND i.schemaname IN {schema_filter}
+                         ORDER BY i.schemaname, i.tablename, i.indexname"
                 );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        let mut indexes = Vec::new();
-        if !rows.is_empty() {
-            for row in rows {
-                let table_index = TableIndex {
-                    schema: row.get("schemaname"),
-                    table: row.get("tablename"),
-                    name: row.get("indexname"),
-                    catalog: row.get("tablespace"),
-                    indexdef: row.get("indexdef"),
-                    is_partition_index: row.get("is_partition_index"),
-                    comment: row.get("index_comment"),
-                };
-
-                indexes.push(table_index);
-            }
-
-            indexes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let mut indexes_by_key: HashMap<(String, String), Vec<TableIndex>> = HashMap::new();
+        for row in rows {
+            let raw_schema: String = row.get("raw_schemaname");
+            let raw_name: String = row.get("raw_tablename");
+            let table_index = TableIndex {
+                schema: row.get("schemaname"),
+                table: row.get("tablename"),
+                name: row.get("indexname"),
+                catalog: row.get("tablespace"),
+                indexdef: row.get("indexdef"),
+                is_partition_index: row.get("is_partition_index"),
+                comment: row.get("index_comment"),
+            };
+            indexes_by_key
+                .entry((raw_schema, raw_name))
+                .or_default()
+                .push(table_index);
         }
 
-        Ok(indexes)
+        Ok(indexes_by_key)
     }
 
-    /// Fetch constraints for the given table.
-    async fn fetch_constraints(
+    /// Fetch constraints for every table in the accessible schemas in one query.
+    async fn fetch_constraints_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
+        schema_filter: &str,
         pg_version: i32,
         caps: PgCatalogCaps,
-    ) -> Result<Vec<TableConstraint>, Error> {
+    ) -> Result<HashMap<(String, String), Vec<TableConstraint>>, Error> {
         let conenforced_col = if caps.has_conenforced {
             ",\n                c.conenforced AS is_enforced"
         } else {
@@ -569,6 +615,8 @@ impl Table {
             "SELECT
                 current_database() AS catalog,
                 quote_ident(n.nspname) AS schema,
+                n.nspname AS raw_schema,
+                t.relname AS raw_table_name,
                 quote_ident(c.conname) AS constraint_name,
                 quote_ident(t.relname) AS table_name,
                 CASE c.contype
@@ -590,23 +638,23 @@ impl Table {
                 JOIN pg_namespace n ON n.oid = t.relnamespace
                 LEFT JOIN pg_description d ON d.objoid = c.oid AND d.classoid = 'pg_constraint'::regclass AND d.objsubid = 0
                 WHERE
-                    n.nspname = '{}' AND
-                    t.relname = '{}' AND
+                    n.nspname IN {schema_filter} AND
                     c.contype IN {contype_filter} AND
                     c.conislocal
                 ORDER BY
                     n.nspname,
                     t.relname,
-                    c.conname;",
-            escape_single_quotes(schema),
-            escape_single_quotes(name)
+                    c.conname;"
         );
 
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        let mut constraints = Vec::new();
+        let mut constraints_by_key: HashMap<(String, String), Vec<TableConstraint>> =
+            HashMap::new();
         for row in rows {
-            constraints.push(TableConstraint {
+            let raw_schema: String = row.get("raw_schema");
+            let raw_name: String = row.get("raw_table_name");
+            let constraint = TableConstraint {
                 catalog: row.get("catalog"),
                 schema: row.get("schema"),
                 name: row.get("constraint_name"),
@@ -620,118 +668,145 @@ impl Table {
                 no_inherit: row.get("no_inherit"),
                 nulls_not_distinct: row.try_get("nulls_not_distinct").unwrap_or(false),
                 comment: row.get("constraint_comment"),
-            });
+            };
+            constraints_by_key
+                .entry((raw_schema, raw_name))
+                .or_default()
+                .push(constraint);
         }
 
-        Ok(constraints)
+        Ok(constraints_by_key)
     }
 
-    /// Fetch triggers for the given table.
-    async fn fetch_triggers(
+    /// Fetch triggers for every table in the accessible schemas in one query.
+    async fn fetch_triggers_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
-    ) -> Result<Vec<TableTrigger>, Error> {
+        schema_filter: &str,
+    ) -> Result<HashMap<(String, String), Vec<TableTrigger>>, Error> {
         let query = format!(
             "select
                 t.oid,
+                n.nspname as raw_schema,
+                c.relname as raw_table_name,
                 quote_ident(t.tgname) as tgname,
                 pg_get_triggerdef(t.oid) as tgdef,
                 t.tgenabled::text as tgenabled,
                 d.description as tgcomment
             from
                 pg_trigger t
+            join pg_class c on c.oid = t.tgrelid
+            join pg_namespace n on n.oid = c.relnamespace
             left join pg_description d on d.objoid = t.oid and d.classoid = 'pg_trigger'::regclass
             where
-                t.tgrelid = format('%I.%I', '{}', '{}')::regclass and
+                n.nspname IN {schema_filter} and
                 t.tgisinternal = false
             order by
-                t.tgname",
-            escape_single_quotes(schema),
-            escape_single_quotes(name)
+                n.nspname, c.relname, t.tgname"
         );
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        let mut triggers = Vec::new();
+        let mut triggers_by_key: HashMap<(String, String), Vec<TableTrigger>> = HashMap::new();
         for row in rows {
-            triggers.push(TableTrigger {
+            let raw_schema: String = row.get("raw_schema");
+            let raw_name: String = row.get("raw_table_name");
+            let trig = TableTrigger {
                 oid: row.get("oid"),
                 name: row.get("tgname"),
                 definition: row.get("tgdef"),
                 enabled: row.get("tgenabled"),
                 comment: row.try_get("tgcomment").ok().flatten(),
-            });
+            };
+            triggers_by_key
+                .entry((raw_schema, raw_name))
+                .or_default()
+                .push(trig);
         }
-        triggers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
-        Ok(triggers)
+        Ok(triggers_by_key)
     }
 
-    /// Fetch row-level security policies and the row security flag.
-    async fn fetch_policies(
+    /// Fetch row-level security policies and per-table rowsecurity flag in
+    /// two schema-wide queries. Returns separate maps keyed by
+    /// `(raw_schema, raw_table_name)`.
+    #[allow(clippy::type_complexity)]
+    async fn fetch_policies_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
-    ) -> Result<(Vec<TablePolicy>, bool), Error> {
-        let query = format!(
+        schema_filter: &str,
+    ) -> Result<
+        (
+            HashMap<(String, String), Vec<TablePolicy>>,
+            HashMap<(String, String), bool>,
+        ),
+        Error,
+    > {
+        let policies_query = format!(
             "SELECT
                     quote_ident(p.polname) as polname,
                     quote_ident(n.nspname) AS schemaname,
                     quote_ident(c.relname) AS tablename,
+                    n.nspname AS raw_schema,
+                    c.relname AS raw_table_name,
                     p.polcmd::text AS polcmd,
                     p.polpermissive,
                     array(SELECT rolname::text FROM pg_roles r WHERE r.oid = ANY(p.polroles) ORDER BY rolname) AS roles,
                     pg_get_expr(p.polqual, p.polrelid) AS using_clause,
-                    pg_get_expr(p.polwithcheck, p.polrelid) AS check_clause,
-                    c.relrowsecurity
+                    pg_get_expr(p.polwithcheck, p.polrelid) AS check_clause
              FROM pg_policy p
              JOIN pg_class c ON c.oid = p.polrelid
              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = '{}' AND c.relname = '{}'
-             ORDER BY p.polname",
-            escape_single_quotes(schema),
-            escape_single_quotes(name),
+             WHERE n.nspname IN {schema_filter}
+             ORDER BY n.nspname, c.relname, p.polname"
         );
 
-        let rows = sqlx::query(&query).fetch_all(pool).await?;
+        // Separate query so we can populate rowsecurity for tables WITHOUT
+        // policies too; matches the old per-table semantics.
+        let rowsecurity_query = format!(
+            "SELECT n.nspname AS raw_schema, c.relname AS raw_table_name, c.relrowsecurity
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname IN {schema_filter} AND c.relkind IN ('r','p')"
+        );
 
-        if !rows.is_empty() {
-            let mut policies = Vec::new();
-            for row in &rows {
-                policies.push(TablePolicy::from_row(row)?);
-            }
-            let rowsecurity: bool = rows[0].get("relrowsecurity");
-            Ok((policies, rowsecurity))
-        } else {
-            // No policies; still record whether row security is enabled on the table.
-            let flag_query = format!(
-                "SELECT relrowsecurity FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = '{}' AND c.relname = '{}';",
-                escape_single_quotes(schema),
-                escape_single_quotes(name),
-            );
+        let (policy_rows, rowsecurity_rows) = tokio::try_join!(
+            sqlx::query(&policies_query).fetch_all(pool),
+            sqlx::query(&rowsecurity_query).fetch_all(pool),
+        )?;
 
-            let rowsecurity =
-                if let Some(row) = sqlx::query(&flag_query).fetch_optional(pool).await? {
-                    row.get("relrowsecurity")
-                } else {
-                    false
-                };
-            Ok((Vec::new(), rowsecurity))
+        let mut policies_by_key: HashMap<(String, String), Vec<TablePolicy>> = HashMap::new();
+        for row in &policy_rows {
+            let raw_schema: String = row.get("raw_schema");
+            let raw_name: String = row.get("raw_table_name");
+            policies_by_key
+                .entry((raw_schema, raw_name))
+                .or_default()
+                .push(TablePolicy::from_row(row)?);
         }
+
+        let mut rowsecurity_by_key: HashMap<(String, String), bool> = HashMap::new();
+        for row in &rowsecurity_rows {
+            let raw_schema: String = row.get("raw_schema");
+            let raw_name: String = row.get("raw_table_name");
+            let rs: bool = row.get("relrowsecurity");
+            rowsecurity_by_key.insert((raw_schema, raw_name), rs);
+        }
+
+        Ok((policies_by_key, rowsecurity_by_key))
     }
 
     /// Fetch partition information for the given table.
     ///
-    /// Returns (partition_key, partition_of, partition_bound).
-    async fn fetch_partition_info(
+    /// Returns a map from `(raw_schema, raw_table_name)` to
+    /// `(partition_key, partition_of, partition_bound)`.
+    #[allow(clippy::type_complexity)]
+    async fn fetch_partition_info_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
-    ) -> Result<(Option<String>, Option<String>, Option<String>), Error> {
+        schema_filter: &str,
+    ) -> Result<HashMap<(String, String), (Option<String>, Option<String>, Option<String>)>, Error>
+    {
         let query = format!(
             "SELECT
+                n.nspname AS raw_schema,
+                c.relname AS raw_table_name,
                 c.relkind::text,
                 pg_get_partkeydef(c.oid) AS partition_key,
                 pg_get_expr(c.relpartbound, c.oid) AS partition_bound,
@@ -742,14 +817,16 @@ impl Table {
             LEFT JOIN pg_inherits i ON i.inhrelid = c.oid
             LEFT JOIN pg_class p ON p.oid = i.inhparent
             LEFT JOIN pg_namespace pn ON pn.oid = p.relnamespace
-            WHERE n.nspname = '{}' AND c.relname = '{}'",
-            escape_single_quotes(schema),
-            escape_single_quotes(name)
+            WHERE n.nspname IN {schema_filter} AND c.relkind IN ('r','p')"
         );
 
-        let row = sqlx::query(&query).fetch_optional(pool).await?;
+        let rows = sqlx::query(&query).fetch_all(pool).await?;
 
-        if let Some(row) = row {
+        let mut out: HashMap<(String, String), (Option<String>, Option<String>, Option<String>)> =
+            HashMap::new();
+        for row in rows {
+            let raw_schema: String = row.get("raw_schema");
+            let raw_name: String = row.get("raw_table_name");
             let relkind: String = row.get("relkind");
 
             let partition_key = if relkind == "p" {
@@ -770,39 +847,45 @@ impl Table {
                 (None, None)
             };
 
-            Ok((partition_key, partition_of, partition_bound))
-        } else {
-            Ok((None, None, None))
+            out.insert(
+                (raw_schema, raw_name),
+                (partition_key, partition_of, partition_bound),
+            );
         }
+        Ok(out)
     }
 
-    /// Fetch the table definition using `pg_get_tabledef` if available.
-    ///
-    /// The `has_tabledef_fn` flag should be pre-checked once per dump run to
-    /// avoid repeating the `pg_proc` lookup for every table.
-    async fn fetch_definition(
+    /// Fetch table definitions via `pg_get_tabledef` for all tables at once.
+    /// Returns an empty map when the extension function is absent.
+    async fn fetch_definitions_bulk(
         pool: &PgPool,
-        schema: &str,
-        name: &str,
+        schema_filter: &str,
         has_tabledef_fn: bool,
-    ) -> Result<Option<String>, Error> {
-        if has_tabledef_fn {
-            let query = format!(
-                "select
-                    pg_get_tabledef(oid) AS definition
-                from
-                    pg_class
-                where
-                    relname = '{}' and
-                    relnamespace = format('%I', '{}')::regnamespace;",
-                escape_single_quotes(name),
-                escape_single_quotes(schema)
-            );
-            let row = sqlx::query(&query).fetch_one(pool).await?;
-            Ok(row.get::<Option<String>, _>("definition"))
-        } else {
-            Ok(None)
+    ) -> Result<HashMap<(String, String), Option<String>>, Error> {
+        if !has_tabledef_fn {
+            return Ok(HashMap::new());
         }
+        let query = format!(
+            "select
+                n.nspname as raw_schema,
+                c.relname as raw_table_name,
+                pg_get_tabledef(c.oid) AS definition
+            from
+                pg_class c
+                join pg_namespace n on n.oid = c.relnamespace
+            where
+                n.nspname IN {schema_filter}
+                and c.relkind in ('r','p')"
+        );
+        let rows = sqlx::query(&query).fetch_all(pool).await?;
+        let mut out: HashMap<(String, String), Option<String>> = HashMap::new();
+        for row in rows {
+            let raw_schema: String = row.get("raw_schema");
+            let raw_name: String = row.get("raw_table_name");
+            let def: Option<String> = row.get("definition");
+            out.insert((raw_schema, raw_name), def);
+        }
+        Ok(out)
     }
 
     /// Hash the table
