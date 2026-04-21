@@ -1,3 +1,8 @@
+                v1.0.17
+
+                Bug fixes:
+                  - PostgreSQL version agnostic handling of attstattarget attribute
+
 2026-04-20      v1.0.16
 
                 Performance:
