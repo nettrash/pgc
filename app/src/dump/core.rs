@@ -35,8 +35,39 @@ use zip::write::SimpleFileOptions;
 /// the duration of its query; if `max_connections` is lower than this value,
 /// branches queue for connections and wall-clock time suffers — or, combined
 /// with nested `try_join!`s in branches like `tables`, deadlock becomes
-/// possible. Keep this in sync with the `try_join!` arity in [`Dump::fill`].
+/// possible.
+///
+/// This constant is statically asserted to equal the actual arity of the
+/// [`fill_try_join!`] invocation in [`Dump::fill`]; adding or removing a
+/// branch without updating this value is a compile error.
 pub(crate) const FILL_SIBLING_BRANCH_COUNT: u32 = 12;
+
+/// Invoke `tokio::try_join!` on the given sibling futures AND statically
+/// assert that the branch count matches [`FILL_SIBLING_BRANCH_COUNT`].
+///
+/// The count is derived from the macro invocation itself (one `()` emitted
+/// per `$fut`), so it is always the real arity of the join. If someone
+/// adds or removes a branch without touching the constant — or touches the
+/// constant without matching the branch list — the `const assert!` fails
+/// the build with the message below.
+macro_rules! fill_try_join {
+    ($($fut:expr),* $(,)?) => {{
+        const _FILL_ARITY: u32 = {
+            // One `()` is emitted per `$fut`; slice length = branch count.
+            // `stringify!` is const-safe and lets us reference `$fut` inside
+            // the repetition (otherwise the metavariable is unused).
+            let branches: &[()] = &[$({ let _ = stringify!($fut); }),*];
+            branches.len() as u32
+        };
+        const _: () = assert!(
+            _FILL_ARITY == FILL_SIBLING_BRANCH_COUNT,
+            "FILL_SIBLING_BRANCH_COUNT is out of sync with the fill_try_join! arity \
+             in Dump::fill. Update the constant to match the new branch count \
+             (or remove the extra branch)."
+        );
+        tokio::try_join!($($fut),*)
+    }};
+}
 
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,10 +313,11 @@ impl Dump {
             ))
         };
 
-        // NOTE: the number of branches below is tracked by
-        // `FILL_SIBLING_BRANCH_COUNT` (see top of this file) and feeds the
-        // pool-size warning in `Dump::process`. If you add or remove a branch
-        // here, update the constant and the compile-time check below.
+        // Branch count is statically checked against FILL_SIBLING_BRANCH_COUNT
+        // by `fill_try_join!`; see the macro definition at the top of this
+        // file. The pool-size warning in `Dump::process` keys off that same
+        // constant, so the warning cannot silently drift out of sync with
+        // the actual parallelism here.
         let (
             types_enums,
             extensions,
@@ -299,7 +331,7 @@ impl Dump {
             event_triggers,
             schema_extras,
             global_extras,
-        ) = tokio::try_join!(
+        ) = fill_try_join!(
             types_enums_fut,
             extensions_fut,
             sequences_fut,
@@ -313,11 +345,6 @@ impl Dump {
             schema_extras_fut,
             global_extras_fut,
         )?;
-
-        // Compile-time guard: if someone changes `FILL_SIBLING_BRANCH_COUNT`
-        // without updating the `try_join!` above (or vice versa), this
-        // dummy tuple won't match arity and the build will fail.
-        const _FILL_BRANCH_ARITY: [(); 12] = [(); FILL_SIBLING_BRANCH_COUNT as usize];
 
         let (types, enums) = types_enums;
         self.types = types;
