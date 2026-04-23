@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.93-slim AS builder
+FROM rust:1.95-slim AS builder
 
 # Install system dependencies needed for building
 RUN apt-get update && apt-get install -y \
@@ -65,11 +65,15 @@ VOLUME ["/home/pgc/data"]
 CMD ["pgc", "--help"]
 
 # Metadata
+# PGC_VERSION is supplied at build time from app/Cargo.toml so the image
+# labels stay in sync with the crate version. Override locally with
+# `docker build --build-arg PGC_VERSION=$(grep '^version' app/Cargo.toml | head -1 | cut -d '"' -f2) .`
+ARG PGC_VERSION=unknown
 LABEL maintainer="nettrash" \
       description="PostgreSQL Database Comparer (PGC) - A tool for comparing PostgreSQL database schemas" \
-      version="1.0.16" \
+      version="${PGC_VERSION}" \
       org.opencontainers.image.title="pgc" \
       org.opencontainers.image.description="PostgreSQL Database Comparer" \
-      org.opencontainers.image.version="1.0.16" \
+      org.opencontainers.image.version="${PGC_VERSION}" \
       org.opencontainers.image.source="https://github.com/nettrash/pgc" \
       org.opencontainers.image.licenses="MIT"

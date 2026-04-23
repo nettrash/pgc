@@ -1,3 +1,76 @@
+2026-04-23      v1.0.17
+
+                Bug fixes:
+                    - PostgreSQL version agnostic handling of attstattarget
+                      attribute.
+                    - Replaced double `.unwrap()` in the dump serialization
+                      path with proper error propagation so a `serde_json`
+                      failure surfaces as a readable error instead of a
+                      panic.
+                    - `compare_types` no longer emits a stray
+                      `-- Multirange … is created automatically` comment for
+                      new range types. PostgreSQL auto-creates the
+                      companion multirange row when `CREATE TYPE … AS RANGE`
+                      runs, so the comparer now skips new-in-`to`
+                      multiranges in the CREATE branch (symmetric to the
+                      existing skip in the DROP branch). The skip is
+                      deliberately scoped to the new-type branch only — an
+                      existing multirange whose owner, comment, or ACL
+                      differs between dumps still reaches
+                      `get_alter_script` and emits the corresponding
+                      `COMMENT ON TYPE` / `ALTER TYPE … OWNER TO`. This
+                      was the leading cause of diffs looking "empty" on
+                      schemas that added a new range type.
+
+                Reliability:
+                    - Added `FILL_SIBLING_BRANCH_COUNT` constant with a
+                      compile-time arity guard against the outer `try_join!`
+                      in `Dump::fill`, plus a runtime warning when
+                      `--max-connections` / `MAX_CONNECTIONS` is below the
+                      number of parallel dump branches (pool starvation
+                      would otherwise go unnoticed).
+                    - `Config::load` now warns when `FROM_*` and `TO_*`
+                      resolve to the same host+port+database+schema, which
+                      almost always means a typo in the config file and
+                      silently produces an empty diff.
+
+                Tooling:
+                    - CI build job runs against both Rust 1.88.0 (floor)
+                      and 1.95.0 (matches the Dockerfile toolchain), so the
+                      shipped Docker image toolchain is CI-validated.
+                    - Dockerfile `version` / `org.opencontainers.image.version`
+                      labels are now filled from `ARG PGC_VERSION` wired
+                      through GitHub Actions from `app/Cargo.toml` — no
+                      more hard-coded version skew on release.
+
+                UX / Docs:
+                    - Fixed copy-pasted `--server` help text on `--port`
+                      and `--scheme`; documented the `SIMILAR TO` matching
+                      behaviour of `--scheme` (e.g. `public|app`) and
+                      expanded `--grants-mode` to describe ignore /
+                      addonly / full explicitly.
+                    - Added explanatory comments at every
+                      `recreated_tables.insert()` site documenting the
+                      coupling with `compare_grants` default-ACL handling
+                      for dropped-and-recreated tables.
+
+                Tests:
+                    - New buffer-ordering tests pin the emission order of
+                      the comparer's post-script buffers:
+                      sequence_post_script → type_post_script →
+                      enum_post_script → trigger_post_script.
+                    - Replaced `.find().unwrap()` assertions in the
+                      clear-script tests with a helper that panics with
+                      the full script, so ordering-test failures are
+                      actionable.
+                    - New multirange regression tests covering both sides
+                      of the fix:
+                      `compare_types_multirange_not_created_independently`
+                      (symptom fix) and
+                      `compare_types_multirange_comment_change_still_emits_alter`
+                      (guards against over-broad skipping — a metadata
+                      ALTER on an existing multirange must still emit).
+
 2026-04-20      v1.0.16
 
                 Performance:

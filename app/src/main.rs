@@ -26,27 +26,29 @@ struct Args {
     #[arg(long)]
     command: Option<String>,
 
-    /// Hostname for the command
+    /// PostgreSQL server hostname
     #[arg(long, default_value = "localhost")]
     server: Option<String>,
 
-    /// Hostname for the command
+    /// PostgreSQL server port
     #[arg(long, default_value = "5432")]
     port: Option<String>,
 
-    /// User name for the command
+    /// PostgreSQL user name
     #[arg(long, default_value = "")]
     user: Option<String>,
 
-    /// Password of user for the command
+    /// PostgreSQL user password
     #[arg(long, default_value = "")]
     password: Option<String>,
 
-    /// Database name for the command
+    /// PostgreSQL database name
     #[arg(long, default_value = "postgres")]
     database: Option<String>,
 
-    /// Schema name for the command
+    /// PostgreSQL schema name — matched against pg_namespace.nspname using
+    /// SQL SIMILAR TO, so patterns like `public|app` select multiple schemas
+    /// and `app_.*` matches every schema with an `app_` prefix.
     #[arg(long, default_value = "public")]
     scheme: Option<String>,
 
@@ -82,7 +84,11 @@ struct Args {
     #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     use_comments: bool,
 
-    /// Grants handling mode: ignore, addonly, full
+    /// Grants handling mode:
+    ///   ignore  - do not emit any GRANT/REVOKE statements (default);
+    ///   addonly - emit only GRANTs that are present in `to` but missing in `from`;
+    ///   full    - emit GRANTs and also REVOKEs for privileges present in `from`
+    ///             but absent in `to` (true synchronisation).
     #[arg(long, value_parser = parse_grants_mode, default_value = "ignore")]
     grants_mode: GrantsMode,
 

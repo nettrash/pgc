@@ -322,18 +322,8 @@ impl Table {
         Ok(())
     }
 
-    /// Fetch columns for every table in the accessible schemas in one query.
-    async fn fetch_columns_bulk(
-        pool: &PgPool,
-        schema_filter: &str,
-        caps: PgCatalogCaps,
-    ) -> Result<HashMap<(String, String), Vec<TableColumn>>, Error> {
-        let compression_col = if caps.has_attcompression {
-            ",\n                                a.attcompression::text as col_compression"
-        } else {
-            ""
-        };
-        let query = format!(
+    fn build_columns_query(compression_col: &str, schema_filter: &str) -> String {
+        format!(
                         "SELECT
                                 c.table_catalog,
                                 quote_ident(c.table_schema) as table_schema,
@@ -386,7 +376,7 @@ impl Table {
                                 c.generation_expression,
                                 a.attgenerated::text as attgenerated,
                                 a.attstorage::text as col_storage,
-                                a.attstattarget as col_stattarget,
+                                a.attstattarget::int4 as col_stattarget,
                                 c.is_updatable,
                                 pd.description as column_comment{compression_col},
                                 coalesce(
@@ -434,7 +424,21 @@ impl Table {
                             AND pd.objsubid = a.attnum
                         WHERE c.table_schema IN {schema_filter}
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position"
-                );
+        )
+    }
+
+    /// Fetch columns for every table in the accessible schemas in one query.
+    async fn fetch_columns_bulk(
+        pool: &PgPool,
+        schema_filter: &str,
+        caps: PgCatalogCaps,
+    ) -> Result<HashMap<(String, String), Vec<TableColumn>>, Error> {
+        let compression_col = if caps.has_attcompression {
+            ",\n                                a.attcompression::text as col_compression"
+        } else {
+            ""
+        };
+        let query = Self::build_columns_query(compression_col, schema_filter);
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         let mut columns_by_key: HashMap<(String, String), Vec<TableColumn>> = HashMap::new();
@@ -519,8 +523,8 @@ impl Table {
                         None
                     },
                     statistics_target: {
-                        let st: Option<i16> = row.get("col_stattarget");
-                        st.filter(|&v| v >= 0).map(|v| v as i32)
+                        let st: Option<i32> = row.get("col_stattarget");
+                        st.filter(|&v| v >= 0)
                     },
                     acl: row.get::<Vec<String>, _>("col_acl"),
                     serial_type: None,
@@ -4496,6 +4500,16 @@ mod tests {
         assert!(
             script.contains("constraint name_nn not null no inherit"),
             "expected NO INHERIT on named NOT NULL constraint: {script}"
+        );
+    }
+
+    #[test]
+    fn fetch_columns_query_casts_attstattarget_to_int4() {
+        let query = Table::build_columns_query("", "('public')");
+
+        assert!(
+            query.contains("a.attstattarget::int4"),
+            "expected ::int4 cast for attstattarget"
         );
     }
 }
