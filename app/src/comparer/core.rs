@@ -798,6 +798,16 @@ impl Comparer {
                     }
                 }
             } else {
+                // New-in-`to` multirange: PostgreSQL auto-creates the
+                // multirange row when its range type is created, so there is
+                // nothing to emit here (and `get_script` for 'm' would only
+                // return a no-op comment). Deliberately narrower than the
+                // drop loop's blanket 'm' skip: multiranges that exist in
+                // BOTH dumps but have metadata drift (owner / comment / ACL)
+                // still reach the ALTER branch above and emit those deltas.
+                if (to_type.typtype as u8 as char) == 'm' {
+                    continue;
+                }
                 self.script.push_str(
                     format!("/* Type: {}.{} */\n", to_type.schema, to_type.typname).as_str(),
                 );
@@ -1578,6 +1588,10 @@ impl Comparer {
                 let to_table = &self.to.tables[tidx];
                 if table.partition_key != to_table.partition_key {
                     recreated_parents.insert(Self::table_key(&table.schema, &table.name));
+                    // Mark for grants: recreated tables auto-inherit default
+                    // privileges when the new row is created, so compare_grants
+                    // must treat the from-side ACL as "default", not the old
+                    // explicit ACL. See the `is_recreated` branch there.
                     self.recreated_tables
                         .insert(Self::table_key(&table.schema, &table.name));
                 }
@@ -1682,6 +1696,10 @@ impl Comparer {
                     );
 
                     if parent_recreated {
+                        // Mark for grants: this partition child is being
+                        // re-created (its parent was dropped+recreated), so it
+                        // inherits default privileges. compare_grants keys off
+                        // `recreated_tables` to swap in the default ACL.
                         self.recreated_tables
                             .insert(Self::table_key(&table.schema, &table.name));
                         self.script
@@ -1696,6 +1714,10 @@ impl Comparer {
                         // and the table is a partitioned parent, record it so its
                         // children will be recreated instead of altered.
                         if alter_script.to_lowercase().contains("drop table if exists") {
+                            // Mark for grants: same reasoning as the branch
+                            // above — the dropped+recreated table inherits
+                            // default privileges, so compare_grants must use
+                            // the default ACL as the effective `from_acl`.
                             self.recreated_tables
                                 .insert(Self::table_key(&table.schema, &table.name));
                             if table.partition_key.is_some() {

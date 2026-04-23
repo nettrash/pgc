@@ -30,6 +30,14 @@ use std::io::{Error, Read};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+/// Number of top-level sibling futures passed to `tokio::try_join!` inside
+/// [`Dump::fill`]. Each branch holds at least one PostgreSQL connection for
+/// the duration of its query; if `max_connections` is lower than this value,
+/// branches queue for connections and wall-clock time suffers — or, combined
+/// with nested `try_join!`s in branches like `tables`, deadlock becomes
+/// possible. Keep this in sync with the `try_join!` arity in [`Dump::fill`].
+pub(crate) const FILL_SIBLING_BRANCH_COUNT: u32 = 12;
+
 // This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dump {
@@ -155,6 +163,16 @@ impl Dump {
 
     // Retrieve the dump from the configuration.
     pub async fn process(&mut self, max_connections: u32) -> Result<(), Error> {
+        if max_connections < FILL_SIBLING_BRANCH_COUNT {
+            eprintln!(
+                "Warning: max_connections ({}) is below the number of parallel \
+                 dump branches ({}). Branches will queue for connections and \
+                 the dump may be significantly slower. Consider raising \
+                 MAX_CONNECTIONS to at least {}.",
+                max_connections, FILL_SIBLING_BRANCH_COUNT, FILL_SIBLING_BRANCH_COUNT
+            );
+        }
+
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(self.configuration.get_connection_string().as_str())
@@ -173,14 +191,8 @@ impl Dump {
         pool.close().await;
 
         // Serialize the dump to a file.
-        let serialized = serde_json::to_string(&self);
-        if serialized.is_err() {
-            return Err(Error::other(format!(
-                "Failed to serialize dump: {}.",
-                serialized.err().unwrap()
-            )));
-        }
-        let serialized_data = serialized.unwrap();
+        let serialized_data = serde_json::to_string(&self)
+            .map_err(|e| Error::other(format!("Failed to serialize dump: {e}.")))?;
         let serialized_bytes = serialized_data.as_bytes();
 
         let file = File::create(&self.configuration.file)?;
@@ -270,6 +282,10 @@ impl Dump {
             ))
         };
 
+        // NOTE: the number of branches below is tracked by
+        // `FILL_SIBLING_BRANCH_COUNT` (see top of this file) and feeds the
+        // pool-size warning in `Dump::process`. If you add or remove a branch
+        // here, update the constant and the compile-time check below.
         let (
             types_enums,
             extensions,
@@ -297,6 +313,11 @@ impl Dump {
             schema_extras_fut,
             global_extras_fut,
         )?;
+
+        // Compile-time guard: if someone changes `FILL_SIBLING_BRANCH_COUNT`
+        // without updating the `try_join!` above (or vice versa), this
+        // dummy tuple won't match arity and the build will fail.
+        const _FILL_BRANCH_ARITY: [(); 12] = [(); FILL_SIBLING_BRANCH_COUNT as usize];
 
         let (types, enums) = types_enums;
         self.types = types;
@@ -3480,15 +3501,18 @@ mod tests {
 
         let script = dump.generate_clear_script(false, false, false);
 
-        let view_pos = script.find("drop view if exists public.v1;").unwrap();
-        let table_pos = script.find("drop table if exists public.tbl1;").unwrap();
-        let routine_pos = script
-            .find("drop function if exists public.fn1 ();")
-            .unwrap();
-        let seq_pos = script.find("drop sequence if exists public.seq1;").unwrap();
-        let type_pos = script.find("drop type if exists public.my_type;").unwrap();
-        let ext_pos = script.find("drop extension if exists pg_trgm;").unwrap();
-        let schema_pos = script.find("drop schema if exists public;").unwrap();
+        let find = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}` in clear script:\n{script}"))
+        };
+        let view_pos = find("drop view if exists public.v1;");
+        let table_pos = find("drop table if exists public.tbl1;");
+        let routine_pos = find("drop function if exists public.fn1 ();");
+        let seq_pos = find("drop sequence if exists public.seq1;");
+        let type_pos = find("drop type if exists public.my_type;");
+        let ext_pos = find("drop extension if exists pg_trgm;");
+        let schema_pos = find("drop schema if exists public;");
 
         assert!(view_pos < table_pos, "views before tables");
         assert!(table_pos < routine_pos, "tables before routines");
@@ -3662,9 +3686,14 @@ mod tests {
         dump.views.push(make_view_with_deps("s", "c", vec!["s.b"]));
 
         let script = dump.generate_clear_script(false, false, false);
-        let pos_c = script.find("drop view if exists s.c;").unwrap();
-        let pos_b = script.find("drop view if exists s.b;").unwrap();
-        let pos_a = script.find("drop view if exists s.a;").unwrap();
+        let find = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}` in clear script:\n{script}"))
+        };
+        let pos_c = find("drop view if exists s.c;");
+        let pos_b = find("drop view if exists s.b;");
+        let pos_a = find("drop view if exists s.a;");
         assert!(pos_c < pos_b, "c before b");
         assert!(pos_b < pos_a, "b before a");
     }
@@ -3678,9 +3707,14 @@ mod tests {
         dump.views.push(make_view("s", "mu"));
 
         let script = dump.generate_clear_script(false, false, false);
-        let pos_a = script.find("drop view if exists s.alpha;").unwrap();
-        let pos_m = script.find("drop view if exists s.mu;").unwrap();
-        let pos_z = script.find("drop view if exists s.zeta;").unwrap();
+        let find = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}` in clear script:\n{script}"))
+        };
+        let pos_a = find("drop view if exists s.alpha;");
+        let pos_m = find("drop view if exists s.mu;");
+        let pos_z = find("drop view if exists s.zeta;");
         assert!(pos_a < pos_m, "alpha before mu");
         assert!(pos_m < pos_z, "mu before zeta");
     }
@@ -3694,11 +3728,14 @@ mod tests {
         dump.views.push(make_view("s", "regular_a"));
 
         let script = dump.generate_clear_script(false, false, false);
-        let mat_pos = script
-            .find("drop materialized view if exists s.mat_a;")
-            .unwrap();
-        let reg_a_pos = script.find("drop view if exists s.regular_a;").unwrap();
-        let reg_b_pos = script.find("drop view if exists s.regular_b;").unwrap();
+        let find = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}` in clear script:\n{script}"))
+        };
+        let mat_pos = find("drop materialized view if exists s.mat_a;");
+        let reg_a_pos = find("drop view if exists s.regular_a;");
+        let reg_b_pos = find("drop view if exists s.regular_b;");
         assert!(mat_pos < reg_a_pos, "materialized before regular_a");
         assert!(mat_pos < reg_b_pos, "materialized before regular_b");
         assert!(

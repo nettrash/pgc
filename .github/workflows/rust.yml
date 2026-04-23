@@ -14,29 +14,36 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Matrix validates the MSRV-ish floor (1.88.0) AND the toolchain used by
+    # the Dockerfile (1.95). Keep the upper bound in sync with `Dockerfile`.
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "1.95.0"]
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.88.0
+        toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
-    
+
     - name: Check format
-      run: 
+      run:
         cd ${{ github.workspace }}/app ;
           cargo fmt -- --check
     - name: Check clippy
-      run: 
+      run:
         cd ${{ github.workspace }}/app ;
           cargo clippy --all-targets --all-features
     - name: Build
-      run: 
+      run:
         cd ${{ github.workspace }}/app ;
         cargo build --verbose
     - name: Run tests
-      run: 
+      run:
         cd ${{ github.workspace }}/app ;
         cargo test --verbose
 
@@ -48,7 +55,13 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
-    
+
+    - name: Read crate version
+      id: crate
+      run: |
+        version=$(grep -m1 '^version' app/Cargo.toml | cut -d '"' -f2)
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
     
@@ -79,6 +92,8 @@ jobs:
         push: false
         tags: pgc:test
         labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          PGC_VERSION=${{ steps.crate.outputs.version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         load: true
@@ -98,6 +113,8 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          PGC_VERSION=${{ steps.crate.outputs.version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
       continue-on-error: true

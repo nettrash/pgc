@@ -161,6 +161,26 @@ impl Config {
             ssl: to_ssl,
             file: to_dump,
         };
+
+        // A FROM and TO that point at exactly the same database+schema almost
+        // always indicates a typo in the config file — comparing a DB to
+        // itself produces an empty diff, which silently looks like a
+        // successful run. Warn loudly so the user notices.
+        if !from.host.is_empty()
+            && !to.host.is_empty()
+            && from.host.eq_ignore_ascii_case(&to.host)
+            && from.port == to.port
+            && from.database.eq_ignore_ascii_case(&to.database)
+            && from.scheme == to.scheme
+        {
+            eprintln!(
+                "Warning: FROM and TO point at the same target \
+                 (host={}, port={}, database={}, scheme={}). The comparison \
+                 will produce an empty diff. Double-check the config file.",
+                from.host, from.port, from.database, from.scheme
+            );
+        }
+
         Ok(Config {
             from,
             to,
