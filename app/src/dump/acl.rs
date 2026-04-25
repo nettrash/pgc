@@ -66,7 +66,7 @@ impl AclEntry {
     /// Valid privilege names for a given object kind.
     fn valid_privileges(object_kind: &str) -> &'static [&'static str] {
         match object_kind {
-            "TABLE" => &[
+            "TABLE" | "FOREIGN TABLE" => &[
                 "SELECT",
                 "INSERT",
                 "UPDATE",
@@ -256,20 +256,20 @@ fn build_privilege_map(
 /// **ignoring the grantor** field entirely.  Returns one [`AclDiffEntry`] per grantee
 /// that has at least one action.  Revoke entries are only produced when `full` is `true`.
 ///
-/// Grantees listed in `from_owners` are skipped only in the FROM ACL; grantees
-/// listed in `to_owners` are skipped only in the TO ACL. PostgreSQL object owners
-/// have implicit full privileges only on the side where they own the object.
+/// Grantees listed in `to_owners` are skipped in both ACLs. Current owners have
+/// implicit privileges after the migration, while former owners must remain in
+/// the diff so full mode can revoke or preserve their explicit grants.
 pub fn diff_acls(
     from_acl: &[String],
     to_acl: &[String],
     full: bool,
     object_kind: &str,
-    from_owners: &[&str],
+    _from_owners: &[&str],
     to_owners: &[&str],
 ) -> Vec<AclDiffEntry> {
     use std::collections::BTreeSet;
 
-    let from_map = build_privilege_map(from_acl, object_kind, from_owners);
+    let from_map = build_privilege_map(from_acl, object_kind, to_owners);
     let to_map = build_privilege_map(to_acl, object_kind, to_owners);
 
     let empty_privs: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
@@ -346,8 +346,8 @@ pub fn diff_acls(
 
 /// Generate the combined GRANT/REVOKE script for an object.
 ///
-/// `from_owners` and `to_owners` list role names that own the object on each
-/// side; owner ACL entries are skipped only for the side where they are owners.
+/// `to_owners` lists role names that own the object after the migration; those
+/// owners are skipped. Former owners stay in the diff as normal grantees.
 pub fn generate_grants_script(
     from_acl: &[String],
     to_acl: &[String],
@@ -634,10 +634,10 @@ mod tests {
 
     #[test]
     fn test_diff_acls_excludes_owners() {
-        // Owner in FROM has explicit entry, absent in TO → should NOT produce a REVOKE
+        // Current owner entries are skipped as implicit owner privileges.
         let from = vec![
-            "owner_a=arwdDxt/owner_a".to_string(),
-            "reader=r/owner_a".to_string(),
+            "owner_b=arwdDxt/owner_b".to_string(),
+            "reader=r/owner_b".to_string(),
         ];
         let to = vec![
             "owner_b=arwdDxt/owner_b".to_string(),
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_generate_grants_script_excludes_owner() {
-        let from = vec!["owner_a=X/owner_a".to_string()];
+        let from = vec!["owner_b=X/owner_b".to_string()];
         let to = vec!["owner_b=X/owner_b".to_string(), "app=X/owner_b".to_string()];
         let script = generate_grants_script(
             &from,
@@ -694,7 +694,7 @@ mod tests {
             true,
             "FUNCTION",
             "public.my_func()",
-            &["owner_a"],
+            &["owner_b"],
             &["owner_b"],
         );
         assert!(
@@ -702,12 +702,8 @@ mod tests {
             "Must grant to non-owner, got: {script}"
         );
         assert!(
-            !script.contains("owner_a"),
-            "Must not reference old owner, got: {script}"
-        );
-        assert!(
             !script.contains("owner_b"),
-            "Must not reference new owner, got: {script}"
+            "Must not reference owner, got: {script}"
         );
     }
 }
