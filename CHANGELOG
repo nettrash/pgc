@@ -1,3 +1,131 @@
+2026-04-25      v1.0.18
+
+                Bug fixes:
+                    - Fixed grants for former owners after an owner change
+                      (two-stage fix). The original v1.0.17 behaviour
+                      filtered both old and new owners as implicit
+                      privilege holders, silently dropping explicit grants
+                      to the previous owner from the diff. The first
+                      attempt switched to filtering only the `to` owner —
+                      which exposed a non-idempotent oscillation: PG
+                      materialises an implicit-owner ACL row in
+                      `pg_class.relacl` (e.g. `pgc_owner_from=arwdDxt/
+                      pgc_owner_from`) and treating it as a regular
+                      grantee made the comparer emit a long REVOKE on
+                      first run, then GRANT statements on every
+                      subsequent run. The fix splits owner filtering into
+                      asymmetric `from_owners` / `to_owners` lists that
+                      model the effect of `ALTER ... OWNER TO`: the FROM
+                      owner's implicit-owner row is stripped from the
+                      FROM side (because `ALTER OWNER` removes it) and
+                      the TO owner's implicit row is stripped from the
+                      TO side (because `ALTER OWNER` recreates it). When
+                      ownership does not change both lists hold the same
+                      single role, collapsing back to the original
+                      behaviour. Column ACLs (`pg_attribute.attacl`) pass
+                      an empty `from_owners` because `ALTER TABLE OWNER`
+                      does not touch column-level grants — explicit
+                      column grants to a former owner persist and must
+                      still be revoked under `full` mode.
+                    - `FOREIGN TABLE` ACL parsing now uses the same
+                      privilege set as `TABLE` (SELECT, INSERT, UPDATE,
+                      DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN).
+                      Previously, foreign-table privileges were parsed
+                      against the default minimal set, which dropped
+                      legitimate privileges from the diff. Foreign-table
+                      grant emission now uses `GRANT ... ON TABLE` rather
+                      than the invalid `GRANT ... ON FOREIGN TABLE`
+                      syntax (PostgreSQL has no `ON FOREIGN TABLE` form
+                      for GRANT/REVOKE — applying the previous diff
+                      raised `syntax error at or near "TABLE"`).
+                    - Foreign-table grants are now idempotent for newly
+                      created foreign tables. PostgreSQL applies default
+                      table privileges (`pg_default_acl.defaclobjtype =
+                      'r'` covers foreign tables too) at CREATE time, so
+                      a TO-only foreign table inherits the FROM database's
+                      default ACL on the freshly created object. Without
+                      adjusting the comparer's effective `from_acl`, a
+                      second compare run after applying the migration
+                      emitted spurious `REVOKE` statements for those
+                      auto-applied privileges. The foreign-table grant
+                      path now mirrors the regular-table path: under
+                      `full` mode, new foreign tables use the FROM
+                      default-table ACL as the effective `from_acl` so
+                      any required revokes are emitted in the same diff
+                      run.
+                    - ACL parser now handles quoted role names with
+                      embedded `=`, `/`, or escaped `""` quotes (e.g.
+                      `"weird=name"=r/owner`). The previous naive
+                      `find('=')` / `find('/')` split misparsed these and
+                      silently corrupted the grantee/grantor strings.
+                    - Dependency-scan needles in the comparer (used to
+                      decide drop/create order for views and routines)
+                      now strip quotes when matching against the
+                      quote-stripped haystack flavour. Dump fields
+                      populated via `quote_ident` literally embed `"` for
+                      mixed-case identifiers, and the previous code could
+                      not match a quoted needle against an unquoted
+                      reference in a definition body — silently losing
+                      real dependency edges.
+                    - `--use-drop=false` is now honoured uniformly for
+                      collations, text-search configurations, text-search
+                      dictionaries, casts, operators, default privileges,
+                      publications, subscriptions, foreign data wrappers,
+                      foreign servers, and user mappings. These eleven
+                      object kinds previously *omitted* the DROP entirely
+                      under `use_drop=false`; they now emit a commented
+                      DROP, matching the behaviour already in place for
+                      tables, views, types, enums, sequences, routines,
+                      rules, event triggers, and foreign tables.
+
+                Reliability:
+                    - `current_setting('server_version_num')` is now
+                      fetched once at the start of `Dump::fill` and
+                      threaded into the per-object-kind futures. Previously
+                      it was queried separately by the type and table
+                      branches, doubling the round-trip cost on every dump.
+                    - Unparseable ACL items are now logged with a
+                      `Warning:` line. Previously a silently-skipped
+                      grantee would simply disappear from the diff if a
+                      future PostgreSQL version introduced an aclitem
+                      syntax pgc did not yet recognise.
+                    - `Config::load` now warns when `FROM_HOST` or
+                      `TO_HOST` is empty. The same-target warning gated
+                      on both hosts being non-empty, so a config with
+                      missing host keys silently fell back to defaults.
+                    - `get_schemas` collapsed an `if let Err` followed by
+                      `result.unwrap()` into a single `?`-chain, removing
+                      a redundant unwrap on a Result that was just
+                      pattern-matched.
+
+                Internals:
+                    - SEQUENCE ACL parsing explicitly documents that
+                      MAINTAIN ('m', PG17+) is filtered out — MAINTAIN is
+                      only valid on tables, views, materialised views,
+                      and foreign tables, never sequences.
+                    - `to_owners` semantics are documented on
+                      `generate_column_grants_script` (extending the
+                      doc already added to `diff_acls`): current owners
+                      are skipped because they have implicit access;
+                      former owners stay in the diff as ordinary grantees.
+
+                Tests:
+                    - New regression tests covering owner-change grant
+                      propagation, explicit grants to former owners under
+                      `full` mode, and the foreign-table privilege set.
+                    - Quoted-grantee ACL parsing tests for embedded `=`,
+                      `/`, escaped `""`, and quoted grantor.
+                    - Owner-unchanged with explicit owner grant in TO
+                      (must be filtered as implicit).
+                    - SEQUENCE with stray MAINTAIN bit (must be silently
+                      dropped, not emitted as an invalid GRANT).
+                    - Column-grant former-owner full-mode test where TO
+                      has *no* explicit column ACL (must still revoke
+                      from former owner without grants to the new owner).
+                    - Dependency-scan needle tests covering both
+                      quoted-against-unquoted and quoted-against-quoted
+                      references.
+
 2026-04-23      v1.0.17
 
                 Bug fixes:

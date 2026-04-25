@@ -231,6 +231,13 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 - `USAGE` on `test_schema.user_id_seq` (sequence) → `pgc_grant_reader` (no grant in TO)
 - `EXECUTE` on `test_schema.update_timestamp()` (function) → `pgc_grant_reader` (no grant in TO)
 
+#### Former-owner explicit grant after owner change (v1.0.18 regression)
+- `SELECT` on `test_schema.users` → `pgc_owner_from` (TO-only): the table's owner changes from `pgc_owner_from` to `pgc_owner_to`, and the TO side retains an explicit grant to the previous owner. Pre-v1.0.18 the comparer filtered both old and new owners as implicit privilege holders and silently dropped this grant from the diff; post-fix only the TO-side owner is filtered, so the grant survives.
+
+#### Foreign table grants (v1.0.18 regression)
+- `SELECT` on `test_schema.foreign_users` → `pgc_grant_reader` (TO-only): pre-v1.0.18 `FOREIGN TABLE` ACL parsing fell through to the empty default privilege set, so any explicit grant on a foreign table was silently filtered out of the diff. Post-fix `FOREIGN TABLE` shares the `TABLE` privilege set (`SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN`).
+- `MAINTAIN` on `test_schema.foreign_users` → `pgc_grant_writer` (commented out, PG17+): uncomment on PG17+ to additionally exercise the new MAINTAIN privilege bit on a foreign table.
+
 ### 18. Exclusion Constraints (btree_gist)
 - **Extension**: `btree_gist` added in both schemas
 - **Modified**: `test_schema.reservations` — exclusion constraint unchanged, but table gains `guest_name` column in Schema B

@@ -181,6 +181,24 @@ impl Config {
             );
         }
 
+        // An empty FROM/TO host slips past the same-target check above
+        // (which gates on both hosts being non-empty). A blank host almost
+        // always means the user forgot a key, mistyped one, or fed in an
+        // empty config file by mistake; silently falling back to defaults
+        // produces a baffling connection error later. Surface it now.
+        if from.host.is_empty() {
+            eprintln!(
+                "Warning: FROM_HOST is empty in the configuration file — \
+                 connection will likely fail. Check that the FROM_* keys are set."
+            );
+        }
+        if to.host.is_empty() {
+            eprintln!(
+                "Warning: TO_HOST is empty in the configuration file — \
+                 connection will likely fail. Check that the TO_* keys are set."
+            );
+        }
+
         Ok(Config {
             from,
             to,

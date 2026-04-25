@@ -264,11 +264,20 @@ impl Dump {
         // high-latency (remote) connections.
         let schema_filter = self.accessible_schema_filter();
 
+        // Detect PostgreSQL server version once and pass it down to the
+        // per-object-kind futures. The value is a session constant, so an
+        // extra round-trip per parallel branch is pure waste.
+        let pg_version: i32 =
+            sqlx::query_scalar("select current_setting('server_version_num')::int4;")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| Error::other(format!("Failed to fetch server_version_num: {e}.")))?;
+
         let types_enums_fut = async {
             let mut types = Vec::new();
             let mut enums = Vec::new();
             // get_types logic (inlined to avoid &mut self borrow conflicts)
-            Self::fetch_types_standalone(pool, &schema_filter, &mut types).await?;
+            Self::fetch_types_standalone(pool, &schema_filter, pg_version, &mut types).await?;
             Self::fetch_domain_constraints_standalone(pool, &schema_filter, &mut types).await?;
             Self::fetch_enums_standalone(pool, &mut types, &mut enums).await?;
             Ok::<(Vec<PgType>, Vec<PgEnum>), Error>((types, enums))
@@ -277,7 +286,7 @@ impl Dump {
         let extensions_fut = Self::fetch_extensions_standalone(pool, &schema_filter);
         let sequences_fut = Self::fetch_sequences_standalone(pool, &schema_filter);
         let routines_fut = Self::fetch_routines_standalone(pool, &schema_filter);
-        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter);
+        let tables_fut = Self::fetch_tables_standalone(pool, &schema_filter, pg_version);
         let views_fut = Self::fetch_views_standalone(pool, &schema_filter);
         let foreign_tables_fut = Self::fetch_foreign_tables_standalone(pool, &schema_filter);
         let statistics_fut = Self::fetch_statistics_standalone(pool, &schema_filter);
@@ -379,7 +388,7 @@ impl Dump {
     }
 
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let result = sqlx::query(
+        let rows = sqlx::query(
             "select
                     quote_ident(n.nspname) as schema_name,
                     n.nspname as raw_schema_name,
@@ -397,11 +406,8 @@ impl Dump {
         )
         .bind(&self.configuration.scheme)
         .fetch_all(pool)
-        .await;
-        if let Err(e) = &result {
-            return Err(Error::other(format!("Failed to fetch schemas: {}.", e)));
-        }
-        let rows = result.unwrap();
+        .await
+        .map_err(|e| Error::other(format!("Failed to fetch schemas: {e}.")))?;
 
         if rows.is_empty() {
             println!("No schemas found.");
@@ -485,6 +491,7 @@ impl Dump {
     async fn fetch_types_standalone(
         pool: &PgPool,
         schema_filter: &str,
+        pg_version: i32,
         types: &mut Vec<PgType>,
     ) -> Result<(), Error> {
         let composite_attributes_rows = sqlx::query(
@@ -531,18 +538,10 @@ impl Dump {
                 .push(attribute);
         }
 
-        // Fetch range type metadata from pg_range
-        let range_pg_version: i32 =
-            sqlx::query_scalar("select current_setting('server_version_num')::int4;")
-                .fetch_one(pool)
-                .await
-                .map_err(|e| {
-                    Error::other(format!(
-                        "Failed to fetch server_version_num for types: {e}."
-                    ))
-                })?;
-
-        let has_rngmultitypid: bool = range_pg_version >= 140000
+        // Fetch range type metadata from pg_range. `pg_version` is fetched
+        // once in `Dump::fill` and threaded through to avoid an extra
+        // round-trip per parallel branch.
+        let has_rngmultitypid: bool = pg_version >= 140000
             && sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_range'::regclass AND attname = 'rngmultitypid' AND NOT attisdropped)",
             )
@@ -1212,6 +1211,7 @@ impl Dump {
     async fn fetch_tables_standalone(
         pool: &PgPool,
         schema_filter: &str,
+        pg_version: i32,
     ) -> Result<Vec<Table>, Error> {
         // Check once whether the pg_get_tabledef extension function exists.
         let has_tabledef_fn =
@@ -1221,13 +1221,7 @@ impl Dump {
                 .unwrap_or(None)
                 .is_some();
 
-        // Detect PostgreSQL server version for conditional feature support.
-        let pg_version: i32 =
-            sqlx::query_scalar("select current_setting('server_version_num')::int4;")
-                .fetch_one(pool)
-                .await
-                .unwrap_or(0);
-
+        // `pg_version` is fetched once in `Dump::fill` and passed in here.
         // Probe catalog capabilities once for the entire dump run.
         let caps = PgCatalogCaps::detect(pool, pg_version).await;
 
