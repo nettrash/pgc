@@ -1225,6 +1225,15 @@ ALTER FUNCTION test_schema.update_timestamp() OWNER TO pgc_owner_to;
 ALTER VIEW test_schema.product_inventory OWNER TO pgc_owner_to;
 ALTER MATERIALIZED VIEW test_schema.active_users_mat OWNER TO pgc_owner_to;
 
+-- v1.0.18 regression: former-owner explicit grant after owner change.
+-- After the owner of `test_schema.users` changes from `pgc_owner_from` to
+-- `pgc_owner_to`, the TO side retains an explicit grant to the previous
+-- owner. Pre-v1.0.18 the comparer filtered both old and new owners as
+-- implicit privilege holders, silently dropping this grant from the
+-- diff. Post-fix only the TO-side owner is filtered, so the explicit
+-- grant to the former owner survives and appears in the migration.
+GRANT SELECT ON test_schema.users TO pgc_owner_from;
+
 -- Serial / bigserial / identity column test (TO side)
 -- These tables are NEW (not present in schema_a / FROM).
 -- The migration script must use serial/bigserial types instead of
@@ -1516,6 +1525,17 @@ GRANT SELECT ON test_schema.product_inventory TO pgc_grant_writer;
 
 -- Function grants (update_timestamp grant removed; new function grant added)
 GRANT EXECUTE ON FUNCTION test_schema.calculate_average_rating(UUID) TO pgc_grant_reader;
+
+-- Foreign table grants
+-- v1.0.18 regression: pre-fix, FOREIGN TABLE ACL parsing fell through to
+-- the empty default privilege set, so any explicit grant on a foreign
+-- table was silently filtered out of the diff. Post-fix, FOREIGN TABLE
+-- shares the TABLE privilege set (SELECT, INSERT, UPDATE, DELETE,
+-- TRUNCATE, REFERENCES, TRIGGER, MAINTAIN).
+GRANT SELECT ON test_schema.foreign_users TO pgc_grant_reader;
+-- MAINTAIN is PG17+; uncomment on PG17+ to additionally exercise the
+-- new privilege bit on a foreign table:
+-- GRANT MAINTAIN ON test_schema.foreign_users TO pgc_grant_writer;
 
 -- =============================================================================
 -- Rules comparison test (TO side)

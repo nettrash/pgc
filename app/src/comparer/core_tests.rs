@@ -3260,13 +3260,158 @@ async fn compare_grants_foreign_table_add_and_revoke() {
     comparer.compare_grants().await.unwrap();
     let script = comparer.get_script();
 
+    // PostgreSQL's GRANT syntax has no `ON FOREIGN TABLE` form — foreign
+    // tables share the regular `ON TABLE` grant syntax. Pre-fix the
+    // comparer emitted `ON FOREIGN TABLE`, which produced invalid SQL
+    // (`syntax error at or near "TABLE"`) when the diff was applied.
     assert!(
-        script.contains("GRANT SELECT, UPDATE ON FOREIGN TABLE public.ft_orders TO writer;"),
-        "Full must add foreign table grant, got: {script}"
+        script.contains("GRANT SELECT, UPDATE ON TABLE public.ft_orders TO writer;"),
+        "Full must add foreign table grant via ON TABLE syntax, got: {script}"
     );
     assert!(
-        script.contains("REVOKE SELECT ON FOREIGN TABLE public.ft_orders FROM reader;"),
-        "Full must revoke removed foreign table grant, got: {script}"
+        script.contains("REVOKE SELECT ON TABLE public.ft_orders FROM reader;"),
+        "Full must revoke removed foreign table grant via ON TABLE syntax, got: {script}"
+    );
+    assert!(
+        !script.contains("ON FOREIGN TABLE"),
+        "Foreign table grants must not use `ON FOREIGN TABLE` (invalid SQL), got: {script}"
+    );
+}
+
+/// User-reported regression: when ownership changes AND TO has an explicit
+/// grant to the former owner, the migration must emit exactly one GRANT
+/// (for the explicit privilege in TO) and zero REVOKEs (the implicit-owner
+/// ACL row is stripped by ALTER OWNER alone). Replays the exact ACL shape
+/// you'd see in the schema_a → schema_b owner-change scenario after both
+/// FROM and TO have run their explicit GRANTs and PG has materialised the
+/// implicit-owner row.
+#[tokio::test]
+async fn compare_grants_owner_change_with_explicit_grant_to_former_owner_is_idempotent() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM table: owned by pgc_owner_from. relacl carries the implicit-
+    // owner row (pg materialises it once any GRANT exists) plus the two
+    // explicit grants to reader/writer.
+    let mut from_table = Table::new(
+        "test_schema".to_string(),
+        "users".to_string(),
+        "test_schema".to_string(),
+        "users".to_string(),
+        "pgc_owner_from".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    from_table.acl = vec![
+        "pgc_owner_from=arwdDxt/pgc_owner_from".to_string(),
+        "pgc_grant_reader=r/pgc_owner_from".to_string(),
+        "pgc_grant_writer=arw/pgc_owner_from".to_string(),
+    ];
+
+    // TO table: owned by pgc_owner_to. relacl has the new implicit-owner
+    // row, the same reader grant, the writer with UPDATE removed, and an
+    // explicit grant to the former owner pgc_owner_from.
+    let mut to_table = Table::new(
+        "test_schema".to_string(),
+        "users".to_string(),
+        "test_schema".to_string(),
+        "users".to_string(),
+        "pgc_owner_to".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_table.acl = vec![
+        "pgc_owner_to=arwdDxt/pgc_owner_to".to_string(),
+        "pgc_owner_from=r/pgc_owner_to".to_string(),
+        "pgc_grant_reader=r/pgc_owner_to".to_string(),
+        "pgc_grant_writer=ar/pgc_owner_to".to_string(),
+    ];
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // Exactly two statements expected:
+    //   - GRANT SELECT TO pgc_owner_from (the new explicit grant in TO)
+    //   - REVOKE UPDATE FROM pgc_grant_writer (UPDATE removed in TO)
+    assert!(
+        script.contains("GRANT SELECT ON TABLE test_schema.users TO pgc_owner_from;"),
+        "Must emit explicit grant to former owner, got: {script}"
+    );
+    assert!(
+        script.contains("REVOKE UPDATE ON TABLE test_schema.users FROM pgc_grant_writer;"),
+        "Must revoke writer's UPDATE removed in TO, got: {script}"
+    );
+    // No REVOKE/GRANT for pgc_owner_to (TO owner — implicit privileges).
+    // No REVOKE for pgc_owner_from's old implicit-owner row — ALTER OWNER
+    // strips it. Specifically NO REVOKE on pgc_owner_from for the 7 other
+    // privileges, which is the bug this regression test guards against.
+    assert!(
+        !script.contains("FROM pgc_owner_from"),
+        "Must not REVOKE anything from former owner — ALTER OWNER strips the implicit row, got: {script}"
+    );
+    assert!(
+        !script.contains("pgc_owner_to"),
+        "Current owner must not appear in grants output, got: {script}"
+    );
+}
+
+/// Regression: a TO-only foreign table must inherit the FROM database's
+/// default-table privileges as the effective `from_acl` under `full` mode,
+/// because PostgreSQL auto-applies them on CREATE. Without this, the diff
+/// is non-idempotent — re-running compare after applying it would emit
+/// `REVOKE` statements for the auto-granted privileges that the migration
+/// itself is responsible for cleaning up.
+#[tokio::test]
+async fn compare_grants_new_foreign_table_revokes_default_priv_grants() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM has a default-privilege rule that grants SELECT to `reader` on
+    // any new table in `public`. No explicit grants in TO → after CREATE,
+    // the auto-applied SELECT must be revoked in this same diff.
+    let dp = DefaultPrivilege {
+        role_name: String::new(),
+        schema_name: "public".to_string(),
+        object_type: "r".to_string(),
+        acl: vec!["reader=r/owner".to_string()],
+        hash: Some("dp".to_string()),
+    };
+    from_dump.default_privileges.push(dp);
+
+    // TO-only foreign table (no FROM counterpart, no explicit ACL).
+    let to_ft = ForeignTable::new(
+        "public".to_string(),
+        "ft_new".to_string(),
+        "fdw_server".to_string(),
+        "owner".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    to_dump.foreign_tables.push(to_ft);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("REVOKE SELECT ON TABLE public.ft_new FROM reader;"),
+        "New foreign table must revoke auto-applied default-privilege grants under full mode, got: {script}"
+    );
+    assert!(
+        !script.contains("ON FOREIGN TABLE"),
+        "Foreign table grants must use `ON TABLE` syntax, got: {script}"
     );
 }
 
@@ -4104,19 +4249,30 @@ async fn compare_grants_excludes_owner_acl_entries() {
     comparer.compare_grants().await.unwrap();
     let script = comparer.get_script();
 
+    // The `old_owner=arwdDxt/old_owner` and `new_owner=arwdDxt/new_owner`
+    // entries are PostgreSQL's implicit-owner ACL rows (materialised once
+    // any GRANT exists). `ALTER TABLE ... OWNER TO new_owner` removes
+    // old_owner's implicit row and adds new_owner's automatically — no
+    // REVOKE/GRANT is needed for those rows. Reader is unchanged on both
+    // sides. Net diff: empty. Pre-fix the comparer treated the implicit
+    // FROM-owner row as if it would persist post-migration and emitted a
+    // long REVOKE, then on the next compare run had nothing to compare
+    // against and emitted GRANTs — a non-idempotent oscillation.
     assert!(
-        script.contains(
-            "REVOKE DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON TABLE public.data FROM old_owner;"
-        ),
-        "Full mode must revoke former-owner explicit table privileges, got: {script}"
-    );
-    assert!(
-        !script.contains("new_owner"),
-        "Must not GRANT to new owner, got: {script}"
+        !script.contains("REVOKE"),
+        "ALTER OWNER alone strips the implicit-owner entry; no REVOKE should be emitted, got: {script}"
     );
     assert!(
         !script.contains("GRANT"),
-        "No grants expected (reader unchanged), got: {script}"
+        "No grants expected — reader is unchanged and new_owner gets implicit privileges via ALTER OWNER, got: {script}"
+    );
+    assert!(
+        !script.contains("new_owner"),
+        "Must not reference the new owner explicitly, got: {script}"
+    );
+    assert!(
+        !script.contains("old_owner"),
+        "Must not reference the former owner explicitly when only the implicit-owner ACL row needs to migrate, got: {script}"
     );
 }
 
@@ -4170,17 +4326,22 @@ async fn compare_grants_full_revokes_explicit_grants_from_former_owner() {
     comparer.compare_grants().await.unwrap();
     let script = comparer.get_script();
 
+    // Same reasoning as `compare_grants_excludes_owner_acl_entries`:
+    // `old_owner=UC/old_owner` and `old_owner=ar/old_owner` are
+    // implicit-owner ACL entries that `ALTER ... OWNER TO new_owner`
+    // strips automatically. Comparing against TO (which has no entries
+    // at all) should produce an empty diff, not REVOKE statements.
     assert!(
-        script.contains("REVOKE CREATE, USAGE ON SCHEMA billing FROM old_owner;"),
-        "Former schema owner grant must be revoked in full mode, got: {script}"
-    );
-    assert!(
-        script.contains("REVOKE INSERT, SELECT ON TABLE billing.invoice FROM old_owner;"),
-        "Former table owner grant must be revoked in full mode, got: {script}"
+        !script.contains("REVOKE"),
+        "Implicit-owner ACL entries are removed by ALTER OWNER alone; no REVOKE should be emitted, got: {script}"
     );
     assert!(
         !script.contains("new_owner"),
-        "Current owner must not receive explicit grant/revoke output, got: {script}"
+        "Current owner must not appear in grant/revoke output, got: {script}"
+    );
+    assert!(
+        !script.contains("old_owner"),
+        "Former owner must not appear in grant/revoke output for the implicit-owner ACL row, got: {script}"
     );
 }
 
@@ -6556,5 +6717,92 @@ async fn buffer_ordering_sequence_drop_before_type_drop() {
     assert!(
         seq_drop_pos < type_drop_pos,
         "sequence_post_script must precede type_post_script, got:\n{script}"
+    );
+}
+
+/// Regression for the dependency-scan needle bug. Dump fields are populated
+/// via `quote_ident`, so a mixed-case identifier comes back literally
+/// quoted (`"MyView"`). Previously the needle kept the quotes and the
+/// quote-stripped haystack flavour could never match an unquoted reference,
+/// silently dropping a real dependency.
+#[test]
+fn text_references_qualified_name_pre_matches_unquoted_reference() {
+    let (lower, unquoted_lower) = Comparer::prelower_pair("SELECT * FROM public.regular_view;");
+    // Needle as built from `quote_ident` for a mixed-case identifier.
+    assert!(Comparer::text_references_qualified_name_pre(
+        &lower,
+        &unquoted_lower,
+        "\"public\"",
+        "\"regular_view\"",
+    ));
+}
+
+#[test]
+fn text_references_qualified_name_pre_still_matches_quoted_reference() {
+    let (lower, unquoted_lower) = Comparer::prelower_pair("SELECT * FROM \"MySchema\".\"MyView\";");
+    assert!(Comparer::text_references_qualified_name_pre(
+        &lower,
+        &unquoted_lower,
+        "\"myschema\"",
+        "\"myview\"",
+    ));
+}
+
+/// Counterpart to `compare_column_grants_revokes_former_owner_and_excludes_current_owner`:
+/// when ownership changes and the new TO has *no* explicit column ACL at all
+/// (only the implicit owner privileges), a former owner's column grant in
+/// FROM must still be revoked under `full` mode. Without this we would leak
+/// the old owner's column-level access into the post-migration database.
+#[tokio::test]
+async fn compare_column_grants_revokes_former_owner_when_to_has_no_column_acl() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_col = int_column("public", "users", "secret", 1);
+    from_col.acl = vec!["old_owner=r/old_owner".to_string()];
+    let from_table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "old_owner".to_string(),
+        None,
+        vec![from_col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    // No column ACL in TO.
+    let to_col = int_column("public", "users", "secret", 1);
+    let to_table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "new_owner".to_string(),
+        None,
+        vec![to_col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("REVOKE SELECT (secret) ON TABLE public.users FROM old_owner;"),
+        "Former owner column ACL must be revoked even without ACL in TO, got: {script}"
+    );
+    assert!(
+        !script.contains("new_owner"),
+        "Current owner must never appear in column grant output, got: {script}"
     );
 }
