@@ -4080,6 +4080,84 @@ async fn compare_grants_excludes_owner_acl_entries() {
 }
 
 #[tokio::test]
+async fn compare_grants_emits_explicit_grants_to_former_owner() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_schema = Schema::new("billing".to_string(), "billing".to_string(), None);
+    from_schema.owner = "old_owner".to_string();
+
+    let mut to_schema = Schema::new("billing".to_string(), "billing".to_string(), None);
+    to_schema.owner = "new_owner".to_string();
+    to_schema.acl = vec![
+        "old_owner=UC/new_owner".to_string(),
+        "app_user=U/new_owner".to_string(),
+    ];
+
+    let from_table = Table::new(
+        "billing".to_string(),
+        "invoice".to_string(),
+        "billing".to_string(),
+        "invoice".to_string(),
+        "old_owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    let mut to_table = Table::new(
+        "billing".to_string(),
+        "invoice".to_string(),
+        "billing".to_string(),
+        "invoice".to_string(),
+        "new_owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_table.acl = vec![
+        "old_owner=ar/new_owner".to_string(),
+        "app_user=r/new_owner".to_string(),
+    ];
+
+    from_dump.schemas.push(from_schema);
+    from_dump.tables.push(from_table);
+    to_dump.schemas.push(to_schema);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("GRANT CREATE, USAGE ON SCHEMA billing TO old_owner;"),
+        "Former schema owner must receive explicit TO grant, got: {script}"
+    );
+    assert!(
+        script.contains("GRANT USAGE ON SCHEMA billing TO app_user;"),
+        "Non-owner schema grant must still be emitted, got: {script}"
+    );
+    assert!(
+        script.contains("GRANT INSERT, SELECT ON TABLE billing.invoice TO old_owner;"),
+        "Former table owner must receive explicit TO grant, got: {script}"
+    );
+    assert!(
+        script.contains("GRANT SELECT ON TABLE billing.invoice TO app_user;"),
+        "Non-owner table grant must still be emitted, got: {script}"
+    );
+    assert!(
+        !script.contains("TO new_owner"),
+        "Current owner must not receive explicit grants, got: {script}"
+    );
+}
+
+#[tokio::test]
 async fn compare_grants_owner_excluded_nonowner_still_diffed() {
     let mut from_dump = Dump::new(DumpConfig::default());
     let mut to_dump = Dump::new(DumpConfig::default());

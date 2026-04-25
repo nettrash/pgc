@@ -3228,7 +3228,9 @@ impl Comparer {
                 .get(schema.name.as_str())
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, schema.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [schema.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3238,7 +3240,8 @@ impl Comparer {
                 full,
                 "SCHEMA",
                 &schema.name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3317,7 +3320,9 @@ impl Comparer {
             } else {
                 (&[], "")
             };
-            let owners: Vec<&str> = [from_owner, table.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [table.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3328,7 +3333,8 @@ impl Comparer {
                 full,
                 "TABLE",
                 &object_name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3360,7 +3366,9 @@ impl Comparer {
             } else {
                 (&[], "")
             };
-            let owners: Vec<&str> = [from_owner, seq.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [seq.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3371,7 +3379,8 @@ impl Comparer {
                 full,
                 "SEQUENCE",
                 &object_name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3421,7 +3430,9 @@ impl Comparer {
             } else {
                 (&[], "")
             };
-            let owners: Vec<&str> = [from_owner, view.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [view.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3432,7 +3443,8 @@ impl Comparer {
                 full,
                 "TABLE",
                 &object_name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3461,7 +3473,9 @@ impl Comparer {
                 .get(&(ft.schema.as_str(), ft.name.as_str()))
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, ft.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [ft.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3472,7 +3486,8 @@ impl Comparer {
                 full,
                 "FOREIGN TABLE",
                 &object_name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3494,7 +3509,9 @@ impl Comparer {
                 ))
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, routine.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [routine.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3509,7 +3526,8 @@ impl Comparer {
                 full,
                 object_kind,
                 &object_name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3539,7 +3557,9 @@ impl Comparer {
                 .get(&(pg_type.schema.as_str(), pg_type.typname.as_str()))
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, pg_type.owner.as_str()]
+            let from_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_owners: Vec<&str> = [pg_type.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3550,7 +3570,8 @@ impl Comparer {
                 full,
                 "TYPE",
                 &object_name,
-                &owners,
+                &from_owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3578,7 +3599,9 @@ impl Comparer {
                 .get(&(table.schema.as_str(), table.name.as_str()))
                 .map(|&(_, o)| o)
                 .unwrap_or("");
-            let table_owners: Vec<&str> = [from_owner, table.owner.as_str()]
+            let from_table_owners: Vec<&str> =
+                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let to_table_owners: Vec<&str> = [table.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3610,7 +3633,8 @@ impl Comparer {
                     full,
                     &object_table_name,
                     &col.name,
-                    &table_owners,
+                    &from_table_owners,
+                    &to_table_owners,
                 );
                 if !col_grants.is_empty() {
                     if self.use_comments {
