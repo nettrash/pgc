@@ -66,7 +66,7 @@ impl AclEntry {
     /// Valid privilege names for a given object kind.
     fn valid_privileges(object_kind: &str) -> &'static [&'static str] {
         match object_kind {
-            "TABLE" => &[
+            "TABLE" | "FOREIGN TABLE" => &[
                 "SELECT",
                 "INSERT",
                 "UPDATE",
@@ -228,11 +228,15 @@ pub struct AclDiffEntry {
 fn build_privilege_map(
     acl: &[String],
     object_kind: &str,
+    owners: &[&str],
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, bool>> {
     use std::collections::HashMap;
     let mut map: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for item in acl {
         if let Some(entry) = AclEntry::parse(item) {
+            if owners.contains(&entry.grantee.as_str()) {
+                continue;
+            }
             let privs = AclEntry::parse_privileges(&entry.privileges, object_kind);
             let grantee_map = map.entry(entry.grantee).or_default();
             for p in privs {
@@ -252,19 +256,20 @@ fn build_privilege_map(
 /// **ignoring the grantor** field entirely.  Returns one [`AclDiffEntry`] per grantee
 /// that has at least one action.  Revoke entries are only produced when `full` is `true`.
 ///
-/// Grantees listed in `owners` are skipped entirely — PostgreSQL object owners have
-/// implicit full privileges, so GRANT/REVOKE targeting them is meaningless.
+/// Grantees listed in `to_owners` are skipped in both ACLs. Current owners have
+/// implicit privileges after the migration, while former owners must remain in
+/// the diff so full mode can revoke or preserve their explicit grants.
 pub fn diff_acls(
     from_acl: &[String],
     to_acl: &[String],
     full: bool,
     object_kind: &str,
-    owners: &[&str],
+    to_owners: &[&str],
 ) -> Vec<AclDiffEntry> {
     use std::collections::BTreeSet;
 
-    let from_map = build_privilege_map(from_acl, object_kind);
-    let to_map = build_privilege_map(to_acl, object_kind);
+    let from_map = build_privilege_map(from_acl, object_kind, to_owners);
+    let to_map = build_privilege_map(to_acl, object_kind, to_owners);
 
     let empty_privs: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
@@ -274,11 +279,6 @@ pub fn diff_acls(
     }
     for g in to_map.keys() {
         all_grantees.insert(g.as_str());
-    }
-
-    // Remove object owners — they have implicit full privileges
-    for owner in owners {
-        all_grantees.remove(owner);
     }
 
     let mut result = Vec::new();
@@ -345,16 +345,17 @@ pub fn diff_acls(
 
 /// Generate the combined GRANT/REVOKE script for an object.
 ///
-/// `owners` lists role names that own the object (from/to); their ACL entries are skipped.
+/// `to_owners` lists role names that own the object after the migration; those
+/// owners are skipped. Former owners stay in the diff as normal grantees.
 pub fn generate_grants_script(
     from_acl: &[String],
     to_acl: &[String],
     full: bool,
     object_kind: &str,
     object_name: &str,
-    owners: &[&str],
+    to_owners: &[&str],
 ) -> String {
-    let diffs = diff_acls(from_acl, to_acl, full, object_kind, owners);
+    let diffs = diff_acls(from_acl, to_acl, full, object_kind, to_owners);
     let mut script = String::new();
 
     for entry in &diffs {
@@ -423,9 +424,9 @@ pub fn generate_column_grants_script(
     full: bool,
     table_name: &str,
     column_name: &str,
-    owners: &[&str],
+    to_owners: &[&str],
 ) -> String {
-    let diffs = diff_acls(from_acl, to_acl, full, "COLUMN", owners);
+    let diffs = diff_acls(from_acl, to_acl, full, "COLUMN", to_owners);
     let mut script = String::new();
 
     for entry in &diffs {
@@ -630,20 +631,36 @@ mod tests {
 
     #[test]
     fn test_diff_acls_excludes_owners() {
-        // Owner in FROM has explicit entry, absent in TO → should NOT produce a REVOKE
+        // Current owner entries are skipped as implicit owner privileges.
         let from = vec![
-            "owner_a=arwdDxt/owner_a".to_string(),
-            "reader=r/owner_a".to_string(),
+            "owner_b=arwdDxt/owner_b".to_string(),
+            "reader=r/owner_b".to_string(),
         ];
         let to = vec![
             "owner_b=arwdDxt/owner_b".to_string(),
             "reader=r/owner_b".to_string(),
         ];
-        let diffs = diff_acls(&from, &to, true, "TABLE", &["owner_a", "owner_b"]);
+        let diffs = diff_acls(&from, &to, true, "TABLE", &["owner_b"]);
         assert!(
             diffs.is_empty(),
             "Owner grantees must be excluded, got: {diffs:?}"
         );
+    }
+
+    #[test]
+    fn test_diff_acls_grants_to_former_owner_when_explicit_in_to() {
+        let from = vec!["reader=r/owner_a".to_string()];
+        let to = vec![
+            "owner_a=ar/owner_b".to_string(),
+            "reader=r/owner_b".to_string(),
+        ];
+        let diffs = diff_acls(&from, &to, true, "TABLE", &["owner_b"]);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].grantee, "owner_a");
+        assert_eq!(diffs[0].grants_plain, vec!["INSERT", "SELECT"]);
+        assert!(diffs[0].grants_with_option.is_empty());
+        assert!(diffs[0].revoke_option_for.is_empty());
+        assert!(diffs[0].revokes.is_empty());
     }
 
     #[test]
@@ -666,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_generate_grants_script_excludes_owner() {
-        let from = vec!["owner_a=X/owner_a".to_string()];
+        let from = vec!["owner_b=X/owner_b".to_string()];
         let to = vec!["owner_b=X/owner_b".to_string(), "app=X/owner_b".to_string()];
         let script = generate_grants_script(
             &from,
@@ -674,19 +691,15 @@ mod tests {
             true,
             "FUNCTION",
             "public.my_func()",
-            &["owner_a", "owner_b"],
+            &["owner_b"],
         );
         assert!(
             script.contains("GRANT EXECUTE ON FUNCTION public.my_func() TO app;"),
             "Must grant to non-owner, got: {script}"
         );
         assert!(
-            !script.contains("owner_a"),
-            "Must not reference old owner, got: {script}"
-        );
-        assert!(
             !script.contains("owner_b"),
-            "Must not reference new owner, got: {script}"
+            "Must not reference owner, got: {script}"
         );
     }
 }

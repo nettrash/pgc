@@ -3,6 +3,7 @@ use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::default_privilege::DefaultPrivilege;
 use crate::dump::extension::Extension;
+use crate::dump::foreign_table::ForeignTable;
 use crate::dump::pg_type::{CompositeAttribute, PgType};
 use crate::dump::routine::Routine;
 use crate::dump::schema::Schema;
@@ -3228,6 +3229,48 @@ async fn compare_grants_view() {
 }
 
 #[tokio::test]
+async fn compare_grants_foreign_table_add_and_revoke() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_ft = ForeignTable::new(
+        "public".to_string(),
+        "ft_orders".to_string(),
+        "fdw_server".to_string(),
+        "owner".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    from_ft.acl = vec!["reader=r/owner".to_string()];
+
+    let mut to_ft = ForeignTable::new(
+        "public".to_string(),
+        "ft_orders".to_string(),
+        "fdw_server".to_string(),
+        "owner".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    to_ft.acl = vec!["writer=rw/owner".to_string()];
+
+    from_dump.foreign_tables.push(from_ft);
+    to_dump.foreign_tables.push(to_ft);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("GRANT SELECT, UPDATE ON FOREIGN TABLE public.ft_orders TO writer;"),
+        "Full must add foreign table grant, got: {script}"
+    );
+    assert!(
+        script.contains("REVOKE SELECT ON FOREIGN TABLE public.ft_orders FROM reader;"),
+        "Full must revoke removed foreign table grant, got: {script}"
+    );
+}
+
+#[tokio::test]
 async fn compare_grants_dropped_view_restores_all_grants() {
     let mut from_dump = Dump::new(DumpConfig::default());
     let mut to_dump = Dump::new(DumpConfig::default());
@@ -4062,8 +4105,10 @@ async fn compare_grants_excludes_owner_acl_entries() {
     let script = comparer.get_script();
 
     assert!(
-        !script.contains("old_owner"),
-        "Must not REVOKE from old owner, got: {script}"
+        script.contains(
+            "REVOKE DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON TABLE public.data FROM old_owner;"
+        ),
+        "Full mode must revoke former-owner explicit table privileges, got: {script}"
     );
     assert!(
         !script.contains("new_owner"),
@@ -4073,9 +4118,147 @@ async fn compare_grants_excludes_owner_acl_entries() {
         !script.contains("GRANT"),
         "No grants expected (reader unchanged), got: {script}"
     );
+}
+
+#[tokio::test]
+async fn compare_grants_full_revokes_explicit_grants_from_former_owner() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_schema = Schema::new("billing".to_string(), "billing".to_string(), None);
+    from_schema.owner = "old_owner".to_string();
+    from_schema.acl = vec!["old_owner=UC/old_owner".to_string()];
+
+    let mut to_schema = Schema::new("billing".to_string(), "billing".to_string(), None);
+    to_schema.owner = "new_owner".to_string();
+
+    let mut from_table = Table::new(
+        "billing".to_string(),
+        "invoice".to_string(),
+        "billing".to_string(),
+        "invoice".to_string(),
+        "old_owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    from_table.acl = vec!["old_owner=ar/old_owner".to_string()];
+
+    let to_table = Table::new(
+        "billing".to_string(),
+        "invoice".to_string(),
+        "billing".to_string(),
+        "invoice".to_string(),
+        "new_owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    from_dump.schemas.push(from_schema);
+    from_dump.tables.push(from_table);
+    to_dump.schemas.push(to_schema);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
     assert!(
-        !script.contains("REVOKE"),
-        "No revokes expected (reader unchanged), got: {script}"
+        script.contains("REVOKE CREATE, USAGE ON SCHEMA billing FROM old_owner;"),
+        "Former schema owner grant must be revoked in full mode, got: {script}"
+    );
+    assert!(
+        script.contains("REVOKE INSERT, SELECT ON TABLE billing.invoice FROM old_owner;"),
+        "Former table owner grant must be revoked in full mode, got: {script}"
+    );
+    assert!(
+        !script.contains("new_owner"),
+        "Current owner must not receive explicit grant/revoke output, got: {script}"
+    );
+}
+
+#[tokio::test]
+async fn compare_grants_emits_explicit_grants_to_former_owner() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_schema = Schema::new("billing".to_string(), "billing".to_string(), None);
+    from_schema.owner = "old_owner".to_string();
+
+    let mut to_schema = Schema::new("billing".to_string(), "billing".to_string(), None);
+    to_schema.owner = "new_owner".to_string();
+    to_schema.acl = vec![
+        "old_owner=UC/new_owner".to_string(),
+        "app_user=U/new_owner".to_string(),
+    ];
+
+    let from_table = Table::new(
+        "billing".to_string(),
+        "invoice".to_string(),
+        "billing".to_string(),
+        "invoice".to_string(),
+        "old_owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    let mut to_table = Table::new(
+        "billing".to_string(),
+        "invoice".to_string(),
+        "billing".to_string(),
+        "invoice".to_string(),
+        "new_owner".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_table.acl = vec![
+        "old_owner=ar/new_owner".to_string(),
+        "app_user=r/new_owner".to_string(),
+    ];
+
+    from_dump.schemas.push(from_schema);
+    from_dump.tables.push(from_table);
+    to_dump.schemas.push(to_schema);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::AddOnly);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("GRANT CREATE, USAGE ON SCHEMA billing TO old_owner;"),
+        "Former schema owner must receive explicit TO grant, got: {script}"
+    );
+    assert!(
+        script.contains("GRANT USAGE ON SCHEMA billing TO app_user;"),
+        "Non-owner schema grant must still be emitted, got: {script}"
+    );
+    assert!(
+        script.contains("GRANT INSERT, SELECT ON TABLE billing.invoice TO old_owner;"),
+        "Former table owner must receive explicit TO grant, got: {script}"
+    );
+    assert!(
+        script.contains("GRANT SELECT ON TABLE billing.invoice TO app_user;"),
+        "Non-owner table grant must still be emitted, got: {script}"
+    );
+    assert!(
+        !script.contains("TO new_owner"),
+        "Current owner must not receive explicit grants, got: {script}"
     );
 }
 
@@ -6050,10 +6233,10 @@ async fn compare_grants_dropped_view_grants_extra_over_default() {
 }
 
 /// When table ownership changes between FROM and TO, column-level ACL
-/// diffing must exclude both old and new owners from the diff so that
-/// implicit-privilege entries do not produce spurious GRANT/REVOKE.
+/// diffing must keep former-owner entries diffable while suppressing
+/// current-owner implicit privilege entries.
 #[tokio::test]
-async fn compare_column_grants_excludes_both_old_and_new_owner() {
+async fn compare_column_grants_revokes_former_owner_and_excludes_current_owner() {
     let mut from_dump = Dump::new(DumpConfig::default());
     let mut to_dump = Dump::new(DumpConfig::default());
 
@@ -6098,17 +6281,19 @@ async fn compare_column_grants_excludes_both_old_and_new_owner() {
     comparer.compare_grants().await.unwrap();
     let script = comparer.get_script();
 
-    // Both old_owner and new_owner have implicit privileges as owners,
-    // so no GRANT or REVOKE should appear for them on the column.
-    let has_col_grant = script
-        .lines()
-        .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("grant "));
-    let has_col_revoke = script
-        .lines()
-        .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("revoke "));
     assert!(
-        !has_col_grant && !has_col_revoke,
-        "Owner ACL entries must be excluded for both old and new owner, got: {script}"
+        script.contains("REVOKE SELECT (secret) ON TABLE public.users FROM old_owner;"),
+        "Former owner column ACL must remain diffable in full mode, got: {script}"
+    );
+    assert!(
+        !script.contains("new_owner"),
+        "Current owner column ACL entries must be suppressed, got: {script}"
+    );
+    assert!(
+        !script
+            .lines()
+            .any(|l| l.contains("secret") && l.trim_start().to_lowercase().starts_with("grant ")),
+        "Unexpected column GRANT for owner ACL entries, got: {script}"
     );
 }
 

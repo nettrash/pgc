@@ -3224,11 +3224,11 @@ impl Comparer {
 
         // --- Schemas ---
         for schema in &self.to.schemas {
-            let (from_acl, from_owner) = from_schema_map
+            let (from_acl, _) = from_schema_map
                 .get(schema.name.as_str())
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, schema.owner.as_str()]
+            let to_owners: Vec<&str> = [schema.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3238,7 +3238,7 @@ impl Comparer {
                 full,
                 "SCHEMA",
                 &schema.name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3308,7 +3308,7 @@ impl Comparer {
             } else {
                 Vec::new()
             };
-            let (from_acl, from_owner): (&[String], &str) = if use_default {
+            let (from_acl, _): (&[String], &str) = if use_default {
                 (default_acl_storage.as_slice(), "")
             } else if let Some(&(acl, owner)) =
                 from_table_map.get(&(table.schema.as_str(), table.name.as_str()))
@@ -3317,7 +3317,7 @@ impl Comparer {
             } else {
                 (&[], "")
             };
-            let owners: Vec<&str> = [from_owner, table.owner.as_str()]
+            let to_owners: Vec<&str> = [table.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3328,7 +3328,7 @@ impl Comparer {
                 full,
                 "TABLE",
                 &object_name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3351,7 +3351,7 @@ impl Comparer {
             } else {
                 Vec::new()
             };
-            let (from_acl, from_owner): (&[String], &str) = if is_new_seq && full {
+            let (from_acl, _): (&[String], &str) = if is_new_seq && full {
                 (default_seq_acl_storage.as_slice(), "")
             } else if let Some(&(acl, owner)) =
                 from_seq_map.get(&(seq.schema.as_str(), seq.name.as_str()))
@@ -3360,7 +3360,7 @@ impl Comparer {
             } else {
                 (&[], "")
             };
-            let owners: Vec<&str> = [from_owner, seq.owner.as_str()]
+            let to_owners: Vec<&str> = [seq.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3371,7 +3371,7 @@ impl Comparer {
                 full,
                 "SEQUENCE",
                 &object_name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3409,7 +3409,7 @@ impl Comparer {
             } else {
                 Vec::new()
             };
-            let (from_acl, from_owner): (&[String], &str) = if use_view_default {
+            let (from_acl, _): (&[String], &str) = if use_view_default {
                 (view_default_acl_storage.as_slice(), "")
             } else if is_dropped {
                 // use_drop=false: view wasn't actually dropped
@@ -3421,7 +3421,7 @@ impl Comparer {
             } else {
                 (&[], "")
             };
-            let owners: Vec<&str> = [from_owner, view.owner.as_str()]
+            let to_owners: Vec<&str> = [view.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3432,7 +3432,7 @@ impl Comparer {
                 full,
                 "TABLE",
                 &object_name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3457,11 +3457,11 @@ impl Comparer {
             .collect();
 
         for ft in &self.to.foreign_tables {
-            let (from_acl, from_owner) = from_ft_map
+            let (from_acl, _) = from_ft_map
                 .get(&(ft.schema.as_str(), ft.name.as_str()))
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, ft.owner.as_str()]
+            let to_owners: Vec<&str> = [ft.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3472,7 +3472,7 @@ impl Comparer {
                 full,
                 "FOREIGN TABLE",
                 &object_name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3486,7 +3486,7 @@ impl Comparer {
 
         // --- Routines ---
         for routine in &self.to.routines {
-            let (from_acl, from_owner) = from_routine_map
+            let (from_acl, _) = from_routine_map
                 .get(&(
                     routine.schema.as_str(),
                     routine.name.as_str(),
@@ -3494,7 +3494,7 @@ impl Comparer {
                 ))
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, routine.owner.as_str()]
+            let to_owners: Vec<&str> = [routine.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3509,7 +3509,7 @@ impl Comparer {
                 full,
                 object_kind,
                 &object_name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3535,11 +3535,11 @@ impl Comparer {
             .collect();
 
         for pg_type in &self.to.types {
-            let (from_acl, from_owner) = from_type_map
+            let (from_acl, _) = from_type_map
                 .get(&(pg_type.schema.as_str(), pg_type.typname.as_str()))
                 .copied()
                 .unwrap_or((&[], ""));
-            let owners: Vec<&str> = [from_owner, pg_type.owner.as_str()]
+            let to_owners: Vec<&str> = [pg_type.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3550,7 +3550,7 @@ impl Comparer {
                 full,
                 "TYPE",
                 &object_name,
-                &owners,
+                &to_owners,
             );
             if !grants_script.is_empty() {
                 if self.use_comments {
@@ -3574,11 +3574,7 @@ impl Comparer {
             .collect();
 
         for table in &self.to.tables {
-            let from_owner = from_table_map
-                .get(&(table.schema.as_str(), table.name.as_str()))
-                .map(|&(_, o)| o)
-                .unwrap_or("");
-            let table_owners: Vec<&str> = [from_owner, table.owner.as_str()]
+            let to_table_owners: Vec<&str> = [table.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
@@ -3610,7 +3606,7 @@ impl Comparer {
                     full,
                     &object_table_name,
                     &col.name,
-                    &table_owners,
+                    &to_table_owners,
                 );
                 if !col_grants.is_empty() {
                     if self.use_comments {
