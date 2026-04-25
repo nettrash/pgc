@@ -47,8 +47,156 @@ jobs:
         cd ${{ github.workspace }}/app ;
         cargo test --verbose
 
-  docker:
+  integration:
     needs: build
+    runs-on: ubuntu-latest
+
+    # Round-trip test against every supported PostgreSQL major version.
+    # For each PG version the job:
+    #   1. Spins up a fresh postgres container (with wal_level=logical so
+    #      the publication tests in the schemas don't fail at CREATE).
+    #   2. Creates two databases `a` and `b`.
+    #   3. Applies `data/test/schema_a.sql` to `a` and `schema_b.sql` to `b`.
+    #      Uses ON_ERROR_STOP=0 because some statements use features specific
+    #      to newer PG versions (NULLS NOT DISTINCT on PG15+, NOT ENFORCED on
+    #      PG18+); they fail to apply on older versions but the round-trip
+    #      property still holds because pgc emits SQL based on dumps, not on
+    #      the source schema files.
+    #   4. Runs pgc compare to produce `output.sql`.
+    #   5. Applies `output.sql` to `a`.
+    #   6. Re-runs pgc compare. The new diff must be empty — that's the
+    #      idempotency contract pgc must satisfy.
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: ["14", "15", "16", "17", "18"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: "1.95.0"
+
+    - name: Install PostgreSQL client
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client
+
+    - name: Start PostgreSQL ${{ matrix.pg_version }}
+      run: |
+        # `services:` does not let us pass `command:` to the container, and
+        # `wal_level=logical` (required by the publication test cases) needs
+        # to be set at server start, so we run docker manually.
+        docker run -d \
+          --name pg \
+          -e POSTGRES_PASSWORD=postgres \
+          -e POSTGRES_USER=postgres \
+          -p 5432:5432 \
+          postgres:${{ matrix.pg_version }} \
+          -c wal_level=logical
+        # Wait for the server to accept connections.
+        for i in $(seq 1 60); do
+          if docker exec pg pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+            echo "PostgreSQL ${{ matrix.pg_version }} ready after ${i}s"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "PostgreSQL did not become ready in time"
+        docker logs pg
+        exit 1
+
+    - name: Create test databases
+      env:
+        PGPASSWORD: postgres
+      run: |
+        psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE a;"
+        psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE b;"
+
+    - name: Apply schemas
+      env:
+        PGPASSWORD: postgres
+      run: |
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=0 \
+          -f data/test/schema_a.sql
+        psql -h 127.0.0.1 -U postgres -d b -v ON_ERROR_STOP=0 \
+          -f data/test/schema_b.sql
+
+    - name: Build pgc (release)
+      run: |
+        cd ${{ github.workspace }}/app
+        cargo build --release
+
+    - name: Generate pgc config
+      run: |
+        cat > /tmp/pgc.conf <<'EOF'
+        FROM_HOST=127.0.0.1
+        FROM_PORT=5432
+        FROM_USER=postgres
+        FROM_PASSWORD=postgres
+        FROM_DATABASE=a
+        FROM_SCHEME=test_schema|shared_schema|new_reporting_schema|data
+        FROM_SSL=false
+        FROM_DUMP=/tmp/a.dump
+        TO_HOST=127.0.0.1
+        TO_PORT=5432
+        TO_USER=postgres
+        TO_PASSWORD=postgres
+        TO_DATABASE=b
+        TO_SCHEME=test_schema|shared_schema|new_reporting_schema|data
+        TO_SSL=false
+        TO_DUMP=/tmp/b.dump
+        OUTPUT=/tmp/output.sql
+        USE_DROP=true
+        USE_COMMENTS=false
+        GRANTS_MODE=full
+        MAX_CONNECTIONS=10
+        USE_SINGLE_TRANSACTION=false
+        EOF
+
+    - name: Run pgc compare (round 1) — generate diff
+      run: |
+        ./app/target/release/pgc --config /tmp/pgc.conf
+        echo "--- output.sql (round 1) size: $(wc -c < /tmp/output.sql) bytes"
+
+    - name: Apply diff to database `a`
+      env:
+        PGPASSWORD: postgres
+      run: |
+        # ON_ERROR_STOP=0 mirrors the schema-apply step above: a diff that
+        # references PG-version-specific syntax may not apply on every
+        # version, but as long as the round-trip closes (round-2 diff is
+        # empty) the test still validates idempotency.
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=0 \
+          -f /tmp/output.sql
+
+    - name: Run pgc compare (round 2) — must be empty
+      run: |
+        ./app/target/release/pgc --config /tmp/pgc.conf
+        size=$(wc -c < /tmp/output.sql)
+        echo "--- output.sql (round 2) size: ${size} bytes"
+        # With USE_COMMENTS=false a fully-idempotent diff produces a 0-byte
+        # file; a non-empty file (even one containing only whitespace) means
+        # the comparer emitted SQL that wasn't covered by round 1.
+        if [ "${size}" -gt 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/output.sql)" ]; then
+          echo "ERROR: round-2 diff is not empty on PG ${{ matrix.pg_version }}"
+          echo "--- output.sql contents: ---"
+          cat /tmp/output.sql
+          exit 1
+        fi
+        echo "OK: pgc is idempotent on PG ${{ matrix.pg_version }}"
+
+    - name: Stop PostgreSQL
+      if: always()
+      run: |
+        docker logs pg | tail -200 || true
+        docker stop pg || true
+        docker rm pg || true
+
+  docker:
+    needs: [build, integration]
     runs-on: ubuntu-latest
     # Only run automatically on master branch, or when manually triggered
     if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
