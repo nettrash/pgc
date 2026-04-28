@@ -4512,5 +4512,9 @@ mod tests {
             query.contains("a.attstattarget::int4"),
             "expected ::int4 cast for attstattarget"
         );
+        assert!(
+            query.contains("pd.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for table column comments"
+        );
     }
 }
