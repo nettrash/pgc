@@ -421,6 +421,7 @@ impl Table {
                             AND a.attisdropped = false
                          LEFT JOIN pg_description pd
                              ON pd.objoid = cls.oid
+                            AND pd.classoid = 'pg_class'::regclass
                             AND pd.objsubid = a.attnum
                         WHERE c.table_schema IN {schema_filter}
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position"

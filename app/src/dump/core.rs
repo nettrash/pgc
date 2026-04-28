@@ -1262,7 +1262,9 @@ impl Dump {
                     and c.relkind in ('r','p')
                     and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
                 left join pg_am am on am.oid = c.relam
-                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+                left join pg_description d on d.objoid = c.oid
+                    and d.classoid = 'pg_class'::regclass
+                    and d.objsubid = 0
                 where 
                     t.schemaname not in ('pg_catalog', 'information_schema') 
                     and t.schemaname in {} 
@@ -1390,7 +1392,9 @@ impl Dump {
             join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
             left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
             left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
-            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+            left join pg_description d on d.objoid = c.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = 0
             where
                 v.table_schema not in ('pg_catalog', 'information_schema')
                 and v.table_schema in {}
@@ -1425,7 +1429,9 @@ impl Dump {
             from pg_matviews mv
             join pg_class c on c.relname = mv.matviewname
                 and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
-            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+            left join pg_description d on d.objoid = c.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = 0
             where mv.schemaname not in ('pg_catalog', 'information_schema')
                 and mv.schemaname in {}
                 and not exists (
