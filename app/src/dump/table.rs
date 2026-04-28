@@ -562,7 +562,10 @@ impl Table {
                          JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
                          JOIN pg_index idx ON idx.indexrelid = ic.oid
                          LEFT JOIN pg_constraint puc ON puc.conindid = ic.oid AND puc.contype IN ('p', 'u')
-                         LEFT JOIN pg_description d ON d.objoid = ic.oid AND d.objsubid = 0
+                         LEFT JOIN pg_description d
+                             ON d.objoid = ic.oid
+                            AND d.classoid = 'pg_class'::regclass
+                            AND d.objsubid = 0
                          WHERE idx.indisprimary = false
                              AND (idx.indisunique = false OR puc.oid IS NULL)
                              AND NOT EXISTS (SELECT 1 FROM pg_constraint xc WHERE xc.conindid = ic.oid AND xc.contype = 'x')

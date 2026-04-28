@@ -915,7 +915,9 @@ impl Dump {
                 left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
                 left join pg_class seq_class on seq_class.relname = seq.sequencename
                     and seq_class.relnamespace = seq_ns.oid
-                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and seq_desc.objsubid = 0
+                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid
+                    and seq_desc.classoid = 'pg_class'::regclass
+                    and seq_desc.objsubid = 0
                 left join pg_depend dep on dep.objid = seq_class.oid
                     and dep.deptype in ('a', 'i')
                 left join pg_class owner_table on owner_table.oid = dep.refobjid
@@ -1363,7 +1365,7 @@ impl Dump {
                 left join pg_description d on d.objoid = c.oid
                     and d.classoid = 'pg_class'::regclass
                     and d.objsubid = 0
-                where 
+                where
                     t.schemaname not in ('pg_catalog', 'information_schema') 
                     and t.schemaname in {} 
                     and t.tablename not like 'pg_%'
@@ -1532,7 +1534,7 @@ impl Dump {
 
     fn build_regular_views_query(schema_filter: &str) -> String {
         format!(
-            "select 
+            "select
                     quote_ident(v.table_schema) as table_schema,
                     quote_ident(v.table_name) as table_name,
                     v.view_definition,
