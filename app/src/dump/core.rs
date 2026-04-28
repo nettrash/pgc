@@ -1366,8 +1366,8 @@ impl Dump {
                     and d.classoid = 'pg_class'::regclass
                     and d.objsubid = 0
                 where
-                    t.schemaname not in ('pg_catalog', 'information_schema') 
-                    and t.schemaname in {} 
+                    t.schemaname not in ('pg_catalog', 'information_schema')
+                    and t.schemaname in {}
                     and t.tablename not like 'pg_%'
                     and not exists (
                         select 1 from pg_depend ext_dep
