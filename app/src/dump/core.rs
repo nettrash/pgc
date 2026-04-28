@@ -889,50 +889,7 @@ impl Dump {
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<Vec<Sequence>, Error> {
-        let query = format!(
-            "
-            select
-                quote_ident(seq.schemaname) as schemaname,
-                quote_ident(seq.sequencename) as sequencename,
-                quote_ident(seq.sequenceowner) as sequenceowner,
-                seq.data_type::varchar as sequencedatatype,
-                seq.start_value,
-                seq.min_value,
-                seq.max_value,
-                seq.increment_by,
-                seq.cycle,
-                seq.cache_size,
-                seq.last_value,
-                quote_ident(owner_ns.nspname) as owned_by_schema,
-                quote_ident(owner_table.relname) as owned_by_table,
-                quote_ident(owner_attr.attname) as owned_by_column,
-                dep.deptype::text as dependency_type,
-                seq_desc.description as seq_comment,
-                seq_class.relacl::text[] as seq_acl,
-                seq_class.relpersistence::text as seq_persistence
-            from
-                pg_sequences seq
-                left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
-                left join pg_class seq_class on seq_class.relname = seq.sequencename
-                    and seq_class.relnamespace = seq_ns.oid
-                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid
-                    and seq_desc.classoid = 'pg_class'::regclass
-                    and seq_desc.objsubid = 0
-                left join pg_depend dep on dep.objid = seq_class.oid
-                    and dep.deptype in ('a', 'i')
-                left join pg_class owner_table on owner_table.oid = dep.refobjid
-                left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
-                left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
-                    and owner_attr.attnum = dep.refobjsubid
-            where
-                seq.schemaname in {}
-                and not exists (
-                    select 1 from pg_depend ext_dep
-                    where ext_dep.objid = seq_class.oid
-                    and ext_dep.deptype = 'e'
-                )",
-            schema_filter
-        );
+        let query = Self::build_sequences_standalone_query(schema_filter);
 
         let rows = sqlx::query(query.as_str())
             .fetch_all(pool)
@@ -985,6 +942,52 @@ impl Dump {
             }
         }
         Ok(sequences)
+    }
+
+    fn build_sequences_standalone_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(seq.schemaname) as schemaname,
+                quote_ident(seq.sequencename) as sequencename,
+                quote_ident(seq.sequenceowner) as sequenceowner,
+                seq.data_type::varchar as sequencedatatype,
+                seq.start_value,
+                seq.min_value,
+                seq.max_value,
+                seq.increment_by,
+                seq.cycle,
+                seq.cache_size,
+                seq.last_value,
+                quote_ident(owner_ns.nspname) as owned_by_schema,
+                quote_ident(owner_table.relname) as owned_by_table,
+                quote_ident(owner_attr.attname) as owned_by_column,
+                dep.deptype::text as dependency_type,
+                seq_desc.description as seq_comment,
+                seq_class.relacl::text[] as seq_acl,
+                seq_class.relpersistence::text as seq_persistence
+            from
+                pg_sequences seq
+                left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
+                left join pg_class seq_class on seq_class.relname = seq.sequencename
+                    and seq_class.relnamespace = seq_ns.oid
+                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid
+                    and seq_desc.classoid = 'pg_class'::regclass
+                    and seq_desc.objsubid = 0
+                left join pg_depend dep on dep.objid = seq_class.oid
+                    and dep.deptype in ('a', 'i')
+                left join pg_class owner_table on owner_table.oid = dep.refobjid
+                left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
+                left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
+                    and owner_attr.attnum = dep.refobjsubid
+            where
+                seq.schemaname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = seq_class.oid
+                    and ext_dep.deptype = 'e'
+                )",
+            schema_filter
+        )
     }
 
     async fn fetch_routines_standalone(
@@ -3821,6 +3824,15 @@ mod tests {
         assert!(
             query.contains("d.classoid = 'pg_class'::regclass"),
             "expected pg_class classoid filter for view column comments"
+        );
+    }
+
+    #[test]
+    fn build_sequences_standalone_query_filters_by_pg_class() {
+        let query = Dump::build_sequences_standalone_query("('public')");
+        assert!(
+            query.contains("seq_desc.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for sequence comments"
         );
     }
 }

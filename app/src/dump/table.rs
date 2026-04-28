@@ -546,32 +546,7 @@ impl Table {
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<HashMap<(String, String), Vec<TableIndex>>, Error> {
-        let query = format!(
-                        "SELECT
-                                quote_ident(i.schemaname) as schemaname,
-                                quote_ident(i.tablename) as tablename,
-                                i.schemaname as raw_schemaname,
-                                i.tablename as raw_tablename,
-                                quote_ident(i.indexname) as indexname,
-                                i.tablespace,
-                                i.indexdef,
-                                EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index,
-                                d.description as index_comment
-                         FROM pg_indexes i
-                         JOIN pg_class ic ON ic.relname = i.indexname
-                         JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
-                         JOIN pg_index idx ON idx.indexrelid = ic.oid
-                         LEFT JOIN pg_constraint puc ON puc.conindid = ic.oid AND puc.contype IN ('p', 'u')
-                         LEFT JOIN pg_description d
-                             ON d.objoid = ic.oid
-                            AND d.classoid = 'pg_class'::regclass
-                            AND d.objsubid = 0
-                         WHERE idx.indisprimary = false
-                             AND (idx.indisunique = false OR puc.oid IS NULL)
-                             AND NOT EXISTS (SELECT 1 FROM pg_constraint xc WHERE xc.conindid = ic.oid AND xc.contype = 'x')
-                             AND i.schemaname IN {schema_filter}
-                         ORDER BY i.schemaname, i.tablename, i.indexname"
-                );
+        let query = Self::build_indexes_bulk_query(schema_filter);
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         let mut indexes_by_key: HashMap<(String, String), Vec<TableIndex>> = HashMap::new();
@@ -594,6 +569,44 @@ impl Table {
         }
 
         Ok(indexes_by_key)
+    }
+
+    fn build_indexes_bulk_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(i.schemaname) as schemaname,
+                quote_ident(i.tablename) as tablename,
+                i.schemaname as raw_schemaname,
+                i.tablename as raw_tablename,
+                quote_ident(i.indexname) as indexname,
+                i.tablespace,
+                i.indexdef,
+                EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = ic.oid) AS is_partition_index,
+                d.description as index_comment
+            from
+                pg_indexes i
+                join pg_class ic on ic.relname = i.indexname
+                join pg_namespace n on n.oid = ic.relnamespace and n.nspname = i.schemaname
+                join pg_index idx on idx.indexrelid = ic.oid
+                left join pg_constraint puc on puc.conindid = ic.oid and puc.contype in ('p', 'u')
+                left join pg_description d
+                    on d.objoid = ic.oid
+                    and d.classoid = 'pg_class'::regclass
+                    and d.objsubid = 0
+            where
+                idx.indisprimary = false
+                and (idx.indisunique = false or puc.oid is null)
+                and not exists (
+                    select 1 from pg_constraint xc
+                    where xc.conindid = ic.oid
+                    and xc.contype = 'x'
+                )
+                and i.schemaname in {schema_filter}
+            order by
+                i.schemaname,
+                i.tablename,
+                i.indexname"
+        )
     }
 
     /// Fetch constraints for every table in the accessible schemas in one query.
@@ -4518,6 +4531,16 @@ mod tests {
         assert!(
             query.contains("pd.classoid = 'pg_class'::regclass"),
             "expected pg_class classoid filter for table column comments"
+        );
+    }
+
+    #[test]
+    fn build_indexes_bulk_query_filters_by_pg_class() {
+        let query = Table::build_indexes_bulk_query("('public')");
+
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for table index comments"
         );
     }
 }
