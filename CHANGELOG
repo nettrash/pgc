@@ -1,3 +1,23 @@
+v1.0.19
+
+                Bug fixes:
+                    - Refactored comment-related query construction into dedicated
+                      helper methods:
+                      `Dump::build_sequences_standalone_query` and
+                      `Table::build_indexes_bulk_query`.
+                    - Kept `pg_description` joins scoped to relation comments by
+                      filtering on `pg_description.classoid = 'pg_class'::regclass`
+                      and `pg_description.objsubid = 0` to avoid catalog
+                      collisions.
+                    - Normalized SQL formatting in the new helper query strings.
+
+                Tests:
+                    - Added regression tests proving both query builders
+                      include the `pg_class` classoid filter:
+                      `build_sequences_standalone_query_filters_by_pg_class`
+                      and
+                      `build_indexes_bulk_query_filters_by_pg_class`.
+
 2026-04-25      v1.0.18
 
                 Bug fixes:
