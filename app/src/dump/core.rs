@@ -25,7 +25,7 @@ use sqlx::postgres::types::Oid;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Error, Read};
+use std::io::{BufWriter, Error, Read, Write};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -225,18 +225,26 @@ impl Dump {
 
     /// Persist this dump to `path` as a zip-compressed JSON archive.
     ///
-    /// The JSON payload is streamed directly into the zip writer, so peak
-    /// memory is bounded by zlib's internal buffers rather than the full
-    /// serialized dump. Pairs with [`Dump::read_from_file`].
+    /// The JSON payload is streamed into the zip writer through a 256 KiB
+    /// `BufWriter`, which is required for performance: `serde_json::to_writer`
+    /// emits many small writes (one per JSON token), and feeding them
+    /// straight into the deflate stream pays a per-call cost on every one.
+    /// Buffering keeps peak memory bounded (no full intermediate `String`
+    /// copy of the payload) while still amortising the compressor overhead.
+    /// Pairs with [`Dump::read_from_file`].
     pub fn write_to_file(&self, path: &str) -> Result<(), Error> {
+        const WRITE_BUF_BYTES: usize = 256 * 1024;
         let file = File::create(path)?;
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
         zip.start_file("dump.io", options)?;
-        serde_json::to_writer(&mut zip, self)
+        let mut buf = BufWriter::with_capacity(WRITE_BUF_BYTES, &mut zip);
+        serde_json::to_writer(&mut buf, self)
             .map_err(|e| Error::other(format!("Failed to serialize dump: {e}.")))?;
+        buf.flush()?;
+        drop(buf);
         zip.finish()?;
         Ok(())
     }

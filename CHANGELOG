@@ -1,4 +1,4 @@
-v1.0.19
+2026-05-03      v1.0.19
 
                 Bug fixes:
                     - Refactored comment-related query construction into dedicated
@@ -44,13 +44,18 @@ v1.0.19
                     - `Dump::process` no longer materializes the entire
                       serialized dump as a `String` before handing it to
                       the zip writer. The JSON payload is now streamed
-                      directly into `ZipWriter` via
-                      `serde_json::to_writer`, bounding peak memory at
-                      zlib's internal buffers rather than ~2x the
-                      uncompressed dump size. The write path is exposed
-                      as `Dump::write_to_file`, mirroring the existing
-                      `Dump::read_from_file` and making the round-trip
-                      directly testable.
+                      into `ZipWriter` via `serde_json::to_writer`
+                      through a 256 KiB `BufWriter`, bounding peak
+                      memory at the buffer plus zlib's internal state
+                      rather than ~2x the uncompressed dump size. The
+                      `BufWriter` is required for speed: `to_writer`
+                      emits one write per JSON token, and feeding those
+                      straight into the deflate stream paid a per-call
+                      cost on every one (an early unbuffered version of
+                      this change made dumps roughly 10x slower). The
+                      write path is exposed as `Dump::write_to_file`,
+                      mirroring the existing `Dump::read_from_file` and
+                      making the round-trip directly testable.
 
                 Tests:
                     - Added regression tests proving both query builders
