@@ -2,9 +2,13 @@
 
                 Bug fixes:
                     - Refactored comment-related query construction into dedicated
-                      helper methods:
-                      `Dump::build_sequences_standalone_query` and
-                      `Table::build_indexes_bulk_query`.
+                      helper methods on `Dump`:
+                      `build_tables_standalone_query`,
+                      `build_regular_views_query`,
+                      `build_materialized_views_query`,
+                      `build_view_column_comments_query`,
+                      `build_sequences_standalone_query`,
+                      and on `Table`: `build_indexes_bulk_query`.
                     - Kept `pg_description` joins scoped to relation comments by
                       filtering on `pg_description.classoid = 'pg_class'::regclass`
                       and `pg_description.objsubid = 0` to avoid catalog
@@ -33,12 +37,22 @@
                       the set and its per-iteration `format!`/`contains`/
                       `insert` calls are removed.
                     - `Comparer::compare_routines` and
-                      `Comparer::compare_routines_and_views` now hold
+                      `Comparer::compare_routines_and_views` no longer
+                      clone every `Routine` (each carries the full
+                      `source_code` string). The drop path now holds
                       `routines_to_drop: Vec<&Routine>` borrowing into
-                      `self.from.routines` instead of cloning every
-                      `Routine` (each carries the full `source_code`
-                      string). Dependency analysis is unchanged; only
-                      the up-front clone is removed.
+                      `self.from.routines`. The create/update path —
+                      previously forced to clone because
+                      `process_target_routine` took `&mut self` and so
+                      conflicted with any borrow into `self.from` /
+                      `self.to` — is unblocked by refactoring that
+                      method into a free associated function
+                      `Self::emit_routine_diff(&mut script, use_drop,
+                      routine, from_routine)`. Disjoint-field split
+                      borrows now allow `&mut self.script` to coexist
+                      with `&Routine` borrows out of the dump fields,
+                      removing the per-emit clones. Same pattern as the
+                      pre-existing `Self::emit_drop`.
 
                 Performance:
                     - `Dump::process` no longer materializes the entire
@@ -58,11 +72,14 @@
                       making the round-trip directly testable.
 
                 Tests:
-                    - Added regression tests proving both query builders
-                      include the `pg_class` classoid filter:
-                      `build_sequences_standalone_query_filters_by_pg_class`
-                      and
-                      `build_indexes_bulk_query_filters_by_pg_class`.
+                    - Added regression tests proving every new query
+                      builder includes the `pg_class` classoid filter:
+                      `build_tables_standalone_query_filters_by_pg_class`,
+                      `build_regular_views_query_filters_by_pg_class`,
+                      `build_materialized_views_query_filters_by_pg_class`,
+                      `build_view_column_comments_query_filters_by_pg_class`,
+                      `build_sequences_standalone_query_filters_by_pg_class`,
+                      and `build_indexes_bulk_query_filters_by_pg_class`.
                     - `write_to_file_round_trips_via_read_from_file`
                       builds a Dump with schemas, extensions, tables,
                       views, sequences, and routines, writes it via the

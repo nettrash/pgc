@@ -199,9 +199,22 @@ impl Comparer {
         }
     }
 
-    fn process_target_routine(&mut self, routine: &Routine, from_routine: Option<&Routine>) {
+    /// Emit the diff for a single TO-side routine into `script`. Free
+    /// associated function (rather than `&mut self` method) so callers
+    /// can pass `&Routine` borrows into `self.from` / `self.to` while
+    /// also passing `&mut self.script` — disjoint fields allow split
+    /// borrows, which lets the dependency-sorted emit loops avoid
+    /// cloning each `Routine` (with its potentially large `source_code`
+    /// string) just to satisfy the borrow checker. Same rationale as
+    /// [`Comparer::emit_drop`].
+    fn emit_routine_diff(
+        script: &mut String,
+        use_drop: bool,
+        routine: &Routine,
+        from_routine: Option<&Routine>,
+    ) {
         if routine.hash.is_none() {
-            self.script.push_str(
+            script.push_str(
                 format!(
                     "/* Skipping routine {}.{}({}) due to missing hash. */\n",
                     routine.schema, routine.name, routine.arguments
@@ -213,7 +226,7 @@ impl Comparer {
 
         if let Some(from_routine) = from_routine {
             if from_routine.hash.is_none() {
-                self.script.push_str(
+                script.push_str(
                     format!(
                         "/* Skipping routine {}.{}({}) due to missing hash. */\n",
                         from_routine.schema, from_routine.name, from_routine.arguments
@@ -228,37 +241,26 @@ impl Comparer {
                     || from_routine.arguments != routine.arguments
                     || from_routine.arguments_defaults != routine.arguments_defaults
                 {
-                    let drop_script = from_routine.get_drop_script();
-                    if self.use_drop {
-                        self.script.push_str(drop_script.as_str());
-                    } else {
-                        self.script.push_str(
-                            drop_script
-                                .lines()
-                                .map(|l| format!("-- {}\n", l))
-                                .collect::<String>()
-                                .as_str(),
-                        );
-                    }
+                    Self::emit_drop(script, use_drop, &from_routine.get_drop_script());
                 }
-                self.script.push_str(
+                script.push_str(
                     format!(
                         "/* Routine: {}.{}({})*/\n",
                         routine.schema, routine.name, routine.arguments
                     )
                     .as_str(),
                 );
-                self.script.push_str(routine.get_script().as_str());
+                script.push_str(routine.get_script().as_str());
             }
         } else {
-            self.script.push_str(
+            script.push_str(
                 format!(
                     "/* Routine: {}.{}({})*/\n",
                     routine.schema, routine.name, routine.arguments
                 )
                 .as_str(),
             );
-            self.script.push_str(routine.get_script().as_str());
+            script.push_str(routine.get_script().as_str());
         }
     }
 
@@ -1409,9 +1411,11 @@ impl Comparer {
             });
 
             // Resolve the emit plan into (to_idx, optional from_idx) pairs
-            // so neither `create_routines` nor `from_routine_map` keeps a
-            // live borrow while we call `process_target_routine` (which
-            // needs `&mut self`).
+            // up front. The actual emission borrows the routines directly
+            // out of `self.to` / `self.from` and writes through
+            // `&mut self.script`; `Self::emit_routine_diff` is a free
+            // associated function precisely so these disjoint-field
+            // borrows can coexist without cloning each `Routine`.
             let plan: Vec<(usize, Option<usize>)> = sorted
                 .iter()
                 .map(|&idx| {
@@ -1429,9 +1433,9 @@ impl Comparer {
             drop(create_routines);
 
             for (to_idx, from_idx) in plan {
-                let routine = self.to.routines[to_idx].clone();
-                let from_routine = from_idx.map(|i| self.from.routines[i].clone());
-                self.process_target_routine(&routine, from_routine.as_ref());
+                let routine = &self.to.routines[to_idx];
+                let from_routine = from_idx.map(|i| &self.from.routines[i]);
+                Self::emit_routine_diff(&mut self.script, self.use_drop, routine, from_routine);
             }
         }
 
@@ -3144,15 +3148,23 @@ impl Comparer {
                 let view = self.to.views[orig_idx].clone();
                 self.emit_view_create(&view);
             } else {
-                let routine = self.to.routines[orig_idx].clone();
-                let from_routine = from_routine_map
-                    .get(&(
-                        routine.schema.clone(),
-                        routine.name.clone(),
-                        routine.arguments.clone(),
-                    ))
-                    .map(|&i| self.from.routines[i].clone());
-                self.process_target_routine(&routine, from_routine.as_ref());
+                // Resolve the matching FROM-side routine by index so
+                // `emit_routine_diff` can borrow the `Routine` out of
+                // `self.from` / `self.to` directly — no clones of the
+                // potentially-large `source_code` string.
+                let from_idx = {
+                    let routine = &self.to.routines[orig_idx];
+                    from_routine_map
+                        .get(&(
+                            routine.schema.clone(),
+                            routine.name.clone(),
+                            routine.arguments.clone(),
+                        ))
+                        .copied()
+                };
+                let routine = &self.to.routines[orig_idx];
+                let from_routine = from_idx.map(|i| &self.from.routines[i]);
+                Self::emit_routine_diff(&mut self.script, self.use_drop, routine, from_routine);
             }
         }
 

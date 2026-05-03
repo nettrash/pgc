@@ -3209,6 +3209,38 @@ mod tests {
     use crate::dump::table_constraint::TableConstraint;
     use crate::dump::view::View;
     use sqlx::postgres::types::Oid;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// RAII guard for a temp file used by a test. The path is deleted
+    /// on drop, including when an assertion panics earlier in the
+    /// test, so failures don't leave files behind in the temp dir.
+    /// Using a per-test-process atomic counter (plus PID) for the name
+    /// also avoids collisions when several tests in the same binary
+    /// reach for a temp file concurrently.
+    struct TempPath(PathBuf);
+
+    impl TempPath {
+        fn new(prefix: &str, suffix: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("{}_{}_{}.{}", prefix, std::process::id(), n, suffix);
+            Self(std::env::temp_dir().join(name))
+        }
+
+        fn as_str(&self) -> std::borrow::Cow<'_, str> {
+            self.0.to_string_lossy()
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            // Ignore NotFound (e.g. test never wrote the file) and
+            // any other error — best-effort cleanup must not mask
+            // the original test failure.
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     fn empty_dump() -> Dump {
         Dump::new(DumpConfig {
@@ -3865,17 +3897,16 @@ mod tests {
         dump.sequences.push(make_sequence("public", "users_id_seq"));
         dump.routines.push(make_routine("public", "noop"));
 
-        let path =
-            std::env::temp_dir().join(format!("pgc_dump_roundtrip_{}.zip", std::process::id()));
-        let path_str = path.to_string_lossy().into_owned();
+        // RAII guard cleans up the temp file even if a later assertion
+        // panics, so failures don't pollute the temp dir.
+        let path = TempPath::new("pgc_dump_roundtrip", "zip");
 
-        dump.write_to_file(&path_str).expect("write_to_file failed");
+        dump.write_to_file(&path.as_str())
+            .expect("write_to_file failed");
 
-        let restored = Dump::read_from_file(&path_str)
+        let restored = Dump::read_from_file(&path.as_str())
             .await
             .expect("read_from_file failed");
-
-        let _ = std::fs::remove_file(&path);
 
         assert_eq!(restored.schemas.len(), dump.schemas.len());
         assert_eq!(restored.extensions.len(), dump.extensions.len());
