@@ -37,8 +37,9 @@ pub struct Comparer {
     // default privileges and must be accounted for in compare_grants.
     recreated_tables: HashSet<String>,
     // Tracks columns that should use serial/bigserial/smallserial type.
-    // Key: "schema.table.column", Value: "serial", "bigserial", or "smallserial".
-    serial_columns: HashMap<String, String>,
+    // Key: (schema, table, column); Value: "serial", "bigserial", or "smallserial".
+    // The tuple form avoids ambiguity when any identifier contains a literal '.'.
+    serial_columns: HashMap<(String, String, String), String>,
 }
 
 impl Comparer {
@@ -165,20 +166,16 @@ impl Comparer {
             .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
             .collect();
 
-        // Collect indices first to avoid borrow conflict
+        // Collect indices first to avoid borrow conflict between the
+        // shared borrow of `self.serial_columns` and the mutable borrow
+        // of `self.to.tables` below.
         let updates: Vec<(usize, String, String)> = self
             .serial_columns
             .iter()
-            .filter_map(|(key, serial_type)| {
-                let parts: Vec<&str> = key.splitn(3, '.').collect();
-                if parts.len() == 3 {
-                    let (schema, table, column) = (parts[0], parts[1], parts[2]);
-                    to_table_idx
-                        .get(&(schema, table))
-                        .map(|&idx| (idx, column.to_string(), serial_type.clone()))
-                } else {
-                    None
-                }
+            .filter_map(|((schema, table, column), serial_type)| {
+                to_table_idx
+                    .get(&(schema.as_str(), table.as_str()))
+                    .map(|&idx| (idx, column.clone(), serial_type.clone()))
             })
             .collect();
 
@@ -1125,8 +1122,10 @@ impl Comparer {
                                     "smallint" => "smallserial",
                                     _ => "serial",
                                 };
-                                let key = format!("{}.{}.{}", schema, table, column);
-                                self.serial_columns.insert(key, serial_type.to_string());
+                                self.serial_columns.insert(
+                                    (schema.clone(), table.clone(), column.clone()),
+                                    serial_type.to_string(),
+                                );
                             }
                             self.script.push_str(
                                         format!(
@@ -1148,12 +1147,7 @@ impl Comparer {
         }
 
         {
-            let mut dropped_sequences = HashSet::new();
             for sequence in &self.from.sequences {
-                if dropped_sequences.contains(&format!("{}.{}", sequence.schema, sequence.name)) {
-                    continue;
-                }
-
                 if to_seq_keys.contains(&(sequence.schema.as_str(), sequence.name.as_str())) {
                     continue; // Sequence is present in both dumps, we already processed it
                 }
@@ -1237,7 +1231,6 @@ impl Comparer {
                             .as_str(),
                     );
                 }
-                dropped_sequences.insert(format!("{}.{}", sequence.schema, sequence.name));
             }
         }
 
@@ -1274,14 +1267,16 @@ impl Comparer {
             .collect();
 
         // ── Drop routines not present in TO (reverse dependency order) ──
-        let routines_to_drop: Vec<Routine> = self
+        // Borrow rather than clone: we only need read access to each Routine
+        // for dep analysis and emission, and `self.from.routines` is never
+        // mutated through this function.
+        let routines_to_drop: Vec<&Routine> = self
             .from
             .routines
             .iter()
             .filter(|r| {
                 !to_routine_keys.contains(&(r.schema.clone(), r.name.clone(), r.arguments.clone()))
             })
-            .cloned()
             .collect();
 
         if !routines_to_drop.is_empty() {
@@ -1327,7 +1322,7 @@ impl Comparer {
             drop_order.reverse();
 
             for idx in drop_order {
-                let routine = &routines_to_drop[idx];
+                let routine = routines_to_drop[idx];
                 self.script.push_str(
                     format!(
                         "/* Routine: {}.{}({})*/\n",
@@ -1353,13 +1348,13 @@ impl Comparer {
         }
 
         // ── Create / update routines in dependency order ──
-        let create_routines: Vec<(usize, Routine)> = self
+        // Borrow into self.to.routines instead of cloning each Routine.
+        let create_routines: Vec<(usize, &Routine)> = self
             .to
             .routines
             .iter()
             .enumerate()
             .filter(|(_, r)| r.hash.is_some())
-            .map(|(i, r)| (i, r.clone()))
             .collect();
 
         if !create_routines.is_empty() {
@@ -1399,7 +1394,7 @@ impl Comparer {
             }
 
             let sorted = Self::kahn_toposort(n, &depends_on, |i| {
-                let r = &create_routines[i].1;
+                let r = create_routines[i].1;
                 let priority: u8 = if r.lang.eq_ignore_ascii_case("sql") {
                     1
                 } else {
@@ -1413,16 +1408,30 @@ impl Comparer {
                 )
             });
 
-            for idx in sorted {
-                let routine = &create_routines[idx].1;
-                let from_routine = from_routine_map
-                    .get(&(
-                        routine.schema.clone(),
-                        routine.name.clone(),
-                        routine.arguments.clone(),
-                    ))
-                    .map(|&i| self.from.routines[i].clone());
-                self.process_target_routine(routine, from_routine.as_ref());
+            // Resolve the emit plan into (to_idx, optional from_idx) pairs
+            // so neither `create_routines` nor `from_routine_map` keeps a
+            // live borrow while we call `process_target_routine` (which
+            // needs `&mut self`).
+            let plan: Vec<(usize, Option<usize>)> = sorted
+                .iter()
+                .map(|&idx| {
+                    let (to_idx, routine) = create_routines[idx];
+                    let from_idx = from_routine_map
+                        .get(&(
+                            routine.schema.clone(),
+                            routine.name.clone(),
+                            routine.arguments.clone(),
+                        ))
+                        .copied();
+                    (to_idx, from_idx)
+                })
+                .collect();
+            drop(create_routines);
+
+            for (to_idx, from_idx) in plan {
+                let routine = self.to.routines[to_idx].clone();
+                let from_routine = from_idx.map(|i| self.from.routines[i].clone());
+                self.process_target_routine(&routine, from_routine.as_ref());
             }
         }
 
@@ -2863,14 +2872,17 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         // Phase 1 – Drop routines that are not present in TO
         // ──────────────────────────────────────────────────────────
-        let routines_to_drop: Vec<Routine> = self
+        // Borrow rather than clone: dependency analysis and emission
+        // only need read access; `self.from.routines` is not mutated
+        // during this function, and emission only mutates `self.script`
+        // (a disjoint field).
+        let routines_to_drop: Vec<&Routine> = self
             .from
             .routines
             .iter()
             .filter(|r| {
                 !to_routine_keys.contains(&(r.schema.clone(), r.name.clone(), r.arguments.clone()))
             })
-            .cloned()
             .collect();
 
         if !routines_to_drop.is_empty() {
@@ -2918,7 +2930,7 @@ impl Comparer {
             drop_order.reverse();
 
             for idx in drop_order {
-                let routine = &routines_to_drop[idx];
+                let routine = routines_to_drop[idx];
                 self.script.push_str(
                     format!(
                         "/* Routine: {}.{}({})*/\n",
@@ -3662,22 +3674,19 @@ impl Comparer {
                 .copied()
                 .unwrap_or(&[]);
 
+            // Index from-columns by name once per table so the per-column
+            // lookup below is O(1) instead of an O(C²) linear scan.
+            let from_col_acls: HashMap<&str, &[String]> = from_cols
+                .iter()
+                .map(|c| (c.name.as_str(), c.acl.as_slice()))
+                .collect();
+
             for col in &table.columns {
-                if col.acl.is_empty() {
-                    let from_col_acl: &[String] = from_cols
-                        .iter()
-                        .find(|c| c.name == col.name)
-                        .map(|c| c.acl.as_slice())
-                        .unwrap_or(&[]);
-                    if from_col_acl.is_empty() {
-                        continue;
-                    }
+                let from_col_acl: &[String] =
+                    from_col_acls.get(col.name.as_str()).copied().unwrap_or(&[]);
+                if col.acl.is_empty() && from_col_acl.is_empty() {
+                    continue;
                 }
-                let from_col_acl: &[String] = from_cols
-                    .iter()
-                    .find(|c| c.name == col.name)
-                    .map(|c| c.acl.as_slice())
-                    .unwrap_or(&[]);
                 let col_grants = acl::generate_column_grants_script(
                     from_col_acl,
                     &col.acl,

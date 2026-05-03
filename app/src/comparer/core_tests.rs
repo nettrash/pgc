@@ -6806,3 +6806,167 @@ async fn compare_column_grants_revokes_former_owner_when_to_has_no_column_acl() 
         "Current owner must never appear in column grant output, got: {script}"
     );
 }
+
+/// Regression test for the per-table column-ACL HashMap rewrite. Previously
+/// each TO column did a linear scan over `from_cols`; the rewrite indexes
+/// `from_cols` by name once per table. This test exercises a table with
+/// multiple columns where each column's effective `from_acl` differs, to
+/// catch off-by-one mistakes that a single-column test would miss.
+#[tokio::test]
+async fn compare_column_grants_dispatches_per_column_acl_correctly() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM: three columns with distinct ACL states.
+    let mut from_a = int_column("public", "t", "a", 1);
+    from_a.acl = vec!["reader=r/owner".to_string()];
+    let mut from_b = int_column("public", "t", "b", 2);
+    from_b.acl = vec!["reader=r/owner".to_string()];
+    let from_c = int_column("public", "t", "c", 3); // no ACL in FROM
+
+    let from_table = Table::new(
+        "public".to_string(),
+        "t".to_string(),
+        "public".to_string(),
+        "t".to_string(),
+        "owner".to_string(),
+        None,
+        vec![from_a, from_b, from_c],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    // TO: a kept, b loses its grant, c gains a grant.
+    let mut to_a = int_column("public", "t", "a", 1);
+    to_a.acl = vec!["reader=r/owner".to_string()];
+    let to_b = int_column("public", "t", "b", 2); // grant should be revoked
+    let mut to_c = int_column("public", "t", "c", 3);
+    to_c.acl = vec!["writer=a/owner".to_string()]; // INSERT grant added
+
+    let to_table = Table::new(
+        "public".to_string(),
+        "t".to_string(),
+        "public".to_string(),
+        "t".to_string(),
+        "owner".to_string(),
+        None,
+        vec![to_a, to_b, to_c],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Full);
+    comparer.compare_grants().await.unwrap();
+    let script = comparer.get_script();
+
+    // a: identical → nothing emitted for column a.
+    assert!(
+        !script.contains("(a)"),
+        "column a is unchanged and must not appear, got: {script}"
+    );
+    // b: REVOKE for the dropped grant.
+    assert!(
+        script.contains("REVOKE SELECT (b) ON TABLE public.t FROM reader;"),
+        "expected REVOKE for column b, got: {script}"
+    );
+    // c: GRANT for the added INSERT privilege.
+    assert!(
+        script.contains("GRANT INSERT (c) ON TABLE public.t TO writer;"),
+        "expected GRANT INSERT on column c, got: {script}"
+    );
+    // Sanity: no cross-talk where column b's REVOKE refers to writer/c, etc.
+    assert!(
+        !script.contains("REVOKE SELECT (c)"),
+        "column c had no FROM grant and must not be revoked, got: {script}"
+    );
+    assert!(
+        !script.contains("GRANT INSERT (a)") && !script.contains("GRANT INSERT (b)"),
+        "INSERT grant must be scoped to column c only, got: {script}"
+    );
+}
+
+/// Regression test for the `serial_columns` key change from a joined
+/// `"schema.table.column"` `String` to a `(String, String, String)` tuple.
+/// The old form was parsed back via `splitn(3, '.')`, which silently
+/// misparsed any identifier containing a literal `.` (legal in PostgreSQL
+/// when quoted). With the tuple key, dotted identifiers round-trip cleanly
+/// and `mark_serial_columns` still finds the target column.
+#[tokio::test]
+async fn mark_serial_columns_handles_dotted_identifier_names() {
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // Schema, table, and column names all contain a literal dot — the
+    // pre-fix `splitn(3, '.')` would slice these in the wrong place and
+    // fail to locate the column.
+    let schema = "weird.schema";
+    let table = "weird.table";
+    let column = "weird.id";
+
+    let serial_seq = Sequence::new(
+        schema.to_string(),
+        format!("{table}_{column}_seq"),
+        "postgres".to_string(),
+        "integer".to_string(),
+        Some(1),
+        Some(1),
+        Some(2147483647),
+        Some(1),
+        false,
+        Some(1),
+        Some(1),
+        Some(schema.to_string()),
+        Some(table.to_string()),
+        Some(column.to_string()),
+    );
+    to_dump.sequences.push(serial_seq);
+
+    let mut col = int_column(schema, table, column, 1);
+    col.column_default = Some(format!(
+        "nextval('{schema}.{table}_{column}_seq'::regclass)"
+    ));
+    col.is_nullable = false;
+
+    let table_obj = Table::new(
+        schema.to_string(),
+        table.to_string(),
+        schema.to_string(),
+        table.to_string(),
+        "postgres".to_string(),
+        None,
+        vec![col],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    to_dump.tables.push(table_obj);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_sequences().await.unwrap();
+    comparer.mark_serial_columns();
+
+    let to_table = comparer
+        .to
+        .tables
+        .iter()
+        .find(|t| t.schema == schema && t.name == table)
+        .expect("table must round-trip");
+    let to_column = to_table
+        .columns
+        .iter()
+        .find(|c| c.name == column)
+        .expect("column must round-trip");
+    assert_eq!(
+        to_column.serial_type.as_deref(),
+        Some("serial"),
+        "dotted-name column must still be marked as serial"
+    );
+}

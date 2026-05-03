@@ -25,7 +25,6 @@ use sqlx::postgres::types::Oid;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
 use std::io::{Error, Read};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -221,18 +220,23 @@ impl Dump {
 
         pool.close().await;
 
-        // Serialize the dump to a file.
-        let serialized_data = serde_json::to_string(&self)
-            .map_err(|e| Error::other(format!("Failed to serialize dump: {e}.")))?;
-        let serialized_bytes = serialized_data.as_bytes();
+        self.write_to_file(&self.configuration.file)
+    }
 
-        let file = File::create(&self.configuration.file)?;
+    /// Persist this dump to `path` as a zip-compressed JSON archive.
+    ///
+    /// The JSON payload is streamed directly into the zip writer, so peak
+    /// memory is bounded by zlib's internal buffers rather than the full
+    /// serialized dump. Pairs with [`Dump::read_from_file`].
+    pub fn write_to_file(&self, path: &str) -> Result<(), Error> {
+        let file = File::create(path)?;
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
         zip.start_file("dump.io", options)?;
-        zip.write_all(serialized_bytes)?;
+        serde_json::to_writer(&mut zip, self)
+            .map_err(|e| Error::other(format!("Failed to serialize dump: {e}.")))?;
         zip.finish()?;
         Ok(())
     }
@@ -3834,5 +3838,58 @@ mod tests {
             query.contains("seq_desc.classoid = 'pg_class'::regclass"),
             "expected pg_class classoid filter for sequence comments"
         );
+    }
+
+    /// Regression test for the streaming dump-write change: a Dump
+    /// serialized via [`Dump::write_to_file`] (which streams JSON
+    /// directly into the zip writer instead of materializing the whole
+    /// payload as a `String`) must still round-trip identically through
+    /// [`Dump::read_from_file`].
+    #[tokio::test]
+    async fn write_to_file_round_trips_via_read_from_file() {
+        let mut dump = empty_dump();
+        dump.schemas.push(make_schema("public"));
+        dump.schemas.push(make_schema("data"));
+        dump.extensions.push(make_extension("pgcrypto"));
+        dump.tables.push(make_table("public", "users"));
+        dump.tables.push(make_table("data", "events"));
+        dump.views.push(make_view("public", "active_users"));
+        dump.sequences.push(make_sequence("public", "users_id_seq"));
+        dump.routines.push(make_routine("public", "noop"));
+
+        let path =
+            std::env::temp_dir().join(format!("pgc_dump_roundtrip_{}.zip", std::process::id()));
+        let path_str = path.to_string_lossy().into_owned();
+
+        dump.write_to_file(&path_str).expect("write_to_file failed");
+
+        let restored = Dump::read_from_file(&path_str)
+            .await
+            .expect("read_from_file failed");
+
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.schemas.len(), dump.schemas.len());
+        assert_eq!(restored.extensions.len(), dump.extensions.len());
+        assert_eq!(restored.tables.len(), dump.tables.len());
+        assert_eq!(restored.views.len(), dump.views.len());
+        assert_eq!(restored.sequences.len(), dump.sequences.len());
+        assert_eq!(restored.routines.len(), dump.routines.len());
+
+        let restored_schemas: Vec<&str> =
+            restored.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(restored_schemas.contains(&"public"));
+        assert!(restored_schemas.contains(&"data"));
+
+        let restored_table_keys: Vec<(&str, &str)> = restored
+            .tables
+            .iter()
+            .map(|t| (t.schema.as_str(), t.name.as_str()))
+            .collect();
+        assert!(restored_table_keys.contains(&("public", "users")));
+        assert!(restored_table_keys.contains(&("data", "events")));
+
+        assert_eq!(restored.routines[0].name, "noop");
+        assert_eq!(restored.sequences[0].name, "users_id_seq");
     }
 }

@@ -10,6 +10,47 @@ v1.0.19
                       and `pg_description.objsubid = 0` to avoid catalog
                       collisions.
                     - Normalized SQL formatting in the new helper query strings.
+                    - `Comparer::compare_grants` no longer runs a duplicate
+                      `iter().find(...)` over `from_cols` for every TO column
+                      whose own ACL is empty. The first scan was discarded
+                      and the second was redone unconditionally; both are
+                      now replaced by a single per-table
+                      `HashMap<&str, &[String]>` lookup, which also reduces
+                      the column-grants emission from O(C^2) to O(C) on
+                      wide tables.
+                    - `Comparer::mark_serial_columns` now keys
+                      `serial_columns` by `(schema, table, column)` tuple
+                      instead of a `format!("{}.{}.{}", ...)` string that
+                      was parsed back via `splitn(3, '.')`. The string
+                      form silently misparsed any identifier containing a
+                      literal `.` (legal in PostgreSQL when quoted),
+                      leaving the corresponding column unmarked.
+                    - `Comparer::compare_sequences` had a dead
+                      `dropped_sequences: HashSet<String>` that was
+                      checked and updated on every iteration of a loop
+                      over `self.from.sequences`. Sequences are unique by
+                      `(schema, name)` so the dedupe could never fire;
+                      the set and its per-iteration `format!`/`contains`/
+                      `insert` calls are removed.
+                    - `Comparer::compare_routines` and
+                      `Comparer::compare_routines_and_views` now hold
+                      `routines_to_drop: Vec<&Routine>` borrowing into
+                      `self.from.routines` instead of cloning every
+                      `Routine` (each carries the full `source_code`
+                      string). Dependency analysis is unchanged; only
+                      the up-front clone is removed.
+
+                Performance:
+                    - `Dump::process` no longer materializes the entire
+                      serialized dump as a `String` before handing it to
+                      the zip writer. The JSON payload is now streamed
+                      directly into `ZipWriter` via
+                      `serde_json::to_writer`, bounding peak memory at
+                      zlib's internal buffers rather than ~2x the
+                      uncompressed dump size. The write path is exposed
+                      as `Dump::write_to_file`, mirroring the existing
+                      `Dump::read_from_file` and making the round-trip
+                      directly testable.
 
                 Tests:
                     - Added regression tests proving both query builders
@@ -17,6 +58,26 @@ v1.0.19
                       `build_sequences_standalone_query_filters_by_pg_class`
                       and
                       `build_indexes_bulk_query_filters_by_pg_class`.
+                    - `write_to_file_round_trips_via_read_from_file`
+                      builds a Dump with schemas, extensions, tables,
+                      views, sequences, and routines, writes it via the
+                      new streaming path, reads it back, and asserts
+                      every collection size and a few content fields
+                      match.
+                    - `compare_column_grants_dispatches_per_column_acl_correctly`
+                      builds a table with three columns whose effective
+                      `from_acl` differs (kept / revoked / newly
+                      granted) and verifies that the per-table
+                      column-ACL HashMap dispatches each column to the
+                      right diff outcome — guarding against off-by-one
+                      mistakes that single-column tests would miss.
+                    - `mark_serial_columns_handles_dotted_identifier_names`
+                      drives the `mark_serial_columns` path with a
+                      schema, table, and column name that all contain a
+                      literal `.`, asserting that the new tuple key
+                      still locates the target column. The pre-fix
+                      `splitn(3, '.')` parser would have failed on this
+                      input.
 
 2026-04-25      v1.0.18
 
