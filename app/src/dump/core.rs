@@ -25,8 +25,7 @@ use sqlx::postgres::types::Oid;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
-use std::io::{Error, Read};
+use std::io::{BufWriter, Error, Read, Write};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -221,18 +220,31 @@ impl Dump {
 
         pool.close().await;
 
-        // Serialize the dump to a file.
-        let serialized_data = serde_json::to_string(&self)
-            .map_err(|e| Error::other(format!("Failed to serialize dump: {e}.")))?;
-        let serialized_bytes = serialized_data.as_bytes();
+        self.write_to_file(&self.configuration.file)
+    }
 
-        let file = File::create(&self.configuration.file)?;
+    /// Persist this dump to `path` as a zip-compressed JSON archive.
+    ///
+    /// The JSON payload is streamed into the zip writer through a 256 KiB
+    /// `BufWriter`, which is required for performance: `serde_json::to_writer`
+    /// emits many small writes (one per JSON token), and feeding them
+    /// straight into the deflate stream pays a per-call cost on every one.
+    /// Buffering keeps peak memory bounded (no full intermediate `String`
+    /// copy of the payload) while still amortising the compressor overhead.
+    /// Pairs with [`Dump::read_from_file`].
+    pub fn write_to_file(&self, path: &str) -> Result<(), Error> {
+        const WRITE_BUF_BYTES: usize = 256 * 1024;
+        let file = File::create(path)?;
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
         zip.start_file("dump.io", options)?;
-        zip.write_all(serialized_bytes)?;
+        let mut buf = BufWriter::with_capacity(WRITE_BUF_BYTES, &mut zip);
+        serde_json::to_writer(&mut buf, self)
+            .map_err(|e| Error::other(format!("Failed to serialize dump: {e}.")))?;
+        buf.flush()?;
+        drop(buf);
         zip.finish()?;
         Ok(())
     }
@@ -889,48 +901,7 @@ impl Dump {
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<Vec<Sequence>, Error> {
-        let query = format!(
-            "
-            select
-                quote_ident(seq.schemaname) as schemaname,
-                quote_ident(seq.sequencename) as sequencename,
-                quote_ident(seq.sequenceowner) as sequenceowner,
-                seq.data_type::varchar as sequencedatatype,
-                seq.start_value,
-                seq.min_value,
-                seq.max_value,
-                seq.increment_by,
-                seq.cycle,
-                seq.cache_size,
-                seq.last_value,
-                quote_ident(owner_ns.nspname) as owned_by_schema,
-                quote_ident(owner_table.relname) as owned_by_table,
-                quote_ident(owner_attr.attname) as owned_by_column,
-                dep.deptype::text as dependency_type,
-                seq_desc.description as seq_comment,
-                seq_class.relacl::text[] as seq_acl,
-                seq_class.relpersistence::text as seq_persistence
-            from
-                pg_sequences seq
-                left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
-                left join pg_class seq_class on seq_class.relname = seq.sequencename
-                    and seq_class.relnamespace = seq_ns.oid
-                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and seq_desc.objsubid = 0
-                left join pg_depend dep on dep.objid = seq_class.oid
-                    and dep.deptype in ('a', 'i')
-                left join pg_class owner_table on owner_table.oid = dep.refobjid
-                left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
-                left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
-                    and owner_attr.attnum = dep.refobjsubid
-            where
-                seq.schemaname in {}
-                and not exists (
-                    select 1 from pg_depend ext_dep
-                    where ext_dep.objid = seq_class.oid
-                    and ext_dep.deptype = 'e'
-                )",
-            schema_filter
-        );
+        let query = Self::build_sequences_standalone_query(schema_filter);
 
         let rows = sqlx::query(query.as_str())
             .fetch_all(pool)
@@ -983,6 +954,52 @@ impl Dump {
             }
         }
         Ok(sequences)
+    }
+
+    fn build_sequences_standalone_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(seq.schemaname) as schemaname,
+                quote_ident(seq.sequencename) as sequencename,
+                quote_ident(seq.sequenceowner) as sequenceowner,
+                seq.data_type::varchar as sequencedatatype,
+                seq.start_value,
+                seq.min_value,
+                seq.max_value,
+                seq.increment_by,
+                seq.cycle,
+                seq.cache_size,
+                seq.last_value,
+                quote_ident(owner_ns.nspname) as owned_by_schema,
+                quote_ident(owner_table.relname) as owned_by_table,
+                quote_ident(owner_attr.attname) as owned_by_column,
+                dep.deptype::text as dependency_type,
+                seq_desc.description as seq_comment,
+                seq_class.relacl::text[] as seq_acl,
+                seq_class.relpersistence::text as seq_persistence
+            from
+                pg_sequences seq
+                left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
+                left join pg_class seq_class on seq_class.relname = seq.sequencename
+                    and seq_class.relnamespace = seq_ns.oid
+                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid
+                    and seq_desc.classoid = 'pg_class'::regclass
+                    and seq_desc.objsubid = 0
+                left join pg_depend dep on dep.objid = seq_class.oid
+                    and dep.deptype in ('a', 'i')
+                left join pg_class owner_table on owner_table.oid = dep.refobjid
+                left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
+                left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
+                    and owner_attr.attnum = dep.refobjsubid
+            where
+                seq.schemaname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = seq_class.oid
+                    and ext_dep.deptype = 'e'
+                )",
+            schema_filter
+        )
     }
 
     async fn fetch_routines_standalone(
@@ -1225,55 +1242,7 @@ impl Dump {
         // Probe catalog capabilities once for the entire dump run.
         let caps = PgCatalogCaps::detect(pool, pg_version).await;
 
-        let query = format!(
-            "
-                select
-                    quote_ident(t.schemaname) as schemaname,
-                    quote_ident(t.tablename) as tablename,
-                    quote_ident(t.tableowner) as tableowner,
-                    t.schemaname as raw_schema_name,
-                    t.tablename as raw_table_name,
-                    t.tablespace,
-                    t.hasindexes,
-                    t.hastriggers,
-                    t.hasrules,
-                    t.rowsecurity,
-                    d.description as table_comment,
-                    c.relacl::text[] as table_acl,
-                    am.amname as access_method,
-                    c.relpersistence as relpersistence,
-                    c.reloptions as reloptions,
-                    c.relreplident as relreplident,
-                    c.relforcerowsecurity as relforcerowsecurity,
-                    case when c.reloftype <> 0 then c.reloftype::regtype::text else null end as typed_table_type,
-                    array(
-                        select quote_ident(pn.nspname) || '.' || quote_ident(pc.relname)
-                        from pg_inherits pi2
-                        join pg_class pc on pc.oid = pi2.inhparent
-                        join pg_namespace pn on pn.oid = pc.relnamespace
-                        where pi2.inhrelid = c.oid
-                        and not exists (
-                            select 1 from pg_partitioned_table pt where pt.partrelid = pi2.inhparent
-                        )
-                        order by pi2.inhseqno
-                    ) as inherits_from
-                from pg_tables t
-                left join pg_class c on c.relname = t.tablename
-                    and c.relkind in ('r','p')
-                    and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
-                left join pg_am am on am.oid = c.relam
-                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-                where 
-                    t.schemaname not in ('pg_catalog', 'information_schema') 
-                    and t.schemaname in {} 
-                    and t.tablename not like 'pg_%'
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = c.oid
-                        and ext_dep.deptype = 'e'
-                    );",
-            schema_filter
-        );
+        let query = Self::build_tables_standalone_query(schema_filter);
 
         let rows = sqlx::query(query.as_str())
             .fetch_all(pool)
@@ -1370,89 +1339,68 @@ impl Dump {
         Ok(shell_tables)
     }
 
+    fn build_tables_standalone_query(schema_filter: &str) -> String {
+        format!(
+            "
+                select
+                    quote_ident(t.schemaname) as schemaname,
+                    quote_ident(t.tablename) as tablename,
+                    quote_ident(t.tableowner) as tableowner,
+                    t.schemaname as raw_schema_name,
+                    t.tablename as raw_table_name,
+                    t.tablespace,
+                    t.hasindexes,
+                    t.hastriggers,
+                    t.hasrules,
+                    t.rowsecurity,
+                    d.description as table_comment,
+                    c.relacl::text[] as table_acl,
+                    am.amname as access_method,
+                    c.relpersistence as relpersistence,
+                    c.reloptions as reloptions,
+                    c.relreplident as relreplident,
+                    c.relforcerowsecurity as relforcerowsecurity,
+                    case when c.reloftype <> 0 then c.reloftype::regtype::text else null end as typed_table_type,
+                    array(
+                        select quote_ident(pn.nspname) || '.' || quote_ident(pc.relname)
+                        from pg_inherits pi2
+                        join pg_class pc on pc.oid = pi2.inhparent
+                        join pg_namespace pn on pn.oid = pc.relnamespace
+                        where pi2.inhrelid = c.oid
+                        and not exists (
+                            select 1 from pg_partitioned_table pt where pt.partrelid = pi2.inhparent
+                        )
+                        order by pi2.inhseqno
+                    ) as inherits_from
+                from pg_tables t
+                left join pg_class c on c.relname = t.tablename
+                    and c.relkind in ('r','p')
+                    and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
+                left join pg_am am on am.oid = c.relam
+                left join pg_description d on d.objoid = c.oid
+                    and d.classoid = 'pg_class'::regclass
+                    and d.objsubid = 0
+                where
+                    t.schemaname not in ('pg_catalog', 'information_schema')
+                    and t.schemaname in {}
+                    and t.tablename not like 'pg_%'
+                    and not exists (
+                        select 1 from pg_depend ext_dep
+                        where ext_dep.objid = c.oid
+                        and ext_dep.deptype = 'e'
+                    );",
+            schema_filter
+        )
+    }
+
     async fn fetch_views_standalone(
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<Vec<View>, Error> {
         // Fetch regular and materialized views concurrently.
-        let regular_query = format!(
-            "select 
-                    quote_ident(v.table_schema) as table_schema,
-                    quote_ident(v.table_name) as table_name,
-                    v.view_definition,
-                    quote_ident(pv.viewowner) as view_owner,
-                    array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
-                    d.description as view_comment,
-                    (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
-                    coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker,
-                    v.check_option
-            from information_schema.views v
-            join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
-            left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
-            left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
-            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-            where
-                v.table_schema not in ('pg_catalog', 'information_schema')
-                and v.table_schema in {}
-                and not exists (
-                    select 1 from pg_depend ext_dep
-                    where ext_dep.objid = c.oid
-                    and ext_dep.deptype = 'e'
-                )
-            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
-            schema_filter
-        );
-
-        let mat_query = format!(
-            "select
-                    mv.schemaname as table_schema,
-                    mv.matviewname as table_name,
-                    mv.definition as view_definition,
-                    mv.matviewowner as view_owner,
-                    array(
-                        select distinct n.nspname || '.' || dc.relname
-                        from pg_depend dep
-                        join pg_class dc on dc.oid = dep.refobjid
-                        join pg_namespace n on n.oid = dc.relnamespace
-                        where dep.objid = c.oid
-                          and dep.deptype = 'n'
-                          and dc.relkind in ('r', 'v', 'm')
-                    ) as table_relation,
-                    d.description as view_comment,
-                    c.relacl::text[] as view_acl,
-                    c.reloptions as storage_options,
-                    (select spcname from pg_tablespace where oid = c.reltablespace) as tablespace_name
-            from pg_matviews mv
-            join pg_class c on c.relname = mv.matviewname
-                and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
-            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-            where mv.schemaname not in ('pg_catalog', 'information_schema')
-                and mv.schemaname in {}
-                and not exists (
-                    select 1 from pg_depend ext_dep
-                    where ext_dep.objid = c.oid
-                    and ext_dep.deptype = 'e'
-                );",
-            schema_filter
-        );
-
-        // Column comments query (works for both regular and materialized views)
-        let col_comments_query = format!(
-            "select
-                quote_ident(n.nspname) as schema_name,
-                quote_ident(c.relname) as view_name,
-                quote_ident(a.attname) as column_name,
-                d.description as col_comment
-            from pg_class c
-            join pg_namespace n on n.oid = c.relnamespace
-            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-            join pg_description d on d.objoid = c.oid and d.objsubid = a.attnum
-            where c.relkind in ('v', 'm')
-                and n.nspname not in ('pg_catalog', 'information_schema')
-                and n.nspname in {}
-            order by n.nspname, c.relname, a.attnum;",
-            schema_filter
-        );
+        let regular_query = Self::build_regular_views_query(schema_filter);
+        let mat_query = Self::build_materialized_views_query(schema_filter);
+        let col_comments_query = Self::build_view_column_comments_query(schema_filter);
 
         let (regular_rows, mat_rows, col_comment_rows) = tokio::try_join!(
             async {
@@ -1597,6 +1545,96 @@ impl Dump {
         }
 
         Ok(views)
+    }
+
+    fn build_regular_views_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                    quote_ident(v.table_schema) as table_schema,
+                    quote_ident(v.table_name) as table_name,
+                    v.view_definition,
+                    quote_ident(pv.viewowner) as view_owner,
+                    array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
+                    d.description as view_comment,
+                    (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
+                    coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker,
+                    v.check_option
+            from information_schema.views v
+            join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
+            left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
+            left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
+            left join pg_description d on d.objoid = c.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = 0
+            where
+                v.table_schema not in ('pg_catalog', 'information_schema')
+                and v.table_schema in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = c.oid
+                    and ext_dep.deptype = 'e'
+                )
+            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
+            schema_filter
+        )
+    }
+
+    fn build_materialized_views_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                    mv.schemaname as table_schema,
+                    mv.matviewname as table_name,
+                    mv.definition as view_definition,
+                    mv.matviewowner as view_owner,
+                    array(
+                        select distinct n.nspname || '.' || dc.relname
+                        from pg_depend dep
+                        join pg_class dc on dc.oid = dep.refobjid
+                        join pg_namespace n on n.oid = dc.relnamespace
+                        where dep.objid = c.oid
+                          and dep.deptype = 'n'
+                          and dc.relkind in ('r', 'v', 'm')
+                    ) as table_relation,
+                    d.description as view_comment,
+                    c.relacl::text[] as view_acl,
+                    c.reloptions as storage_options,
+                    (select spcname from pg_tablespace where oid = c.reltablespace) as tablespace_name
+            from pg_matviews mv
+            join pg_class c on c.relname = mv.matviewname
+                and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
+            left join pg_description d on d.objoid = c.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = 0
+            where mv.schemaname not in ('pg_catalog', 'information_schema')
+                and mv.schemaname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.objid = c.oid
+                    and ext_dep.deptype = 'e'
+                );",
+            schema_filter
+        )
+    }
+
+    fn build_view_column_comments_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as schema_name,
+                quote_ident(c.relname) as view_name,
+                quote_ident(a.attname) as column_name,
+                d.description as col_comment
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+            join pg_description d on d.objoid = c.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = a.attnum
+            where c.relkind in ('v', 'm')
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname in {}
+            order by n.nspname, c.relname, a.attnum;",
+            schema_filter
+        )
     }
 
     async fn fetch_foreign_tables_standalone(
@@ -3171,6 +3209,38 @@ mod tests {
     use crate::dump::table_constraint::TableConstraint;
     use crate::dump::view::View;
     use sqlx::postgres::types::Oid;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// RAII guard for a temp file used by a test. The path is deleted
+    /// on drop, including when an assertion panics earlier in the
+    /// test, so failures don't leave files behind in the temp dir.
+    /// Using a per-test-process atomic counter (plus PID) for the name
+    /// also avoids collisions when several tests in the same binary
+    /// reach for a temp file concurrently.
+    struct TempPath(PathBuf);
+
+    impl TempPath {
+        fn new(prefix: &str, suffix: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("{}_{}_{}.{}", prefix, std::process::id(), n, suffix);
+            Self(std::env::temp_dir().join(name))
+        }
+
+        fn as_str(&self) -> std::borrow::Cow<'_, str> {
+            self.0.to_string_lossy()
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            // Ignore NotFound (e.g. test never wrote the file) and
+            // any other error — best-effort cleanup must not mask
+            // the original test failure.
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     fn empty_dump() -> Dump {
         Dump::new(DumpConfig {
@@ -3763,5 +3833,102 @@ mod tests {
             reg_a_pos < reg_b_pos,
             "regular_a before regular_b alphabetically"
         );
+    }
+
+    #[test]
+    fn build_tables_standalone_query_filters_by_pg_class() {
+        let query = Dump::build_tables_standalone_query("('public')");
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for table comments"
+        );
+    }
+
+    #[test]
+    fn build_regular_views_query_filters_by_pg_class() {
+        let query = Dump::build_regular_views_query("('public')");
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for regular view comments"
+        );
+    }
+
+    #[test]
+    fn build_materialized_views_query_filters_by_pg_class() {
+        let query = Dump::build_materialized_views_query("('public')");
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for materialized view comments"
+        );
+    }
+
+    #[test]
+    fn build_view_column_comments_query_filters_by_pg_class() {
+        let query = Dump::build_view_column_comments_query("('public')");
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for view column comments"
+        );
+    }
+
+    #[test]
+    fn build_sequences_standalone_query_filters_by_pg_class() {
+        let query = Dump::build_sequences_standalone_query("('public')");
+        assert!(
+            query.contains("seq_desc.classoid = 'pg_class'::regclass"),
+            "expected pg_class classoid filter for sequence comments"
+        );
+    }
+
+    /// Regression test for the streaming dump-write change: a Dump
+    /// serialized via [`Dump::write_to_file`] (which streams JSON
+    /// directly into the zip writer instead of materializing the whole
+    /// payload as a `String`) must still round-trip identically through
+    /// [`Dump::read_from_file`].
+    #[tokio::test]
+    async fn write_to_file_round_trips_via_read_from_file() {
+        let mut dump = empty_dump();
+        dump.schemas.push(make_schema("public"));
+        dump.schemas.push(make_schema("data"));
+        dump.extensions.push(make_extension("pgcrypto"));
+        dump.tables.push(make_table("public", "users"));
+        dump.tables.push(make_table("data", "events"));
+        dump.views.push(make_view("public", "active_users"));
+        dump.sequences.push(make_sequence("public", "users_id_seq"));
+        dump.routines.push(make_routine("public", "noop"));
+
+        // RAII guard cleans up the temp file even if a later assertion
+        // panics, so failures don't pollute the temp dir.
+        let path = TempPath::new("pgc_dump_roundtrip", "zip");
+
+        dump.write_to_file(&path.as_str())
+            .expect("write_to_file failed");
+
+        let restored = Dump::read_from_file(&path.as_str())
+            .await
+            .expect("read_from_file failed");
+
+        assert_eq!(restored.schemas.len(), dump.schemas.len());
+        assert_eq!(restored.extensions.len(), dump.extensions.len());
+        assert_eq!(restored.tables.len(), dump.tables.len());
+        assert_eq!(restored.views.len(), dump.views.len());
+        assert_eq!(restored.sequences.len(), dump.sequences.len());
+        assert_eq!(restored.routines.len(), dump.routines.len());
+
+        let restored_schemas: Vec<&str> =
+            restored.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(restored_schemas.contains(&"public"));
+        assert!(restored_schemas.contains(&"data"));
+
+        let restored_table_keys: Vec<(&str, &str)> = restored
+            .tables
+            .iter()
+            .map(|t| (t.schema.as_str(), t.name.as_str()))
+            .collect();
+        assert!(restored_table_keys.contains(&("public", "users")));
+        assert!(restored_table_keys.contains(&("data", "events")));
+
+        assert_eq!(restored.routines[0].name, "noop");
+        assert_eq!(restored.sequences[0].name, "users_id_seq");
     }
 }
