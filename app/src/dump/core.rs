@@ -1461,7 +1461,7 @@ impl Dump {
                 let mut view = View {
                     schema,
                     name,
-                    definition: row.get("view_definition"),
+                    definition: row.get::<Option<String>, _>("view_definition").unwrap_or_default(),
                     table_relation: row.get("table_relation"),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
@@ -1516,7 +1516,7 @@ impl Dump {
                 let mut view = View {
                     schema,
                     name,
-                    definition: row.get("view_definition"),
+                    definition: row.get::<Option<String>, _>("view_definition").unwrap_or_default(),
                     table_relation: row.get("table_relation"),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
