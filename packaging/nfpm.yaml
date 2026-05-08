@@ -1,0 +1,25 @@
+name: pgc
+arch: ${PKG_ARCH}
+version: ${PKG_VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: nettrash <nettrash@nettrash.me>
+description: |
+  PostgreSQL schema dump and compare tool.
+  Connects to PostgreSQL, dumps schema metadata to a portable format,
+  and compares two schemas to produce a migration script.
+vendor: nettrash
+homepage: https://github.com/nettrash/pgc
+license: MIT
+contents:
+  - src: ${PKG_BIN}
+    dst: /usr/bin/pgc
+    file_info:
+      mode: 0755
+  - src: ./README.md
+    dst: /usr/share/doc/pgc/README.md
+  - src: ./LICENSE
+    dst: /usr/share/doc/pgc/LICENSE
+  - src: ./CHANGELOG
+    dst: /usr/share/doc/pgc/CHANGELOG
