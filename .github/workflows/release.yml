@@ -52,8 +52,11 @@ jobs:
             pkg_formats: "apk"
 
           # ---------- macOS ----------
+          # Both targets run on Apple Silicon (macos-latest); the x86_64
+          # build is a cross-compile, which Apple's toolchain handles
+          # natively. macos-13 is no longer in the free GitHub-hosted pool.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             archive: tar.gz
             pkg_formats: "macpkg"
 
@@ -169,12 +172,18 @@ jobs:
           PKG_ARCH: ${{ matrix.pkg_arch }}
           PKG_BIN: app/target/${{ matrix.target }}/release/pgc
         run: |
+          # nfpm expands env vars in only a few top-level fields; contents.src
+          # is not one of them, so render the config with envsubst first.
+          envsubst < packaging/nfpm.yaml > /tmp/nfpm.yaml
+          echo "--- rendered nfpm.yaml ---"
+          cat /tmp/nfpm.yaml
+          echo "--------------------------"
           IFS=',' read -ra formats <<< "${{ matrix.pkg_formats }}"
           for fmt in "${formats[@]}"; do
             case "$fmt" in
               deb|rpm|apk|archlinux)
                 echo "::group::nfpm $fmt"
-                nfpm pkg --config packaging/nfpm.yaml --packager "$fmt" --target dist/
+                nfpm pkg --config /tmp/nfpm.yaml --packager "$fmt" --target dist/
                 echo "::endgroup::"
                 ;;
             esac

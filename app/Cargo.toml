@@ -3,6 +3,7 @@ name = "pgc"
 version = "1.0.19"
 edition = "2024"
 license = "MIT"
+authors = ["nettrash <nettrash@nettrash.me>"]
 
 [[bin]]
 name = "pgc"
