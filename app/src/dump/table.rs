@@ -323,108 +323,177 @@ impl Table {
     }
 
     fn build_columns_query(compression_col: &str, schema_filter: &str) -> String {
+        // Read column metadata directly from pg_catalog instead of
+        // information_schema.columns. The standard view filters rows by
+        // `pg_has_role(... ) OR has_column_privilege(...)`, so a dump taken
+        // by a role without privileges on a table silently produces an empty
+        // column list. pg_catalog views have no such filter, which keeps the
+        // dump faithful regardless of the connecting role's grants.
+        //
+        // For the typmod-derived metrics (character/numeric/datetime
+        // precisions, interval type) we still call the
+        // `information_schema._pg_*` helper functions: they're plain SQL
+        // helpers that the standard view itself uses internally, and unlike
+        // the view they aren't privilege-filtered.
         format!(
-                        "SELECT
-                                c.table_catalog,
-                                quote_ident(c.table_schema) as table_schema,
-                                quote_ident(c.table_name) as table_name,
-                                c.table_schema as raw_table_schema,
-                                c.table_name as raw_table_name,
-                                quote_ident(c.column_name) as column_name,
-                                c.ordinal_position,
-                                c.column_default,
-                                c.is_nullable,
-                                CASE
-                                        WHEN c.data_type IN ('USER-DEFINED', 'ARRAY')
-                                                THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
-                                        ELSE c.data_type
-                                END AS formatted_data_type,
-                                c.character_maximum_length,
-                                c.character_octet_length,
-                                c.numeric_precision,
-                                c.numeric_precision_radix,
-                                c.numeric_scale,
-                                c.datetime_precision,
-                                c.interval_type,
-                                c.interval_precision,
-                                c.character_set_catalog,
-                                c.character_set_schema,
-                                c.character_set_name,
-                                c.collation_catalog,
-                                c.collation_schema,
-                                c.collation_name,
-                                c.domain_catalog,
-                                c.domain_schema,
-                                c.domain_name,
-                                c.udt_catalog,
-                                c.udt_schema,
-                                c.udt_name,
-                                c.scope_catalog,
-                                c.scope_schema,
-                                c.scope_name,
-                                c.maximum_cardinality,
-                                c.dtd_identifier,
-                                c.is_self_referencing,
-                                c.is_identity,
-                                c.identity_generation,
-                                c.identity_start,
-                                c.identity_increment,
-                                c.identity_maximum,
-                                c.identity_minimum,
-                                c.identity_cycle,
-                                c.is_generated,
-                                c.generation_expression,
-                                a.attgenerated::text as attgenerated,
-                                a.attstorage::text as col_storage,
-                                a.attstattarget::int4 as col_stattarget,
-                                c.is_updatable,
-                                pd.description as column_comment{compression_col},
-                                coalesce(
-                                        (select array_agg(acl_item::text) from unnest(a.attacl) as acl_item),
-                                        '{{}}'::text[]
-                                ) as col_acl,
-                                (
-                                        SELECT string_agg(DISTINCT rel, ', ')
-                                        FROM (
-                                            SELECT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name) AS rel
-                                            FROM information_schema.view_column_usage v
-                                            WHERE v.table_schema = c.table_schema
-                                                AND v.table_name  = c.table_name
-                                                AND v.column_name = c.column_name
-                                            UNION ALL
-                                            SELECT quote_ident(mn.nspname) || '.' || quote_ident(mc.relname) AS rel
-                                            FROM pg_attribute  pa
-                                            JOIN pg_class      tc  ON tc.oid           = pa.attrelid
-                                            JOIN pg_namespace  tn  ON tn.oid           = tc.relnamespace
-                                            JOIN pg_depend     dep ON dep.refobjid     = pa.attrelid
-                                                                  AND dep.refobjsubid  = pa.attnum
-                                                                  AND dep.deptype      = 'n'
-                                            JOIN pg_class      mc  ON mc.oid = dep.objid AND mc.relkind = 'm'
-                                            JOIN pg_namespace  mn  ON mn.oid = mc.relnamespace
-                                            WHERE tn.nspname = c.table_schema
-                                              AND tc.relname = c.table_name
-                                              AND pa.attname = c.column_name
-                                              AND pa.attnum  > 0
-                                              AND pa.attisdropped = false
-                                        ) sub
-                                ) AS related_views
-                         FROM information_schema.columns c
-                         JOIN pg_catalog.pg_namespace ns
-                             ON ns.nspname = c.table_schema
-                         JOIN pg_catalog.pg_class cls
-                             ON cls.relnamespace = ns.oid
-                            AND cls.relname = c.table_name
-                         JOIN pg_catalog.pg_attribute a
-                             ON a.attrelid = cls.oid
-                            AND a.attname = c.column_name
-                            AND a.attnum > 0
-                            AND a.attisdropped = false
-                         LEFT JOIN pg_description pd
-                             ON pd.objoid = cls.oid
-                            AND pd.classoid = 'pg_class'::regclass
-                            AND pd.objsubid = a.attnum
-                        WHERE c.table_schema IN {schema_filter}
-                        ORDER BY c.table_schema, c.table_name, c.ordinal_position"
+            "SELECT
+                current_database()::text as table_catalog,
+                quote_ident(nc.nspname) as table_schema,
+                quote_ident(c.relname) as table_name,
+                nc.nspname as raw_table_schema,
+                c.relname as raw_table_name,
+                quote_ident(a.attname) as column_name,
+                a.attnum::int4 as ordinal_position,
+                pg_get_expr(ad.adbin, ad.adrelid) as column_default,
+                CASE
+                    WHEN a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) THEN 'NO'
+                    ELSE 'YES'
+                END as is_nullable,
+                CASE
+                    WHEN (
+                        (t.typtype = 'd' AND bt.typelem <> 0 AND bt.typlen = -1)
+                        OR (t.typtype <> 'd' AND t.typelem <> 0 AND t.typlen = -1)
+                    )
+                    THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    WHEN (
+                        (t.typtype = 'd' AND nbt.nspname IS NOT NULL AND nbt.nspname <> 'pg_catalog')
+                        OR (t.typtype <> 'd' AND nt.nspname <> 'pg_catalog')
+                    )
+                    THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    WHEN t.typtype = 'd' THEN pg_catalog.format_type(t.typbasetype, NULL)
+                    ELSE pg_catalog.format_type(a.atttypid, NULL)
+                END AS formatted_data_type,
+                information_schema._pg_char_max_length(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as character_maximum_length,
+                information_schema._pg_char_octet_length(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as character_octet_length,
+                information_schema._pg_numeric_precision(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as numeric_precision,
+                information_schema._pg_numeric_precision_radix(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as numeric_precision_radix,
+                information_schema._pg_numeric_scale(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as numeric_scale,
+                information_schema._pg_datetime_precision(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as datetime_precision,
+                information_schema._pg_interval_type(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                ) as interval_type,
+                NULL::int4 as interval_precision,
+                NULL::text as character_set_catalog,
+                NULL::text as character_set_schema,
+                NULL::text as character_set_name,
+                CASE
+                    WHEN co.collname IS NOT NULL
+                         AND NOT (nco.nspname = 'pg_catalog' AND co.collname = 'default')
+                    THEN current_database()
+                    ELSE NULL
+                END as collation_catalog,
+                CASE
+                    WHEN co.collname IS NOT NULL
+                         AND NOT (nco.nspname = 'pg_catalog' AND co.collname = 'default')
+                    THEN nco.nspname
+                    ELSE NULL
+                END as collation_schema,
+                CASE
+                    WHEN co.collname IS NOT NULL
+                         AND NOT (nco.nspname = 'pg_catalog' AND co.collname = 'default')
+                    THEN co.collname
+                    ELSE NULL
+                END as collation_name,
+                CASE WHEN t.typtype = 'd' THEN current_database() ELSE NULL END as domain_catalog,
+                CASE WHEN t.typtype = 'd' THEN nt.nspname ELSE NULL END as domain_schema,
+                CASE WHEN t.typtype = 'd' THEN t.typname ELSE NULL END as domain_name,
+                current_database() as udt_catalog,
+                COALESCE(nbt.nspname, nt.nspname) as udt_schema,
+                COALESCE(bt.typname, t.typname) as udt_name,
+                NULL::text as scope_catalog,
+                NULL::text as scope_schema,
+                NULL::text as scope_name,
+                NULL::int4 as maximum_cardinality,
+                a.attnum::text as dtd_identifier,
+                'NO' as is_self_referencing,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN 'YES' ELSE 'NO' END as is_identity,
+                CASE a.attidentity
+                    WHEN 'a' THEN 'ALWAYS'
+                    WHEN 'd' THEN 'BY DEFAULT'
+                    ELSE NULL
+                END as identity_generation,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqstart::text ELSE NULL END as identity_start,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqincrement::text ELSE NULL END as identity_increment,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqmax::text ELSE NULL END as identity_maximum,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqmin::text ELSE NULL END as identity_minimum,
+                CASE
+                    WHEN a.attidentity IN ('a', 'd')
+                    THEN CASE WHEN ps.seqcycle THEN 'YES' ELSE 'NO' END
+                    ELSE 'NO'
+                END as identity_cycle,
+                CASE WHEN a.attgenerated <> '' THEN 'ALWAYS' ELSE 'NEVER' END as is_generated,
+                CASE WHEN a.attgenerated <> '' THEN pg_get_expr(ad.adbin, ad.adrelid) ELSE NULL END as generation_expression,
+                a.attgenerated::text as attgenerated,
+                a.attstorage::text as col_storage,
+                a.attstattarget::int4 as col_stattarget,
+                'YES' as is_updatable,
+                pd.description as column_comment{compression_col},
+                COALESCE(
+                    (SELECT array_agg(acl_item::text) FROM unnest(a.attacl) as acl_item),
+                    '{{}}'::text[]
+                ) as col_acl,
+                (
+                    SELECT string_agg(DISTINCT quote_ident(vn.nspname) || '.' || quote_ident(vc.relname), ', ')
+                    FROM pg_depend dep
+                    JOIN pg_rewrite r
+                        ON r.oid = dep.objid
+                       AND dep.classid = 'pg_rewrite'::regclass
+                    JOIN pg_class vc
+                        ON vc.oid = r.ev_class
+                       AND vc.relkind IN ('v', 'm')
+                       AND vc.oid <> a.attrelid
+                    JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+                    WHERE dep.refclassid = 'pg_class'::regclass
+                      AND dep.refobjid = a.attrelid
+                      AND dep.refobjsubid = a.attnum
+                      AND dep.deptype = 'n'
+                ) AS related_views
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace nc ON nc.oid = c.relnamespace
+            JOIN pg_type t ON t.oid = a.atttypid
+            JOIN pg_namespace nt ON nt.oid = t.typnamespace
+            LEFT JOIN pg_type bt ON t.typtype = 'd' AND bt.oid = t.typbasetype
+            LEFT JOIN pg_namespace nbt ON nbt.oid = bt.typnamespace
+            LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+            LEFT JOIN pg_collation co ON co.oid = a.attcollation
+            LEFT JOIN pg_namespace nco ON nco.oid = co.collnamespace
+            LEFT JOIN pg_depend ident_dep
+                ON ident_dep.refclassid = 'pg_class'::regclass
+               AND ident_dep.refobjid = a.attrelid
+               AND ident_dep.refobjsubid = a.attnum
+               AND ident_dep.classid = 'pg_class'::regclass
+               AND ident_dep.deptype = 'i'
+            LEFT JOIN pg_class seq ON seq.oid = ident_dep.objid AND seq.relkind = 'S'
+            LEFT JOIN pg_sequence ps ON ps.seqrelid = seq.oid
+            LEFT JOIN pg_description pd
+                ON pd.objoid = c.oid
+               AND pd.classoid = 'pg_class'::regclass
+               AND pd.objsubid = a.attnum
+            WHERE nc.nspname IN {schema_filter}
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND c.relkind IN ('r','v','m','f','p')
+            ORDER BY nc.nspname, c.relname, a.attnum"
         )
     }
 
@@ -1021,7 +1090,8 @@ impl Table {
             // 2. Add column definitions
             // Build a map from column name (lowered) to named NOT NULL constraint.
             // A NOT NULL constraint is "named" if its name differs from PG's
-            // auto-generated default "{table}_{col}_not_null".
+            // auto-generated default "{table}_{col}_not_null" (or that name with
+            // a numeric suffix that PG appends to resolve cross-table collisions).
             let named_nn_constraints: HashMap<String, &TableConstraint> = self
                 .constraints
                 .iter()
@@ -1030,13 +1100,10 @@ impl Table {
                     let def = c.definition.as_deref()?;
                     let def_lower = def.to_lowercase();
                     let col_name = def_lower.strip_prefix("not null ")?.trim().to_string();
-                    let raw_cname = c.name.trim_matches('"');
-                    let raw_col = col_name.trim_matches('"');
-                    let default_name = format!("{}_{}_not_null", self.raw_name, raw_col);
-                    if !raw_cname.eq_ignore_ascii_case(&default_name) {
-                        Some((col_name, c))
-                    } else {
+                    if c.auto_not_null_column(&self.raw_name).is_some() {
                         None
+                    } else {
+                        Some((col_name, c))
                     }
                 })
                 .collect();
@@ -1546,6 +1613,29 @@ impl Table {
             }
         }
 
+        // Match constraints by name, except for NOT NULL constraints with
+        // auto-generated names: those are matched by column because PG's
+        // auto-generated name may differ between databases (collision suffixes).
+        let find_old = |new_c: &TableConstraint| -> Option<&TableConstraint> {
+            if let Some(found) = self.constraints.iter().find(|c| c.name == new_c.name) {
+                return Some(found);
+            }
+            let new_col = new_c.auto_not_null_column(&to_table.raw_name)?;
+            self.constraints
+                .iter()
+                .find(|c| c.auto_not_null_column(&self.raw_name).as_deref() == Some(new_col.as_str()))
+        };
+        let find_new = |old_c: &TableConstraint| -> Option<&TableConstraint> {
+            if let Some(found) = to_table.constraints.iter().find(|c| c.name == old_c.name) {
+                return Some(found);
+            }
+            let old_col = old_c.auto_not_null_column(&self.raw_name)?;
+            to_table
+                .constraints
+                .iter()
+                .find(|c| c.auto_not_null_column(&to_table.raw_name).as_deref() == Some(old_col.as_str()))
+        };
+
         // Collect constraint changes; drop statements run before column drops
         for new_constraint in &to_table.constraints {
             let is_fk = new_constraint.constraint_type.to_lowercase() == "foreign key";
@@ -1555,12 +1645,21 @@ impl Table {
             if is_target_partition && !is_fk && new_constraint.coninhcount > 0 {
                 continue;
             }
-            if let Some(old_constraint) = self
-                .constraints
-                .iter()
-                .find(|c| c.name == new_constraint.name)
-            {
-                if old_constraint != new_constraint {
+            if let Some(old_constraint) = find_old(new_constraint) {
+                // Auto-named NOT NULL on the same column is semantically a no-op
+                // regardless of the numeric suffix PG chose for the name.
+                let both_auto_nn = old_constraint
+                    .auto_not_null_column(&self.raw_name)
+                    .is_some()
+                    && new_constraint
+                        .auto_not_null_column(&to_table.raw_name)
+                        .is_some();
+                let nn_equivalent = both_auto_nn
+                    && old_constraint.is_enforced == new_constraint.is_enforced
+                    && old_constraint.no_inherit == new_constraint.no_inherit
+                    && old_constraint.comment == new_constraint.comment;
+
+                if old_constraint != new_constraint && !nn_equivalent {
                     if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
                         if !is_fk {
                             constraint_post_script.push_str(&alter_script);
@@ -1599,11 +1698,7 @@ impl Table {
             {
                 continue;
             }
-            if !to_table
-                .constraints
-                .iter()
-                .any(|c| c.name == old_constraint.name)
-            {
+            if find_new(old_constraint).is_none() {
                 let drop_cmd = old_constraint.get_drop_script();
                 if use_drop {
                     constraint_pre_script.push_str(&drop_cmd);
@@ -4521,6 +4616,132 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_generated_not_null_with_numeric_suffix_skips_constraint_keyword() {
+        // PG appends a numeric suffix to resolve cross-table auto-name collisions.
+        // The result is still semantically anonymous and should not be emitted
+        // with the CONSTRAINT keyword in the column definition.
+        let table = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("users_name_not_null1", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = table.get_script();
+        assert!(
+            script.contains("name text not null"),
+            "expected plain NOT NULL for auto-generated suffixed name: {script}"
+        );
+        assert!(
+            !script.contains("constraint users_name_not_null1"),
+            "auto-generated NOT NULL name with suffix should not use CONSTRAINT keyword: {script}"
+        );
+    }
+
+    #[test]
+    fn test_auto_named_not_null_swap_produces_no_diff() {
+        // Reproduces the cross-table auto-name swap scenario:
+        // OLD has "users_name_not_null", NEW has "users_name_not_null1" on the
+        // same column. Both are auto-generated names — diff must be empty.
+        let from = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("users_name_not_null", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+        let to = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("users_name_not_null1", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            !script.contains("drop constraint users_name_not_null"),
+            "auto-name suffix swap must not emit a drop: {script}"
+        );
+        assert!(
+            !script.contains("add constraint users_name_not_null"),
+            "auto-name suffix swap must not emit an add: {script}"
+        );
+    }
+
+    #[test]
+    fn test_named_to_auto_named_not_null_still_diffs() {
+        // A user-named NOT NULL ("name_must_exist") replaced with an auto-named
+        // one is a real change — diff should drop+add.
+        let from = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("name_must_exist", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+        let to = Table::new(
+            "public".to_string(),
+            "users".to_string(),
+            "public".to_string(),
+            "users".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![identity_column("id", 1, "integer"), name_column()],
+            vec![
+                primary_key_constraint(),
+                not_null_constraint("users_name_not_null", "name"),
+            ],
+            vec![primary_key_index()],
+            vec![],
+            None,
+        );
+
+        let script = from.get_alter_script(&to, true);
+        assert!(
+            script.contains("drop constraint name_must_exist"),
+            "renaming away from a user-chosen name must still emit a drop: {script}"
+        );
+    }
+
+    #[test]
     fn fetch_columns_query_casts_attstattarget_to_int4() {
         let query = Table::build_columns_query("", "('public')");
 
@@ -4531,6 +4752,30 @@ mod tests {
         assert!(
             query.contains("pd.classoid = 'pg_class'::regclass"),
             "expected pg_class classoid filter for table column comments"
+        );
+    }
+
+    #[test]
+    fn fetch_columns_query_uses_pg_catalog_not_information_schema_columns() {
+        // information_schema.columns is filtered by `pg_has_role(...) OR
+        // has_column_privilege(...)`, so dumps taken by a role without
+        // privileges silently lose columns of tables it can't read. The
+        // query must read from pg_attribute directly.
+        let query = Table::build_columns_query("", "('public')");
+
+        assert!(
+            !query.contains("information_schema.columns"),
+            "build_columns_query must not read from information_schema.columns \
+             (privilege-filtered); use pg_attribute directly. Query was:\n{query}"
+        );
+        assert!(
+            query.contains("FROM pg_attribute a"),
+            "expected pg_attribute as the column source. Query was:\n{query}"
+        );
+        assert!(
+            !query.contains("information_schema.view_column_usage"),
+            "related_views lookup must not use information_schema.view_column_usage \
+             (privilege-filtered); use pg_depend/pg_rewrite. Query was:\n{query}"
         );
     }
 
