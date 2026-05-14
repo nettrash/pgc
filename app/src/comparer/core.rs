@@ -3508,17 +3508,23 @@ impl Comparer {
         if name.is_empty() {
             return false;
         }
+        // Iterate via `match_indices`, which yields byte offsets that are
+        // guaranteed UTF-8 char boundaries. The previous loop used
+        // `text[start..]` with `start = i + 1`, which panics when `name`
+        // contains non-ASCII bytes (PostgreSQL allows Unicode
+        // identifiers like `"русское_имя"`): `i + 1` lands inside a
+        // multi-byte codepoint and the next slice fails. The boundary
+        // checks below are pure byte comparisons against ASCII, so a
+        // non-ASCII neighbour byte simply fails every `is_ascii_*` test
+        // — that's the desired behaviour, since the call gate further
+        // down requires `(` (after optional ASCII whitespace) and any
+        // non-paren byte exits without matching.
         let bytes = text.as_bytes();
         let name_len = name.len();
-        let mut start = 0;
-        while let Some(pos) = text[start..].find(name) {
-            let i = start + pos;
-            let next_search = i + 1;
-
+        for (i, _) in text.match_indices(name) {
             if i > 0 {
                 let before = bytes[i - 1];
                 if before.is_ascii_alphanumeric() || before == b'_' || before == b'.' {
-                    start = next_search;
                     continue;
                 }
             }
@@ -3526,11 +3532,9 @@ impl Comparer {
             if end < bytes.len() {
                 let after = bytes[end];
                 if after.is_ascii_alphanumeric() || after == b'_' {
-                    start = next_search;
                     continue;
                 }
             }
-            // Skip whitespace, then require `(`.
             let mut j = end;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -3538,7 +3542,6 @@ impl Comparer {
             if j < bytes.len() && bytes[j] == b'(' {
                 return true;
             }
-            start = next_search;
         }
         false
     }

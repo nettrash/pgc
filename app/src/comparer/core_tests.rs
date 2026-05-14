@@ -7421,6 +7421,42 @@ fn issue179_unqualified_match_rejects_substrings_and_non_calls() {
     ));
 }
 
+#[test]
+fn issue179_unqualified_match_handles_non_ascii_identifiers() {
+    // PostgreSQL allows Unicode identifiers (quoted), and the dump's
+    // `quote_ident` machinery preserves them. After `prelower_pair`
+    // strips the surrounding quotes the haystack and needle both
+    // contain raw multi-byte UTF-8 — the previous implementation did
+    // `text[start..]` with `start = i + 1` and panicked on the next
+    // iteration because byte index `i + 1` lands inside a codepoint.
+    // Drive the matcher with a Cyrillic name and several haystacks to
+    // ensure: (a) it returns true for a real call, (b) it returns
+    // false for a non-call use without panicking, and (c) it returns
+    // false for a substring without panicking.
+    let mut affected: HashSet<(String, String)> = HashSet::new();
+    affected.insert(("test_schema".to_string(), "функция".to_string()));
+
+    assert!(Comparer::definition_references_any(
+        "check (функция(value) > 0)",
+        &affected
+    ));
+    assert!(!Comparer::definition_references_any(
+        "check (функция > 0)",
+        &affected
+    ));
+    // Repeated occurrences without a `(` — would have triggered the
+    // panic on the post-match `start = i + 1` advance.
+    assert!(!Comparer::definition_references_any(
+        "check (функция функция функция > 0)",
+        &affected
+    ));
+    // Substring (Cyrillic suffix) must not falsely match.
+    assert!(!Comparer::definition_references_any(
+        "check (функция_v2(value) > 0)",
+        &affected
+    ));
+}
+
 #[tokio::test]
 async fn issue179_quoted_routine_name_recreates_dependents() {
     // The dump query wraps `proname` with `quote_ident`, so a
