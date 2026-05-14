@@ -55,7 +55,26 @@
                       a quoted `"MyFunc"` (the dump query wraps
                       `nspname` / `proname` with `quote_ident`) lines
                       up with the quote-stripped `myfunc(` in
-                      dependent text. `Routine::hash()` now
+                      dependent text. The qualified matcher requires
+                      the same `(` call gate so a routine sharing its
+                      name with a table / sequence / view in the same
+                      schema does not false-positive on the deparsed
+                      `ON schema.table` of a CREATE INDEX or the
+                      `'schema.seq'::regclass` of a `nextval` default.
+                      Each recreate is also gated on the *TO-side*
+                      definition still referencing the affected
+                      routine. `compare_tables()` runs before
+                      `compare_routines_and_views()`, so a dependent
+                      that has been rewritten to no longer reference
+                      the function reaches the CASCADE step with the
+                      `pg_depend` link already broken and PostgreSQL
+                      leaves it intact; re-emitting in that case is
+                      wasted work for constraints / indexes / policies
+                      and *destructive* for generated columns —
+                      `DROP COLUMN IF EXISTS` cascades to indexes,
+                      FKs, and constraints attached to the column,
+                      none of which Phase 7 restores. `Routine::hash()`
+                      now
                       incorporates `arguments_defaults` so
                       `Comparer::emit_routine_diff` and Phase 7's
                       CASCADE-recreate detection both see defaults-

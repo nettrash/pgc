@@ -3305,10 +3305,29 @@ impl Comparer {
             let is_target_partition =
                 from_table.partition_of.is_some() && to_table.partition_of.is_some();
 
-            // CHECK and EXCLUDE constraints can reference functions; FKs
-            // and PKs cannot — skip them to avoid spurious matches in
-            // their textual `definition` (e.g. a referenced table named
-            // similarly to a routine).
+            // Each scan below requires BOTH FROM and TO to reference an
+            // affected routine before re-emitting:
+            //
+            // * FROM-reference is necessary to know the dependent
+            //   *had* a `pg_depend` link to the function before the
+            //   migration began — otherwise CASCADE would never have
+            //   touched it in the first place.
+            //
+            // * TO-reference is necessary because `compare_tables()`
+            //   runs *before* `compare_routines_and_views()` and may
+            //   already have rewritten the dependent to its TO-side
+            //   form, breaking the dependency. Once the link is gone,
+            //   `DROP FUNCTION ... CASCADE` leaves the object alone —
+            //   re-emitting a recreate would be redundant for
+            //   constraints/indexes/policies and *destructive* for
+            //   generated columns: `DROP COLUMN IF EXISTS` cascades to
+            //   indexes, constraints, and FKs that reference the
+            //   column, none of which Phase 7 restores.
+            //
+            // CHECK and EXCLUDE constraints can reference functions;
+            // FKs and PKs cannot — skip them to avoid spurious matches
+            // in their textual `definition` (e.g. a referenced table
+            // named similarly to a routine).
             for constraint in &from_table.constraints {
                 let is_check = constraint.constraint_type.eq_ignore_ascii_case("check")
                     || constraint.constraint_type.eq_ignore_ascii_case("exclude");
@@ -3332,6 +3351,19 @@ impl Comparer {
                 // (coninhcount > 0) propagate from the parent and must
                 // not be re-emitted locally.
                 if is_target_partition && to_constraint.coninhcount > 0 {
+                    continue;
+                }
+                // TO-side gate: skip when the TO definition no longer
+                // references the affected routine — `compare_tables`
+                // has rewritten the constraint, the new form has no
+                // pg_depend link to the function, CASCADE will leave
+                // it intact, and re-emitting would be wasted work.
+                let to_def_refs = to_constraint
+                    .definition
+                    .as_deref()
+                    .map(|d| Self::definition_references_any(d, &affected))
+                    .unwrap_or(false);
+                if !to_def_refs {
                     continue;
                 }
                 let key = format!(
@@ -3363,6 +3395,10 @@ impl Comparer {
                     continue;
                 };
                 if to_index.is_partition_index {
+                    continue;
+                }
+                // TO-side gate: see the constraint scan above.
+                if !Self::definition_references_any(&to_index.indexdef, &affected) {
                     continue;
                 }
                 let key = format!("index:{}.{}", to_index.schema, to_index.name);
@@ -3404,6 +3440,26 @@ impl Comparer {
                     };
 
                     if generation_referenced {
+                        // TO-side gate: only `DROP COLUMN IF EXISTS` +
+                        // re-add the column when TO is *still* a
+                        // generated column whose expression references
+                        // the affected routine. If TO has dropped the
+                        // generation expression or rewritten it to no
+                        // longer reference the function, the column
+                        // survives CASCADE intact and dropping it here
+                        // would cascade-destroy any indexes / FKs /
+                        // constraints attached to it — none of which
+                        // Phase 7 knows how to restore.
+                        let to_generation_refs =
+                            to_column.is_generated.eq_ignore_ascii_case("ALWAYS")
+                                && to_column
+                                    .generation_expression
+                                    .as_deref()
+                                    .map(|e| Self::definition_references_any(e, &affected))
+                                    .unwrap_or(false);
+                        if !to_generation_refs {
+                            continue;
+                        }
                         let key = format!(
                             "column-generated:{}.{}.{}",
                             to_column.schema, to_column.table, to_column.name
@@ -3416,6 +3472,16 @@ impl Comparer {
                             );
                         }
                     } else if default_referenced && let Some(default) = &to_column.column_default {
+                        // TO-side gate: only re-set the DEFAULT when
+                        // TO's default itself still references the
+                        // affected routine. If TO has switched to a
+                        // function-free default (or no default), the
+                        // CASCADE leaves the column alone and
+                        // `compare_tables` already emitted the right
+                        // ALTER COLUMN SET DEFAULT.
+                        if !Self::definition_references_any(default, &affected) {
+                            continue;
+                        }
                         let key = format!(
                             "column-default:{}.{}.{}",
                             to_column.schema, to_column.table, to_column.name
@@ -3452,6 +3518,20 @@ impl Comparer {
                 else {
                     continue;
                 };
+                // TO-side gate: same rationale as constraints/indexes.
+                let to_policy_refs = to_policy
+                    .using_clause
+                    .as_deref()
+                    .map(|c| Self::definition_references_any(c, &affected))
+                    .unwrap_or(false)
+                    || to_policy
+                        .check_clause
+                        .as_deref()
+                        .map(|c| Self::definition_references_any(c, &affected))
+                        .unwrap_or(false);
+                if !to_policy_refs {
+                    continue;
+                }
                 let key = format!(
                     "policy:{}.{}.{}",
                     to_policy.schema, to_policy.table, to_policy.name

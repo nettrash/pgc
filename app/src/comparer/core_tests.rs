@@ -7503,6 +7503,222 @@ fn issue179_qualified_match_requires_call_context() {
 }
 
 #[tokio::test]
+async fn issue179_to_side_gate_skips_dependents_no_longer_referencing_routine() {
+    // `compare_tables()` runs before `compare_routines_and_views()`, so
+    // dependents that have been rewritten to no longer reference the
+    // affected routine reach the CASCADE-drop step with the dependency
+    // already broken — PostgreSQL leaves them alone. Phase 7 must NOT
+    // re-emit recreates for those: doing so is at best wasteful and at
+    // worst destructive (a `DROP COLUMN IF EXISTS` for a generated
+    // column also drops every index / FK / constraint attached to the
+    // column, none of which Phase 7 restores).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    // FROM table: every dependent references `test_deps.compute`.
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+
+    // TO table: dependents have been rewritten to NOT reference
+    // `test_deps.compute` anymore. After `compare_tables` runs they
+    // exist in this rewritten form, so the `DROP FUNCTION ... CASCADE`
+    // does not touch them.
+    let mut value_col = int_column("test_deps", "items", "value", 1);
+    value_col.is_nullable = false;
+
+    let mut def_col = int_column("test_deps", "items", "def_col", 2);
+    def_col.data_type = "integer".to_string();
+    def_col.column_default = Some("0".to_string()); // no longer references compute
+
+    let mut gen_col = int_column("test_deps", "items", "gen_col", 3);
+    gen_col.data_type = "integer".to_string();
+    gen_col.is_generated = "ALWAYS".to_string();
+    gen_col.generation_expression = Some("(value * 3)".to_string()); // no compute()
+    gen_col.generation_type = Some("s".to_string());
+
+    let chk = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "chk_compute".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        // No compute() here either — TO swapped it out.
+        definition: Some("CHECK (value > 0)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "idx_compute".to_string(),
+        catalog: Some("postgres".to_string()),
+        // No compute() in the index expression either.
+        indexdef: "CREATE INDEX idx_compute ON test_deps.items USING btree (value)".to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let policy = TablePolicy {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "p_items".to_string(),
+        command: "all".to_string(),
+        permissive: true,
+        roles: vec![],
+        // No compute() in the policy clause either.
+        using_clause: Some("(value > 0)".to_string()),
+        check_clause: None,
+    };
+
+    let mut to_table = Table::new(
+        "test_deps".to_string(),
+        "items".to_string(),
+        "test_deps".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col, def_col, gen_col],
+        vec![chk],
+        vec![idx],
+        vec![],
+        None,
+    );
+    to_table.policies = vec![policy];
+    to_table.has_rowsecurity = true;
+    to_table.hash();
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // Function still gets the CASCADE drop (signature change still
+    // requires DROP+CREATE).
+    assert!(
+        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
+        "function drop must still be emitted: {}",
+        script
+    );
+
+    // CRITICAL: the destructive generated-column path must stay silent.
+    assert!(
+        !script.contains("alter table test_deps.items drop column if exists gen_col"),
+        "generated column must NOT be dropped+re-added when TO no longer references the routine — that would cascade-destroy attached indexes/FKs without restoring them: {}",
+        script
+    );
+    assert!(
+        !script.contains("alter table test_deps.items add column gen_col"),
+        "generated column add must not be emitted when TO does not reference the routine: {}",
+        script
+    );
+
+    // Constraint, index, and policy recreates must also be skipped to
+    // avoid redundant work that would conflict with `compare_tables`.
+    assert!(
+        !script.contains("alter table test_deps.items add constraint chk_compute"),
+        "CHECK recreate must not fire when TO definition no longer references the routine: {}",
+        script
+    );
+    assert!(
+        !script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        "index recreate must not fire when TO indexdef no longer references the routine: {}",
+        script
+    );
+    assert!(
+        !script.contains("create policy p_items"),
+        "policy recreate must not fire when TO clauses no longer reference the routine: {}",
+        script
+    );
+
+    // Column DEFAULT must also be skipped (TO default is `0`, no
+    // function reference).
+    assert!(
+        !script.contains("alter table test_deps.items alter column def_col set default 0;"),
+        "column DEFAULT recreate must not fire when TO default no longer references the routine: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue179_to_side_gate_still_recreates_when_to_keeps_reference() {
+    // Sanity check on the gate: when TO *does* still reference the
+    // affected routine (e.g. the dependent definition is unchanged),
+    // Phase 7 must continue to emit recreates exactly as before.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)::integer",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table(
+        "bigint",
+        "test_deps.compute(0)",
+        "bigint",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // Each kind of dependent must be re-emitted because TO still
+    // references the routine.
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_compute"),
+        "CHECK constraint recreate expected when TO still references the routine: {}",
+        script
+    );
+    assert!(
+        script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        "index recreate expected when TO still references the routine: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_deps.items add column gen_col"),
+        "generated column recreate expected when TO still references the routine: {}",
+        script
+    );
+    assert!(
+        script.contains(
+            "alter table test_deps.items alter column def_col set default test_deps.compute(0);"
+        ),
+        "column DEFAULT recreate expected when TO still references the routine: {}",
+        script
+    );
+    assert!(
+        script.contains("create policy p_items on test_deps.items"),
+        "policy recreate expected when TO still references the routine: {}",
+        script
+    );
+}
+
+#[tokio::test]
 async fn issue179_quoted_routine_name_recreates_dependents() {
     // The dump query wraps `proname` with `quote_ident`, so a
     // mixed-case routine like `MyFunc` arrives as `"MyFunc"`. The
