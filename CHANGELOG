@@ -1,3 +1,19 @@
+2026-05-14      v1.0.21
+
+                Enhancements:
+                    - Resolved issue #192 (separate tests into
+                      `_tests.rs` files): every dump/, comparer/,
+                      config/, and utils/ source file that used to
+                      embed `#[cfg(test)] mod tests { ... }` at the
+                      bottom now declares a sibling test module via
+                      `#[cfg(test)] #[path = "<name>_tests.rs"] mod
+                      tests;`, with the test bodies moved verbatim
+                      into the new `<name>_tests.rs` files. This
+                      matches the existing convention already used
+                      by `comparer/core.rs` and `comparer/core_tests.rs`
+                      and keeps production code files readable
+                      without changing what `cargo test` runs.
+
 2026-05-14      v1.0.20
 
                 Bug fixes:
