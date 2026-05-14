@@ -44,6 +44,27 @@
                       unqualified pass requires a `(` after the
                       identifier (with whitespace tolerance) so it only
                       matches function-call positions.
+                    - Phase 7's affected-routine set now stores the
+                      quote-stripped lowercase form of `schema` and
+                      `name`. The dump query wraps `nspname` / `proname`
+                      with `quote_ident`, so a routine named `MyFunc`
+                      arrives as `"MyFunc"`; both matchers operate on
+                      the quote-stripped half of `prelower_pair`, so a
+                      quoted needle would otherwise never line up with
+                      the deparsed `myfunc(` in dependent text.
+                    - `Routine::hash()` now incorporates
+                      `arguments_defaults`. PostgreSQL has no
+                      `ALTER FUNCTION ... ARGUMENT ... DEFAULT`, so a
+                      defaults-only change requires DROP+CREATE — but
+                      the previous hash excluded defaults, leaving
+                      `Comparer::emit_routine_diff` (and Phase 7's
+                      CASCADE-recreate detection) blind to defaults-
+                      only diffs and silently dropping the change.
+                      Note: this changes hash output, so a v1.0.19
+                      dump compared against a v1.0.20 dump may flag
+                      every routine carrying defaults as changed even
+                      when the body is identical; rebuild the FROM
+                      dump under v1.0.20 to suppress the noise.
 
 2026-05-03      v1.0.19
 

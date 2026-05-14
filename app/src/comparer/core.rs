@@ -3253,9 +3253,17 @@ impl Comparer {
                 }
             };
             if cascaded {
+                // The dump query wraps `nspname` / `proname` with
+                // `quote_ident` (see `dump/core.rs`), so a routine named
+                // `MyFunc` lands here as `"MyFunc"`. Strip the quotes
+                // before storing — both matchers below operate on
+                // quote-stripped haystacks (`unquoted` half of
+                // `prelower_pair`), and the qualified matcher already
+                // re-strips its pattern internally, so a quote-free
+                // needle works for both forms.
                 affected.insert((
-                    from_routine.schema.to_lowercase(),
-                    from_routine.name.to_lowercase(),
+                    from_routine.schema.to_lowercase().replace('"', ""),
+                    from_routine.name.to_lowercase().replace('"', ""),
                 ));
             }
         }

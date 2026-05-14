@@ -7421,6 +7421,176 @@ fn issue179_unqualified_match_rejects_substrings_and_non_calls() {
     ));
 }
 
+#[tokio::test]
+async fn issue179_quoted_routine_name_recreates_dependents() {
+    // The dump query wraps `proname` with `quote_ident`, so a
+    // mixed-case routine like `MyFunc` arrives as `"MyFunc"`. The
+    // unqualified-call matcher operates on the quote-stripped haystack,
+    // so the affected-routine name must also be quote-stripped or
+    // dependents like `CHECK ("MyFunc"(value) > 0)` are missed.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "\"MySchema\"".to_string(),
+        Oid(950),
+        "\"MyFunc\"".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x integer".to_string(),
+        None,
+        None,
+        "SELECT x * 2;".to_string(),
+    );
+    from_routine.hash();
+    from_dump.routines.push(from_routine);
+
+    let mut to_routine = Routine::new(
+        "\"MySchema\"".to_string(),
+        Oid(950),
+        "\"MyFunc\"".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "bigint".to_string(),
+        "x integer".to_string(),
+        None,
+        None,
+        "SELECT (x * 2)::bigint;".to_string(),
+    );
+    to_routine.hash();
+    to_dump.routines.push(to_routine);
+
+    let mut value_col = int_column("public", "items", "value", 1);
+    value_col.is_nullable = false;
+
+    let chk = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "public".to_string(),
+        name: "chk_my".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("CHECK (\"MyFunc\"(value) > 0)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let mut from_table = Table::new(
+        "public".to_string(),
+        "items".to_string(),
+        "public".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col.clone()],
+        vec![chk.clone()],
+        vec![],
+        vec![],
+        None,
+    );
+    from_table.hash();
+    let mut to_table = Table::new(
+        "public".to_string(),
+        "items".to_string(),
+        "public".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col],
+        vec![chk],
+        vec![],
+        vec![],
+        None,
+    );
+    to_table.hash();
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter table public.items add constraint chk_my"),
+        "quoted-name function reference must trigger CHECK recreate: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue179_defaults_only_change_recreates_dependents() {
+    // Defaults-only change: same return type, same arg list, but
+    // `arguments_defaults` differs. PostgreSQL has no `ALTER FUNCTION`
+    // for default values, so the comparer must DROP+CREATE the routine
+    // — and Phase 7 must in turn restore any CASCADE-dropped
+    // dependents. Exercises the `arguments_defaults`-in-hash fix
+    // end-to-end (without the hash inclusion, both `emit_routine_diff`
+    // and Phase 7 silently skip this case).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "test_deps".to_string(),
+        Oid(951),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x integer".to_string(),
+        Some("DEFAULT 0".to_string()),
+        None,
+        "SELECT x * 2;".to_string(),
+    );
+    from_routine.hash();
+    from_dump.routines.push(from_routine);
+
+    let mut to_routine = Routine::new(
+        "test_deps".to_string(),
+        Oid(951),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x integer".to_string(),
+        Some("DEFAULT 1".to_string()),
+        None,
+        "SELECT x * 2;".to_string(),
+    );
+    to_routine.hash();
+    to_dump.routines.push(to_routine);
+
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
+        "defaults-only change must trigger CASCADE drop: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_compute"),
+        "dependent CHECK must be recreated after defaults-only DROP+CREATE: {}",
+        script
+    );
+}
+
 /// Build a partition child of `parent_table` whose dependents (CHECK
 /// constraint with `coninhcount=1`, `is_partition_index=true` index, a
 /// generated column, and a CHECK with `coninhcount=0` so we can prove
@@ -7638,5 +7808,155 @@ async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
     assert!(
         script.contains("create policy p_items on test_deps.items"),
         "policy present in TO must be re-created after CASCADE"
+    );
+}
+
+#[tokio::test]
+async fn issue179_quoted_routine_names_match_unqualified_calls() {
+    // PGC's dump query wraps `nspname` / `proname` with `quote_ident`,
+    // so a function named `MyFunc` lands here as `Routine.name = "MyFunc"`.
+    // Phase 7 must strip those quotes when building its affected set —
+    // otherwise the unqualified matcher (which scans quote-stripped
+    // text) never lines up with the deparsed `myfunc(` in dependents.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "\"TestDeps\"".to_string(),
+        Oid(900),
+        "\"MyFunc\"".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x integer".to_string(),
+        None,
+        None,
+        "SELECT x * 2;".to_string(),
+    );
+    from_routine.hash();
+    let mut to_routine = from_routine.clone();
+    to_routine.return_type = "bigint".to_string();
+    to_routine.source_code = "SELECT (x * 2)::bigint;".to_string();
+    to_routine.hash();
+    from_dump.routines.push(from_routine);
+    to_dump.routines.push(to_routine);
+
+    // Dependent uses the deparsed unqualified form `"MyFunc"(value)`
+    // (PostgreSQL preserves the case-sensitive identifier with quotes
+    // but drops the schema qualifier when the function is in
+    // `search_path`).
+    let chk = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "public".to_string(),
+        name: "chk_myfunc".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("CHECK (\"MyFunc\"(value) > 0)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let mut value_col = int_column("public", "items", "value", 1);
+    value_col.is_nullable = false;
+
+    let mut from_table = Table::new(
+        "public".to_string(),
+        "items".to_string(),
+        "public".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col.clone()],
+        vec![chk.clone()],
+        vec![],
+        vec![],
+        None,
+    );
+    from_table.hash();
+    let mut to_table = Table::new(
+        "public".to_string(),
+        "items".to_string(),
+        "public".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col],
+        vec![chk],
+        vec![],
+        vec![],
+        None,
+    );
+    to_table.hash();
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter table public.items add constraint chk_myfunc"),
+        "quoted routine name must still match its unqualified deparsed dependent: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue179_defaults_only_change_triggers_recreate() {
+    // PostgreSQL has no `ALTER FUNCTION ... ARGUMENT ... DEFAULT`, so a
+    // defaults-only change requires DROP+CREATE. Routine::hash() now
+    // includes `arguments_defaults` so `emit_routine_diff` sees a hash
+    // diff and Phase 7 detects the CASCADE — the dependents must be
+    // recreated.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_routine = Routine::new(
+        "test_deps".to_string(),
+        Oid(900),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x integer".to_string(),
+        Some("0".to_string()),
+        None,
+        "SELECT x * 2;".to_string(),
+    );
+    from_routine.hash();
+    let mut to_routine = from_routine.clone();
+    // ONLY the default value changes — every other field is identical.
+    to_routine.arguments_defaults = Some("1".to_string());
+    to_routine.hash();
+    from_dump.routines.push(from_routine);
+    to_dump.routines.push(to_routine);
+
+    let table = issue179_items_table("integer", "test_deps.compute(0)", "integer");
+    from_dump.tables.push(table.clone());
+    to_dump.tables.push(table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
+        "defaults-only change must still emit CASCADE drop: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_compute"),
+        "Phase 7 must fire on defaults-only change: {}",
+        script
+    );
+    assert!(
+        script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        "Phase 7 must recreate index on defaults-only change: {}",
+        script
     );
 }
