@@ -244,21 +244,32 @@ impl Sequence {
     /// owning table is flipping persistence (the table's `ALTER TABLE
     /// SET LOGGED|UNLOGGED` propagates to the sequence on its own —
     /// re-emitting the full clause list would be cosmetic noise).
+    ///
+    /// Implementation strategy: clone `self`, force its `is_unlogged`
+    /// back to `from`'s value, recompute the hash, and compare. This
+    /// piggy-backs on [`Self::hash`] so any new field added to the
+    /// hash is automatically considered here — there's no field list
+    /// to forget to update. We also explicitly compare the few fields
+    /// that `hash()` deliberately leaves out but `get_alter_script`
+    /// renders (`owned_by_*`); a change there must still block the
+    /// suppression because the table-cascade does NOT propagate
+    /// ownership changes.
     pub fn is_only_persistence_change(&self, from: &Sequence) -> bool {
-        self.is_unlogged != from.is_unlogged
-            && self.schema == from.schema
-            && self.name == from.name
-            && self.owner == from.owner
-            && self.data_type == from.data_type
-            && self.start_value == from.start_value
-            && self.min_value == from.min_value
-            && self.max_value == from.max_value
-            && self.increment_by == from.increment_by
-            && self.cycle == from.cycle
-            && self.cache_size == from.cache_size
-            && self.is_identity == from.is_identity
-            && self.comment == from.comment
-            && self.owned_by_schema == from.owned_by_schema
+        if self.is_unlogged == from.is_unlogged {
+            return false;
+        }
+        // Hash mismatch on the persistence-equalised clone means SOME
+        // hashed field other than `is_unlogged` differs.
+        let mut probe = self.clone();
+        probe.is_unlogged = from.is_unlogged;
+        probe.hash();
+        if probe.hash != from.hash {
+            return false;
+        }
+        // Ownership info is rendered in `get_alter_script` but not
+        // hashed — keep the explicit checks as a belt-and-braces guard
+        // against a behaviour-affecting change being silently dropped.
+        self.owned_by_schema == from.owned_by_schema
             && self.owned_by_table == from.owned_by_table
             && self.owned_by_column == from.owned_by_column
     }

@@ -1865,6 +1865,26 @@ impl Comparer {
     ///
     /// `Table::build_alter_script` deliberately omits the persistence
     /// line so this single phase owns the order. See issue #180.
+    ///
+    /// **FK timing analysis** (issue #184 review thread): this phase
+    /// runs at the end of `compare_tables`, before `compare_foreign_
+    /// keys` has had a chance to add new FKs. The migration order is:
+    ///
+    ///   1. `compare_tables` per-table loop drops FKs whose
+    ///      definition changed (and FROM-only FKs alongside their
+    ///      table). Unchanged FKs are left in place.
+    ///   2. `emit_persistence_changes` (this method) runs the SETs.
+    ///   3. `compare_foreign_keys` re-adds modified FKs and creates
+    ///      new ones.
+    ///
+    /// So the live FK graph at the SET point is exactly the
+    /// **intersection** of FROM and TO by `(table, fk-name,
+    /// definition)` — neither the soon-to-be-added new FKs nor the
+    /// already-dropped modified FKs are active. The adjacency below
+    /// is built from that intersection (rather than the TO-side
+    /// constraints alone) so we don't impose ordering for FKs that
+    /// won't exist at the SET point and so we don't miss ordering
+    /// for FKs that DO exist but will later be dropped+re-added.
     fn emit_persistence_changes(&mut self) {
         let from_table_map: HashMap<(&str, &str), &Table> = self
             .from
@@ -1907,17 +1927,41 @@ impl Comparer {
             return;
         }
 
-        // FK adjacency on the TO side (the live FK shape at the SET
-        // point is whatever `compare_tables` produced, which converges
-        // on TO). `fk_targets[i]` holds the indices of tables that
-        // table `i` references via FK — i.e. `i` *depends on* those.
+        // FK adjacency restricted to the **live** FK set — FKs that
+        // exist in BOTH FROM and TO with the same definition. See the
+        // doc comment above this method for the timing rationale.
+        // `fk_targets[i]` holds the indices of tables that table `i`
+        // references via FK — i.e. `i` *depends on* those.
         let mut fk_targets: Vec<HashSet<usize>> = vec![HashSet::new(); self.to.tables.len()];
-        for (i, table) in self.to.tables.iter().enumerate() {
-            for c in &table.constraints {
+        for (i, to_table) in self.to.tables.iter().enumerate() {
+            // Lift the matching FROM table once so the FK lookup
+            // doesn't pay a per-constraint hashmap miss.
+            let from_table = from_table_map
+                .get(&(to_table.schema.as_str(), to_table.name.as_str()))
+                .copied();
+            for c in &to_table.constraints {
                 if !c.constraint_type.eq_ignore_ascii_case("foreign key") {
                     continue;
                 }
                 let Some(def) = &c.definition else { continue };
+                // Live edge requires the same FK to exist in FROM with
+                // the same definition. A new FK (TO-only) won't be
+                // present at the SET point — `compare_foreign_keys`
+                // adds it later. A modified FK was dropped in the
+                // per-table ALTER loop and is also absent here. Both
+                // get filtered out.
+                let live = from_table
+                    .map(|ft| {
+                        ft.constraints.iter().any(|fc| {
+                            fc.name == c.name
+                                && fc.constraint_type.eq_ignore_ascii_case("foreign key")
+                                && fc.definition.as_deref() == c.definition.as_deref()
+                        })
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    continue;
+                }
                 if let Some((schema, name)) = Self::parse_fk_referenced_table(def)
                     && let Some(&j) = to_index_by_key.get(&(schema.as_str(), name.as_str()))
                     && j != i
@@ -2007,10 +2051,57 @@ impl Comparer {
     /// `FOREIGN KEY (col) REFERENCES schema.table(col)`). Tolerates
     /// quoted identifiers; returns `None` when the definition isn't
     /// recognisably an FK or the referenced identifier is unqualified.
+    ///
+    /// The keyword scan is anchored to a whole-word match — a naive
+    /// `find("references ")` would false-match a column name like
+    /// `"references "` that happened to appear inside the FK column
+    /// list (or any earlier substring containing the literal text).
+    /// The schema/name split is quote-aware so a quoted identifier
+    /// that itself contains a literal `.`
+    /// (e.g. `REFERENCES "weird.schema"."t"(id)`) is split at the
+    /// dot OUTSIDE the quotes, not the first dot in byte order.
     fn parse_fk_referenced_table(def: &str) -> Option<(String, String)> {
         let lower = def.to_lowercase();
-        let start = lower.find("references ")? + "references ".len();
-        let after = &def[start..];
+        let bytes = lower.as_bytes();
+        let kw = b"references";
+        let kw_len = kw.len();
+
+        // Walk every occurrence of "references" until we find one that
+        // sits at an identifier word boundary AND is followed by
+        // whitespace — `pg_get_constraintdef` always renders the
+        // keyword that way. Substring matches inside quoted column
+        // names (the FK column list precedes the keyword) fail one of
+        // these checks: a quoted `"references"` is followed by `"`
+        // (not whitespace), `references_table` is followed by `_`
+        // (still an identifier char), and `xxx_references` is
+        // preceded by `_`.
+        let mut search_from = 0;
+        let kw_pos = loop {
+            if search_from + kw_len > bytes.len() {
+                return None;
+            }
+            let rel = lower[search_from..].find("references")?;
+            let pos = search_from + rel;
+            let left_ok = pos == 0
+                || !{
+                    let b = bytes[pos - 1];
+                    b.is_ascii_alphanumeric() || b == b'_' || b == b'"'
+                };
+            let after_kw = pos + kw_len;
+            let right_ok = after_kw < bytes.len() && bytes[after_kw].is_ascii_whitespace();
+            if left_ok && right_ok {
+                break pos;
+            }
+            // Advance one byte to keep ASCII-byte indices valid; the
+            // haystack is `lower` which is purely ASCII at byte 0 of
+            // each match candidate (because `find` lands on the
+            // ASCII keyword `references`).
+            search_from = pos + 1;
+        };
+
+        // Skip the keyword and the run of whitespace immediately after.
+        let after = (def[kw_pos + kw_len..]).trim_start();
+
         // Scan a single qualified identifier: identifier chars, dot,
         // or quoted segments. Stop at the first non-identifier byte
         // outside quotes (typically `(` for the column list).
@@ -2033,7 +2124,27 @@ impl Comparer {
             }
         }
         let target = &after[..end];
-        let dot = target.find('.')?;
+        Self::split_qualified_name_quote_aware(target)
+    }
+
+    /// Split a `schema.name` identifier at the first dot that lives
+    /// OUTSIDE any double-quoted segment. PostgreSQL allows quoted
+    /// identifiers to contain literal dots (`"weird.schema"`), so the
+    /// naive `target.find('.')` would split inside the quoted segment
+    /// and produce an invalid pair.
+    fn split_qualified_name_quote_aware(target: &str) -> Option<(String, String)> {
+        let bytes = target.as_bytes();
+        let mut in_quotes = false;
+        let mut split_at = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'"' {
+                in_quotes = !in_quotes;
+            } else if b == b'.' && !in_quotes {
+                split_at = Some(i);
+                break;
+            }
+        }
+        let dot = split_at?;
         let schema = target[..dot].trim_matches('"').to_string();
         let name = target[dot + 1..].trim_matches('"').to_string();
         if schema.is_empty() || name.is_empty() {
