@@ -1375,3 +1375,45 @@ CREATE USER MAPPING FOR PUBLIC
 CREATE PUBLICATION test_pub_from_only FOR TABLE test_schema.users;
 CREATE PUBLICATION test_pub_unchanged FOR TABLE test_schema.users, test_schema.products;
 
+-- =============================================================================
+-- Issue #179 — DROP FUNCTION ... CASCADE recreate test (FROM side)
+-- =============================================================================
+-- Function `cascade_compute(integer)` returns INTEGER here. Schema B
+-- changes the return type to BIGINT. The argument list (`integer`) is
+-- unchanged, so the routine's signature in PostgreSQL terms is the
+-- same on both sides — but PostgreSQL has no `ALTER FUNCTION` for
+-- return types, so the comparer still emits DROP+CREATE. PostgreSQL
+-- silently CASCADE-drops every object whose `pg_depend` row points at
+-- the function: the CHECK constraint, the functional index, the
+-- generated column, the column DEFAULT, and the RLS policy. The
+-- comparer must re-emit each one (Phase 7 of
+-- `compare_routines_and_views`) — otherwise the migrated database is
+-- missing those objects until a second `pgc compare` run notices the
+-- drift.
+CREATE FUNCTION test_schema.cascade_compute(x integer)
+RETURNS integer LANGUAGE sql IMMUTABLE AS $$
+    SELECT x * 2;
+$$;
+
+CREATE TABLE test_schema.cascade_items (
+    id      serial  PRIMARY KEY,
+    value   integer NOT NULL,
+    -- DEFAULT expression depends on cascade_compute → cascaded by CASCADE
+    def_col integer DEFAULT test_schema.cascade_compute(0)::integer,
+    -- Generated column depends on cascade_compute → column dropped by CASCADE
+    gen_col integer GENERATED ALWAYS AS (test_schema.cascade_compute(value)) STORED
+);
+
+-- CHECK constraint depends on cascade_compute → cascaded by CASCADE
+ALTER TABLE test_schema.cascade_items
+    ADD CONSTRAINT chk_cascade_compute CHECK (test_schema.cascade_compute(value) > 0);
+
+-- Functional index depends on cascade_compute → cascaded by CASCADE
+CREATE INDEX idx_cascade_compute
+    ON test_schema.cascade_items (test_schema.cascade_compute(value));
+
+-- RLS policy depends on cascade_compute → cascaded by CASCADE
+ALTER TABLE test_schema.cascade_items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pol_cascade_items ON test_schema.cascade_items
+    USING (test_schema.cascade_compute(value) > 0);
+

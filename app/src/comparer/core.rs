@@ -1,5 +1,9 @@
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
+use crate::dump::table_column::TableColumn;
+use crate::dump::table_constraint::TableConstraint;
+use crate::dump::table_index::TableIndex;
+use crate::dump::table_policy::TablePolicy;
 use crate::dump::{core::Dump, routine::Routine, table::Table, view::View};
 use crate::utils::string_extensions::StringExt;
 use std::{
@@ -3185,9 +3189,533 @@ impl Comparer {
             }
         }
 
+        // ──────────────────────────────────────────────────────────
+        // Phase 7 – Recreate dependents silently dropped by CASCADE
+        // ──────────────────────────────────────────────────────────
+        // When a routine is fully dropped, or its return type / argument
+        // list / argument defaults change (each forces DROP+CREATE
+        // because PostgreSQL has no in-place ALTER for those), PGC emits
+        // `DROP ... CASCADE` and PostgreSQL removes every object whose
+        // `pg_depend` entry points at that function: functional indexes,
+        // CHECK constraints, generated columns, column DEFAULT
+        // expressions and RLS policies. The rest of the comparer never
+        // re-emits those dependents because they were unchanged between
+        // FROM and TO. See issue #179.
+        self.recreate_routine_dependents();
+
         self.script
             .append_block("\n/* ---> Routines & Views: End section --------------- */");
         Ok(())
+    }
+
+    /// Re-emit objects that PostgreSQL silently dropped via
+    /// `DROP FUNCTION ... CASCADE` so they are present in the database
+    /// after the migration applies. Targets functional indexes, CHECK
+    /// constraints, generated columns, column DEFAULT expressions and
+    /// RLS policies that reference any routine being dropped+recreated
+    /// or fully dropped. Detection is text-based against the FROM-side
+    /// definition; the recreated form comes from TO so any reshape of
+    /// the dependent (e.g. a column type change) is preserved. Issued
+    /// statements are idempotent (`drop ... if exists` followed by the
+    /// CREATE) so they are safe even when other diff phases also
+    /// emitted the object.
+    fn recreate_routine_dependents(&mut self) {
+        // Collect (schema_lc, name_lc) for every routine whose drop will
+        // CASCADE: routines absent from TO, plus routines whose signature
+        // (return type, args, default args) changed — the same condition
+        // that drives the DROP+CREATE branch in `emit_routine_diff`.
+        let to_routines_by_full_id: HashMap<(&str, &str, &str), &Routine> = self
+            .to
+            .routines
+            .iter()
+            .map(|r| {
+                (
+                    (r.schema.as_str(), r.name.as_str(), r.arguments.as_str()),
+                    r,
+                )
+            })
+            .collect();
+
+        let mut affected: HashSet<(String, String)> = HashSet::new();
+        for from_routine in &self.from.routines {
+            let key = (
+                from_routine.schema.as_str(),
+                from_routine.name.as_str(),
+                from_routine.arguments.as_str(),
+            );
+            let cascaded = match to_routines_by_full_id.get(&key) {
+                None => true,
+                Some(to_routine) => {
+                    from_routine.hash.is_some()
+                        && to_routine.hash.is_some()
+                        && Self::hashes_differ(&from_routine.hash, &to_routine.hash)
+                        && (from_routine.return_type != to_routine.return_type
+                            || from_routine.arguments != to_routine.arguments
+                            || from_routine.arguments_defaults != to_routine.arguments_defaults)
+                }
+            };
+            if cascaded {
+                // The dump query wraps `nspname` / `proname` with
+                // `quote_ident` (see `dump/core.rs`), so a routine named
+                // `MyFunc` lands here as `"MyFunc"`. Strip the quotes
+                // before storing — both matchers below operate on
+                // quote-stripped haystacks (`unquoted` half of
+                // `prelower_pair`), and the qualified matcher already
+                // re-strips its pattern internally, so a quote-free
+                // needle works for both forms.
+                affected.insert((
+                    from_routine.schema.to_lowercase().replace('"', ""),
+                    from_routine.name.to_lowercase().replace('"', ""),
+                ));
+            }
+        }
+
+        if affected.is_empty() {
+            return;
+        }
+
+        let to_table_by_id: HashMap<(&str, &str), &Table> = self
+            .to
+            .tables
+            .iter()
+            .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+            .collect();
+
+        let mut emitted_keys: HashSet<String> = HashSet::new();
+        let mut recreate: String = String::new();
+
+        for from_table in &self.from.tables {
+            // If the table is gone in TO it is being dropped — there is
+            // no post-migration object to restore the dependents onto.
+            let Some(to_table) =
+                to_table_by_id.get(&(from_table.schema.as_str(), from_table.name.as_str()))
+            else {
+                continue;
+            };
+
+            // Mirror Table::diff's partition-child safeguards. When both
+            // FROM and TO are partition children, structural changes to
+            // inherited columns/constraints/indexes belong to the
+            // parent's recreate path: PostgreSQL forbids `ALTER TABLE
+            // child DROP COLUMN` for inherited columns, refuses direct
+            // ALTER on inherited constraints (`coninhcount > 0`), and
+            // partition-inherited indexes are managed by attaching to
+            // the parent's index. Re-emitting them on the child would
+            // produce a script PostgreSQL rejects.
+            let is_target_partition =
+                from_table.partition_of.is_some() && to_table.partition_of.is_some();
+
+            // Each scan below requires BOTH FROM and TO to reference an
+            // affected routine before re-emitting:
+            //
+            // * FROM-reference is necessary to know the dependent
+            //   *had* a `pg_depend` link to the function before the
+            //   migration began — otherwise CASCADE would never have
+            //   touched it in the first place.
+            //
+            // * TO-reference is necessary because `compare_tables()`
+            //   runs *before* `compare_routines_and_views()` and may
+            //   already have rewritten the dependent to its TO-side
+            //   form, breaking the dependency. Once the link is gone,
+            //   `DROP FUNCTION ... CASCADE` leaves the object alone —
+            //   re-emitting a recreate would be redundant for
+            //   constraints/indexes/policies and *destructive* for
+            //   generated columns: `DROP COLUMN IF EXISTS` cascades to
+            //   indexes, constraints, and FKs that reference the
+            //   column, none of which Phase 7 restores.
+            //
+            // CHECK and EXCLUDE constraints can reference functions;
+            // FKs and PKs cannot — skip them to avoid spurious matches
+            // in their textual `definition` (e.g. a referenced table
+            // named similarly to a routine).
+            for constraint in &from_table.constraints {
+                let is_check = constraint.constraint_type.eq_ignore_ascii_case("check")
+                    || constraint.constraint_type.eq_ignore_ascii_case("exclude");
+                if !is_check {
+                    continue;
+                }
+                let Some(def) = &constraint.definition else {
+                    continue;
+                };
+                if !Self::definition_references_any(def, &affected) {
+                    continue;
+                }
+                let Some(to_constraint) = to_table
+                    .constraints
+                    .iter()
+                    .find(|tc| tc.name == constraint.name)
+                else {
+                    continue;
+                };
+                // On partition children, inherited constraints
+                // (coninhcount > 0) propagate from the parent and must
+                // not be re-emitted locally.
+                if is_target_partition && to_constraint.coninhcount > 0 {
+                    continue;
+                }
+                // TO-side gate: skip when the TO definition no longer
+                // references the affected routine — `compare_tables`
+                // has rewritten the constraint, the new form has no
+                // pg_depend link to the function, CASCADE will leave
+                // it intact, and re-emitting would be wasted work.
+                let to_def_refs = to_constraint
+                    .definition
+                    .as_deref()
+                    .map(|d| Self::definition_references_any(d, &affected))
+                    .unwrap_or(false);
+                if !to_def_refs {
+                    continue;
+                }
+                let key = format!(
+                    "constraint:{}.{}.{}",
+                    to_constraint.schema, to_constraint.table_name, to_constraint.name
+                );
+                if !emitted_keys.insert(key) {
+                    continue;
+                }
+                Self::emit_dependent_recreate(
+                    &mut recreate,
+                    self.use_drop,
+                    &constraint_recreate_block(to_constraint),
+                );
+            }
+
+            for index in &from_table.indexes {
+                // Partition-inherited indexes are recreated via the
+                // parent — a redundant CREATE INDEX on the child would
+                // collide with the inherited index name.
+                if index.is_partition_index {
+                    continue;
+                }
+                if !Self::definition_references_any(&index.indexdef, &affected) {
+                    continue;
+                }
+                let Some(to_index) = to_table.indexes.iter().find(|ti| ti.name == index.name)
+                else {
+                    continue;
+                };
+                if to_index.is_partition_index {
+                    continue;
+                }
+                // TO-side gate: see the constraint scan above.
+                if !Self::definition_references_any(&to_index.indexdef, &affected) {
+                    continue;
+                }
+                let key = format!("index:{}.{}", to_index.schema, to_index.name);
+                if !emitted_keys.insert(key) {
+                    continue;
+                }
+                Self::emit_dependent_recreate(
+                    &mut recreate,
+                    self.use_drop,
+                    &index_recreate_block(to_index),
+                );
+            }
+
+            // Structural column changes (ADD / DROP / type) are forbidden
+            // on partition children — the parent owns the column shape.
+            // Skip the whole column scan in that case; the parent's
+            // recreate (handled when we iterate the parent table) will
+            // re-add the dependent.
+            if !is_target_partition {
+                for column in &from_table.columns {
+                    let default_referenced = column
+                        .column_default
+                        .as_deref()
+                        .map(|d| Self::definition_references_any(d, &affected))
+                        .unwrap_or(false);
+                    let generation_referenced = column.is_generated.eq_ignore_ascii_case("ALWAYS")
+                        && column
+                            .generation_expression
+                            .as_deref()
+                            .map(|e| Self::definition_references_any(e, &affected))
+                            .unwrap_or(false);
+
+                    if !default_referenced && !generation_referenced {
+                        continue;
+                    }
+                    let Some(to_column) = to_table.columns.iter().find(|tc| tc.name == column.name)
+                    else {
+                        continue;
+                    };
+
+                    if generation_referenced {
+                        // TO-side gate: only `DROP COLUMN IF EXISTS` +
+                        // re-add the column when TO is *still* a
+                        // generated column whose expression references
+                        // the affected routine. If TO has dropped the
+                        // generation expression or rewritten it to no
+                        // longer reference the function, the column
+                        // survives CASCADE intact and dropping it here
+                        // would cascade-destroy any indexes / FKs /
+                        // constraints attached to it — none of which
+                        // Phase 7 knows how to restore.
+                        let to_generation_refs =
+                            to_column.is_generated.eq_ignore_ascii_case("ALWAYS")
+                                && to_column
+                                    .generation_expression
+                                    .as_deref()
+                                    .map(|e| Self::definition_references_any(e, &affected))
+                                    .unwrap_or(false);
+                        if !to_generation_refs {
+                            continue;
+                        }
+                        let key = format!(
+                            "column-generated:{}.{}.{}",
+                            to_column.schema, to_column.table, to_column.name
+                        );
+                        if emitted_keys.insert(key) {
+                            Self::emit_dependent_recreate(
+                                &mut recreate,
+                                self.use_drop,
+                                &column_recreate_block(to_column),
+                            );
+                        }
+                    } else if default_referenced && let Some(default) = &to_column.column_default {
+                        // TO-side gate: only re-set the DEFAULT when
+                        // TO's default itself still references the
+                        // affected routine. If TO has switched to a
+                        // function-free default (or no default), the
+                        // CASCADE leaves the column alone and
+                        // `compare_tables` already emitted the right
+                        // ALTER COLUMN SET DEFAULT.
+                        if !Self::definition_references_any(default, &affected) {
+                            continue;
+                        }
+                        let key = format!(
+                            "column-default:{}.{}.{}",
+                            to_column.schema, to_column.table, to_column.name
+                        );
+                        if emitted_keys.insert(key) {
+                            let stmt = format!(
+                                "alter table {}.{} alter column {} set default {};",
+                                to_column.schema, to_column.table, to_column.name, default
+                            )
+                            .with_empty_lines();
+                            Self::emit_dependent_recreate(&mut recreate, self.use_drop, &stmt);
+                        }
+                    }
+                }
+            }
+
+            // RLS policies are not inherited via PARTITION OF — each
+            // partition has its own — so no partition-child skip applies.
+            for policy in &from_table.policies {
+                let referenced = policy
+                    .using_clause
+                    .as_deref()
+                    .map(|c| Self::definition_references_any(c, &affected))
+                    .unwrap_or(false)
+                    || policy
+                        .check_clause
+                        .as_deref()
+                        .map(|c| Self::definition_references_any(c, &affected))
+                        .unwrap_or(false);
+                if !referenced {
+                    continue;
+                }
+                let Some(to_policy) = to_table.policies.iter().find(|tp| tp.name == policy.name)
+                else {
+                    continue;
+                };
+                // TO-side gate: same rationale as constraints/indexes.
+                let to_policy_refs = to_policy
+                    .using_clause
+                    .as_deref()
+                    .map(|c| Self::definition_references_any(c, &affected))
+                    .unwrap_or(false)
+                    || to_policy
+                        .check_clause
+                        .as_deref()
+                        .map(|c| Self::definition_references_any(c, &affected))
+                        .unwrap_or(false);
+                if !to_policy_refs {
+                    continue;
+                }
+                let key = format!(
+                    "policy:{}.{}.{}",
+                    to_policy.schema, to_policy.table, to_policy.name
+                );
+                if !emitted_keys.insert(key) {
+                    continue;
+                }
+                Self::emit_dependent_recreate(
+                    &mut recreate,
+                    self.use_drop,
+                    &policy_recreate_block(to_policy),
+                );
+            }
+        }
+
+        if !recreate.is_empty() {
+            self.script
+                .append_block("\n/* ---> Recreate dependents dropped by CASCADE: Start ---- */");
+            self.script.push_str(&recreate);
+            self.script
+                .append_block("/* ---> Recreate dependents dropped by CASCADE: End ------ */");
+        }
+    }
+
+    /// True when `definition` textually references any `(schema, name)` in
+    /// `routines`. Tries the qualified `schema.name` form first, then
+    /// falls back to an *unqualified* function-call match (`name(`):
+    /// PostgreSQL's deparsers (`pg_get_constraintdef`, `pg_get_indexdef`,
+    /// `pg_get_expr`) drop the schema qualifier whenever the function is
+    /// reachable via the active `search_path` — typical for `public` —
+    /// so dependents like `CHECK (compute(value) > 0)` would otherwise
+    /// be missed and the CASCADE drift left unfixed.
+    ///
+    /// The unqualified pass requires `(` (after optional whitespace) so
+    /// it only matches function-call positions: identifiers used as
+    /// column references, type names, or string-literal contents do not
+    /// trigger a false positive.
+    fn definition_references_any(definition: &str, routines: &HashSet<(String, String)>) -> bool {
+        let (lower, unquoted) = Self::prelower_pair(definition);
+        routines.iter().any(|(schema, name)| {
+            // Both passes require a function-call context (`name(` after
+            // optional whitespace). The qualified pass inherits this gate
+            // so a routine name that collides with another object kind
+            // in the same schema (table, sequence, view, …) does not
+            // trip Phase 7 — `pg_get_indexdef` emits `ON schema.table`,
+            // `pg_get_expr` emits `nextval('schema.seq'::regclass)`,
+            // etc., and those non-call references must not look like
+            // CASCADE-affected dependents.
+            Self::text_references_qualified_call(&lower, &unquoted, schema, name)
+                || Self::text_references_unqualified_call(&unquoted, name)
+        })
+    }
+
+    /// Like [`Self::text_references_qualified_name_pre`] but additionally
+    /// requires the `schema.name` reference to be a function call:
+    /// followed (after optional ASCII whitespace) by `(`. Phase 7 uses
+    /// this stricter form so a routine sharing its name with another
+    /// object kind in the same schema (table, sequence, view) does not
+    /// false-positive on the deparsed `ON schema.table` of a CREATE
+    /// INDEX or the `'schema.seq'::regclass` of a `nextval` default.
+    /// The looser, call-context-free
+    /// [`Self::text_references_qualified_name_pre`] is kept for the
+    /// inter-routine dependency scan (which filters non-routine matches
+    /// by identity afterwards) and other call-sites where a non-call
+    /// reference is still meaningful.
+    fn text_references_qualified_call(
+        lowered: &str,
+        unquoted_lowered: &str,
+        schema_lc: &str,
+        name_lc: &str,
+    ) -> bool {
+        let mut pattern = String::with_capacity(schema_lc.len() + 1 + name_lc.len());
+        pattern.push_str(schema_lc);
+        pattern.push('.');
+        pattern.push_str(name_lc);
+        if Self::has_whole_qualified_call(lowered, &pattern) {
+            return true;
+        }
+        let unquoted_pattern: String = if pattern.contains('"') {
+            pattern.chars().filter(|c| *c != '"').collect()
+        } else {
+            pattern
+        };
+        Self::has_whole_qualified_call(unquoted_lowered, &unquoted_pattern)
+    }
+
+    /// Identifier-boundary delimited match for `qualified` plus a call
+    /// gate (optional whitespace then `(`). Mirrors
+    /// [`Self::has_whole_qualified_name`] for boundary semantics; the
+    /// extra gate makes it safe to feed deparsed DDL that may contain
+    /// `schema.name` references in non-call positions.
+    fn has_whole_qualified_call(text: &str, qualified: &str) -> bool {
+        let bytes = text.as_bytes();
+        for (idx, _) in text.match_indices(qualified) {
+            if idx > 0 {
+                let before = bytes[idx - 1];
+                if before.is_ascii_alphanumeric() || before == b'_' {
+                    continue;
+                }
+            }
+            let end = idx + qualified.len();
+            if end < bytes.len() {
+                let after = bytes[end];
+                if after.is_ascii_alphanumeric() || after == b'_' || after == b'.' {
+                    continue;
+                }
+            }
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True when `text` contains `name` as a function call: a whole
+    /// identifier (delimited on the left by a non-identifier, non-dot
+    /// character, on the right by a non-identifier character) followed
+    /// — possibly across whitespace — by `(`. The left-side dot
+    /// exclusion ensures `schema.name(` is left to the qualified
+    /// matcher; the right-side identifier check stops `compute_v2(`
+    /// from matching when `name = "compute"`. `text` and `name` must
+    /// already be lowercased and quote-stripped (use the `unquoted`
+    /// half of [`Self::prelower_pair`]).
+    fn text_references_unqualified_call(text: &str, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        // Iterate via `match_indices`, which yields byte offsets that are
+        // guaranteed UTF-8 char boundaries. The previous loop used
+        // `text[start..]` with `start = i + 1`, which panics when `name`
+        // contains non-ASCII bytes (PostgreSQL allows Unicode
+        // identifiers like `"русское_имя"`): `i + 1` lands inside a
+        // multi-byte codepoint and the next slice fails. The boundary
+        // checks below are pure byte comparisons against ASCII, so a
+        // non-ASCII neighbour byte simply fails every `is_ascii_*` test
+        // — that's the desired behaviour, since the call gate further
+        // down requires `(` (after optional ASCII whitespace) and any
+        // non-paren byte exits without matching.
+        let bytes = text.as_bytes();
+        let name_len = name.len();
+        for (i, _) in text.match_indices(name) {
+            if i > 0 {
+                let before = bytes[i - 1];
+                if before.is_ascii_alphanumeric() || before == b'_' || before == b'.' {
+                    continue;
+                }
+            }
+            let end = i + name_len;
+            if end < bytes.len() {
+                let after = bytes[end];
+                if after.is_ascii_alphanumeric() || after == b'_' {
+                    continue;
+                }
+            }
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Append a recreate block (drop-if-exists + create) to `out`. When
+    /// `use_drop` is false every line is line-prefixed with `-- ` so the
+    /// SQL is left in for review but won't execute, mirroring
+    /// [`Comparer::emit_drop`].
+    fn emit_dependent_recreate(out: &mut String, use_drop: bool, block: &str) {
+        if use_drop {
+            out.push_str(block);
+        } else {
+            out.push_str(
+                &block
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>(),
+            );
+        }
     }
 
     // Compare grants (privileges) for all objects
@@ -3727,6 +4255,82 @@ impl Comparer {
             .append_block("\n/* ---> Grants: End section --------------- */");
         Ok(())
     }
+}
+
+/// `drop constraint if exists` + `add constraint` block from the TO-side
+/// constraint, used to restore a CHECK/EXCLUDE constraint that PostgreSQL
+/// removed when CASCADE-dropping a referenced function.
+fn constraint_recreate_block(constraint: &TableConstraint) -> String {
+    let mut block = format!(
+        "alter table {}.{} drop constraint if exists {};",
+        constraint.schema, constraint.table_name, constraint.name
+    )
+    .with_empty_lines();
+    block.push_str(&constraint.get_script());
+    block
+}
+
+/// `CREATE INDEX IF NOT EXISTS` block built from the TO-side index.
+/// We deliberately *do not* `DROP INDEX` first: Phase 7's text-based
+/// matching cannot tell which overload of an `(schema, name)` routine
+/// a dependent actually called, and the TO-side gate cannot detect
+/// that case either, so the matcher may false-positive on an index
+/// that PostgreSQL never actually CASCADE-dropped. An unconditional
+/// drop in that case would silently invalidate a perfectly good index.
+/// `IF NOT EXISTS` makes the recreate a no-op when the index survived
+/// CASCADE and a real create when it did not.
+fn index_recreate_block(index: &TableIndex) -> String {
+    inject_if_not_exists_into_create_index(&index.get_script())
+}
+
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` block — used to restore a
+/// generated column that PostgreSQL removed when CASCADE-dropping a
+/// referenced function. Crucially we do NOT emit `DROP COLUMN IF
+/// EXISTS` first: that would cascade-destroy every index, FK, and
+/// CHECK constraint attached to the column, and Phase 7 has no way to
+/// restore those secondary dependents. Because Phase 7's affected-set
+/// keys on `(schema, name)` only and overloaded routines collapse
+/// together, the matcher can false-positive on a column referencing a
+/// completely unrelated overload that survived CASCADE — using
+/// `IF NOT EXISTS` makes that case a no-op rather than a destructive
+/// drop, and still does the right thing when the column was actually
+/// removed.
+fn column_recreate_block(column: &TableColumn) -> String {
+    inject_if_not_exists_into_add_column(&column.get_add_script())
+}
+
+/// Rewrites `CREATE [UNIQUE] INDEX <name>` to
+/// `CREATE [UNIQUE] INDEX IF NOT EXISTS <name>`. PostgreSQL's
+/// `pg_get_indexdef` always uses uppercase keywords, so a literal
+/// prefix match suffices; if neither prefix is present the script is
+/// returned unchanged rather than corrupted.
+fn inject_if_not_exists_into_create_index(script: &str) -> String {
+    if let Some(rest) = script.strip_prefix("CREATE UNIQUE INDEX ") {
+        return format!("CREATE UNIQUE INDEX IF NOT EXISTS {}", rest);
+    }
+    if let Some(rest) = script.strip_prefix("CREATE INDEX ") {
+        return format!("CREATE INDEX IF NOT EXISTS {}", rest);
+    }
+    script.to_string()
+}
+
+/// Rewrites the `add column ` clause produced by `TableColumn::get_add_script`
+/// into `add column if not exists `. The clause is generated by us in
+/// known lowercase form, so a single `replacen` against the first hit
+/// is safe and unambiguous.
+fn inject_if_not_exists_into_add_column(script: &str) -> String {
+    script.replacen("add column ", "add column if not exists ", 1)
+}
+
+/// `drop policy if exists` + `create policy` block from the TO-side policy.
+fn policy_recreate_block(policy: &TablePolicy) -> String {
+    let mut block = format!(
+        "drop policy if exists {} on {}.{};",
+        policy.name, policy.schema, policy.table
+    )
+    .with_empty_lines();
+    block.push_str(&policy.get_script());
+    block
 }
 
 #[cfg(test)]
