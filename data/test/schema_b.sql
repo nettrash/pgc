@@ -1740,3 +1740,34 @@ CREATE INDEX idx_cascade_compute
 ALTER TABLE test_schema.cascade_items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY pol_cascade_items ON test_schema.cascade_items
     USING (test_schema.cascade_compute(value) > 0);
+
+-- =============================================================================
+-- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
+-- =============================================================================
+-- TO mirrors Schema A's FK chain (child -> parent -> grandparent) but
+-- every table is now UNLOGGED. The comparer must emit
+-- `ALTER TABLE ... SET UNLOGGED` in FK-leaf-first order
+-- (child, then parent, then grandparent) — alphabetical order rejects
+-- with:
+--   ERROR: could not change table "grandparent" to unlogged because
+--   it references logged table "parent"
+--
+-- The serial PKs auto-create owned sequences (`*_id_seq`). PostgreSQL
+-- propagates the table's `ALTER TABLE SET UNLOGGED` to every owned
+-- sequence on its own, so no explicit `ALTER SEQUENCE ... SET
+-- UNLOGGED` should appear for those sequences in the migration.
+CREATE SCHEMA IF NOT EXISTS test_order;
+
+CREATE UNLOGGED TABLE test_order.grandparent (
+    id serial PRIMARY KEY
+);
+
+CREATE UNLOGGED TABLE test_order.parent (
+    id serial PRIMARY KEY,
+    grandparent_id integer REFERENCES test_order.grandparent(id)
+);
+
+CREATE UNLOGGED TABLE test_order.child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES test_order.parent(id)
+);

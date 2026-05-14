@@ -8239,6 +8239,480 @@ async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Issue #180 — SET UNLOGGED / SET LOGGED statements must respect FK
+// dependencies (PostgreSQL rejects an out-of-order conversion), and
+// owned sequences should not redundantly re-emit the persistence flip
+// the table cascade already propagates.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build a logged/unlogged-controlled table with a single FK to another
+/// table in the same schema, named with a numeric `id` PK column. Used
+/// by the issue-#180 ordering tests.
+fn issue180_logged_table(
+    schema: &str,
+    name: &str,
+    is_unlogged: bool,
+    fk_target: Option<(&str, &str, &str)>,
+) -> Table {
+    let mut id_col = int_column(schema, name, "id", 1);
+    id_col.is_nullable = false;
+
+    let mut constraints: Vec<TableConstraint> = vec![TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: schema.to_string(),
+        name: format!("{name}_pkey"),
+        table_name: name.to_string(),
+        constraint_type: "PRIMARY KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("PRIMARY KEY (id)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    }];
+
+    let mut columns = vec![id_col];
+    if let Some((fk_col, fk_schema, fk_table)) = fk_target {
+        let mut ref_col = int_column(schema, name, fk_col, 2);
+        ref_col.is_nullable = true;
+        columns.push(ref_col);
+        constraints.push(TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: schema.to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {fk_schema}.{fk_table}(id)"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        });
+    }
+
+    let mut table = Table::new(
+        schema.to_string(),
+        name.to_string(),
+        schema.to_string(),
+        name.to_string(),
+        "postgres".to_string(),
+        None,
+        columns,
+        constraints,
+        vec![],
+        vec![],
+        None,
+    );
+    table.is_unlogged = is_unlogged;
+    table.hash();
+    table
+}
+
+#[tokio::test]
+async fn issue180_set_unlogged_orders_dependents_before_referenced() {
+    // FROM: three logged tables with FK chain
+    //   child -> parent -> grandparent.
+    // TO:   the same three tables, all UNLOGGED.
+    // PostgreSQL refuses `SET UNLOGGED` on a table while a LOGGED table
+    // still references it, so the conversion order must be leaves
+    // first: child, then parent, then grandparent.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "grandparent",
+        false,
+        None,
+    ));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "parent",
+        false,
+        Some(("grandparent_id", "test_order", "grandparent")),
+    ));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        false,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "grandparent",
+        true,
+        None,
+    ));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "parent",
+        true,
+        Some(("grandparent_id", "test_order", "grandparent")),
+    ));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        true,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    let pos_child = script
+        .find("alter table test_order.child set unlogged;")
+        .expect("child SET UNLOGGED must be emitted");
+    let pos_parent = script
+        .find("alter table test_order.parent set unlogged;")
+        .expect("parent SET UNLOGGED must be emitted");
+    let pos_grand = script
+        .find("alter table test_order.grandparent set unlogged;")
+        .expect("grandparent SET UNLOGGED must be emitted");
+
+    assert!(
+        pos_child < pos_parent && pos_parent < pos_grand,
+        "SET UNLOGGED must be ordered child -> parent -> grandparent (FK leaves first); got\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue180_set_logged_orders_referenced_before_dependents() {
+    // Reverse direction: all UNLOGGED -> all LOGGED.
+    // PostgreSQL refuses `SET LOGGED` while the table still references
+    // an UNLOGGED one, so order must be roots first: grandparent, then
+    // parent, then child.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "grandparent",
+        true,
+        None,
+    ));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "parent",
+        true,
+        Some(("grandparent_id", "test_order", "grandparent")),
+    ));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        true,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "grandparent",
+        false,
+        None,
+    ));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "parent",
+        false,
+        Some(("grandparent_id", "test_order", "grandparent")),
+    ));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        false,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    let pos_grand = script
+        .find("alter table test_order.grandparent set logged;")
+        .expect("grandparent SET LOGGED must be emitted");
+    let pos_parent = script
+        .find("alter table test_order.parent set logged;")
+        .expect("parent SET LOGGED must be emitted");
+    let pos_child = script
+        .find("alter table test_order.child set logged;")
+        .expect("child SET LOGGED must be emitted");
+
+    assert!(
+        pos_grand < pos_parent && pos_parent < pos_child,
+        "SET LOGGED must be ordered grandparent -> parent -> child (FK roots first); got\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue180_persistence_change_does_not_emit_inline_inside_alter_table() {
+    // A table-level ALTER (e.g. add column) MUST NOT carry a SET
+    // UNLOGGED line — that would re-introduce the alphabetical ordering
+    // bug. The persistence flip is owned by the dedicated phase.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_table = Table::new(
+        "test_order".to_string(),
+        "items".to_string(),
+        "test_order".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![int_column("test_order", "items", "id", 1)],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    from_table.is_unlogged = false;
+    from_table.hash();
+
+    let mut to_table = Table::new(
+        "test_order".to_string(),
+        "items".to_string(),
+        "test_order".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![
+            int_column("test_order", "items", "id", 1),
+            int_column("test_order", "items", "name", 2),
+        ],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    to_table.is_unlogged = true;
+    to_table.hash();
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // SET UNLOGGED is still emitted, but only once and after the ADD
+    // COLUMN — not interleaved inside the per-table ALTER block.
+    let add_pos = script
+        .find("alter table test_order.items add column name")
+        .expect("add column must be emitted");
+    let set_pos = script
+        .find("alter table test_order.items set unlogged;")
+        .expect("set unlogged must be emitted by the dedicated phase");
+    assert!(
+        add_pos < set_pos,
+        "SET UNLOGGED must come from the dedicated phase, after the per-table ALTER: {}",
+        script
+    );
+    assert_eq!(
+        script.matches("set unlogged").count(),
+        1,
+        "SET UNLOGGED must be emitted exactly once (no inline + dedicated double-up): {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue180_owned_sequence_persistence_only_diff_is_skipped() {
+    // A sequence whose owning table flips persistence — and which has
+    // no other diff — produces a redundant `ALTER SEQUENCE ... SET
+    // UNLOGGED` followed by the full clause list. Both are noise: the
+    // table's `ALTER TABLE ... SET UNLOGGED` already cascades to all
+    // owned sequences. Suppress the entire ALTER SEQUENCE.
+    use crate::dump::sequence::Sequence;
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_table = Table::new(
+        "test_order".to_string(),
+        "items".to_string(),
+        "test_order".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![int_column("test_order", "items", "id", 1)],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    from_table.is_unlogged = false;
+    from_table.hash();
+
+    let mut to_table = from_table.clone();
+    to_table.is_unlogged = true;
+    to_table.hash();
+
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let make_seq = |is_unlogged: bool| {
+        let mut s = Sequence::new(
+            "test_order".to_string(),
+            "items_id_seq".to_string(),
+            "postgres".to_string(),
+            "integer".to_string(),
+            Some(1),
+            Some(1),
+            Some(2147483647),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            Some("test_order".to_string()),
+            Some("items".to_string()),
+            Some("id".to_string()),
+        );
+        s.is_unlogged = is_unlogged;
+        s.hash();
+        s
+    };
+    from_dump.sequences.push(make_seq(false));
+    to_dump.sequences.push(make_seq(true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_sequences().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("alter sequence test_order.items_id_seq"),
+        "owned-sequence persistence-only flip must be suppressed (table cascade handles it); got:\n{}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue180_owned_sequence_other_diff_skips_only_persistence_line() {
+    // When the sequence has a real change (e.g. cache_size) AND the
+    // owning table is also flipping persistence, we still need the
+    // ALTER SEQUENCE — but not the `SET UNLOGGED|LOGGED` line, because
+    // the table cascade handles that.
+    use crate::dump::sequence::Sequence;
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let mut from_table = Table::new(
+        "test_order".to_string(),
+        "items".to_string(),
+        "test_order".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![int_column("test_order", "items", "id", 1)],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    from_table.is_unlogged = false;
+    from_table.hash();
+    let mut to_table = from_table.clone();
+    to_table.is_unlogged = true;
+    to_table.hash();
+    from_dump.tables.push(from_table);
+    to_dump.tables.push(to_table);
+
+    let make_seq = |is_unlogged: bool, cache: i64| {
+        let mut s = Sequence::new(
+            "test_order".to_string(),
+            "items_id_seq".to_string(),
+            "postgres".to_string(),
+            "integer".to_string(),
+            Some(1),
+            Some(1),
+            Some(2147483647),
+            Some(1),
+            false,
+            Some(cache),
+            Some(1),
+            Some("test_order".to_string()),
+            Some("items".to_string()),
+            Some("id".to_string()),
+        );
+        s.is_unlogged = is_unlogged;
+        s.hash();
+        s
+    };
+    from_dump.sequences.push(make_seq(false, 1));
+    to_dump.sequences.push(make_seq(true, 5));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_sequences().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter sequence test_order.items_id_seq"),
+        "ALTER SEQUENCE must be emitted when non-persistence params changed: {}",
+        script
+    );
+    assert!(
+        script.contains("cache 5"),
+        "the changed cache value must be in the script: {}",
+        script
+    );
+    assert!(
+        !script.contains("alter sequence test_order.items_id_seq set unlogged"),
+        "SET UNLOGGED on owned sequence is redundant when the owning table is flipping persistence: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue180_standalone_sequence_persistence_change_still_emits_set() {
+    // A sequence not owned by any table (or owned by a table whose
+    // persistence is unchanged) must still get its own SET because no
+    // table cascade applies.
+    use crate::dump::sequence::Sequence;
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let make_seq = |is_unlogged: bool| {
+        let mut s = Sequence::new(
+            "test_order".to_string(),
+            "global_seq".to_string(),
+            "postgres".to_string(),
+            "integer".to_string(),
+            Some(1),
+            Some(1),
+            Some(2147483647),
+            Some(1),
+            false,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        s.is_unlogged = is_unlogged;
+        s.hash();
+        s
+    };
+    from_dump.sequences.push(make_seq(false));
+    to_dump.sequences.push(make_seq(true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_sequences().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter sequence test_order.global_seq set unlogged"),
+        "standalone sequence must still emit SET UNLOGGED: {}",
+        script
+    );
+}
+
 #[tokio::test]
 async fn issue179_quoted_routine_names_match_unqualified_calls() {
     // PGC's dump query wraps `nspname` / `proname` with `quote_ident`,
@@ -8386,5 +8860,187 @@ async fn issue179_defaults_only_change_triggers_recreate() {
         script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
         "Phase 7 must recreate index on defaults-only change: {}",
         script
+    );
+}
+
+#[test]
+fn issue180_parse_fk_referenced_table_word_boundary() {
+    // PR #184 review: a naive `find("references ")` substring match
+    // can pick up the literal text inside a quoted column name in the
+    // FK column list. The matcher must be anchored to a word boundary
+    // and the keyword must be followed by whitespace.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table("FOREIGN KEY (col_a) REFERENCES public.target(id)"),
+        Some(("public".to_string(), "target".to_string())),
+        "happy-path FK definition must parse"
+    );
+    // Column literally named `"references "` (with trailing space) in
+    // the FK column list. Naive substring search would lock onto it
+    // before the real keyword and parse garbage.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (\"references \", col_b) REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string()))
+    );
+    // Column named `references_count` — substring match on
+    // "references" without the right-side word-boundary check would
+    // see this column first and try to parse what follows.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (references_count) REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string()))
+    );
+}
+
+#[test]
+fn issue180_parse_fk_referenced_table_quoted_identifier_with_dot() {
+    // PR #184 review: a quoted identifier may contain a literal `.`,
+    // and the schema/name split must respect quotes — otherwise the
+    // first dot inside the quoted segment is taken as the boundary
+    // and the parsed pair is nonsensical.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"weird.schema\".\"t\"(id)"
+        ),
+        Some(("weird.schema".to_string(), "t".to_string()))
+    );
+    // Both halves quoted with embedded dots — the split must still
+    // land on the dot OUTSIDE every quoted segment.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"a.b\".\"c.d\"(id)"),
+        Some(("a.b".to_string(), "c.d".to_string()))
+    );
+}
+
+#[test]
+fn issue180_parse_fk_referenced_table_handles_non_ascii_column_names() {
+    // PR #184 follow-up review: `parse_fk_referenced_table` previously
+    // built the case-insensitive haystack via `to_lowercase()`, which
+    // can change byte length for some non-ASCII characters
+    // (e.g. capital Turkish dotted I, `İ`, lowercases to a multi-char
+    // sequence with a different UTF-8 length). The keyword position
+    // came from the lowercased haystack but the slice that produces
+    // the parsed identifier reaches back into `def`, so a
+    // length-changing lowercasing would land mid-codepoint and panic.
+    // `to_ascii_lowercase()` is byte-length-preserving — pin that
+    // contract by parsing FK definitions whose column list contains
+    // identifiers that trip every byte-length-changing lowercase
+    // conversion in common locales.
+    //
+    // Quoted column with capital `İ` (U+0130). With `to_lowercase()`
+    // this produces `i\u{0307}` (3 bytes total); `to_ascii_lowercase`
+    // leaves the 2-byte `İ` alone, so byte offsets line up.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (\"\u{0130}d\") REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string()))
+    );
+    // German sharp S (`ß`, U+00DF). `to_lowercase()` keeps it as `ß`,
+    // but the inverse — uppercase `ẞ` (U+1E9E) lowercasing to `ß` —
+    // is length-preserving in UTF-8 too. Use a Cyrillic lowercase
+    // identifier here just to round out coverage of identifiers whose
+    // bytes lie outside the ASCII range.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (\"русское_имя\") REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string()))
+    );
+    // Same case in the qualified target identifier.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"тест\".\"target\"(id)"),
+        Some(("тест".to_string(), "target".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn issue180_set_unlogged_skips_ordering_for_new_fks_added_later() {
+    // PR #184 review (FK-timing): when an FK is brand-new in TO it is
+    // not yet active at the moment `emit_persistence_changes` runs —
+    // `compare_foreign_keys` adds it strictly after. The adjacency
+    // must therefore filter to FKs that exist UNCHANGED in both
+    // FROM and TO. Without that filter, an alphabetical pair would
+    // be over-ordered as if the new FK were already live.
+    //
+    // Setup: child references parent in TO (new FK). FROM has no FK.
+    // Both flip from LOGGED to UNLOGGED.
+    //
+    // With the live-FK-set tightening, the adjacency is empty, so
+    // ordering falls back to alphabetical (deterministic via the
+    // sort_key in the topo sort). This is safe because PG won't see
+    // the FK link until after the SET phase.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", false, None));
+    // FROM child has no FK to parent — the FK is new in TO.
+    from_dump
+        .tables
+        .push(issue180_logged_table("test_order", "child", false, None));
+    to_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", true, None));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        true,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Both SET UNLOGGED statements must be present; ordering between
+    // them is not constrained by the (not-yet-live) new FK.
+    assert!(script.contains("alter table test_order.child set unlogged;"));
+    assert!(script.contains("alter table test_order.parent set unlogged;"));
+}
+
+#[test]
+fn issue180_sequence_only_persistence_change_uses_hash_diff() {
+    // PR #184 review: `is_only_persistence_change` clones, equalises
+    // `is_unlogged` to FROM, recomputes the hash, and compares.
+    // That keeps the check honest if `Sequence::hash` later starts
+    // covering a new field. This test pins the contract by exercising
+    // both directions: identical-except-persistence returns true; a
+    // hashed field different (here `cache_size`) returns false.
+    use crate::dump::sequence::Sequence;
+
+    let make = |is_unlogged: bool, cache: i64| {
+        let mut s = Sequence::new(
+            "public".to_string(),
+            "s".to_string(),
+            "postgres".to_string(),
+            "integer".to_string(),
+            Some(1),
+            Some(1),
+            Some(2147483647),
+            Some(1),
+            false,
+            Some(cache),
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        s.is_unlogged = is_unlogged;
+        s.hash();
+        s
+    };
+    let from = make(false, 1);
+    let to_only_persistence = make(true, 1);
+    let to_persistence_and_cache = make(true, 5);
+    assert!(
+        to_only_persistence.is_only_persistence_change(&from),
+        "identical except is_unlogged must be detected as persistence-only"
+    );
+    assert!(
+        !to_persistence_and_cache.is_only_persistence_change(&from),
+        "a hashed field difference must block the persistence-only suppression"
     );
 }

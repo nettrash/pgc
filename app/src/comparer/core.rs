@@ -1067,6 +1067,32 @@ impl Comparer {
             .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
             .collect();
 
+        // Tables whose persistence is flipping in this migration. The
+        // table-level `ALTER TABLE SET LOGGED|UNLOGGED` (emitted by the
+        // FK-ordered phase at the end of `compare_tables`) automatically
+        // propagates to every owned sequence, so re-emitting the same
+        // SET on the sequence — or, when persistence is the *only*
+        // diff, the entire ALTER SEQUENCE block — is redundant noise.
+        // See issue #180.
+        let tables_flipping_persistence: HashMap<(&str, &str), bool> = self
+            .to
+            .tables
+            .iter()
+            .filter_map(|to_table| {
+                let from_table = from_table_map
+                    .get(&(to_table.schema.as_str(), to_table.name.as_str()))
+                    .map(|&i| &self.from.tables[i])?;
+                from_table
+                    .persistence_change_for(to_table)
+                    .map(|new_unlogged| {
+                        (
+                            (to_table.schema.as_str(), to_table.name.as_str()),
+                            new_unlogged,
+                        )
+                    })
+            })
+            .collect();
+
         // We will find all new sequences from "to" dump that are not in "from" dump
         // and we will find all existing sequences in both dumps with different hashes
         // and add them to the script.
@@ -1096,11 +1122,31 @@ impl Comparer {
                     continue;
                 }
                 if Self::hashes_differ(&from_sequence.hash, &sequence.hash) {
+                    // Determine whether the owning table — if any — is
+                    // also flipping persistence in this migration.
+                    let owning_table_flipping = match (
+                        sequence.owned_by_schema.as_deref(),
+                        sequence.owned_by_table.as_deref(),
+                    ) {
+                        (Some(s), Some(t)) => tables_flipping_persistence.contains_key(&(s, t)),
+                        _ => false,
+                    };
+                    if owning_table_flipping && sequence.is_only_persistence_change(from_sequence) {
+                        // The whole ALTER SEQUENCE is redundant — the
+                        // owning table's `ALTER TABLE SET LOGGED|
+                        // UNLOGGED` propagates to this sequence on its
+                        // own. Suppress the entire emit (issue #180).
+                        continue;
+                    }
                     self.script.push_str(
                         format!("/* Sequence: {}.{}*/\n", sequence.schema, sequence.name).as_str(),
                     );
-                    self.script
-                        .push_str(sequence.get_alter_script(from_sequence).as_str());
+                    let alter = if owning_table_flipping {
+                        sequence.get_alter_script_excluding_persistence(from_sequence)
+                    } else {
+                        sequence.get_alter_script(from_sequence)
+                    };
+                    self.script.push_str(alter.as_str());
                 }
             } else {
                 // Check if the sequence is owned by a column that is an identity column or serial type.
@@ -1798,9 +1844,326 @@ impl Comparer {
                 .push_str(table.get_trigger_script().as_str());
         }
 
+        self.emit_persistence_changes();
+
         self.script
             .append_block("\n/* ---> Tables: End section --------------- */");
         Ok(())
+    }
+
+    /// Emit `ALTER TABLE ... SET LOGGED|UNLOGGED` statements in FK
+    /// topological order. PostgreSQL rejects the conversion when a
+    /// related table is in the wrong persistence state at the moment
+    /// the ALTER runs:
+    ///
+    ///   * `SET UNLOGGED` fails if any LOGGED table references the
+    ///     target via FK — every FK-referencing table must already be
+    ///     UNLOGGED.  Ordering: leaves before roots (reverse topo).
+    ///   * `SET LOGGED`   fails if the target references any UNLOGGED
+    ///     table via FK — every FK-referenced table must already be
+    ///     LOGGED.  Ordering: roots before leaves (forward topo).
+    ///
+    /// `Table::build_alter_script` deliberately omits the persistence
+    /// line so this single phase owns the order. See issue #180.
+    ///
+    /// **FK timing analysis** (issue #184 review thread): this phase
+    /// runs at the end of `compare_tables`, before `compare_foreign_
+    /// keys` has had a chance to add new FKs. The migration order is:
+    ///
+    ///   1. `compare_tables` per-table loop drops FKs whose
+    ///      definition changed (and FROM-only FKs alongside their
+    ///      table). Unchanged FKs are left in place.
+    ///   2. `emit_persistence_changes` (this method) runs the SETs.
+    ///   3. `compare_foreign_keys` re-adds modified FKs and creates
+    ///      new ones.
+    ///
+    /// So the live FK graph at the SET point is exactly the
+    /// **intersection** of FROM and TO by `(table, fk-name,
+    /// definition)` — neither the soon-to-be-added new FKs nor the
+    /// already-dropped modified FKs are active. The adjacency below
+    /// is built from that intersection (rather than the TO-side
+    /// constraints alone) so we don't impose ordering for FKs that
+    /// won't exist at the SET point and so we don't miss ordering
+    /// for FKs that DO exist but will later be dropped+re-added.
+    fn emit_persistence_changes(&mut self) {
+        let from_table_map: HashMap<(&str, &str), &Table> = self
+            .from
+            .tables
+            .iter()
+            .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+            .collect();
+
+        // Index every TO table once; the FK adjacency below and the
+        // subset orderings refer to tables by their position in
+        // `self.to.tables` to avoid borrow-tied pointer identity.
+        let to_index_by_key: HashMap<(&str, &str), usize> = self
+            .to
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .collect();
+
+        // Partition into the two flip directions; tables newly created
+        // (no FROM counterpart) do not need a SET — they're created
+        // with their TO-side persistence inline.
+        let mut to_unlogged: Vec<usize> = Vec::new();
+        let mut to_logged: Vec<usize> = Vec::new();
+        for (idx, to_table) in self.to.tables.iter().enumerate() {
+            let Some(from_table) = from_table_map
+                .get(&(to_table.schema.as_str(), to_table.name.as_str()))
+                .copied()
+            else {
+                continue;
+            };
+            match from_table.persistence_change_for(to_table) {
+                Some(true) => to_unlogged.push(idx),
+                Some(false) => to_logged.push(idx),
+                None => {}
+            }
+        }
+
+        if to_unlogged.is_empty() && to_logged.is_empty() {
+            return;
+        }
+
+        // FK adjacency restricted to the **live** FK set — FKs that
+        // exist in BOTH FROM and TO with the same definition. See the
+        // doc comment above this method for the timing rationale.
+        // `fk_targets[i]` holds the indices of tables that table `i`
+        // references via FK — i.e. `i` *depends on* those.
+        let mut fk_targets: Vec<HashSet<usize>> = vec![HashSet::new(); self.to.tables.len()];
+        for (i, to_table) in self.to.tables.iter().enumerate() {
+            // Lift the matching FROM table once so the FK lookup
+            // doesn't pay a per-constraint hashmap miss.
+            let from_table = from_table_map
+                .get(&(to_table.schema.as_str(), to_table.name.as_str()))
+                .copied();
+            for c in &to_table.constraints {
+                if !c.constraint_type.eq_ignore_ascii_case("foreign key") {
+                    continue;
+                }
+                let Some(def) = &c.definition else { continue };
+                // Live edge requires the same FK to exist in FROM with
+                // the same definition. A new FK (TO-only) won't be
+                // present at the SET point — `compare_foreign_keys`
+                // adds it later. A modified FK was dropped in the
+                // per-table ALTER loop and is also absent here. Both
+                // get filtered out.
+                let live = from_table
+                    .map(|ft| {
+                        ft.constraints.iter().any(|fc| {
+                            fc.name == c.name
+                                && fc.constraint_type.eq_ignore_ascii_case("foreign key")
+                                && fc.definition.as_deref() == c.definition.as_deref()
+                        })
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    continue;
+                }
+                if let Some((schema, name)) = Self::parse_fk_referenced_table(def)
+                    && let Some(&j) = to_index_by_key.get(&(schema.as_str(), name.as_str()))
+                    && j != i
+                {
+                    fk_targets[i].insert(j);
+                }
+            }
+        }
+
+        // For SET UNLOGGED we want leaves (referencers) first. The
+        // generic toposort returns `dependencies before dependents`
+        // when fed `depends_on[i] = nodes i references`, so we reverse
+        // its output to get the dependent-first order this direction
+        // requires.
+        if !to_unlogged.is_empty() {
+            for table_idx in
+                Self::topo_order_within_subset(&to_unlogged, &fk_targets, &self.to.tables, true)
+            {
+                let table = &self.to.tables[table_idx];
+                self.script.append_block(&format!(
+                    "alter table {}.{} set unlogged;",
+                    table.schema, table.name
+                ));
+            }
+        }
+
+        // For SET LOGGED we want roots (referenced tables) first —
+        // forward topo order is exactly what we need.
+        if !to_logged.is_empty() {
+            for table_idx in
+                Self::topo_order_within_subset(&to_logged, &fk_targets, &self.to.tables, false)
+            {
+                let table = &self.to.tables[table_idx];
+                self.script.append_block(&format!(
+                    "alter table {}.{} set logged;",
+                    table.schema, table.name
+                ));
+            }
+        }
+    }
+
+    /// Order `subset` (absolute indices into `tables`) by FK
+    /// dependencies restricted to the subset itself. Edges to tables
+    /// outside the subset are ignored: a table the migration isn't
+    /// flipping doesn't constrain the SET ordering — only PostgreSQL's
+    /// runtime check against the live state does, and that's the
+    /// user's problem (they would have to add the missing flip to the
+    /// migration). With `dependents_first = true` returns reverse-topo
+    /// (leaves first — `SET UNLOGGED`); else forward-topo (roots
+    /// first — `SET LOGGED`). Result is a permutation of `subset`.
+    fn topo_order_within_subset(
+        subset: &[usize],
+        fk_targets: &[HashSet<usize>],
+        tables: &[Table],
+        dependents_first: bool,
+    ) -> Vec<usize> {
+        let n = subset.len();
+        let pos_in_subset: HashMap<usize, usize> = subset
+            .iter()
+            .enumerate()
+            .map(|(pos, &abs)| (abs, pos))
+            .collect();
+
+        let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for (pos, &abs_idx) in subset.iter().enumerate() {
+            for &target_abs in &fk_targets[abs_idx] {
+                if let Some(&target_pos) = pos_in_subset.get(&target_abs)
+                    && target_pos != pos
+                {
+                    depends_on[pos].insert(target_pos);
+                }
+            }
+        }
+
+        let mut sorted = Self::kahn_toposort(n, &depends_on, |i| {
+            let t = &tables[subset[i]];
+            (t.schema.to_lowercase(), t.name.to_lowercase())
+        });
+        if dependents_first {
+            sorted.reverse();
+        }
+        sorted.into_iter().map(|pos| subset[pos]).collect()
+    }
+
+    /// Pull the `schema.name` of the table targeted by an FK constraint
+    /// definition (`pg_get_constraintdef` output, e.g.
+    /// `FOREIGN KEY (col) REFERENCES schema.table(col)`). Tolerates
+    /// quoted identifiers; returns `None` when the definition isn't
+    /// recognisably an FK or the referenced identifier is unqualified.
+    ///
+    /// The keyword scan is anchored to a whole-word match — a naive
+    /// `find("references ")` would false-match a column name like
+    /// `"references "` that happened to appear inside the FK column
+    /// list (or any earlier substring containing the literal text).
+    /// The schema/name split is quote-aware so a quoted identifier
+    /// that itself contains a literal `.`
+    /// (e.g. `REFERENCES "weird.schema"."t"(id)`) is split at the
+    /// dot OUTSIDE the quotes, not the first dot in byte order.
+    ///
+    /// The case-insensitive haystack is built with [`str::to_ascii_
+    /// lowercase`] rather than [`str::to_lowercase`]: the latter can
+    /// change byte length for some non-ASCII characters (e.g. capital
+    /// Turkish dotted I, which lowercases into a multi-character
+    /// sequence with a different UTF-8 length), and we slice back
+    /// into the original `def` using offsets that came from the
+    /// haystack — a length-changing lowercasing would leave those
+    /// offsets pointing inside a UTF-8 codepoint and panic.
+    /// `to_ascii_lowercase` is byte-length-preserving (only ASCII
+    /// letters change, every other byte is left intact) and the
+    /// keyword `references` is pure ASCII, so it's the right tool.
+    fn parse_fk_referenced_table(def: &str) -> Option<(String, String)> {
+        let lower = def.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let kw = b"references";
+        let kw_len = kw.len();
+
+        // Walk every occurrence of "references" until we find one that
+        // sits at an identifier word boundary AND is followed by
+        // whitespace — `pg_get_constraintdef` always renders the
+        // keyword that way. Substring matches inside quoted column
+        // names (the FK column list precedes the keyword) fail one of
+        // these checks: a quoted `"references"` is followed by `"`
+        // (not whitespace), `references_table` is followed by `_`
+        // (still an identifier char), and `xxx_references` is
+        // preceded by `_`.
+        let mut search_from = 0;
+        let kw_pos = loop {
+            if search_from + kw_len > bytes.len() {
+                return None;
+            }
+            let rel = lower[search_from..].find("references")?;
+            let pos = search_from + rel;
+            let left_ok = pos == 0
+                || !{
+                    let b = bytes[pos - 1];
+                    b.is_ascii_alphanumeric() || b == b'_' || b == b'"'
+                };
+            let after_kw = pos + kw_len;
+            let right_ok = after_kw < bytes.len() && bytes[after_kw].is_ascii_whitespace();
+            if left_ok && right_ok {
+                break pos;
+            }
+            // Advance one byte to keep ASCII-byte indices valid; the
+            // haystack is `lower` which is purely ASCII at byte 0 of
+            // each match candidate (because `find` lands on the
+            // ASCII keyword `references`).
+            search_from = pos + 1;
+        };
+
+        // Skip the keyword and the run of whitespace immediately after.
+        let after = (def[kw_pos + kw_len..]).trim_start();
+
+        // Scan a single qualified identifier: identifier chars, dot,
+        // or quoted segments. Stop at the first non-identifier byte
+        // outside quotes (typically `(` for the column list).
+        let mut end = 0;
+        let mut in_quotes = false;
+        for (i, ch) in after.char_indices() {
+            if ch == '"' {
+                in_quotes = !in_quotes;
+                end = i + ch.len_utf8();
+                continue;
+            }
+            if in_quotes {
+                end = i + ch.len_utf8();
+                continue;
+            }
+            if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+                end = i + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let target = &after[..end];
+        Self::split_qualified_name_quote_aware(target)
+    }
+
+    /// Split a `schema.name` identifier at the first dot that lives
+    /// OUTSIDE any double-quoted segment. PostgreSQL allows quoted
+    /// identifiers to contain literal dots (`"weird.schema"`), so the
+    /// naive `target.find('.')` would split inside the quoted segment
+    /// and produce an invalid pair.
+    fn split_qualified_name_quote_aware(target: &str) -> Option<(String, String)> {
+        let bytes = target.as_bytes();
+        let mut in_quotes = false;
+        let mut split_at = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'"' {
+                in_quotes = !in_quotes;
+            } else if b == b'.' && !in_quotes {
+                split_at = Some(i);
+                break;
+            }
+        }
+        let dot = split_at?;
+        let schema = target[..dot].trim_matches('"').to_string();
+        let name = target[dot + 1..].trim_matches('"').to_string();
+        if schema.is_empty() || name.is_empty() {
+            None
+        } else {
+            Some((schema, name))
+        }
     }
 
     // Comparing foreign keys

@@ -1417,3 +1417,43 @@ ALTER TABLE test_schema.cascade_items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY pol_cascade_items ON test_schema.cascade_items
     USING (test_schema.cascade_compute(value) > 0);
 
+-- =============================================================================
+-- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
+-- =============================================================================
+-- FROM has three LOGGED tables connected by a foreign-key chain
+-- (child -> parent -> grandparent). Schema B converts every table in
+-- the chain to UNLOGGED. The migration script must emit
+-- `ALTER TABLE ... SET UNLOGGED` in FK-leaf-first order
+-- (child -> parent -> grandparent); alphabetical order — which the
+-- comparer used before this fix — fails with:
+--   ERROR: could not change table "grandparent" to unlogged because
+--   it references logged table "parent"
+--
+-- The reverse direction (UNLOGGED -> LOGGED) requires the opposite
+-- order (roots first); both directions are exercised by the comparer's
+-- `Comparer::emit_persistence_changes` phase, which sorts each
+-- direction topologically over the FK adjacency derived from
+-- `pg_get_constraintdef`.
+--
+-- The serial PKs auto-create owned sequences. PostgreSQL propagates
+-- the table's `ALTER TABLE SET UNLOGGED` to every owned sequence
+-- automatically, so the comparer must NOT emit an explicit
+-- `ALTER SEQUENCE ... SET UNLOGGED` for them — when the only diff is
+-- `is_unlogged` and the owning table is also flipping, the entire
+-- ALTER SEQUENCE block is suppressed (issue #180).
+CREATE SCHEMA IF NOT EXISTS test_order;
+
+CREATE TABLE test_order.grandparent (
+    id serial PRIMARY KEY
+);
+
+CREATE TABLE test_order.parent (
+    id serial PRIMARY KEY,
+    grandparent_id integer REFERENCES test_order.grandparent(id)
+);
+
+CREATE TABLE test_order.child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES test_order.parent(id)
+);
+
