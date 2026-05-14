@@ -1702,7 +1702,10 @@ CREATE PUBLICATION test_pub_to_only FOR ALL TABLES;
 -- Issue #179 — DROP FUNCTION ... CASCADE recreate test (TO side)
 -- =============================================================================
 -- Function `cascade_compute(integer)` returns BIGINT here (was INTEGER in
--- Schema A). This signature change forces `DROP FUNCTION ... CASCADE`,
+-- Schema A). The argument list (`integer`) is unchanged, so the
+-- routine's signature in PostgreSQL terms is identical to FROM; only
+-- the return type differs. PostgreSQL has no `ALTER FUNCTION` for
+-- return types, so the comparer still emits `DROP FUNCTION ... CASCADE`,
 -- which silently removes the CHECK / functional index / generated column
 -- / column DEFAULT / RLS policy below — every dependent that
 -- `pg_depend` connects to the function. Phase 7 of

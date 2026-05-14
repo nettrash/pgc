@@ -1379,11 +1379,14 @@ CREATE PUBLICATION test_pub_unchanged FOR TABLE test_schema.users, test_schema.p
 -- Issue #179 — DROP FUNCTION ... CASCADE recreate test (FROM side)
 -- =============================================================================
 -- Function `cascade_compute(integer)` returns INTEGER here. Schema B
--- changes the return type to BIGINT, which forces a DROP+CREATE
--- (signature change). PostgreSQL silently CASCADE-drops every object
--- whose `pg_depend` row points at the function: the CHECK constraint,
--- the functional index, the generated column, the column DEFAULT, and
--- the RLS policy. The comparer must re-emit each one (Phase 7 of
+-- changes the return type to BIGINT. The argument list (`integer`) is
+-- unchanged, so the routine's signature in PostgreSQL terms is the
+-- same on both sides — but PostgreSQL has no `ALTER FUNCTION` for
+-- return types, so the comparer still emits DROP+CREATE. PostgreSQL
+-- silently CASCADE-drops every object whose `pg_depend` row points at
+-- the function: the CHECK constraint, the functional index, the
+-- generated column, the column DEFAULT, and the RLS policy. The
+-- comparer must re-emit each one (Phase 7 of
 -- `compare_routines_and_views`) — otherwise the migrated database is
 -- missing those objects until a second `pgc compare` run notices the
 -- drift.

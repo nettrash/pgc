@@ -3192,13 +3192,15 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         // Phase 7 – Recreate dependents silently dropped by CASCADE
         // ──────────────────────────────────────────────────────────
-        // When a routine's signature changes (or the routine is fully
-        // dropped) PGC emits `DROP ... CASCADE` and PostgreSQL removes
-        // every object whose `pg_depend` entry points at that function:
-        // functional indexes, CHECK constraints, generated columns,
-        // column DEFAULT expressions and RLS policies. The rest of the
-        // comparer never re-emits those dependents because they were
-        // unchanged between FROM and TO. See issue #179.
+        // When a routine is fully dropped, or its return type / argument
+        // list / argument defaults change (each forces DROP+CREATE
+        // because PostgreSQL has no in-place ALTER for those), PGC emits
+        // `DROP ... CASCADE` and PostgreSQL removes every object whose
+        // `pg_depend` entry points at that function: functional indexes,
+        // CHECK constraints, generated columns, column DEFAULT
+        // expressions and RLS policies. The rest of the comparer never
+        // re-emits those dependents because they were unchanged between
+        // FROM and TO. See issue #179.
         self.recreate_routine_dependents();
 
         self.script
@@ -3490,9 +3492,82 @@ impl Comparer {
     fn definition_references_any(definition: &str, routines: &HashSet<(String, String)>) -> bool {
         let (lower, unquoted) = Self::prelower_pair(definition);
         routines.iter().any(|(schema, name)| {
-            Self::text_references_qualified_name_pre(&lower, &unquoted, schema, name)
+            // Both passes require a function-call context (`name(` after
+            // optional whitespace). The qualified pass inherits this gate
+            // so a routine name that collides with another object kind
+            // in the same schema (table, sequence, view, …) does not
+            // trip Phase 7 — `pg_get_indexdef` emits `ON schema.table`,
+            // `pg_get_expr` emits `nextval('schema.seq'::regclass)`,
+            // etc., and those non-call references must not look like
+            // CASCADE-affected dependents.
+            Self::text_references_qualified_call(&lower, &unquoted, schema, name)
                 || Self::text_references_unqualified_call(&unquoted, name)
         })
+    }
+
+    /// Like [`Self::text_references_qualified_name_pre`] but additionally
+    /// requires the `schema.name` reference to be a function call:
+    /// followed (after optional ASCII whitespace) by `(`. Phase 7 uses
+    /// this stricter form so a routine sharing its name with another
+    /// object kind in the same schema (table, sequence, view) does not
+    /// false-positive on the deparsed `ON schema.table` of a CREATE
+    /// INDEX or the `'schema.seq'::regclass` of a `nextval` default.
+    /// The looser, call-context-free
+    /// [`Self::text_references_qualified_name_pre`] is kept for the
+    /// inter-routine dependency scan (which filters non-routine matches
+    /// by identity afterwards) and other call-sites where a non-call
+    /// reference is still meaningful.
+    fn text_references_qualified_call(
+        lowered: &str,
+        unquoted_lowered: &str,
+        schema_lc: &str,
+        name_lc: &str,
+    ) -> bool {
+        let mut pattern = String::with_capacity(schema_lc.len() + 1 + name_lc.len());
+        pattern.push_str(schema_lc);
+        pattern.push('.');
+        pattern.push_str(name_lc);
+        if Self::has_whole_qualified_call(lowered, &pattern) {
+            return true;
+        }
+        let unquoted_pattern: String = if pattern.contains('"') {
+            pattern.chars().filter(|c| *c != '"').collect()
+        } else {
+            pattern
+        };
+        Self::has_whole_qualified_call(unquoted_lowered, &unquoted_pattern)
+    }
+
+    /// Identifier-boundary delimited match for `qualified` plus a call
+    /// gate (optional whitespace then `(`). Mirrors
+    /// [`Self::has_whole_qualified_name`] for boundary semantics; the
+    /// extra gate makes it safe to feed deparsed DDL that may contain
+    /// `schema.name` references in non-call positions.
+    fn has_whole_qualified_call(text: &str, qualified: &str) -> bool {
+        let bytes = text.as_bytes();
+        for (idx, _) in text.match_indices(qualified) {
+            if idx > 0 {
+                let before = bytes[idx - 1];
+                if before.is_ascii_alphanumeric() || before == b'_' {
+                    continue;
+                }
+            }
+            let end = idx + qualified.len();
+            if end < bytes.len() {
+                let after = bytes[end];
+                if after.is_ascii_alphanumeric() || after == b'_' || after == b'.' {
+                    continue;
+                }
+            }
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                return true;
+            }
+        }
+        false
     }
 
     /// True when `text` contains `name` as a function call: a whole

@@ -1,9 +1,13 @@
 2026-05-14      v1.0.20
 
                 Bug fixes:
-                    - Fixed issue #179: a routine signature change (or
-                      a full routine drop) caused PGC to emit
-                      `DROP FUNCTION ... CASCADE`, and PostgreSQL
+                    - Fixed issue #179: a routine fully dropped, or one
+                      whose return type / argument list / argument
+                      defaults changed (each forces DROP+CREATE because
+                      PostgreSQL has no in-place `ALTER FUNCTION` for
+                      those — only the argument list change is a
+                      true PostgreSQL signature change), caused PGC to
+                      emit `DROP FUNCTION ... CASCADE`, and PostgreSQL
                       silently removed every object whose `pg_depend`
                       row pointed at the function — functional indexes,
                       CHECK constraints, generated columns, column

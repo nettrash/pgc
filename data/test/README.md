@@ -120,7 +120,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **generate_token()**: implementation changed from `gen_random_bytes` (pgcrypto) to `md5`-based
 - **get_active_usernames_sql()**: return type adds `preferred_contact` column
 - **product_price_with_tax_sql()**: new parameter `p_currency varchar DEFAULT 'USD'`
-- **cascade_compute(integer)**: return type `INTEGER` → `BIGINT` — signature change forces `DROP FUNCTION ... CASCADE`. Exercises Phase 7 of `compare_routines_and_views`, which must re-emit every dependent (CHECK / functional index / generated column / DEFAULT / RLS policy) silently dropped by CASCADE; see _CASCADE-Drop Dependent Recreation (Issue #179)_ in section 46.
+- **cascade_compute(integer)**: return type `INTEGER` → `BIGINT` — return type change requires `DROP FUNCTION ... CASCADE` (PostgreSQL has no `ALTER FUNCTION` for return types). The argument list (`integer`) is unchanged, so the function's signature in PostgreSQL terms is identical between FROM and TO; the cascade still fires. Exercises Phase 7 of `compare_routines_and_views`, which must re-emit every dependent (CHECK / functional index / generated column / DEFAULT / RLS policy) silently dropped by CASCADE; see _CASCADE-Drop Dependent Recreation (Issue #179)_ in section 46.
 
 #### Removed Functions
 - **calculate_order_total()**: depends on removed `orders` table
@@ -436,7 +436,7 @@ Requires `wal_level = logical`. Comment out these statements if the test server 
 
 #### CASCADE-Drop Dependent Recreation (Issue #179)
 
-- `test_schema.cascade_compute(integer)` returns `INTEGER` in FROM and `BIGINT` in TO. The signature change forces `DROP FUNCTION ... CASCADE`, which silently removes every object whose `pg_depend` row points at the function.
+- `test_schema.cascade_compute(integer)` returns `INTEGER` in FROM and `BIGINT` in TO. The argument list (`integer`) is unchanged, so the routine's signature in PostgreSQL terms is identical between FROM and TO; the return-type change still requires `DROP FUNCTION ... CASCADE` (PostgreSQL has no `ALTER FUNCTION` for return types). The cascade silently removes every object whose `pg_depend` row points at the function.
 - `test_schema.cascade_items` carries one of each affected dependent kind, all referencing `cascade_compute`:
   - **CHECK constraint**: `chk_cascade_compute CHECK (cascade_compute(value) > 0)`
   - **Functional index**: `idx_cascade_compute ON (cascade_compute(value))`
@@ -613,4 +613,4 @@ The comparison should detect and generate SQL for:
 - Creating, modifying, and revoking default privileges (ALTER DEFAULT PRIVILEGES per role/schema/object type)
 - Creating, modifying, and dropping foreign servers and user mappings (OPTIONS changes, add/remove entries)
 - Creating, modifying, and dropping publications (FOR TABLE list, FOR ALL TABLES, publish operations)
-- Recreating dependents silently dropped by `DROP FUNCTION ... CASCADE` on routine signature change (functional indexes, CHECK constraints, generated columns, column DEFAULT expressions, RLS policies — Issue #179)
+- Recreating dependents silently dropped by `DROP FUNCTION ... CASCADE` when a routine is fully dropped or its return type / argument list / argument defaults change (functional indexes, CHECK constraints, generated columns, column DEFAULT expressions, RLS policies — Issue #179)

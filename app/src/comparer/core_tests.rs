@@ -7457,6 +7457,51 @@ fn issue179_unqualified_match_handles_non_ascii_identifiers() {
     ));
 }
 
+#[test]
+fn issue179_qualified_match_requires_call_context() {
+    // `pg_get_indexdef` emits `CREATE INDEX … ON schema.table …`,
+    // `pg_get_expr` emits `nextval('schema.seq'::regclass)`, etc.
+    // Without a call gate the qualified matcher would pick up those
+    // `schema.name` references whenever a routine happens to share its
+    // name with a table / view / sequence in the same schema, and
+    // Phase 7 would emit spurious recreates for unrelated objects.
+    let mut affected: HashSet<(String, String)> = HashSet::new();
+    affected.insert(("test_schema".to_string(), "users".to_string()));
+
+    // Match: real qualified function call.
+    assert!(Comparer::definition_references_any(
+        "check (test_schema.users(value) > 0)",
+        &affected,
+    ));
+    // Match with whitespace before `(`.
+    assert!(Comparer::definition_references_any(
+        "check (test_schema.users  (value) > 0)",
+        &affected,
+    ));
+
+    // No match: qualified reference is the table in a CREATE INDEX
+    // ON clause — not a function call.
+    assert!(!Comparer::definition_references_any(
+        "create index idx ON test_schema.users using btree (value)",
+        &affected,
+    ));
+    // No match: qualified reference inside a `nextval` regclass cast.
+    assert!(!Comparer::definition_references_any(
+        "nextval('test_schema.users'::regclass)",
+        &affected,
+    ));
+    // No match: identifier without a `(` after.
+    assert!(!Comparer::definition_references_any(
+        "check (test_schema.users > 0)",
+        &affected,
+    ));
+    // No match: qualified suffix of a longer name (boundary check).
+    assert!(!Comparer::definition_references_any(
+        "check (test_schema.users_v2(value) > 0)",
+        &affected,
+    ));
+}
+
 #[tokio::test]
 async fn issue179_quoted_routine_name_recreates_dependents() {
     // The dump query wraps `proname` with `quote_ident`, so a
