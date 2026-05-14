@@ -1,0 +1,554 @@
+use super::*;
+use sha2::{Digest, Sha256};
+
+fn create_test_trigger() -> TableTrigger {
+    TableTrigger {
+        oid: Oid(12345),
+        name: "test_trigger".to_string(),
+        definition:
+            "before insert or update on test_table for each row execute function test_function()"
+                .to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    }
+}
+
+fn create_simple_trigger() -> TableTrigger {
+    TableTrigger {
+        oid: Oid(67890),
+        name: "simple_trigger".to_string(),
+        definition: "after delete on users for each row execute function audit_delete()"
+            .to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    }
+}
+
+fn create_complex_trigger() -> TableTrigger {
+    TableTrigger {
+        oid: Oid(11111),
+        name: "complex_trigger".to_string(),
+        definition: "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user()".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    }
+}
+
+#[test]
+fn test_table_trigger_creation() {
+    let trigger = create_test_trigger();
+
+    assert_eq!(trigger.oid, Oid(12345));
+    assert_eq!(trigger.name, "test_trigger");
+    assert_eq!(
+        trigger.definition,
+        "before insert or update on test_table for each row execute function test_function()"
+    );
+}
+
+#[test]
+fn test_table_trigger_creation_with_different_values() {
+    let trigger = create_simple_trigger();
+
+    assert_eq!(trigger.oid, Oid(67890));
+    assert_eq!(trigger.name, "simple_trigger");
+    assert_eq!(
+        trigger.definition,
+        "after delete on users for each row execute function audit_delete()"
+    );
+}
+
+#[test]
+fn test_table_trigger_creation_complex() {
+    let trigger = create_complex_trigger();
+
+    assert_eq!(trigger.oid, Oid(11111));
+    assert_eq!(trigger.name, "complex_trigger");
+    assert_eq!(
+        trigger.definition,
+        "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user()"
+    );
+}
+
+#[test]
+fn test_add_to_hasher() {
+    let trigger = create_test_trigger();
+    let mut hasher1 = Sha256::new();
+    let mut hasher2 = Sha256::new();
+
+    // Add the same trigger to both hashers
+    trigger.add_to_hasher(&mut hasher1);
+    trigger.add_to_hasher(&mut hasher2);
+
+    // Should produce the same hash
+    let hash1 = format!("{:x}", hasher1.finalize());
+    let hash2 = format!("{:x}", hasher2.finalize());
+    assert_eq!(hash1, hash2);
+
+    // Hash should be 64 characters (SHA256)
+    assert_eq!(hash1.len(), 64);
+    assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn test_add_to_hasher_different_triggers() {
+    let trigger1 = create_test_trigger();
+    let trigger2 = create_simple_trigger();
+
+    let mut hasher1 = Sha256::new();
+    let mut hasher2 = Sha256::new();
+
+    trigger1.add_to_hasher(&mut hasher1);
+    trigger2.add_to_hasher(&mut hasher2);
+
+    let hash1 = format!("{:x}", hasher1.finalize());
+    let hash2 = format!("{:x}", hasher2.finalize());
+
+    // Different triggers should produce different hashes
+    assert_ne!(hash1, hash2);
+}
+
+#[test]
+fn test_add_to_hasher_includes_all_fields() {
+    let base_trigger = create_test_trigger();
+
+    // Test that changing name or definition affects the hash
+    let mut trigger_diff_name = base_trigger.clone();
+    trigger_diff_name.name = "different_name".to_string();
+
+    let mut trigger_diff_definition = base_trigger.clone();
+    trigger_diff_definition.definition =
+        "after insert on different_table for each row execute function different_function()"
+            .to_string();
+
+    // Get hashes for all variations
+    let mut hasher_base = Sha256::new();
+    base_trigger.add_to_hasher(&mut hasher_base);
+    let hash_base = format!("{:x}", hasher_base.finalize());
+
+    let mut hasher_name = Sha256::new();
+    trigger_diff_name.add_to_hasher(&mut hasher_name);
+    let hash_name = format!("{:x}", hasher_name.finalize());
+
+    let mut hasher_definition = Sha256::new();
+    trigger_diff_definition.add_to_hasher(&mut hasher_definition);
+    let hash_definition = format!("{:x}", hasher_definition.finalize());
+
+    // All hashes should be different
+    assert_ne!(hash_base, hash_name);
+    assert_ne!(hash_base, hash_definition);
+    assert_ne!(hash_name, hash_definition);
+}
+
+#[test]
+fn test_get_script_simple() {
+    let trigger = create_test_trigger();
+    let script = trigger.get_script("public", "test_table");
+
+    let expected =
+        "before insert or update on test_table for each row execute function test_function();\n\n";
+    assert_eq!(script, expected);
+}
+
+#[test]
+fn test_get_script_after_delete() {
+    let trigger = create_simple_trigger();
+    let script = trigger.get_script("public", "users");
+
+    let expected = "after delete on users for each row execute function audit_delete();\n\n";
+    assert_eq!(script, expected);
+}
+
+#[test]
+fn test_get_script_complex() {
+    let trigger = create_complex_trigger();
+    let script = trigger.get_script("public", "users");
+
+    let expected = "before insert or update of name, email on users for each row when (new.active = true) execute function validate_user();\n\n";
+    assert_eq!(script, expected);
+}
+
+#[test]
+fn test_get_script_with_special_characters() {
+    let trigger = TableTrigger {
+        oid: Oid(22222),
+        name: "test_trigger$name".to_string(),
+        definition:
+            "before insert on \"special-table\" for each row execute function \"validate_data\"()"
+                .to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+
+    let script = trigger.get_script("public", "\"special-table\"");
+    let expected =
+        "before insert on \"special-table\" for each row execute function \"validate_data\"();\n\n";
+    assert_eq!(script, expected);
+}
+
+#[test]
+fn test_get_script_with_empty_definition() {
+    let trigger = TableTrigger {
+        oid: Oid(33333),
+        name: "empty_trigger".to_string(),
+        definition: "".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+
+    let script = trigger.get_script("public", "test");
+    let expected = ";\n\n";
+    assert_eq!(script, expected);
+}
+
+#[test]
+fn test_get_script_disabled_trigger() {
+    let trigger = TableTrigger {
+        oid: Oid(44444),
+        name: "disabled_trigger".to_string(),
+        definition: "before insert on public.test for each row execute function func()".to_string(),
+        enabled: "D".to_string(),
+        comment: None,
+    };
+
+    let script = trigger.get_script("public", "test");
+    assert!(script.contains("alter table public.test disable trigger disabled_trigger;"));
+}
+
+#[test]
+fn test_get_script_always_trigger() {
+    let trigger = TableTrigger {
+        oid: Oid(55555),
+        name: "always_trigger".to_string(),
+        definition: "before insert on public.test for each row execute function func()".to_string(),
+        enabled: "A".to_string(),
+        comment: None,
+    };
+
+    let script = trigger.get_script("public", "test");
+    assert!(script.contains("alter table public.test enable always trigger always_trigger;"));
+}
+
+#[test]
+fn test_get_script_with_comment() {
+    let trigger = TableTrigger {
+        oid: Oid(66666),
+        name: "commented_trigger".to_string(),
+        definition: "before insert on public.test for each row execute function func()".to_string(),
+        enabled: "O".to_string(),
+        comment: Some("Audit trigger".to_string()),
+    };
+
+    let script = trigger.get_script("public", "test");
+    assert!(
+        script.contains("comment on trigger commented_trigger on public.test is 'Audit trigger';")
+    );
+}
+
+#[test]
+fn test_alter_script_enabled_change() {
+    let from = TableTrigger {
+        oid: Oid(1),
+        name: "trg".to_string(),
+        definition: "before insert on public.t for each row execute function f()".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+    let to = TableTrigger {
+        oid: Oid(1),
+        name: "trg".to_string(),
+        definition: "before insert on public.t for each row execute function f()".to_string(),
+        enabled: "D".to_string(),
+        comment: None,
+    };
+
+    let script = from.get_alter_script(&to, "public", "t", true);
+    assert!(script.contains("disable trigger"));
+    assert!(!script.contains("drop trigger"));
+}
+
+#[test]
+fn test_partial_eq_identical_triggers() {
+    let trigger1 = create_test_trigger();
+    let trigger2 = create_test_trigger();
+
+    assert_eq!(trigger1, trigger2);
+    assert!(trigger1.eq(&trigger2));
+}
+
+#[test]
+fn test_partial_eq_different_name() {
+    let trigger1 = create_test_trigger();
+    let mut trigger2 = create_test_trigger();
+    trigger2.name = "different_name".to_string();
+
+    assert_ne!(trigger1, trigger2);
+    assert!(!trigger1.eq(&trigger2));
+}
+
+#[test]
+fn test_partial_eq_different_definition() {
+    let trigger1 = create_test_trigger();
+    let mut trigger2 = create_test_trigger();
+    trigger2.definition =
+        "after insert on different_table for each row execute function different_function()"
+            .to_string();
+
+    assert_ne!(trigger1, trigger2);
+    assert!(!trigger1.eq(&trigger2));
+}
+
+#[test]
+fn test_table_trigger_clone() {
+    let original = create_test_trigger();
+    let cloned = original.clone();
+
+    assert_eq!(original.oid, cloned.oid);
+    assert_eq!(original.name, cloned.name);
+    assert_eq!(original.definition, cloned.definition);
+    assert_eq!(original, cloned);
+
+    // Verify hash consistency
+    let mut hasher_original = Sha256::new();
+    let mut hasher_cloned = Sha256::new();
+    original.add_to_hasher(&mut hasher_original);
+    cloned.add_to_hasher(&mut hasher_cloned);
+
+    let hash_original = format!("{:x}", hasher_original.finalize());
+    let hash_cloned = format!("{:x}", hasher_cloned.finalize());
+    assert_eq!(hash_original, hash_cloned);
+}
+
+#[test]
+fn test_table_trigger_debug_format() {
+    let trigger = create_test_trigger();
+    let debug_string = format!("{trigger:?}");
+
+    // Verify that the debug string contains all fields
+    assert!(debug_string.contains("TableTrigger"));
+    assert!(debug_string.contains("oid"));
+    assert!(debug_string.contains("12345"));
+    assert!(debug_string.contains("name"));
+    assert!(debug_string.contains("test_trigger"));
+    assert!(debug_string.contains("definition"));
+    assert!(debug_string.contains("before insert or update"));
+}
+
+#[test]
+fn test_serde_serialization() {
+    let trigger = create_test_trigger();
+
+    // Test serialization
+    let json = serde_json::to_string(&trigger).expect("Failed to serialize");
+    assert!(json.contains("12345"));
+    assert!(json.contains("test_trigger"));
+    assert!(json.contains("before insert or update on test_table"));
+
+    // Test deserialization
+    let deserialized: TableTrigger = serde_json::from_str(&json).expect("Failed to deserialize");
+    assert_eq!(trigger.oid, deserialized.oid);
+    assert_eq!(trigger.name, deserialized.name);
+    assert_eq!(trigger.definition, deserialized.definition);
+    assert_eq!(trigger, deserialized);
+}
+
+#[test]
+fn test_edge_cases_empty_strings() {
+    let trigger = TableTrigger {
+        oid: Oid(0),
+        name: "".to_string(),
+        definition: "".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+
+    // Should handle empty strings gracefully
+    assert_eq!(trigger.oid, Oid(0));
+    assert_eq!(trigger.name, "");
+    assert_eq!(trigger.definition, "");
+
+    // Hash should still work with empty strings
+    let mut hasher = Sha256::new();
+    trigger.add_to_hasher(&mut hasher);
+    let hash = format!("{:x}", hasher.finalize());
+    assert_eq!(hash.len(), 64);
+
+    // Script should work with empty strings
+    let script = trigger.get_script("public", "t");
+    assert_eq!(script, ";\n\n");
+
+    // Equality should work
+    let trigger2 = TableTrigger {
+        oid: Oid(0),
+        name: "".to_string(),
+        definition: "".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+    assert_eq!(trigger, trigger2);
+}
+
+#[test]
+fn test_trigger_with_multiline_definition() {
+    let trigger = TableTrigger {
+        oid: Oid(44444),
+        name: "multiline_trigger".to_string(),
+        definition: "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email()".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+
+    let script = trigger.get_script("public", "users");
+    let expected = "before insert or update on users\n    for each row\n    when (new.email is not null)\n    execute function validate_email();\n\n";
+    assert_eq!(script, expected);
+
+    // Hash should work with multiline definitions
+    let mut hasher = Sha256::new();
+    trigger.add_to_hasher(&mut hasher);
+    let hash = format!("{:x}", hasher.finalize());
+    assert_eq!(hash.len(), 64);
+}
+
+#[test]
+fn test_trigger_with_very_long_definition() {
+    let long_definition = "before insert or update on ".to_string()
+        + &"very_long_table_name_".repeat(10)
+        + " for each row execute function "
+        + &"very_long_function_name_".repeat(5)
+        + "()";
+
+    let trigger = TableTrigger {
+        oid: Oid(55556),
+        name: "long_trigger".to_string(),
+        definition: long_definition.clone(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+
+    assert_eq!(trigger.definition, long_definition);
+
+    let script = trigger.get_script("public", "t");
+    assert_eq!(script, format!("{};\n\n", long_definition));
+
+    // Hash should work with very long definitions
+    let mut hasher = Sha256::new();
+    trigger.add_to_hasher(&mut hasher);
+    let hash = format!("{:x}", hasher.finalize());
+    assert_eq!(hash.len(), 64);
+}
+
+#[test]
+fn test_known_sha256_hash() {
+    let trigger = TableTrigger {
+        oid: Oid(1),
+        name: "test".to_string(),
+        definition: "definition".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+
+    // Create the same hash as the implementation
+    let mut hasher = Sha256::new();
+    hasher.update("test".as_bytes()); // name
+    hasher.update("definition".as_bytes()); // definition
+    hasher.update("O".as_bytes()); // enabled
+
+    let expected_hash = format!("{:x}", hasher.finalize());
+
+    let mut test_hasher = Sha256::new();
+    trigger.add_to_hasher(&mut test_hasher);
+    let actual_hash = format!("{:x}", test_hasher.finalize());
+
+    assert_eq!(actual_hash, expected_hash);
+}
+
+#[test]
+fn test_trigger_types_coverage() {
+    // Test different trigger types and events
+    let triggers = vec![
+        TableTrigger {
+            oid: Oid(1001),
+            name: "before_insert_trigger".to_string(),
+            definition: "before insert on table1 for each row execute function func1()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
+        },
+        TableTrigger {
+            oid: Oid(1002),
+            name: "after_update_trigger".to_string(),
+            definition: "after update on table2 for each row execute function func2()".to_string(),
+            enabled: "O".to_string(),
+            comment: None,
+        },
+        TableTrigger {
+            oid: Oid(1003),
+            name: "instead_of_trigger".to_string(),
+            definition: "instead of delete on view1 for each row execute function func3()"
+                .to_string(),
+            enabled: "O".to_string(),
+            comment: None,
+        },
+        TableTrigger {
+            oid: Oid(1004),
+            name: "statement_trigger".to_string(),
+            definition: "after truncate on table3 for each statement execute function func4()"
+                .to_string(),
+            enabled: "O".to_string(),
+            comment: None,
+        },
+    ];
+
+    for trigger in triggers {
+        // Each should produce a valid script (definition + semicolon)
+        let script = trigger.get_script("public", "t");
+        assert!(script.starts_with(&trigger.definition));
+
+        // Each should produce a valid hash
+        let mut hasher = Sha256::new();
+        trigger.add_to_hasher(&mut hasher);
+        let hash = format!("{:x}", hasher.finalize());
+        assert_eq!(hash.len(), 64);
+    }
+}
+
+#[test]
+fn test_alter_script_definition_change_includes_enabled_and_comment() {
+    let from = TableTrigger {
+        oid: Oid(1),
+        name: "trg".to_string(),
+        definition: "before insert on public.t for each row execute function f()".to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+    let to = TableTrigger {
+        oid: Oid(1),
+        name: "trg".to_string(),
+        definition: "after insert on public.t for each row execute function g()".to_string(),
+        enabled: "D".to_string(),
+        comment: Some("audit trigger".to_string()),
+    };
+
+    let script = from.get_alter_script(&to, "public", "t", true);
+    assert!(
+        script.contains("drop trigger if exists trg on public.t;"),
+        "must drop old trigger, got: {script}"
+    );
+    assert!(
+        script.contains("after insert on public.t for each row execute function g();"),
+        "must recreate with new definition, got: {script}"
+    );
+    assert!(
+        script.contains("disable trigger trg"),
+        "must include enabled state from get_script, got: {script}"
+    );
+    assert!(
+        script.contains("comment on trigger trg on public.t is 'audit trigger';"),
+        "must include comment from get_script, got: {script}"
+    );
+    // Must not have duplicate disable statements
+    let disable_count = script.matches("disable trigger").count();
+    assert_eq!(
+        disable_count, 1,
+        "must not duplicate disable statement, got {disable_count} in: {script}"
+    );
+}
