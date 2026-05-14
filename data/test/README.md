@@ -15,6 +15,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 
 ### 1. Schemas
 - **Added**: `new_reporting_schema` in Schema B
+- **Added**: `test_order` (issue #180 FK-ordered SET LOGGED/UNLOGGED) in both schemas — entire chain flips from LOGGED in Schema A to UNLOGGED in Schema B
 - **Unchanged**: `test_schema`, `shared_schema`
 
 ### 2. Extensions
@@ -282,6 +283,7 @@ Grant comparison test using roles `pgc_grant_reader` and `pgc_grant_writer`.
 ### 28. UNLOGGED Tables
 - **Modified**: `test_schema.unlogged_test` — regular (logged) table in FROM; UNLOGGED in TO
 - Verifies `ALTER TABLE SET UNLOGGED` / `SET LOGGED` generation
+- **FK-chain conversion (Issue #180)**: `test_order.grandparent`, `test_order.parent`, `test_order.child` — three LOGGED tables with FK chain `child -> parent -> grandparent` in Schema A; all three UNLOGGED in Schema B. Verifies the comparer emits `SET UNLOGGED` in FK-leaf-first order (`child`, then `parent`, then `grandparent`); the alphabetical order PostgreSQL would otherwise reject with `ERROR: could not change table "grandparent" to unlogged because it references logged table "parent"`. Each table's `serial` PK auto-creates an owned sequence (`*_id_seq`) — these must NOT receive an explicit `ALTER SEQUENCE ... SET UNLOGGED`, since `ALTER TABLE SET UNLOGGED` propagates to owned sequences automatically.
 
 ### 29. Storage Parameters (reloptions)
 - **Modified**: `test_schema.storage_params_test` — `fillfactor=70` in FROM; `fillfactor=90, autovacuum_enabled=false` in TO
@@ -594,7 +596,7 @@ The comparison should detect and generate SQL for:
 - Creating, dropping, and altering extended statistics (kind changes via drop+recreate)
 - Detecting NOT ENFORCED constraint flag changes (PG18+)
 - Handling virtual/stored generated column transitions (PG18+)
-- Detecting UNLOGGED ↔ LOGGED table persistence changes
+- Detecting UNLOGGED ↔ LOGGED table persistence changes, ordering `SET UNLOGGED` / `SET LOGGED` topologically over the FK graph (leaves-first / roots-first respectively) and suppressing redundant `ALTER SEQUENCE ... SET UNLOGGED|LOGGED` on owned sequences whose owning table is flipping in the same migration — PostgreSQL propagates the table change to owned sequences automatically (Issue #180)
 - Detecting storage parameters (reloptions/WITH clause) changes (fillfactor, autovacuum settings, etc.)
 - Detecting REPLICA IDENTITY changes (DEFAULT, NOTHING, FULL)
 - Detecting FORCE ROW LEVEL SECURITY changes
