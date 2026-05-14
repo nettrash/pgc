@@ -1,6 +1,38 @@
 2026-05-14      v1.0.20
 
                 Bug fixes:
+                    - Fixed issue #180: `ALTER TABLE ... SET LOGGED|
+                      UNLOGGED` was emitted inline with the per-table
+                      alter loop in alphabetical order, which
+                      PostgreSQL rejects whenever an FK chain flips
+                      persistence in the same migration —
+                      `SET UNLOGGED` fails if any LOGGED table
+                      references the target, `SET LOGGED` fails if the
+                      target references any UNLOGGED one. Moved the
+                      emission out of `Table::build_alter_script` and
+                      into a dedicated `Comparer::emit_persistence_
+                      changes` phase that runs at the end of
+                      `compare_tables`: tables flipping to UNLOGGED are
+                      sorted leaves-before-roots (reverse FK topo),
+                      tables flipping to LOGGED are sorted
+                      roots-before-leaves (forward FK topo), each via
+                      `Self::topo_order_within_subset` over an FK
+                      adjacency derived from the TO-side constraint
+                      definitions (parsed by `Self::parse_fk_
+                      referenced_table`). Owned sequences also get
+                      cleaner output: `Sequence::is_only_persistence_
+                      change` lets `compare_sequences` skip the entire
+                      `ALTER SEQUENCE` for sequences whose only diff is
+                      `is_unlogged` and whose owning table is itself
+                      flipping persistence (PostgreSQL propagates the
+                      `ALTER TABLE SET LOGGED|UNLOGGED` to every owned
+                      sequence automatically, so the explicit emit was
+                      redundant), and `Sequence::get_alter_script_
+                      excluding_persistence` strips just the
+                      `ALTER SEQUENCE … SET LOGGED|UNLOGGED` line when
+                      the sequence has other diffs to emit but the
+                      owning table will still propagate the persistence
+                      flip.
                     - Fixed issue #179: when a routine was dropped or
                       its return type / arguments / argument defaults
                       changed, `DROP FUNCTION ... CASCADE` silently

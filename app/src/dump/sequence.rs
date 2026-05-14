@@ -224,11 +224,51 @@ impl Sequence {
     /// would rewind a live sequence whose current position is already above the new
     /// `start_value`, risking duplicate-key violations.
     pub fn get_alter_script(&self, from: &Sequence) -> String {
+        self.build_alter_script(from, true)
+    }
+
+    /// Same as [`Self::get_alter_script`] but never emits the
+    /// `ALTER SEQUENCE ... SET LOGGED|UNLOGGED` line. The comparer
+    /// uses this when the owning table is itself flipping persistence
+    /// in the same migration: PostgreSQL automatically propagates the
+    /// table's `ALTER TABLE SET LOGGED|UNLOGGED` to every owned
+    /// sequence, so re-emitting the SET on the sequence is redundant
+    /// (issue #180).
+    pub fn get_alter_script_excluding_persistence(&self, from: &Sequence) -> String {
+        self.build_alter_script(from, false)
+    }
+
+    /// True when the only field that differs between `self` (TO) and
+    /// `from` is `is_unlogged`. Used by the comparer to suppress an
+    /// otherwise no-op `ALTER SEQUENCE …` for owned sequences whose
+    /// owning table is flipping persistence (the table's `ALTER TABLE
+    /// SET LOGGED|UNLOGGED` propagates to the sequence on its own —
+    /// re-emitting the full clause list would be cosmetic noise).
+    pub fn is_only_persistence_change(&self, from: &Sequence) -> bool {
+        self.is_unlogged != from.is_unlogged
+            && self.schema == from.schema
+            && self.name == from.name
+            && self.owner == from.owner
+            && self.data_type == from.data_type
+            && self.start_value == from.start_value
+            && self.min_value == from.min_value
+            && self.max_value == from.max_value
+            && self.increment_by == from.increment_by
+            && self.cycle == from.cycle
+            && self.cache_size == from.cache_size
+            && self.is_identity == from.is_identity
+            && self.comment == from.comment
+            && self.owned_by_schema == from.owned_by_schema
+            && self.owned_by_table == from.owned_by_table
+            && self.owned_by_column == from.owned_by_column
+    }
+
+    fn build_alter_script(&self, from: &Sequence, include_persistence: bool) -> String {
         let mut clauses = Vec::new();
 
         // Handle logged/unlogged change
         let mut logging_script = String::new();
-        if self.is_unlogged != from.is_unlogged {
+        if include_persistence && self.is_unlogged != from.is_unlogged {
             if self.is_unlogged {
                 logging_script =
                     format!("alter sequence {}.{} set unlogged;", self.schema, self.name)

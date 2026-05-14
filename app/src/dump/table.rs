@@ -1811,21 +1811,18 @@ impl Table {
             ));
         }
 
-        // UNLOGGED / LOGGED change
-        if self.is_unlogged != to_table.is_unlogged {
-            let stmt = if to_table.is_unlogged {
-                format!(
-                    "alter table {}.{} set unlogged;",
-                    to_table.schema, to_table.name
-                )
-            } else {
-                format!(
-                    "alter table {}.{} set logged;",
-                    to_table.schema, to_table.name
-                )
-            };
-            script.append_block(&stmt);
-        }
+        // UNLOGGED / LOGGED change is emitted by the comparer in a
+        // separate FK-ordered phase (see issue #180). Doing it inline
+        // here would interleave SET UNLOGGED/LOGGED statements with the
+        // alphabetical table order PostgreSQL rejects:
+        //   * SET UNLOGGED fails if any LOGGED table references this
+        //     one — referencers (leaves) must be converted first.
+        //   * SET LOGGED   fails if this table references any UNLOGGED
+        //     one — referenced tables (roots) must be converted first.
+        // Both directions therefore need a topological pass that this
+        // per-table function can't perform. The comparer collects
+        // `Self::persistence_change_for(&to_table)` results from every
+        // pair and emits them in the right order at end of compare.
 
         // Storage parameters change
         if self.storage_parameters != to_table.storage_parameters {
@@ -1905,6 +1902,22 @@ impl Table {
     /// Get script for altering the table without triggers (for deferred trigger creation)
     pub fn get_alter_script_without_triggers(&self, to_table: &Table, use_drop: bool) -> String {
         self.build_alter_script(to_table, use_drop, false)
+    }
+
+    /// Returns `Some(target_is_unlogged)` when this table's logging
+    /// status differs from `to_table`. The comparer collects these per
+    /// (FROM, TO) pair and emits the resulting `ALTER TABLE ... SET
+    /// LOGGED|UNLOGGED` statements in FK-topological order (see issue
+    /// #180): inline emission in `build_alter_script` would honour the
+    /// alphabetical table iteration order, which PostgreSQL rejects
+    /// whenever a referencing-table / referenced-table pair flip
+    /// persistence in the same migration.
+    pub fn persistence_change_for(&self, to_table: &Table) -> Option<bool> {
+        if self.is_unlogged != to_table.is_unlogged {
+            Some(to_table.is_unlogged)
+        } else {
+            None
+        }
     }
 
     fn get_trigger_alter_parts(&self, to_table: &Table, use_drop: bool) -> (String, String) {
