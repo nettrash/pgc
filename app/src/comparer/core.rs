@@ -2060,8 +2060,20 @@ impl Comparer {
     /// that itself contains a literal `.`
     /// (e.g. `REFERENCES "weird.schema"."t"(id)`) is split at the
     /// dot OUTSIDE the quotes, not the first dot in byte order.
+    ///
+    /// The case-insensitive haystack is built with [`str::to_ascii_
+    /// lowercase`] rather than [`str::to_lowercase`]: the latter can
+    /// change byte length for some non-ASCII characters (e.g. capital
+    /// Turkish dotted I, which lowercases into a multi-character
+    /// sequence with a different UTF-8 length), and we slice back
+    /// into the original `def` using offsets that came from the
+    /// haystack — a length-changing lowercasing would leave those
+    /// offsets pointing inside a UTF-8 codepoint and panic.
+    /// `to_ascii_lowercase` is byte-length-preserving (only ASCII
+    /// letters change, every other byte is left intact) and the
+    /// keyword `references` is pure ASCII, so it's the right tool.
     fn parse_fk_referenced_table(def: &str) -> Option<(String, String)> {
-        let lower = def.to_lowercase();
+        let lower = def.to_ascii_lowercase();
         let bytes = lower.as_bytes();
         let kw = b"references";
         let kw_len = kw.len();

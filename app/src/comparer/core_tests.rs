@@ -8914,6 +8914,48 @@ fn issue180_parse_fk_referenced_table_quoted_identifier_with_dot() {
     );
 }
 
+#[test]
+fn issue180_parse_fk_referenced_table_handles_non_ascii_column_names() {
+    // PR #184 follow-up review: `parse_fk_referenced_table` previously
+    // built the case-insensitive haystack via `to_lowercase()`, which
+    // can change byte length for some non-ASCII characters
+    // (e.g. capital Turkish dotted I, `İ`, lowercases to a multi-char
+    // sequence with a different UTF-8 length). The keyword position
+    // came from the lowercased haystack but the slice that produces
+    // the parsed identifier reaches back into `def`, so a
+    // length-changing lowercasing would land mid-codepoint and panic.
+    // `to_ascii_lowercase()` is byte-length-preserving — pin that
+    // contract by parsing FK definitions whose column list contains
+    // identifiers that trip every byte-length-changing lowercase
+    // conversion in common locales.
+    //
+    // Quoted column with capital `İ` (U+0130). With `to_lowercase()`
+    // this produces `i\u{0307}` (3 bytes total); `to_ascii_lowercase`
+    // leaves the 2-byte `İ` alone, so byte offsets line up.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (\"\u{0130}d\") REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string()))
+    );
+    // German sharp S (`ß`, U+00DF). `to_lowercase()` keeps it as `ß`,
+    // but the inverse — uppercase `ẞ` (U+1E9E) lowercasing to `ß` —
+    // is length-preserving in UTF-8 too. Use a Cyrillic lowercase
+    // identifier here just to round out coverage of identifiers whose
+    // bytes lie outside the ASCII range.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (\"русское_имя\") REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string()))
+    );
+    // Same case in the qualified target identifier.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"тест\".\"target\"(id)"),
+        Some(("тест".to_string(), "target".to_string()))
+    );
+}
+
 #[tokio::test]
 async fn issue180_set_unlogged_skips_ordering_for_new_fks_added_later() {
     // PR #184 review (FK-timing): when an FK is brand-new in TO it is
