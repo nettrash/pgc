@@ -6970,3 +6970,316 @@ async fn mark_serial_columns_handles_dotted_identifier_names() {
         "dotted-name column must still be marked as serial"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Issue #179 — DROP FUNCTION ... CASCADE silently drops dependent
+// objects (functional indexes, CHECK constraints, generated columns,
+// column DEFAULT expressions, RLS policies). Phase 7 of
+// `compare_routines_and_views` re-emits them.
+// ─────────────────────────────────────────────────────────────────────
+
+use crate::dump::table_index::TableIndex;
+use crate::dump::table_policy::TablePolicy;
+
+/// Build a `Routine` mirroring `test_deps.compute(x integer)` from the
+/// issue report, parameterised by return type so a single helper covers
+/// both the FROM (integer) and TO (bigint) sides.
+fn issue179_compute_routine(return_type: &str, body: &str) -> Routine {
+    let mut routine = Routine::new(
+        "test_deps".to_string(),
+        Oid(900),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        return_type.to_string(),
+        "x integer".to_string(),
+        None,
+        None,
+        body.to_string(),
+    );
+    routine.hash();
+    routine
+}
+
+/// Construct an `items` table that mirrors the issue's example: each
+/// dependent (functional index, CHECK constraint, generated column,
+/// column DEFAULT, RLS policy) references `test_deps.compute`.
+fn issue179_items_table(value_type: &str, def_default: &str, gen_type: &str) -> Table {
+    let mut def_col = int_column("test_deps", "items", "def_col", 2);
+    def_col.data_type = value_type.to_string();
+    def_col.column_default = Some(def_default.to_string());
+
+    let mut gen_col = int_column("test_deps", "items", "gen_col", 3);
+    gen_col.data_type = gen_type.to_string();
+    gen_col.is_generated = "ALWAYS".to_string();
+    gen_col.generation_expression = Some("test_deps.compute(value)".to_string());
+    gen_col.generation_type = Some("s".to_string());
+
+    let mut value_col = int_column("test_deps", "items", "value", 1);
+    value_col.is_nullable = false;
+
+    let chk_constraint = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "chk_compute".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("CHECK (test_deps.compute(value) > 0)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "idx_compute".to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef:
+            "CREATE INDEX idx_compute ON test_deps.items USING btree (test_deps.compute(value))"
+                .to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let policy = TablePolicy {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "p_items".to_string(),
+        command: "all".to_string(),
+        permissive: true,
+        roles: vec![],
+        using_clause: Some("(test_deps.compute(value) > 0)".to_string()),
+        check_clause: None,
+    };
+
+    let mut table = Table::new(
+        "test_deps".to_string(),
+        "items".to_string(),
+        "test_deps".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col, def_col, gen_col],
+        vec![chk_constraint],
+        vec![idx],
+        vec![],
+        None,
+    );
+    table.policies = vec![policy];
+    table.has_rowsecurity = true;
+    table.hash();
+    table
+}
+
+#[tokio::test]
+async fn issue179_signature_change_recreates_all_cascade_dependents() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)::integer",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table(
+        "bigint",
+        "test_deps.compute(0)",
+        "bigint",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let drop_pos = script
+        .find("drop function if exists test_deps.compute (x integer) cascade;")
+        .expect("CASCADE drop must be emitted for the signature change");
+    let create_pos = script
+        .find("create or replace function test_deps.compute(x integer) returns bigint")
+        .expect("function recreate must be emitted");
+    assert!(drop_pos < create_pos);
+
+    // The recreate phase must run AFTER the function is recreated so the
+    // dependent objects can be created against the new function.
+    let chk_pos = script
+        .find("alter table test_deps.items add constraint chk_compute")
+        .expect("CHECK constraint must be re-added after CASCADE");
+    assert!(
+        create_pos < chk_pos,
+        "CHECK must be re-added after function recreate"
+    );
+    assert!(
+        script.contains("alter table test_deps.items drop constraint if exists chk_compute;"),
+        "drop-if-exists guard for CHECK constraint missing: {}",
+        script
+    );
+
+    let idx_pos = script
+        .find("CREATE INDEX idx_compute ON test_deps.items")
+        .expect("functional index must be re-created after CASCADE");
+    assert!(create_pos < idx_pos);
+    assert!(
+        script.contains("drop index if exists test_deps.idx_compute;"),
+        "drop-if-exists guard for index missing"
+    );
+
+    // Generated column: column itself is dropped, not just its expression.
+    assert!(
+        script.contains("alter table test_deps.items drop column if exists gen_col;"),
+        "drop-if-exists guard for generated column missing"
+    );
+    assert!(
+        script.contains("alter table test_deps.items add column gen_col bigint generated always as (test_deps.compute(value)) stored;"),
+        "generated column must be re-added with TO type/expression"
+    );
+
+    // Column DEFAULT: column survives, only the default is gone.
+    assert!(
+        script.contains(
+            "alter table test_deps.items alter column def_col set default test_deps.compute(0);"
+        ),
+        "column default must be restored from TO"
+    );
+    // We must NOT drop+re-add a non-generated column whose default was cascaded:
+    assert!(
+        !script.contains("drop column if exists def_col"),
+        "non-generated column must survive — only its DEFAULT clause was cascaded"
+    );
+
+    let policy_pos = script
+        .find("create policy p_items on test_deps.items")
+        .expect("policy must be re-created after CASCADE");
+    assert!(create_pos < policy_pos);
+    assert!(
+        script.contains("drop policy if exists p_items on test_deps.items;"),
+        "drop-if-exists guard for policy missing"
+    );
+}
+
+#[tokio::test]
+async fn issue179_recreate_skipped_when_routine_unchanged() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let routine = issue179_compute_routine("integer", "SELECT x * 2;");
+    from_dump.routines.push(routine.clone());
+    to_dump.routines.push(routine);
+
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("Recreate dependents dropped by CASCADE"),
+        "no CASCADE drop happened — recreate phase must stay silent: {}",
+        script
+    );
+    assert!(!script.contains("alter table test_deps.items add constraint chk_compute"));
+    assert!(!script.contains("CREATE INDEX idx_compute"));
+    assert!(!script.contains("create policy p_items"));
+}
+
+#[tokio::test]
+async fn issue179_recreate_skipped_when_to_dependent_missing() {
+    // Function is dropped entirely. The dependent objects are also gone
+    // in TO (user removed both function and dependents). We must NOT
+    // resurrect the dependents — they're intentionally absent.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("alter table test_deps.items add constraint chk_compute"),
+        "CHECK must not be resurrected when neither it nor the function exist in TO"
+    );
+    assert!(
+        !script.contains("CREATE INDEX idx_compute"),
+        "index must not be resurrected when neither it nor the function exist in TO"
+    );
+    assert!(
+        !script.contains("create policy p_items"),
+        "policy must not be resurrected when neither it nor the function exist in TO"
+    );
+}
+
+#[tokio::test]
+async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
+    // Function is dropped from TO entirely, but the dependents remain
+    // in TO referencing some other expression (here we keep the same
+    // text reference simply to exercise the lookup — the test asserts
+    // the recreate path fires when TO still has the object).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+    // TO has the table and dependents but no function.
+    to_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)",
+        "integer",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
+        "function must be dropped"
+    );
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_compute"),
+        "CHECK present in TO must be re-added after CASCADE"
+    );
+    assert!(
+        script.contains("CREATE INDEX idx_compute"),
+        "functional index present in TO must be re-created after CASCADE"
+    );
+    assert!(
+        script.contains("create policy p_items on test_deps.items"),
+        "policy present in TO must be re-created after CASCADE"
+    );
+}

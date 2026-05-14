@@ -1,3 +1,27 @@
+2026-05-14      v1.0.20
+
+                Bug fixes:
+                    - Fixed issue #179: `DROP FUNCTION ... CASCADE`
+                      silently removed dependent objects (functional
+                      indexes, CHECK constraints, generated columns,
+                      column DEFAULT expressions, and RLS policies)
+                      without re-emitting them, so the migrated
+                      database was missing those objects until a
+                      second `pgc compare` run noticed the drift.
+                    - Added Phase 7 to
+                      `Comparer::compare_routines_and_views`: after the
+                      affected functions are recreated, scan the FROM
+                      dump for objects that textually reference any
+                      routine being CASCADE-dropped (full drop, or
+                      DROP+CREATE due to signature/return-type/default
+                      change), look up the equivalent object in TO,
+                      and emit an idempotent `drop ... if exists` +
+                      CREATE block. Generated columns are re-added via
+                      `alter table ... add column` (CASCADE removes the
+                      column itself); column defaults are restored via
+                      `alter column ... set default` (the column
+                      survives, only the DEFAULT clause is dropped).
+
 2026-05-03      v1.0.19
 
                 Bug fixes:

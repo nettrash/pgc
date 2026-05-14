@@ -1,5 +1,9 @@
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
+use crate::dump::table_column::TableColumn;
+use crate::dump::table_constraint::TableConstraint;
+use crate::dump::table_index::TableIndex;
+use crate::dump::table_policy::TablePolicy;
 use crate::dump::{core::Dump, routine::Routine, table::Table, view::View};
 use crate::utils::string_extensions::StringExt;
 use std::{
@@ -3185,9 +3189,283 @@ impl Comparer {
             }
         }
 
+        // ──────────────────────────────────────────────────────────
+        // Phase 7 – Recreate dependents silently dropped by CASCADE
+        // ──────────────────────────────────────────────────────────
+        // When a routine's signature changes (or the routine is fully
+        // dropped) PGC emits `DROP ... CASCADE` and PostgreSQL removes
+        // every object whose `pg_depend` entry points at that function:
+        // functional indexes, CHECK constraints, generated columns,
+        // column DEFAULT expressions and RLS policies. The rest of the
+        // comparer never re-emits those dependents because they were
+        // unchanged between FROM and TO. See issue #179.
+        self.recreate_routine_dependents();
+
         self.script
             .append_block("\n/* ---> Routines & Views: End section --------------- */");
         Ok(())
+    }
+
+    /// Re-emit objects that PostgreSQL silently dropped via
+    /// `DROP FUNCTION ... CASCADE` so they are present in the database
+    /// after the migration applies. Targets functional indexes, CHECK
+    /// constraints, generated columns, column DEFAULT expressions and
+    /// RLS policies that reference any routine being dropped+recreated
+    /// or fully dropped. Detection is text-based against the FROM-side
+    /// definition; the recreated form comes from TO so any reshape of
+    /// the dependent (e.g. a column type change) is preserved. Issued
+    /// statements are idempotent (`drop ... if exists` followed by the
+    /// CREATE) so they are safe even when other diff phases also
+    /// emitted the object.
+    fn recreate_routine_dependents(&mut self) {
+        // Collect (schema_lc, name_lc) for every routine whose drop will
+        // CASCADE: routines absent from TO, plus routines whose signature
+        // (return type, args, default args) changed — the same condition
+        // that drives the DROP+CREATE branch in `emit_routine_diff`.
+        let to_routines_by_full_id: HashMap<(&str, &str, &str), &Routine> = self
+            .to
+            .routines
+            .iter()
+            .map(|r| {
+                (
+                    (r.schema.as_str(), r.name.as_str(), r.arguments.as_str()),
+                    r,
+                )
+            })
+            .collect();
+
+        let mut affected: HashSet<(String, String)> = HashSet::new();
+        for from_routine in &self.from.routines {
+            let key = (
+                from_routine.schema.as_str(),
+                from_routine.name.as_str(),
+                from_routine.arguments.as_str(),
+            );
+            let cascaded = match to_routines_by_full_id.get(&key) {
+                None => true,
+                Some(to_routine) => {
+                    from_routine.hash.is_some()
+                        && to_routine.hash.is_some()
+                        && Self::hashes_differ(&from_routine.hash, &to_routine.hash)
+                        && (from_routine.return_type != to_routine.return_type
+                            || from_routine.arguments != to_routine.arguments
+                            || from_routine.arguments_defaults != to_routine.arguments_defaults)
+                }
+            };
+            if cascaded {
+                affected.insert((
+                    from_routine.schema.to_lowercase(),
+                    from_routine.name.to_lowercase(),
+                ));
+            }
+        }
+
+        if affected.is_empty() {
+            return;
+        }
+
+        let to_table_by_id: HashMap<(&str, &str), &Table> = self
+            .to
+            .tables
+            .iter()
+            .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+            .collect();
+
+        let mut emitted_keys: HashSet<String> = HashSet::new();
+        let mut recreate: String = String::new();
+
+        for from_table in &self.from.tables {
+            // CHECK and EXCLUDE constraints can reference functions; FKs
+            // and PKs cannot — skip them to avoid spurious matches in
+            // their textual `definition` (e.g. a referenced table named
+            // similarly to a routine).
+            for constraint in &from_table.constraints {
+                let is_check = constraint.constraint_type.eq_ignore_ascii_case("check")
+                    || constraint.constraint_type.eq_ignore_ascii_case("exclude");
+                if !is_check {
+                    continue;
+                }
+                let Some(def) = &constraint.definition else {
+                    continue;
+                };
+                if !Self::definition_references_any(def, &affected) {
+                    continue;
+                }
+                let Some(to_table) = to_table_by_id
+                    .get(&(constraint.schema.as_str(), constraint.table_name.as_str()))
+                else {
+                    continue;
+                };
+                let Some(to_constraint) = to_table
+                    .constraints
+                    .iter()
+                    .find(|tc| tc.name == constraint.name)
+                else {
+                    continue;
+                };
+                let key = format!(
+                    "constraint:{}.{}.{}",
+                    to_constraint.schema, to_constraint.table_name, to_constraint.name
+                );
+                if !emitted_keys.insert(key) {
+                    continue;
+                }
+                Self::emit_dependent_recreate(
+                    &mut recreate,
+                    self.use_drop,
+                    &constraint_recreate_block(to_constraint),
+                );
+            }
+
+            for index in &from_table.indexes {
+                if !Self::definition_references_any(&index.indexdef, &affected) {
+                    continue;
+                }
+                let Some(to_table) =
+                    to_table_by_id.get(&(index.schema.as_str(), index.table.as_str()))
+                else {
+                    continue;
+                };
+                let Some(to_index) = to_table.indexes.iter().find(|ti| ti.name == index.name)
+                else {
+                    continue;
+                };
+                let key = format!("index:{}.{}", to_index.schema, to_index.name);
+                if !emitted_keys.insert(key) {
+                    continue;
+                }
+                Self::emit_dependent_recreate(
+                    &mut recreate,
+                    self.use_drop,
+                    &index_recreate_block(to_index),
+                );
+            }
+
+            for column in &from_table.columns {
+                let default_referenced = column
+                    .column_default
+                    .as_deref()
+                    .map(|d| Self::definition_references_any(d, &affected))
+                    .unwrap_or(false);
+                let generation_referenced = column.is_generated.eq_ignore_ascii_case("ALWAYS")
+                    && column
+                        .generation_expression
+                        .as_deref()
+                        .map(|e| Self::definition_references_any(e, &affected))
+                        .unwrap_or(false);
+
+                if !default_referenced && !generation_referenced {
+                    continue;
+                }
+                let Some(to_table) =
+                    to_table_by_id.get(&(column.schema.as_str(), column.table.as_str()))
+                else {
+                    continue;
+                };
+                let Some(to_column) = to_table.columns.iter().find(|tc| tc.name == column.name)
+                else {
+                    continue;
+                };
+
+                if generation_referenced {
+                    let key = format!(
+                        "column-generated:{}.{}.{}",
+                        to_column.schema, to_column.table, to_column.name
+                    );
+                    if emitted_keys.insert(key) {
+                        Self::emit_dependent_recreate(
+                            &mut recreate,
+                            self.use_drop,
+                            &column_recreate_block(to_column),
+                        );
+                    }
+                } else if default_referenced && let Some(default) = &to_column.column_default {
+                    let key = format!(
+                        "column-default:{}.{}.{}",
+                        to_column.schema, to_column.table, to_column.name
+                    );
+                    if emitted_keys.insert(key) {
+                        let stmt = format!(
+                            "alter table {}.{} alter column {} set default {};",
+                            to_column.schema, to_column.table, to_column.name, default
+                        )
+                        .with_empty_lines();
+                        Self::emit_dependent_recreate(&mut recreate, self.use_drop, &stmt);
+                    }
+                }
+            }
+
+            for policy in &from_table.policies {
+                let referenced = policy
+                    .using_clause
+                    .as_deref()
+                    .map(|c| Self::definition_references_any(c, &affected))
+                    .unwrap_or(false)
+                    || policy
+                        .check_clause
+                        .as_deref()
+                        .map(|c| Self::definition_references_any(c, &affected))
+                        .unwrap_or(false);
+                if !referenced {
+                    continue;
+                }
+                let Some(to_table) =
+                    to_table_by_id.get(&(policy.schema.as_str(), policy.table.as_str()))
+                else {
+                    continue;
+                };
+                let Some(to_policy) = to_table.policies.iter().find(|tp| tp.name == policy.name)
+                else {
+                    continue;
+                };
+                let key = format!(
+                    "policy:{}.{}.{}",
+                    to_policy.schema, to_policy.table, to_policy.name
+                );
+                if !emitted_keys.insert(key) {
+                    continue;
+                }
+                Self::emit_dependent_recreate(
+                    &mut recreate,
+                    self.use_drop,
+                    &policy_recreate_block(to_policy),
+                );
+            }
+        }
+
+        if !recreate.is_empty() {
+            self.script
+                .append_block("\n/* ---> Recreate dependents dropped by CASCADE: Start ---- */");
+            self.script.push_str(&recreate);
+            self.script
+                .append_block("/* ---> Recreate dependents dropped by CASCADE: End ------ */");
+        }
+    }
+
+    /// True when `definition` textually references any `(schema, name)` in
+    /// `routines` (both keys lowercased), with identifier-boundary matching.
+    fn definition_references_any(definition: &str, routines: &HashSet<(String, String)>) -> bool {
+        let (lower, unquoted) = Self::prelower_pair(definition);
+        routines.iter().any(|(schema, name)| {
+            Self::text_references_qualified_name_pre(&lower, &unquoted, schema, name)
+        })
+    }
+
+    /// Append a recreate block (drop-if-exists + create) to `out`. When
+    /// `use_drop` is false every line is line-prefixed with `-- ` so the
+    /// SQL is left in for review but won't execute, mirroring
+    /// [`Comparer::emit_drop`].
+    fn emit_dependent_recreate(out: &mut String, use_drop: bool, block: &str) {
+        if use_drop {
+            out.push_str(block);
+        } else {
+            out.push_str(
+                &block
+                    .lines()
+                    .map(|l| format!("-- {}\n", l))
+                    .collect::<String>(),
+            );
+        }
     }
 
     // Compare grants (privileges) for all objects
@@ -3727,6 +4005,51 @@ impl Comparer {
             .append_block("\n/* ---> Grants: End section --------------- */");
         Ok(())
     }
+}
+
+/// `drop constraint if exists` + `add constraint` block from the TO-side
+/// constraint, used to restore a CHECK/EXCLUDE constraint that PostgreSQL
+/// removed when CASCADE-dropping a referenced function.
+fn constraint_recreate_block(constraint: &TableConstraint) -> String {
+    let mut block = format!(
+        "alter table {}.{} drop constraint if exists {};",
+        constraint.schema, constraint.table_name, constraint.name
+    )
+    .with_empty_lines();
+    block.push_str(&constraint.get_script());
+    block
+}
+
+/// `drop index if exists` + `create index` block from the TO-side index.
+fn index_recreate_block(index: &TableIndex) -> String {
+    let mut block =
+        format!("drop index if exists {}.{};", index.schema, index.name).with_empty_lines();
+    block.push_str(&index.get_script());
+    block
+}
+
+/// `drop column if exists` + `add column` block — used when a generated
+/// column was CASCADE-dropped (the column itself is gone, not just its
+/// generation expression).
+fn column_recreate_block(column: &TableColumn) -> String {
+    let mut block = format!(
+        "alter table {}.{} drop column if exists {};",
+        column.schema, column.table, column.name
+    )
+    .with_empty_lines();
+    block.push_str(&column.get_add_script());
+    block
+}
+
+/// `drop policy if exists` + `create policy` block from the TO-side policy.
+fn policy_recreate_block(policy: &TablePolicy) -> String {
+    let mut block = format!(
+        "drop policy if exists {} on {}.{};",
+        policy.name, policy.schema, policy.table
+    )
+    .with_empty_lines();
+    block.push_str(&policy.get_script());
+    block
 }
 
 #[cfg(test)]
