@@ -108,13 +108,17 @@ impl TableConstraint {
             // `NOT ENFORCED` for non-enforced constraints, so the
             // lowercased deparser output flowing through `clause`
             // already contains `not enforced`. Appending again
-            // produces `... not enforced not enforced ;`. The literal
-            // itself is `[not_enforced_keyword]` which can only appear
-            // in the keyword position, so a substring search against
-            // the (literal-preserved-case) clause is the right test.
-            // Older PG versions and PGC's own `parts.join`-built form
-            // don't include the keyword, and still need it appended.
-            if !clause.to_ascii_lowercase().contains("not enforced") {
+            // produces `... not enforced not enforced ;`. Older PG
+            // versions and PGC's own `parts.join`-built form don't
+            // include the keyword, and still need it appended.
+            //
+            // PR #187 review: the substring scan must skip string
+            // literals — a CHECK predicate like
+            // `CHECK (msg <> 'not enforced')` would otherwise match
+            // and silently suppress the keyword.
+            // `lowercase_outside_literals` preserves literal contents
+            // verbatim, so the literal text survives in `clause`.
+            if !Self::lowercased_contains_outside_literals(&clause, "not enforced") {
                 let trimmed = script.trim_end().to_string();
                 script.clear();
                 script.push_str(&trimmed);
@@ -210,6 +214,63 @@ impl TableConstraint {
     /// inside single-quoted string literals.  Handles the standard `''` escape
     /// for embedded quotes.  Iterates by `char` so multi-byte UTF-8 sequences
     /// are never split.
+    /// True when `needle` (must already be lowercase) appears in `s`
+    /// OUTSIDE every single-quoted string literal. Mirrors the
+    /// quote-tracking state machine used by [`Self::lowercase_outside_
+    /// literals`] so a `CHECK (msg <> 'not enforced')` predicate
+    /// doesn't get confused with the keyword position. PR #187 review
+    /// (issue #182): a plain `clause.contains("not enforced")` would
+    /// also match string literals and silently suppress the
+    /// constraint flag.
+    fn lowercased_contains_outside_literals(s: &str, needle: &str) -> bool {
+        debug_assert!(needle.chars().all(|c| !c.is_ascii_uppercase()));
+        if needle.is_empty() {
+            return true;
+        }
+        let mut buf = String::with_capacity(needle.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                // Skip past the literal entirely; nothing inside it
+                // counts toward keyword detection.
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            if chars.as_str().starts_with('\'') {
+                                chars.next(); // doubled-quote escape
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                        None => return false, // unterminated literal
+                    }
+                }
+                // The literal is treated as a token boundary — flush
+                // any partial match accumulated before it.
+                buf.clear();
+                continue;
+            }
+            for lc in c.to_lowercase() {
+                buf.push(lc);
+                while !needle.starts_with(buf.as_str()) {
+                    if buf.is_empty() {
+                        break;
+                    }
+                    // Drop one char from the front and retry. Because
+                    // the haystack is searched as a stream, this
+                    // simple back-off is enough for ASCII keyword
+                    // needles like `not enforced`.
+                    buf.remove(0);
+                }
+                if buf == needle {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn lowercase_outside_literals(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars();
@@ -772,6 +833,36 @@ mod tests {
             script.matches("not enforced").count(),
             1,
             "still must appear exactly once: {script}"
+        );
+    }
+
+    #[test]
+    fn issue182_not_enforced_in_string_literal_does_not_suppress_keyword() {
+        // PR #187 review (C1): a CHECK predicate that contains the
+        // literal text `'not enforced'` must NOT cause the keyword
+        // append to be skipped — the substring is inside a string
+        // literal, not in keyword position. Without the
+        // literal-aware containment check, `is_enforced=false` would
+        // silently emit no `NOT ENFORCED` clause, changing the
+        // constraint's semantics on apply.
+        let mut constraint = create_check_constraint();
+        constraint.definition = Some("CHECK (msg <> 'not enforced')".to_string());
+        constraint.is_enforced = false;
+
+        let script = constraint.get_script();
+
+        assert!(
+            script.contains("'not enforced'"),
+            "literal contents must be preserved: {script}"
+        );
+        assert!(
+            script.trim_end().ends_with("not enforced ;") || script.contains("not enforced ;"),
+            "the keyword must still be appended despite the matching literal: {script}"
+        );
+        assert_eq!(
+            script.matches("not enforced").count(),
+            2,
+            "expected `not enforced` once inside the literal AND once as the appended keyword: {script}"
         );
     }
 

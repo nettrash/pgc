@@ -241,9 +241,18 @@ impl Comparer {
             }
 
             if Self::hashes_differ(&from_routine.hash, &routine.hash) {
+                // PR #187 review (C10/C11): only return-type and
+                // identity-argument changes require DROP+CREATE in
+                // PostgreSQL. Default-argument values can be updated
+                // by `CREATE OR REPLACE FUNCTION` for the same
+                // identity signature, so a defaults-only diff (now
+                // detected because the hash includes
+                // `arguments_defaults`) must NOT trigger the
+                // CASCADE-drop path; the routine's own
+                // `get_script()` already emits a `CREATE OR REPLACE`
+                // form that covers the change non-destructively.
                 if from_routine.return_type != routine.return_type
                     || from_routine.arguments != routine.arguments
-                    || from_routine.arguments_defaults != routine.arguments_defaults
                 {
                     Self::emit_drop(script, use_drop, &from_routine.get_drop_script());
                 }
@@ -1896,12 +1905,20 @@ impl Comparer {
         // Index every TO table once; the FK adjacency below and the
         // subset orderings refer to tables by their position in
         // `self.to.tables` to avoid borrow-tied pointer identity.
-        let to_index_by_key: HashMap<(&str, &str), usize> = self
+        // Quote-stripped lookup so FK targets parsed by
+        // `parse_fk_referenced_table` (which strips the surrounding
+        // quotes from a quoted identifier like `"MyTable"`) match the
+        // table-side keys without requiring callers to know the
+        // dump-time quoting form. PR #187 review (C2): without this
+        // normalisation, mixed-case FK chains stored as `"Schema"."T"`
+        // would fall back to alphabetical SET ordering and fail.
+        let strip_quotes = |s: &str| -> String { s.replace('"', "") };
+        let to_index_by_key: HashMap<(String, String), usize> = self
             .to
             .tables
             .iter()
             .enumerate()
-            .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
+            .map(|(i, t)| ((strip_quotes(&t.schema), strip_quotes(&t.name)), i))
             .collect();
 
         // Partition into the two flip directions; tables newly created
@@ -1950,12 +1967,23 @@ impl Comparer {
                 // adds it later. A modified FK was dropped in the
                 // per-table ALTER loop and is also absent here. Both
                 // get filtered out.
+                // PR #187 review (C13): an FK is also live during the
+                // SET phase when its sole change between FROM and TO
+                // is one of the in-place-alterable knobs
+                // (deferrability / enforced / no-inherit / comment).
+                // `compare_tables` does NOT drop those — they get
+                // ALTERed in `compare_foreign_keys` later — so the
+                // FK constraint is still active when the persistence
+                // flip runs. Filtering only on byte-identical
+                // definitions would miss them. Use the definitive
+                // alterability check from `TableConstraint`.
                 let live = from_table
                     .map(|ft| {
                         ft.constraints.iter().any(|fc| {
                             fc.name == c.name
                                 && fc.constraint_type.eq_ignore_ascii_case("foreign key")
-                                && fc.definition.as_deref() == c.definition.as_deref()
+                                && (fc.definition.as_deref() == c.definition.as_deref()
+                                    || fc.can_be_altered_to(c))
                         })
                     })
                     .unwrap_or(false);
@@ -1963,7 +1991,7 @@ impl Comparer {
                     continue;
                 }
                 if let Some((schema, name)) = Self::parse_fk_referenced_table(def)
-                    && let Some(&j) = to_index_by_key.get(&(schema.as_str(), name.as_str()))
+                    && let Some(&j) = to_index_by_key.get(&(schema, name))
                     && j != i
                 {
                     fk_targets[i].insert(j);
@@ -2087,6 +2115,35 @@ impl Comparer {
         // (not whitespace), `references_table` is followed by `_`
         // (still an identifier char), and `xxx_references` is
         // preceded by `_`.
+        // Track double-quoted regions across the whole scan so a
+        // column literally named `"my references col"` (the keyword
+        // appears mid-quote but is preceded and followed by spaces)
+        // doesn't pass the boundary check. PR #187 review.
+        let mut quote_open_at: Vec<usize> = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'"' {
+                if quote_open_at.last().copied() == Some(usize::MAX) {
+                    quote_open_at.pop();
+                } else {
+                    quote_open_at.push(usize::MAX);
+                }
+                quote_open_at.push(i);
+            }
+        }
+        // Reduce to a flat list of (open, close) byte ranges.
+        let mut quoted_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut iter = quote_open_at.into_iter();
+        while let (Some(_), Some(open)) = (iter.next(), iter.next()) {
+            if let (Some(_), Some(close)) = (iter.next(), iter.next()) {
+                quoted_ranges.push((open, close));
+            }
+        }
+        let in_quoted_range = |idx: usize| -> bool {
+            quoted_ranges
+                .iter()
+                .any(|&(open, close)| idx > open && idx < close)
+        };
+
         let mut search_from = 0;
         let kw_pos = loop {
             if search_from + kw_len > bytes.len() {
@@ -2097,11 +2154,11 @@ impl Comparer {
             let left_ok = pos == 0
                 || !{
                     let b = bytes[pos - 1];
-                    b.is_ascii_alphanumeric() || b == b'_' || b == b'"'
+                    b.is_ascii_alphanumeric() || b == b'_' || b == b'"' || b == b'$'
                 };
             let after_kw = pos + kw_len;
             let right_ok = after_kw < bytes.len() && bytes[after_kw].is_ascii_whitespace();
-            if left_ok && right_ok {
+            if left_ok && right_ok && !in_quoted_range(pos) {
                 break pos;
             }
             // Advance one byte to keep ASCII-byte indices valid; the
@@ -2116,7 +2173,9 @@ impl Comparer {
 
         // Scan a single qualified identifier: identifier chars, dot,
         // or quoted segments. Stop at the first non-identifier byte
-        // outside quotes (typically `(` for the column list).
+        // outside quotes (typically `(` for the column list). PG
+        // identifiers may include `$`, so include it here — PR #187
+        // review.
         let mut end = 0;
         let mut in_quotes = false;
         for (i, ch) in after.char_indices() {
@@ -2129,7 +2188,7 @@ impl Comparer {
                 end = i + ch.len_utf8();
                 continue;
             }
-            if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+            if ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '$' {
                 end = i + ch.len_utf8();
             } else {
                 break;
@@ -3609,12 +3668,17 @@ impl Comparer {
             let cascaded = match to_routines_by_full_id.get(&key) {
                 None => true,
                 Some(to_routine) => {
+                    // PR #187 review (C10/C11): defaults-only changes
+                    // are emitted via `CREATE OR REPLACE FUNCTION` —
+                    // they do NOT cause CASCADE drops, so Phase 7 must
+                    // also exclude them from `affected` or it would
+                    // emit pointless dependent recreates for routines
+                    // that PostgreSQL never dropped.
                     from_routine.hash.is_some()
                         && to_routine.hash.is_some()
                         && Self::hashes_differ(&from_routine.hash, &to_routine.hash)
                         && (from_routine.return_type != to_routine.return_type
-                            || from_routine.arguments != to_routine.arguments
-                            || from_routine.arguments_defaults != to_routine.arguments_defaults)
+                            || from_routine.arguments != to_routine.arguments)
                 }
             };
             if cascaded {
@@ -3633,6 +3697,30 @@ impl Comparer {
             }
         }
 
+        if affected.is_empty() {
+            return;
+        }
+
+        // PR #187 review (C16): only recreate dependents when at
+        // least one routine sharing the affected `(schema, name)`
+        // survives in TO. If the routine name is gone entirely from
+        // TO, dependents that text-match it would resolve to nothing
+        // — emitting a recreate would generate invalid SQL. The
+        // surviving routine may be a different overload (different
+        // argument types) but PostgreSQL's name-based binding will
+        // pick it up.
+        let surviving_routine_names: HashSet<(String, String)> = self
+            .to
+            .routines
+            .iter()
+            .map(|r| {
+                (
+                    r.schema.to_lowercase().replace('"', ""),
+                    r.name.to_lowercase().replace('"', ""),
+                )
+            })
+            .collect();
+        affected.retain(|key| surviving_routine_names.contains(key));
         if affected.is_empty() {
             return;
         }
@@ -3933,7 +4021,14 @@ impl Comparer {
     /// column references, type names, or string-literal contents do not
     /// trigger a false positive.
     fn definition_references_any(definition: &str, routines: &HashSet<(String, String)>) -> bool {
-        let (lower, unquoted) = Self::prelower_pair(definition);
+        // PR #187 review: blank out single-quoted string-literal
+        // contents before matching so a literal like
+        // `CHECK (msg <> 'compute(')` doesn't trip the matcher.
+        // `prelower_pair` only handles double quotes (identifier
+        // quoting); single quotes are SQL string literals and any
+        // routine-name lookalikes inside them must not count.
+        let scrubbed = Self::blank_single_quoted_literals(definition);
+        let (lower, unquoted) = Self::prelower_pair(&scrubbed);
         routines.iter().any(|(schema, name)| {
             // Both passes require a function-call context (`name(` after
             // optional whitespace). The qualified pass inherits this gate
@@ -3946,6 +4041,54 @@ impl Comparer {
             Self::text_references_qualified_call(&lower, &unquoted, schema, name)
                 || Self::text_references_unqualified_call(&unquoted, name)
         })
+    }
+
+    /// Replace every character inside single-quoted string literals
+    /// with a space (length-preserved so byte indices in callers stay
+    /// stable). Doubled-single-quote escapes (`''`) are treated as a
+    /// literal `'` inside the string and stay scrubbed. Used by the
+    /// Phase-7 dependency matcher (PR #187 review): a SQL string
+    /// literal like `'compute('` must not be mistaken for a function
+    /// call to `compute`.
+    fn blank_single_quoted_literals(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\'' {
+                out.push(c);
+                continue;
+            }
+            // Opening quote stays as-is so token boundaries are
+            // preserved; only the literal's body is scrubbed.
+            out.push('\'');
+            loop {
+                match chars.next() {
+                    Some('\'') => {
+                        if chars.as_str().starts_with('\'') {
+                            // doubled-quote escape — still inside the
+                            // literal, blank both single quotes' worth
+                            // of whitespace (one for the escape pair).
+                            out.push(' ');
+                            out.push(' ');
+                            chars.next();
+                        } else {
+                            out.push('\''); // closing quote
+                            break;
+                        }
+                    }
+                    Some(ch) => {
+                        // Replace each char with a space-equivalent
+                        // sequence of the same byte length so indices
+                        // in callers stay aligned with the original.
+                        for _ in 0..ch.len_utf8() {
+                            out.push(' ');
+                        }
+                    }
+                    None => break, // unterminated literal
+                }
+            }
+        }
+        out
     }
 
     /// Like [`Self::text_references_qualified_name_pre`] but additionally
@@ -4026,32 +4169,30 @@ impl Comparer {
         if name.is_empty() {
             return false;
         }
-        // Iterate via `match_indices`, which yields byte offsets that are
-        // guaranteed UTF-8 char boundaries. The previous loop used
-        // `text[start..]` with `start = i + 1`, which panics when `name`
-        // contains non-ASCII bytes (PostgreSQL allows Unicode
-        // identifiers like `"русское_имя"`): `i + 1` lands inside a
-        // multi-byte codepoint and the next slice fails. The boundary
-        // checks below are pure byte comparisons against ASCII, so a
-        // non-ASCII neighbour byte simply fails every `is_ascii_*` test
-        // — that's the desired behaviour, since the call gate further
-        // down requires `(` (after optional ASCII whitespace) and any
-        // non-paren byte exits without matching.
+        // `match_indices` yields byte offsets that are guaranteed UTF-8
+        // char boundaries — safe to slice around. PR #187 review: the
+        // boundary check now uses CHARACTER classification rather than
+        // raw byte tests so identifier-class Unicode neighbours
+        // (e.g. another Cyrillic letter next to a Cyrillic name) are
+        // correctly rejected. ASCII byte tests treated those bytes
+        // as non-identifier and would let `функция` match inside the
+        // longer identifier `мояфункция`.
         let bytes = text.as_bytes();
         let name_len = name.len();
+        let is_ident_continuation = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
         for (i, _) in text.match_indices(name) {
-            if i > 0 {
-                let before = bytes[i - 1];
-                if before.is_ascii_alphanumeric() || before == b'_' || before == b'.' {
-                    continue;
-                }
+            if i > 0
+                && let Some(prev_ch) = text[..i].chars().next_back()
+                && (is_ident_continuation(prev_ch) || prev_ch == '.')
+            {
+                continue;
             }
             let end = i + name_len;
-            if end < bytes.len() {
-                let after = bytes[end];
-                if after.is_ascii_alphanumeric() || after == b'_' {
-                    continue;
-                }
+            if end < bytes.len()
+                && let Some(next_ch) = text[end..].chars().next()
+                && is_ident_continuation(next_ch)
+            {
+                continue;
             }
             let mut j = end;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {

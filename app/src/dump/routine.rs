@@ -289,13 +289,16 @@ impl Routine {
         let rows_repr = self.rows.map_or(String::new(), |r| r.to_string());
         let support_repr = self.support_function.clone().unwrap_or_default();
         let transform_repr = self.transform_types.join(",");
-        // `arguments_defaults` participates in the hash because PostgreSQL
-        // has no `ALTER FUNCTION` for default values — a defaults-only
-        // change requires DROP+CREATE — and `Comparer::emit_routine_diff`
-        // (and Phase 7's CASCADE-recreate detection) gate that
-        // recreation on `hashes_differ`. Excluding defaults here would
-        // silently swallow defaults-only diffs and leave the database
-        // out of sync.
+        // `arguments_defaults` participates in the hash so a
+        // defaults-only diff is *detected* — `Comparer::emit_routine_
+        // diff` keys off `hashes_differ` to decide whether to emit
+        // anything at all. The actual migration uses `CREATE OR
+        // REPLACE FUNCTION`, NOT `DROP FUNCTION ... CASCADE`:
+        // PostgreSQL accepts default-argument changes via the
+        // OR REPLACE form when the identity argument types and return
+        // type are unchanged. PR #187 review (C11) corrected the
+        // earlier wording here that misleadingly framed defaults as
+        // a DROP+CREATE requirement.
         let defaults_repr = self.arguments_defaults.clone().unwrap_or_default();
         let src = format!(
             "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",

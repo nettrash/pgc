@@ -7952,14 +7952,16 @@ async fn issue179_quoted_routine_name_recreates_dependents() {
 }
 
 #[tokio::test]
-async fn issue179_defaults_only_change_recreates_dependents() {
-    // Defaults-only change: same return type, same arg list, but
-    // `arguments_defaults` differs. PostgreSQL has no `ALTER FUNCTION`
-    // for default values, so the comparer must DROP+CREATE the routine
-    // — and Phase 7 must in turn restore any CASCADE-dropped
-    // dependents. Exercises the `arguments_defaults`-in-hash fix
-    // end-to-end (without the hash inclusion, both `emit_routine_diff`
-    // and Phase 7 silently skip this case).
+async fn issue179_defaults_only_change_uses_create_or_replace_no_cascade() {
+    // PR #187 review (C10/C15): defaults-only changes must NOT
+    // trigger `DROP FUNCTION ... CASCADE`. PostgreSQL accepts
+    // default-argument changes via `CREATE OR REPLACE FUNCTION`
+    // when the identity argument types and return type are
+    // unchanged. The earlier version of this test pinned the
+    // destructive behaviour (DROP CASCADE + Phase 7 dependent
+    // recreates); the correct expectation is the non-destructive
+    // OR REPLACE form, with no CASCADE drop and no dependent
+    // recreates (since the function was never actually dropped).
     let mut from_dump = Dump::new(DumpConfig::default());
     let mut to_dump = Dump::new(DumpConfig::default());
 
@@ -8009,13 +8011,18 @@ async fn issue179_defaults_only_change_recreates_dependents() {
     let script = comparer.get_script();
 
     assert!(
-        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
-        "defaults-only change must trigger CASCADE drop: {}",
+        script.contains("create or replace function test_deps.compute(x integer DEFAULT 1)"),
+        "defaults-only change must be re-emitted via CREATE OR REPLACE: {}",
         script
     );
     assert!(
-        script.contains("alter table test_deps.items add constraint chk_compute"),
-        "dependent CHECK must be recreated after defaults-only DROP+CREATE: {}",
+        !script.contains("drop function if exists test_deps.compute"),
+        "defaults-only change must NOT emit DROP FUNCTION CASCADE: {}",
+        script
+    );
+    assert!(
+        !script.contains("alter table test_deps.items add constraint chk_compute"),
+        "dependents must NOT be recreated when the function was not actually dropped: {}",
         script
     );
 }
@@ -8194,23 +8201,47 @@ async fn issue179_partition_child_skips_inherited_dependents() {
 }
 
 #[tokio::test]
-async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
-    // Function is dropped from TO entirely, but the dependents remain
-    // in TO referencing some other expression (here we keep the same
-    // text reference simply to exercise the lookup — the test asserts
-    // the recreate path fires when TO still has the object).
+async fn issue179_full_drop_recreates_dependents_when_overload_survives() {
+    // PR #187 review (C16): the previous version of this test built
+    // an invalid PostgreSQL state — TO had dependents referencing
+    // `test_deps.compute` but no function with that name at all, so
+    // the recreate SQL would fail to apply. The valid scenario where
+    // "function fully dropped, dependents kept" is meaningful is when
+    // a *different overload* of the same name survives in TO and the
+    // dependents resolve to it via PostgreSQL's name-based function
+    // binding. Set that up explicitly here. FROM has both
+    // `compute(integer)` (which gets dropped) and `compute(text)`
+    // (the surviving overload). TO has only `compute(text)`.
+    // Dependents in both sides reference `test_deps.compute` and
+    // resolve via overload resolution.
     let mut from_dump = Dump::new(DumpConfig::default());
     let mut to_dump = Dump::new(DumpConfig::default());
 
     from_dump
         .routines
         .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    let mut compute_text_from = Routine::new(
+        "test_deps".to_string(),
+        Oid(961),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x text".to_string(),
+        None,
+        None,
+        "SELECT length(x);".to_string(),
+    );
+    compute_text_from.hash();
+    from_dump.routines.push(compute_text_from.clone());
+    // TO keeps only the text overload — `compute(integer)` is gone.
+    to_dump.routines.push(compute_text_from);
+
     from_dump.tables.push(issue179_items_table(
         "integer",
         "test_deps.compute(0)",
         "integer",
     ));
-    // TO has the table and dependents but no function.
     to_dump.tables.push(issue179_items_table(
         "integer",
         "test_deps.compute(0)",
@@ -8223,11 +8254,11 @@ async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
 
     assert!(
         script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
-        "function must be dropped"
+        "the integer overload must be dropped"
     );
     assert!(
         script.contains("alter table test_deps.items add constraint chk_compute"),
-        "CHECK present in TO must be re-added after CASCADE"
+        "CHECK present in TO must be re-added after CASCADE (overload-resolves to surviving compute)"
     );
     assert!(
         script.contains("CREATE INDEX IF NOT EXISTS idx_compute"),
@@ -8809,12 +8840,14 @@ async fn issue179_quoted_routine_names_match_unqualified_calls() {
 }
 
 #[tokio::test]
-async fn issue179_defaults_only_change_triggers_recreate() {
-    // PostgreSQL has no `ALTER FUNCTION ... ARGUMENT ... DEFAULT`, so a
-    // defaults-only change requires DROP+CREATE. Routine::hash() now
-    // includes `arguments_defaults` so `emit_routine_diff` sees a hash
-    // diff and Phase 7 detects the CASCADE — the dependents must be
-    // recreated.
+async fn issue179_defaults_only_change_emits_create_or_replace_no_cascade() {
+    // PR #187 review (C10/C15): PostgreSQL accepts default-argument
+    // changes via `CREATE OR REPLACE FUNCTION` for the same identity
+    // signature/return type — there is no DROP+CREATE requirement.
+    // The `arguments_defaults` field is included in `Routine::hash()`
+    // so the diff is *detected*; the migration is then emitted as a
+    // plain `CREATE OR REPLACE` form (no CASCADE drop, no Phase 7
+    // dependent recreates).
     let mut from_dump = Dump::new(DumpConfig::default());
     let mut to_dump = Dump::new(DumpConfig::default());
 
@@ -8847,18 +8880,23 @@ async fn issue179_defaults_only_change_triggers_recreate() {
     let script = comparer.get_script();
 
     assert!(
-        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
-        "defaults-only change must still emit CASCADE drop: {}",
+        script.contains("create or replace function test_deps.compute(x integer DEFAULT 1)"),
+        "defaults-only change must use CREATE OR REPLACE FUNCTION: {}",
         script
     );
     assert!(
-        script.contains("alter table test_deps.items add constraint chk_compute"),
-        "Phase 7 must fire on defaults-only change: {}",
+        !script.contains("drop function if exists test_deps.compute"),
+        "defaults-only change must NOT emit DROP FUNCTION CASCADE: {}",
         script
     );
     assert!(
-        script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
-        "Phase 7 must recreate index on defaults-only change: {}",
+        !script.contains("alter table test_deps.items add constraint chk_compute"),
+        "Phase 7 must NOT fire on defaults-only change (no CASCADE happened): {}",
+        script
+    );
+    assert!(
+        !script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
+        "no index recreate on defaults-only change: {}",
         script
     );
 }
@@ -8911,6 +8949,202 @@ fn issue180_parse_fk_referenced_table_quoted_identifier_with_dot() {
     assert_eq!(
         Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"a.b\".\"c.d\"(id)"),
         Some(("a.b".to_string(), "c.d".to_string()))
+    );
+}
+
+#[test]
+fn pr187_parse_fk_skips_keyword_inside_quoted_column_name() {
+    // PR #187 review (C7): a column literally named
+    // `"my references col"` puts the bytes `references` between two
+    // spaces, passing the naive boundary check, then returns `None`
+    // from the false match without ever reaching the real keyword.
+    // The scanner must skip matches that fall inside a double-quoted
+    // identifier.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (\"my references col\") REFERENCES public.target(id)"
+        ),
+        Some(("public".to_string(), "target".to_string())),
+        "FK keyword must still be located even with `references` inside a quoted column name"
+    );
+}
+
+#[test]
+fn pr187_parse_fk_handles_dollar_in_identifier() {
+    // PR #187 review (C8): PostgreSQL identifiers may contain `$`,
+    // so the unquoted-identifier scan must include it. Otherwise a
+    // target like `public.parent$table` is truncated to
+    // `public.parent`.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES public.parent$table(id)"),
+        Some(("public".to_string(), "parent$table".to_string()))
+    );
+}
+
+#[test]
+fn pr187_definition_references_any_skips_string_literals() {
+    // PR #187 review (C4): a SQL string literal containing routine
+    // text — `CHECK (msg <> 'compute(value)')` — must not trigger
+    // the unqualified-call matcher. The `definition_references_any`
+    // pre-pass must blank out single-quoted literals before scanning.
+    let mut affected: HashSet<(String, String)> = HashSet::new();
+    affected.insert(("public".to_string(), "compute".to_string()));
+    assert!(
+        !Comparer::definition_references_any("CHECK (msg <> 'compute(value)')", &affected),
+        "literal text must not be treated as a function call"
+    );
+    // Sanity check: a real call outside a literal still matches.
+    assert!(
+        Comparer::definition_references_any(
+            "CHECK (compute(value) > 0 AND msg <> 'compute(value)')",
+            &affected
+        ),
+        "real call outside the literal must still match"
+    );
+}
+
+#[tokio::test]
+async fn pr187_persistence_ordering_works_with_quoted_identifiers() {
+    // PR #187 review (C2): mixed-case table names round-trip into
+    // `Table.schema` / `Table.name` with surrounding quotes
+    // (`quote_ident` in the dump query). The FK parser strips quotes
+    // from its returned `(schema, name)`. Without normalising the
+    // lookup map to the same quote-stripped form, FK edges between
+    // quoted-identifier tables go missing and persistence flips fall
+    // back to alphabetical order, which PostgreSQL rejects for FK
+    // chains. Build a parent→child chain whose names are quoted and
+    // assert the SET UNLOGGED order is leaves-first.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    let mk = |name: &str, is_unlogged: bool, fk: Option<(&str, &str, &str)>| {
+        // Wrap the schema/name in quotes the way `quote_ident` would.
+        let mut t = issue180_logged_table("\"TestOrder\"", name, is_unlogged, fk);
+        t.schema = "\"TestOrder\"".to_string();
+        t.raw_schema = "\"TestOrder\"".to_string();
+        t
+    };
+    from_dump.tables.push(mk("\"Grand\"", false, None));
+    from_dump.tables.push(mk(
+        "\"Parent\"",
+        false,
+        Some(("grand_id", "\"TestOrder\"", "\"Grand\"")),
+    ));
+    from_dump.tables.push(mk(
+        "\"Child\"",
+        false,
+        Some(("parent_id", "\"TestOrder\"", "\"Parent\"")),
+    ));
+    to_dump.tables.push(mk("\"Grand\"", true, None));
+    to_dump.tables.push(mk(
+        "\"Parent\"",
+        true,
+        Some(("grand_id", "\"TestOrder\"", "\"Grand\"")),
+    ));
+    to_dump.tables.push(mk(
+        "\"Child\"",
+        true,
+        Some(("parent_id", "\"TestOrder\"", "\"Parent\"")),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    let pos_child = script
+        .find("alter table \"TestOrder\".\"Child\" set unlogged;")
+        .expect("child SET UNLOGGED missing");
+    let pos_parent = script
+        .find("alter table \"TestOrder\".\"Parent\" set unlogged;")
+        .expect("parent SET UNLOGGED missing");
+    let pos_grand = script
+        .find("alter table \"TestOrder\".\"Grand\" set unlogged;")
+        .expect("grand SET UNLOGGED missing");
+    assert!(
+        pos_child < pos_parent && pos_parent < pos_grand,
+        "FK-leaf-first order must hold for quoted identifiers too: {script}"
+    );
+}
+
+#[tokio::test]
+async fn pr187_persistence_ordering_includes_in_place_alterable_fks() {
+    // PR #187 review (C13): an FK whose definition differs only in
+    // an in-place-alterable property (deferrability, enforced,
+    // no_inherit, comment) is NOT dropped by `compare_tables` — it
+    // stays live until `compare_foreign_keys` ALTERs it. The live
+    // FK adjacency for the SET phase must include it, otherwise
+    // chains where one FK is being toggled deferrable/enforced fall
+    // back to alphabetical SET order.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", false, None));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        false,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+    to_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", true, None));
+    let mut to_child = issue180_logged_table(
+        "test_order",
+        "child",
+        true,
+        Some(("parent_id", "test_order", "parent")),
+    );
+    // Toggle the FK's deferrability — `can_be_altered_to` accepts
+    // this, so the FK survives `compare_tables` and is still live at
+    // the SET point.
+    if let Some(fk) = to_child
+        .constraints
+        .iter_mut()
+        .find(|c| c.constraint_type.eq_ignore_ascii_case("foreign key"))
+    {
+        fk.is_deferrable = true;
+        fk.initially_deferred = true;
+    }
+    to_child.hash();
+    to_dump.tables.push(to_child);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    let pos_child = script
+        .find("alter table test_order.child set unlogged;")
+        .expect("child SET UNLOGGED missing");
+    let pos_parent = script
+        .find("alter table test_order.parent set unlogged;")
+        .expect("parent SET UNLOGGED missing");
+    assert!(
+        pos_child < pos_parent,
+        "child must come before parent even when the FK between them is being in-place ALTERed: {script}"
+    );
+}
+
+#[test]
+fn pr187_unqualified_matcher_unicode_boundary_rejects_longer_identifier() {
+    // PR #187 review (C17): the boundary check used raw ASCII byte
+    // tests, which treated Cyrillic neighbours as non-identifier and
+    // let `функция` match inside `мояфункция(`. The check now uses
+    // character-class identifier rules, so Cyrillic-letter neighbours
+    // correctly extend the identifier and reject the match.
+    let mut affected: HashSet<(String, String)> = HashSet::new();
+    affected.insert(("public".to_string(), "функция".to_string()));
+    assert!(
+        !Comparer::definition_references_any("CHECK (мояфункция(x) > 0)", &affected),
+        "unicode letter to the left must extend the identifier"
+    );
+    assert!(
+        !Comparer::definition_references_any("CHECK (функцияд(x) > 0)", &affected),
+        "unicode letter to the right must extend the identifier"
+    );
+    // Sanity: a clean Cyrillic call still matches.
+    assert!(
+        Comparer::definition_references_any("CHECK (функция(x) > 0)", &affected),
+        "standalone unicode call must still match"
     );
 }
 

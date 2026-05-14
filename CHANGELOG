@@ -49,29 +49,33 @@
                       references the target, `SET LOGGED` fails if the
                       target references any UNLOGGED one. Moved the
                       emission out of `Table::build_alter_script` and
-                      into a dedicated `Comparer::emit_persistence_
-                      changes` phase that runs at the end of
-                      `compare_tables`: tables flipping to UNLOGGED are
-                      sorted leaves-before-roots (reverse FK topo),
-                      tables flipping to LOGGED are sorted
+                      into a dedicated
+                      `Comparer::emit_persistence_changes` phase that
+                      runs at the end of `compare_tables`: tables
+                      flipping to UNLOGGED are sorted
+                      leaves-before-roots (reverse FK topo), tables
+                      flipping to LOGGED are sorted
                       roots-before-leaves (forward FK topo), each via
                       `Self::topo_order_within_subset` over an FK
                       adjacency derived from the TO-side constraint
-                      definitions (parsed by `Self::parse_fk_
-                      referenced_table`). Owned sequences also get
-                      cleaner output: `Sequence::is_only_persistence_
-                      change` lets `compare_sequences` skip the entire
-                      `ALTER SEQUENCE` for sequences whose only diff is
-                      `is_unlogged` and whose owning table is itself
-                      flipping persistence (PostgreSQL propagates the
+                      definitions (parsed by
+                      `Self::parse_fk_referenced_table`). Owned
+                      sequences also get cleaner output:
+                      `Sequence::is_only_persistence_change` lets
+                      `compare_sequences` skip the entire
+                      `ALTER SEQUENCE` for sequences whose only diff
+                      is `is_unlogged` and whose owning table is
+                      itself flipping persistence (PostgreSQL
+                      propagates the
                       `ALTER TABLE SET LOGGED|UNLOGGED` to every owned
                       sequence automatically, so the explicit emit was
-                      redundant), and `Sequence::get_alter_script_
-                      excluding_persistence` strips just the
+                      redundant), and
+                      `Sequence::get_alter_script_excluding_persistence`
+                      strips just the
                       `ALTER SEQUENCE … SET LOGGED|UNLOGGED` line when
                       the sequence has other diffs to emit but the
-                      owning table will still propagate the persistence
-                      flip.
+                      owning table will still propagate the
+                      persistence flip.
                     - Fixed issue #179: when a routine was dropped or
                       its return type / arguments / argument defaults
                       changed, `DROP FUNCTION ... CASCADE` silently
@@ -114,8 +118,16 @@
                       constraints attached to a still-present column).
                       `Routine::hash()` now includes
                       `arguments_defaults` so a defaults-only change
-                      actually triggers DROP+CREATE (PostgreSQL has no
-                      in-place `ALTER FUNCTION` for default values).
+                      is *detected*. The migration is then emitted
+                      via `CREATE OR REPLACE FUNCTION` — defaults can
+                      be updated for the same identity signature and
+                      return type without a DROP+CREATE — so
+                      `emit_routine_diff` and Phase 7 explicitly
+                      exclude defaults-only diffs from the
+                      DROP-CASCADE path. The earlier draft of this
+                      entry described defaults as a DROP+CREATE
+                      requirement; that wording was wrong (PR #187
+                      review).
                       Note: a v1.0.19 dump compared against a v1.0.20
                       dump may flag every routine carrying defaults as
                       changed even when the body is identical; rebuild
