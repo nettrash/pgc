@@ -1,70 +1,68 @@
 2026-05-14      v1.0.20
 
                 Bug fixes:
-                    - Fixed issue #179: `DROP FUNCTION ... CASCADE`
-                      silently removed dependent objects (functional
-                      indexes, CHECK constraints, generated columns,
-                      column DEFAULT expressions, and RLS policies)
-                      without re-emitting them, so the migrated
-                      database was missing those objects until a
-                      second `pgc compare` run noticed the drift.
-                    - Added Phase 7 to
+                    - Fixed issue #179: a routine signature change (or
+                      a full routine drop) caused PGC to emit
+                      `DROP FUNCTION ... CASCADE`, and PostgreSQL
+                      silently removed every object whose `pg_depend`
+                      row pointed at the function — functional indexes,
+                      CHECK constraints, generated columns, column
+                      DEFAULT expressions, and RLS policies. Those
+                      dependents were unchanged between FROM and TO so
+                      the rest of the comparer never re-emitted them,
+                      leaving the migrated database missing the objects
+                      until a second `pgc compare` run noticed the
+                      drift. Added Phase 7 to
                       `Comparer::compare_routines_and_views`: after the
                       affected functions are recreated, scan the FROM
                       dump for objects that textually reference any
-                      routine being CASCADE-dropped (full drop, or
-                      DROP+CREATE due to signature/return-type/default
-                      change), look up the equivalent object in TO,
-                      and emit an idempotent `drop ... if exists` +
-                      CREATE block. Generated columns are re-added via
+                      CASCADE-dropped routine, look up the equivalent
+                      object in TO, and emit an idempotent
+                      `drop ... if exists` + CREATE block. Generated
+                      columns are re-added via
                       `alter table ... add column` (CASCADE removes the
                       column itself); column defaults are restored via
                       `alter column ... set default` (the column
                       survives, only the DEFAULT clause is dropped).
-                    - Phase 7 mirrors `Table::diff`'s partition-child
+                      The phase mirrors `Table::diff`'s partition-child
                       safeguards: when both FROM and TO are partition
-                      children, inherited constraints (`coninhcount > 0`)
-                      and partition-inherited indexes
-                      (`is_partition_index = true`) are skipped on the
-                      child — the parent's recreate propagates them —
-                      and structural column changes are skipped entirely
-                      (PostgreSQL forbids `ALTER TABLE child DROP
-                      COLUMN` for inherited columns). Truly-local child
-                      constraints (`coninhcount == 0`) are still
-                      re-emitted.
-                    - Phase 7 dependency detection now also matches
-                      *unqualified* function calls (`compute(value)`)
-                      in addition to qualified ones
-                      (`public.compute(value)`). PostgreSQL's deparsers
-                      (`pg_get_constraintdef`, `pg_get_indexdef`,
-                      `pg_get_expr`) drop the schema qualifier when the
-                      function is reachable via `search_path` — typical
-                      for `public` — so dependents would otherwise be
-                      missed and the CASCADE drift left unfixed. The
-                      unqualified pass requires a `(` after the
-                      identifier (with whitespace tolerance) so it only
-                      matches function-call positions.
-                    - Phase 7's affected-routine set now stores the
-                      quote-stripped lowercase form of `schema` and
-                      `name`. The dump query wraps `nspname` / `proname`
-                      with `quote_ident`, so a routine named `MyFunc`
-                      arrives as `"MyFunc"`; both matchers operate on
-                      the quote-stripped half of `prelower_pair`, so a
-                      quoted needle would otherwise never line up with
-                      the deparsed `myfunc(` in dependent text.
-                    - `Routine::hash()` now incorporates
-                      `arguments_defaults`. PostgreSQL has no
+                      children, inherited constraints
+                      (`coninhcount > 0`) and partition-inherited
+                      indexes (`is_partition_index = true`) are skipped
+                      on the child — the parent's recreate propagates
+                      them — and structural column changes are skipped
+                      entirely (PostgreSQL forbids `ALTER TABLE child
+                      DROP COLUMN` for inherited columns); truly-local
+                      child constraints (`coninhcount == 0`) are still
+                      re-emitted. Dependency detection matches both
+                      qualified `schema.name(` and unqualified
+                      `name(` references (PostgreSQL's deparsers —
+                      `pg_get_constraintdef`, `pg_get_indexdef`,
+                      `pg_get_expr` — drop the schema qualifier when
+                      the function is reachable via `search_path`,
+                      typical for `public`); the unqualified pass
+                      requires a `(` after the identifier (with
+                      whitespace tolerance) so it only matches
+                      function-call positions, walks UTF-8 char
+                      boundaries via `match_indices` (PostgreSQL allows
+                      Unicode identifiers like `"русское_имя"` and
+                      naïve byte-index advancement panicked), and
+                      strips quotes from the affected-routine names so
+                      a quoted `"MyFunc"` (the dump query wraps
+                      `nspname` / `proname` with `quote_ident`) lines
+                      up with the quote-stripped `myfunc(` in
+                      dependent text. `Routine::hash()` now
+                      incorporates `arguments_defaults` so
+                      `Comparer::emit_routine_diff` and Phase 7's
+                      CASCADE-recreate detection both see defaults-
+                      only diffs (PostgreSQL has no
                       `ALTER FUNCTION ... ARGUMENT ... DEFAULT`, so a
-                      defaults-only change requires DROP+CREATE — but
-                      the previous hash excluded defaults, leaving
-                      `Comparer::emit_routine_diff` (and Phase 7's
-                      CASCADE-recreate detection) blind to defaults-
-                      only diffs and silently dropping the change.
-                      Note: this changes hash output, so a v1.0.19
-                      dump compared against a v1.0.20 dump may flag
-                      every routine carrying defaults as changed even
-                      when the body is identical; rebuild the FROM
-                      dump under v1.0.20 to suppress the noise.
+                      defaults-only change requires DROP+CREATE).
+                      Note: including defaults changes hash output, so
+                      a v1.0.19 dump compared against a v1.0.20 dump
+                      may flag every routine carrying defaults as
+                      changed even when the body is identical; rebuild
+                      the FROM dump under v1.0.20 to suppress the noise.
 
 2026-05-03      v1.0.19
 
