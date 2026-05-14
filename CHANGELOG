@@ -1,6 +1,21 @@
 2026-05-14      v1.0.20
 
                 Bug fixes:
+                    - Fixed issue #182 (PG18 NOT ENFORCED CHECK
+                      constraints): `TableConstraint::get_script` was
+                      appending its own ` not enforced ` clause even
+                      when the deparser-supplied `definition` already
+                      ended in `NOT ENFORCED`. PG18+
+                      `pg_get_constraintdef()` includes the keyword
+                      when the constraint is non-enforced, so the
+                      generated SQL came out as `… not enforced not
+                      enforced ;`. PostgreSQL accepts the duplicate
+                      idempotently so it never failed at runtime, but
+                      the output was wrong. The fix only appends the
+                      keyword when the `clause` (case-insensitively)
+                      doesn't already contain it; older-PG dumps and
+                      the keyword-less `parts.join`-built path keep
+                      working.
                     - Fixed issue #181 (PG18 virtual generated columns):
                       a STORED ↔ VIRTUAL flip with the same generation
                       expression produced no script at all, because

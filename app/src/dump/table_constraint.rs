@@ -104,11 +104,22 @@ impl TableConstraint {
 
         script.push_str(&format!("{} ", clause));
         if !self.is_enforced {
-            // Remove trailing space before appending NOT ENFORCED
-            let trimmed = script.trim_end().to_string();
-            script.clear();
-            script.push_str(&trimmed);
-            script.push_str(" not enforced ");
+            // Issue #182: PG18+ `pg_get_constraintdef()` already emits
+            // `NOT ENFORCED` for non-enforced constraints, so the
+            // lowercased deparser output flowing through `clause`
+            // already contains `not enforced`. Appending again
+            // produces `... not enforced not enforced ;`. The literal
+            // itself is `[not_enforced_keyword]` which can only appear
+            // in the keyword position, so a substring search against
+            // the (literal-preserved-case) clause is the right test.
+            // Older PG versions and PGC's own `parts.join`-built form
+            // don't include the keyword, and still need it appended.
+            if !clause.to_ascii_lowercase().contains("not enforced") {
+                let trimmed = script.trim_end().to_string();
+                script.clear();
+                script.push_str(&trimmed);
+                script.push_str(" not enforced ");
+            }
         }
         script.append_block(";");
         if let Some(ref comment) = self.comment {
@@ -714,6 +725,54 @@ mod tests {
         // Simplified behavior: just the base type
         let expected = "alter table test.persons add constraint chk_age_positive check ;\n\n";
         assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn issue182_not_enforced_already_in_definition_is_not_appended_again() {
+        // PG18+ `pg_get_constraintdef()` already emits `NOT ENFORCED`
+        // in its returned string for non-enforced CHECK constraints.
+        // Without the issue-#182 fix, `get_script` would also append
+        // its own `not enforced` clause, producing the doubled
+        // `... not enforced not enforced ;` shown in the issue.
+        let mut constraint = create_check_constraint();
+        constraint.definition = Some("CHECK (price > 0::numeric) NOT ENFORCED".to_string());
+        constraint.is_enforced = false;
+
+        let script = constraint.get_script();
+
+        let count = script.matches("not enforced").count();
+        assert_eq!(
+            count, 1,
+            "`not enforced` must appear exactly once when the deparser already included it: {script}"
+        );
+        assert!(
+            script.contains("check (price > 0::numeric) not enforced"),
+            "expected the deparser-supplied keyword to survive lowercasing: {script}"
+        );
+    }
+
+    #[test]
+    fn issue182_not_enforced_appended_when_definition_omits_it() {
+        // The fix must not regress older-PG / no-deparser-keyword
+        // cases: when the source definition does NOT contain
+        // `NOT ENFORCED` and `is_enforced=false`, we still need to
+        // append the keyword so the emitted DDL reflects the desired
+        // state.
+        let mut constraint = create_check_constraint();
+        constraint.definition = Some("CHECK (price > 0::numeric)".to_string());
+        constraint.is_enforced = false;
+
+        let script = constraint.get_script();
+
+        assert!(
+            script.contains("not enforced"),
+            "expected `not enforced` to be appended when the definition omits it: {script}"
+        );
+        assert_eq!(
+            script.matches("not enforced").count(),
+            1,
+            "still must appear exactly once: {script}"
+        );
     }
 
     #[test]
