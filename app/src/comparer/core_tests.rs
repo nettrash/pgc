@@ -7238,6 +7238,189 @@ async fn issue179_recreate_skipped_when_to_dependent_missing() {
     );
 }
 
+/// Variant of [`issue179_items_table`] that mirrors PostgreSQL's
+/// deparser output when the function is reachable via `search_path`:
+/// the dependent texts use *unqualified* `compute(value)` instead of
+/// `test_deps.compute(value)`. The `pg_get_*` family routinely drops
+/// the schema qualifier in this case.
+fn issue179_items_table_unqualified(value_type: &str, def_default: &str, gen_type: &str) -> Table {
+    let mut def_col = int_column("test_deps", "items", "def_col", 2);
+    def_col.data_type = value_type.to_string();
+    def_col.column_default = Some(def_default.to_string());
+
+    let mut gen_col = int_column("test_deps", "items", "gen_col", 3);
+    gen_col.data_type = gen_type.to_string();
+    gen_col.is_generated = "ALWAYS".to_string();
+    // Unqualified function call.
+    gen_col.generation_expression = Some("compute(value)".to_string());
+    gen_col.generation_type = Some("s".to_string());
+
+    let mut value_col = int_column("test_deps", "items", "value", 1);
+    value_col.is_nullable = false;
+
+    let chk_constraint = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "chk_compute".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        // Unqualified function call.
+        definition: Some("CHECK (compute(value) > 0)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "idx_compute".to_string(),
+        catalog: Some("postgres".to_string()),
+        // Unqualified function call.
+        indexdef: "CREATE INDEX idx_compute ON test_deps.items USING btree (compute(value))"
+            .to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let policy = TablePolicy {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "p_items".to_string(),
+        command: "all".to_string(),
+        permissive: true,
+        roles: vec![],
+        // Unqualified function call.
+        using_clause: Some("(compute(value) > 0)".to_string()),
+        check_clause: None,
+    };
+
+    let mut table = Table::new(
+        "test_deps".to_string(),
+        "items".to_string(),
+        "test_deps".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col, def_col, gen_col],
+        vec![chk_constraint],
+        vec![idx],
+        vec![],
+        None,
+    );
+    table.policies = vec![policy];
+    table.has_rowsecurity = true;
+    table.hash();
+    table
+}
+
+#[tokio::test]
+async fn issue179_unqualified_function_calls_are_detected() {
+    // PostgreSQL's pg_get_constraintdef / pg_get_indexdef / pg_get_expr
+    // drop the schema qualifier when the function is in search_path
+    // (the typical `public` case). Phase 7 must still recognise these
+    // dependents — otherwise the CASCADE-drop drift goes unfixed for
+    // anything the deparser deemed "in scope".
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.tables.push(issue179_items_table_unqualified(
+        "integer",
+        "compute(0)::integer",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table_unqualified(
+        "bigint",
+        "compute(0)",
+        "bigint",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_compute"),
+        "unqualified CHECK reference must trigger recreate: {}",
+        script
+    );
+    assert!(
+        script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        "unqualified index reference must trigger recreate: {}",
+        script
+    );
+    assert!(
+        script.contains(
+            "alter table test_deps.items add column gen_col bigint generated always as (compute(value)) stored;"
+        ),
+        "unqualified generated-column reference must trigger recreate: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_deps.items alter column def_col set default compute(0);"),
+        "unqualified column DEFAULT reference must trigger recreate: {}",
+        script
+    );
+    assert!(
+        script.contains("create policy p_items on test_deps.items"),
+        "unqualified policy reference must trigger recreate: {}",
+        script
+    );
+}
+
+#[test]
+fn issue179_unqualified_match_rejects_substrings_and_non_calls() {
+    // Direct unit test for the boundary rules: the unqualified matcher
+    // must require `name(` at an identifier boundary, not match
+    // partial-name suffixes, qualified `schema.name`, or non-call uses.
+    let mut affected: HashSet<(String, String)> = HashSet::new();
+    affected.insert(("ignored_schema".to_string(), "compute".to_string()));
+
+    // Bare function call — should match.
+    assert!(Comparer::definition_references_any(
+        "check (compute(value) > 0)",
+        &affected
+    ));
+    // Whitespace between name and `(` — still a call.
+    assert!(Comparer::definition_references_any(
+        "check (compute  (value) > 0)",
+        &affected
+    ));
+    // Qualified — qualified matcher handles it via the schema, but we
+    // also exercise that the unqualified matcher's left-dot exclusion
+    // does not double-match `other_schema.compute(`.
+    assert!(!Comparer::definition_references_any(
+        "check (other_schema.compute(value) > 0)",
+        &affected
+    ));
+    // Substring — must NOT match.
+    assert!(!Comparer::definition_references_any(
+        "check (compute_v2(value) > 0)",
+        &affected
+    ));
+    assert!(!Comparer::definition_references_any(
+        "check (precompute(value) > 0)",
+        &affected
+    ));
+    // Identifier without trailing `(` — must NOT match.
+    assert!(!Comparer::definition_references_any(
+        "check (compute > 0)",
+        &affected
+    ));
+}
+
 /// Build a partition child of `parent_table` whose dependents (CHECK
 /// constraint with `coninhcount=1`, `is_partition_index=true` index, a
 /// generated column, and a CHECK with `coninhcount=0` so we can prove

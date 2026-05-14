@@ -3467,12 +3467,72 @@ impl Comparer {
     }
 
     /// True when `definition` textually references any `(schema, name)` in
-    /// `routines` (both keys lowercased), with identifier-boundary matching.
+    /// `routines`. Tries the qualified `schema.name` form first, then
+    /// falls back to an *unqualified* function-call match (`name(`):
+    /// PostgreSQL's deparsers (`pg_get_constraintdef`, `pg_get_indexdef`,
+    /// `pg_get_expr`) drop the schema qualifier whenever the function is
+    /// reachable via the active `search_path` — typical for `public` —
+    /// so dependents like `CHECK (compute(value) > 0)` would otherwise
+    /// be missed and the CASCADE drift left unfixed.
+    ///
+    /// The unqualified pass requires `(` (after optional whitespace) so
+    /// it only matches function-call positions: identifiers used as
+    /// column references, type names, or string-literal contents do not
+    /// trigger a false positive.
     fn definition_references_any(definition: &str, routines: &HashSet<(String, String)>) -> bool {
         let (lower, unquoted) = Self::prelower_pair(definition);
         routines.iter().any(|(schema, name)| {
             Self::text_references_qualified_name_pre(&lower, &unquoted, schema, name)
+                || Self::text_references_unqualified_call(&unquoted, name)
         })
+    }
+
+    /// True when `text` contains `name` as a function call: a whole
+    /// identifier (delimited on the left by a non-identifier, non-dot
+    /// character, on the right by a non-identifier character) followed
+    /// — possibly across whitespace — by `(`. The left-side dot
+    /// exclusion ensures `schema.name(` is left to the qualified
+    /// matcher; the right-side identifier check stops `compute_v2(`
+    /// from matching when `name = "compute"`. `text` and `name` must
+    /// already be lowercased and quote-stripped (use the `unquoted`
+    /// half of [`Self::prelower_pair`]).
+    fn text_references_unqualified_call(text: &str, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let bytes = text.as_bytes();
+        let name_len = name.len();
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(name) {
+            let i = start + pos;
+            let next_search = i + 1;
+
+            if i > 0 {
+                let before = bytes[i - 1];
+                if before.is_ascii_alphanumeric() || before == b'_' || before == b'.' {
+                    start = next_search;
+                    continue;
+                }
+            }
+            let end = i + name_len;
+            if end < bytes.len() {
+                let after = bytes[end];
+                if after.is_ascii_alphanumeric() || after == b'_' {
+                    start = next_search;
+                    continue;
+                }
+            }
+            // Skip whitespace, then require `(`.
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                return true;
+            }
+            start = next_search;
+        }
+        false
     }
 
     /// Append a recreate block (drop-if-exists + create) to `out`. When

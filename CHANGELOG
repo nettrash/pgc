@@ -32,6 +32,18 @@
                       COLUMN` for inherited columns). Truly-local child
                       constraints (`coninhcount == 0`) are still
                       re-emitted.
+                    - Phase 7 dependency detection now also matches
+                      *unqualified* function calls (`compute(value)`)
+                      in addition to qualified ones
+                      (`public.compute(value)`). PostgreSQL's deparsers
+                      (`pg_get_constraintdef`, `pg_get_indexdef`,
+                      `pg_get_expr`) drop the schema qualifier when the
+                      function is reachable via `search_path` — typical
+                      for `public` — so dependents would otherwise be
+                      missed and the CASCADE drift left unfixed. The
+                      unqualified pass requires a `(` after the
+                      identifier (with whitespace tolerance) so it only
+                      matches function-call positions.
 
 2026-05-03      v1.0.19
 
