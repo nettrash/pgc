@@ -2537,17 +2537,7 @@ impl Comparer {
                 self.script.push_str(&to_view.get_script());
             }
         } else {
-            let mut view_script = to_view.get_script();
-            if !view_script
-                .to_uppercase()
-                .contains("CREATE OR REPLACE VIEW")
-            {
-                const TARGET: &str = "create view";
-                const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
-                if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
-                    view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
-                }
-            }
+            let view_script = rewrite_create_view_to_create_or_replace(&to_view.get_script());
             let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
             let drop_was_active = self
                 .dropped_views
@@ -3620,9 +3610,10 @@ impl Comparer {
         // `DROP ... CASCADE` and PostgreSQL removes every object whose
         // `pg_depend` entry points at that function: functional indexes,
         // CHECK constraints, generated columns, column DEFAULT
-        // expressions and RLS policies. The rest of the comparer never
-        // re-emits those dependents because they were unchanged between
-        // FROM and TO. See issue #179.
+        // expressions, RLS policies and views (regular + materialized).
+        // The rest of the comparer never re-emits those dependents
+        // because they were unchanged between FROM and TO. See issues
+        // #179 (non-view dependents) and #189 (views).
         self.recreate_routine_dependents();
 
         self.script
@@ -3633,14 +3624,15 @@ impl Comparer {
     /// Re-emit objects that PostgreSQL silently dropped via
     /// `DROP FUNCTION ... CASCADE` so they are present in the database
     /// after the migration applies. Targets functional indexes, CHECK
-    /// constraints, generated columns, column DEFAULT expressions and
-    /// RLS policies that reference any routine being dropped+recreated
-    /// or fully dropped. Detection is text-based against the FROM-side
-    /// definition; the recreated form comes from TO so any reshape of
-    /// the dependent (e.g. a column type change) is preserved. Issued
-    /// statements are idempotent (`drop ... if exists` followed by the
-    /// CREATE) so they are safe even when other diff phases also
-    /// emitted the object.
+    /// constraints, generated columns, column DEFAULT expressions, RLS
+    /// policies and views (regular + materialized) that reference any
+    /// routine being dropped+recreated or fully dropped. Detection is
+    /// text-based against the FROM-side definition; the recreated form
+    /// comes from TO so any reshape of the dependent (e.g. a column
+    /// type change) is preserved. Issued statements are idempotent
+    /// (`drop ... if exists` followed by the CREATE, or `CREATE OR
+    /// REPLACE` / `IF NOT EXISTS` for views) so they are safe even
+    /// when other diff phases also emitted the object.
     fn recreate_routine_dependents(&mut self) {
         // Collect (schema_lc, name_lc) for every routine whose drop will
         // CASCADE: routines absent from TO, plus routines whose signature
@@ -3996,6 +3988,53 @@ impl Comparer {
                     &policy_recreate_block(to_policy),
                 );
             }
+        }
+
+        // Views (regular and materialized) whose definition references an
+        // affected routine are also CASCADE-dropped by PostgreSQL — issue
+        // #189 / PR #187 review. The hash check in
+        // `compare_routines_and_views` skips byte-identical views, so this
+        // is the only place where an unchanged view referencing a
+        // signature-changed function gets re-emitted.
+        let to_view_by_id: HashMap<(&str, &str), &View> = self
+            .to
+            .views
+            .iter()
+            .map(|v| ((v.schema.as_str(), v.name.as_str()), v))
+            .collect();
+
+        for from_view in &self.from.views {
+            if !Self::definition_references_any(&from_view.definition, &affected) {
+                continue;
+            }
+            let Some(to_view) =
+                to_view_by_id.get(&(from_view.schema.as_str(), from_view.name.as_str()))
+            else {
+                continue;
+            };
+            // TO-side gate: if the TO definition no longer references the
+            // affected routine, `compare_tables`/Phase 5 has already
+            // rewritten the view or its function dependency is gone — the
+            // CASCADE leaves it intact (or another phase re-emits it).
+            if !Self::definition_references_any(&to_view.definition, &affected) {
+                continue;
+            }
+            // Phase 5 already emits the view when `dropped_views`
+            // contains it (drop-and-recreate path triggered by a
+            // referenced table changing) — don't duplicate that work.
+            let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
+            if self.dropped_views.contains_key(&normalized_view) {
+                continue;
+            }
+            let key = format!("view:{}.{}", to_view.schema, to_view.name);
+            if !emitted_keys.insert(key) {
+                continue;
+            }
+            Self::emit_dependent_recreate(
+                &mut recreate,
+                self.use_drop,
+                &view_recreate_block(to_view),
+            );
         }
 
         if !recreate.is_empty() {
@@ -4824,6 +4863,54 @@ fn inject_if_not_exists_into_create_index(script: &str) -> String {
 /// is safe and unambiguous.
 fn inject_if_not_exists_into_add_column(script: &str) -> String {
     script.replacen("add column ", "add column if not exists ", 1)
+}
+
+/// Idempotent recreate block for a view that may have been silently
+/// dropped by `DROP FUNCTION ... CASCADE`. Regular views use
+/// `CREATE OR REPLACE VIEW` (a no-op when the view still exists with the
+/// same definition; a create when CASCADE removed it). Materialized
+/// views use `CREATE MATERIALIZED VIEW IF NOT EXISTS` for the same
+/// reason — Phase 7's text-based matching can false-positive on a view
+/// that PostgreSQL never actually dropped, and an unconditional CREATE
+/// would fail against a surviving view.
+fn view_recreate_block(view: &View) -> String {
+    let script = view.get_script();
+    if view.is_materialized {
+        inject_if_not_exists_into_create_materialized_view(&script)
+    } else {
+        rewrite_create_view_to_create_or_replace(&script)
+    }
+}
+
+/// Rewrites the lowercase `create view ` prefix produced by
+/// `View::get_script` to `CREATE OR REPLACE VIEW `. The check is
+/// anchored to the start of the script via `strip_prefix` rather than a
+/// whole-script `contains` / `find` scan: the view definition body
+/// `View::get_script` appends after the prefix can legitimately contain
+/// the literal text `create view` or `CREATE OR REPLACE VIEW` (e.g. a
+/// string literal in the select list), and a non-anchored matcher would
+/// either false-positive on the early-return branch (leaving the
+/// leading `create view` unrewritten) or rewrite a non-prefix
+/// occurrence. If the script already starts with `CREATE OR REPLACE
+/// VIEW` (upstream rewrite) or some other unanticipated leading form,
+/// it is returned unchanged.
+fn rewrite_create_view_to_create_or_replace(script: &str) -> String {
+    if let Some(rest) = script.strip_prefix("create view ") {
+        return format!("CREATE OR REPLACE VIEW {}", rest);
+    }
+    script.to_string()
+}
+
+/// Rewrites the lowercase `create materialized view ` prefix produced by
+/// `View::get_script` to `create materialized view if not exists `. The
+/// prefix is generated by us in known lowercase form so a single
+/// `replacen` against the first hit is safe and unambiguous.
+fn inject_if_not_exists_into_create_materialized_view(script: &str) -> String {
+    script.replacen(
+        "create materialized view ",
+        "create materialized view if not exists ",
+        1,
+    )
 }
 
 /// `drop policy if exists` + `create policy` block from the TO-side policy.

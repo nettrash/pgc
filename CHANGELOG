@@ -1,5 +1,37 @@
 2026-05-14      v1.0.21
 
+                Bug fixes:
+                    - Fixed issue #189 (Phase 7 doesn't recreate
+                      views silently dropped by `DROP FUNCTION ...
+                      CASCADE`). PR #183's Phase 7 restored functional
+                      indexes, CHECK constraints, generated columns,
+                      column DEFAULTs, and RLS policies after a
+                      CASCADE drop, but skipped views — a view whose
+                      definition referenced the cascaded routine and
+                      was byte-identical between FROM and TO had its
+                      hash matched in
+                      `compare_routines_and_views`, was never
+                      re-emitted, and disappeared from the database
+                      until a second `pgc compare` run noticed the
+                      drift. Extended
+                      `Comparer::recreate_routine_dependents` with a
+                      view scan that runs `definition_references_any`
+                      over `from_view.definition`, applies the same
+                      TO-side gate (PR #186) against
+                      `to_view.definition` so views already rewritten
+                      by another phase are left alone, and skips views
+                      already present in `dropped_views` (Phase 5
+                      handles those via the drop-and-recreate path).
+                      Regular views emit `CREATE OR REPLACE VIEW`
+                      (idempotent: no-op if the view survived CASCADE,
+                      a real create if it did not); materialized views
+                      emit `CREATE MATERIALIZED VIEW IF NOT EXISTS`
+                      for the same reason — Phase 7's text-based
+                      matcher can false-positive on a view that
+                      PostgreSQL never actually dropped, and an
+                      unconditional CREATE would fail against a
+                      surviving view.
+
                 Enhancements:
                     - Resolved issue #192 (separate tests into
                       `_tests.rs` files): every dump/, comparer/,
