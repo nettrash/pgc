@@ -289,14 +289,26 @@ impl Routine {
         let rows_repr = self.rows.map_or(String::new(), |r| r.to_string());
         let support_repr = self.support_function.clone().unwrap_or_default();
         let transform_repr = self.transform_types.join(",");
+        // `arguments_defaults` participates in the hash so a
+        // defaults-only diff is *detected* — `Comparer::emit_routine_
+        // diff` keys off `hashes_differ` to decide whether to emit
+        // anything at all. The actual migration uses `CREATE OR
+        // REPLACE FUNCTION`, NOT `DROP FUNCTION ... CASCADE`:
+        // PostgreSQL accepts default-argument changes via the
+        // OR REPLACE form when the identity argument types and return
+        // type are unchanged. PR #187 review (C11) corrected the
+        // earlier wording here that misleadingly framed defaults as
+        // a DROP+CREATE requirement.
+        let defaults_repr = self.arguments_defaults.clone().unwrap_or_default();
         let src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             self.schema,
             self.name,
             self.lang,
             self.kind,
             self.return_type,
             self.arguments,
+            defaults_repr,
             self.owner,
             self.comment.clone().unwrap_or_default(),
             self.source_code,
@@ -851,13 +863,14 @@ mod tests {
         assert!(routine.aggregate_info.is_none());
 
         let expected_src = format!(
-            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
+            "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
             schema,
             name,
             lang,
             kind,
             return_type,
             arguments,
+            defaults.as_deref().unwrap_or(""),
             "",
             "",
             source_code,
@@ -942,14 +955,18 @@ mod tests {
     }
 
     #[test]
-    fn hash_does_not_include_argument_defaults() {
+    fn hash_includes_argument_defaults() {
+        // PostgreSQL has no `ALTER FUNCTION` for default values — a
+        // defaults-only change requires DROP+CREATE — so the hash must
+        // reflect `arguments_defaults` or the comparer's `hashes_differ`
+        // gate would silently swallow the diff.
         let mut routine = build_function_routine();
         let original_hash = routine.hash.clone();
 
         routine.arguments_defaults = Some("DEFAULT 99".to_string());
         routine.hash();
 
-        assert_eq!(routine.hash, original_hash);
+        assert_ne!(routine.hash, original_hash);
     }
 
     #[test]

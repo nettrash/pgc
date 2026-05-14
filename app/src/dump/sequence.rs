@@ -224,11 +224,62 @@ impl Sequence {
     /// would rewind a live sequence whose current position is already above the new
     /// `start_value`, risking duplicate-key violations.
     pub fn get_alter_script(&self, from: &Sequence) -> String {
+        self.build_alter_script(from, true)
+    }
+
+    /// Same as [`Self::get_alter_script`] but never emits the
+    /// `ALTER SEQUENCE ... SET LOGGED|UNLOGGED` line. The comparer
+    /// uses this when the owning table is itself flipping persistence
+    /// in the same migration: PostgreSQL automatically propagates the
+    /// table's `ALTER TABLE SET LOGGED|UNLOGGED` to every owned
+    /// sequence, so re-emitting the SET on the sequence is redundant
+    /// (issue #180).
+    pub fn get_alter_script_excluding_persistence(&self, from: &Sequence) -> String {
+        self.build_alter_script(from, false)
+    }
+
+    /// True when the only field that differs between `self` (TO) and
+    /// `from` is `is_unlogged`. Used by the comparer to suppress an
+    /// otherwise no-op `ALTER SEQUENCE …` for owned sequences whose
+    /// owning table is flipping persistence (the table's `ALTER TABLE
+    /// SET LOGGED|UNLOGGED` propagates to the sequence on its own —
+    /// re-emitting the full clause list would be cosmetic noise).
+    ///
+    /// Implementation strategy: clone `self`, force its `is_unlogged`
+    /// back to `from`'s value, recompute the hash, and compare. This
+    /// piggy-backs on [`Self::hash`] so any new field added to the
+    /// hash is automatically considered here — there's no field list
+    /// to forget to update. We also explicitly compare the few fields
+    /// that `hash()` deliberately leaves out but `get_alter_script`
+    /// renders (`owned_by_*`); a change there must still block the
+    /// suppression because the table-cascade does NOT propagate
+    /// ownership changes.
+    pub fn is_only_persistence_change(&self, from: &Sequence) -> bool {
+        if self.is_unlogged == from.is_unlogged {
+            return false;
+        }
+        // Hash mismatch on the persistence-equalised clone means SOME
+        // hashed field other than `is_unlogged` differs.
+        let mut probe = self.clone();
+        probe.is_unlogged = from.is_unlogged;
+        probe.hash();
+        if probe.hash != from.hash {
+            return false;
+        }
+        // Ownership info is rendered in `get_alter_script` but not
+        // hashed — keep the explicit checks as a belt-and-braces guard
+        // against a behaviour-affecting change being silently dropped.
+        self.owned_by_schema == from.owned_by_schema
+            && self.owned_by_table == from.owned_by_table
+            && self.owned_by_column == from.owned_by_column
+    }
+
+    fn build_alter_script(&self, from: &Sequence, include_persistence: bool) -> String {
         let mut clauses = Vec::new();
 
         // Handle logged/unlogged change
         let mut logging_script = String::new();
-        if self.is_unlogged != from.is_unlogged {
+        if include_persistence && self.is_unlogged != from.is_unlogged {
             if self.is_unlogged {
                 logging_script =
                     format!("alter sequence {}.{} set unlogged;", self.schema, self.name)

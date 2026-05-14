@@ -1375,3 +1375,85 @@ CREATE USER MAPPING FOR PUBLIC
 CREATE PUBLICATION test_pub_from_only FOR TABLE test_schema.users;
 CREATE PUBLICATION test_pub_unchanged FOR TABLE test_schema.users, test_schema.products;
 
+-- =============================================================================
+-- Issue #179 — DROP FUNCTION ... CASCADE recreate test (FROM side)
+-- =============================================================================
+-- Function `cascade_compute(integer)` returns INTEGER here. Schema B
+-- changes the return type to BIGINT. The argument list (`integer`) is
+-- unchanged, so the routine's signature in PostgreSQL terms is the
+-- same on both sides — but PostgreSQL has no `ALTER FUNCTION` for
+-- return types, so the comparer still emits DROP+CREATE. PostgreSQL
+-- silently CASCADE-drops every object whose `pg_depend` row points at
+-- the function: the CHECK constraint, the functional index, the
+-- generated column, the column DEFAULT, and the RLS policy. The
+-- comparer must re-emit each one (Phase 7 of
+-- `compare_routines_and_views`) — otherwise the migrated database is
+-- missing those objects until a second `pgc compare` run notices the
+-- drift.
+CREATE FUNCTION test_schema.cascade_compute(x integer)
+RETURNS integer LANGUAGE sql IMMUTABLE AS $$
+    SELECT x * 2;
+$$;
+
+CREATE TABLE test_schema.cascade_items (
+    id      serial  PRIMARY KEY,
+    value   integer NOT NULL,
+    -- DEFAULT expression depends on cascade_compute → cascaded by CASCADE
+    def_col integer DEFAULT test_schema.cascade_compute(0)::integer,
+    -- Generated column depends on cascade_compute → column dropped by CASCADE
+    gen_col integer GENERATED ALWAYS AS (test_schema.cascade_compute(value)) STORED
+);
+
+-- CHECK constraint depends on cascade_compute → cascaded by CASCADE
+ALTER TABLE test_schema.cascade_items
+    ADD CONSTRAINT chk_cascade_compute CHECK (test_schema.cascade_compute(value) > 0);
+
+-- Functional index depends on cascade_compute → cascaded by CASCADE
+CREATE INDEX idx_cascade_compute
+    ON test_schema.cascade_items (test_schema.cascade_compute(value));
+
+-- RLS policy depends on cascade_compute → cascaded by CASCADE
+ALTER TABLE test_schema.cascade_items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pol_cascade_items ON test_schema.cascade_items
+    USING (test_schema.cascade_compute(value) > 0);
+
+-- =============================================================================
+-- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
+-- =============================================================================
+-- FROM has three LOGGED tables connected by a foreign-key chain
+-- (child -> parent -> grandparent). Schema B converts every table in
+-- the chain to UNLOGGED. The migration script must emit
+-- `ALTER TABLE ... SET UNLOGGED` in FK-leaf-first order
+-- (child -> parent -> grandparent); alphabetical order — which the
+-- comparer used before this fix — fails with:
+--   ERROR: could not change table "grandparent" to unlogged because
+--   it references logged table "parent"
+--
+-- The reverse direction (UNLOGGED -> LOGGED) requires the opposite
+-- order (roots first); both directions are exercised by the comparer's
+-- `Comparer::emit_persistence_changes` phase, which sorts each
+-- direction topologically over the FK adjacency derived from
+-- `pg_get_constraintdef`.
+--
+-- The serial PKs auto-create owned sequences. PostgreSQL propagates
+-- the table's `ALTER TABLE SET UNLOGGED` to every owned sequence
+-- automatically, so the comparer must NOT emit an explicit
+-- `ALTER SEQUENCE ... SET UNLOGGED` for them — when the only diff is
+-- `is_unlogged` and the owning table is also flipping, the entire
+-- ALTER SEQUENCE block is suppressed (issue #180).
+CREATE SCHEMA IF NOT EXISTS test_order;
+
+CREATE TABLE test_order.grandparent (
+    id serial PRIMARY KEY
+);
+
+CREATE TABLE test_order.parent (
+    id serial PRIMARY KEY,
+    grandparent_id integer REFERENCES test_order.grandparent(id)
+);
+
+CREATE TABLE test_order.child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES test_order.parent(id)
+);
+

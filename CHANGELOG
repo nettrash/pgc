@@ -1,3 +1,138 @@
+2026-05-14      v1.0.20
+
+                Bug fixes:
+                    - Fixed issue #182 (PG18 NOT ENFORCED CHECK
+                      constraints): `TableConstraint::get_script` was
+                      appending its own ` not enforced ` clause even
+                      when the deparser-supplied `definition` already
+                      ended in `NOT ENFORCED`. PG18+
+                      `pg_get_constraintdef()` includes the keyword
+                      when the constraint is non-enforced, so the
+                      generated SQL came out as `… not enforced not
+                      enforced ;`. PostgreSQL accepts the duplicate
+                      idempotently so it never failed at runtime, but
+                      the output was wrong. The fix only appends the
+                      keyword when the `clause` (case-insensitively)
+                      doesn't already contain it; older-PG dumps and
+                      the keyword-less `parts.join`-built path keep
+                      working.
+                    - Fixed issue #181 (PG18 virtual generated columns):
+                      a STORED ↔ VIRTUAL flip with the same generation
+                      expression produced no script at all, because
+                      `TableColumn::get_alter_script`'s
+                      `generated_changed` predicate only considered
+                      `is_generated` and `generation_expression` and
+                      ignored `generation_type`. Now compares
+                      `effective_generation_type` as well, so the flip
+                      is detected. And a virtual generated column with
+                      a changed expression used to emit
+                      `ALTER COLUMN DROP EXPRESSION` + `ALTER COLUMN
+                      ADD GENERATED ALWAYS AS (...) VIRTUAL`, both of
+                      which PG18 rejects (DROP EXPRESSION is
+                      STORED-only; the ADD GENERATED form has no
+                      VIRTUAL variant). The fix routes every VIRTUAL
+                      participant — flips of `generation_type` in
+                      either direction, and expression changes on a
+                      VIRTUAL column — through the full
+                      `DROP COLUMN` + `ADD COLUMN ... GENERATED ALWAYS
+                      AS (...) VIRTUAL|STORED` round-trip, which is
+                      the only valid migration PG18 accepts. STORED →
+                      STORED expression changes keep the cheaper
+                      in-place `DROP EXPRESSION` + `ADD GENERATED ...
+                      STORED` form.
+                    - Fixed issue #180: `ALTER TABLE ... SET LOGGED|
+                      UNLOGGED` was emitted inline with the per-table
+                      alter loop in alphabetical order, which
+                      PostgreSQL rejects whenever an FK chain flips
+                      persistence in the same migration —
+                      `SET UNLOGGED` fails if any LOGGED table
+                      references the target, `SET LOGGED` fails if the
+                      target references any UNLOGGED one. Moved the
+                      emission out of `Table::build_alter_script` and
+                      into a dedicated
+                      `Comparer::emit_persistence_changes` phase that
+                      runs at the end of `compare_tables`: tables
+                      flipping to UNLOGGED are sorted
+                      leaves-before-roots (reverse FK topo), tables
+                      flipping to LOGGED are sorted
+                      roots-before-leaves (forward FK topo), each via
+                      `Self::topo_order_within_subset` over an FK
+                      adjacency derived from the TO-side constraint
+                      definitions (parsed by
+                      `Self::parse_fk_referenced_table`). Owned
+                      sequences also get cleaner output:
+                      `Sequence::is_only_persistence_change` lets
+                      `compare_sequences` skip the entire
+                      `ALTER SEQUENCE` for sequences whose only diff
+                      is `is_unlogged` and whose owning table is
+                      itself flipping persistence (PostgreSQL
+                      propagates the
+                      `ALTER TABLE SET LOGGED|UNLOGGED` to every owned
+                      sequence automatically, so the explicit emit was
+                      redundant), and
+                      `Sequence::get_alter_script_excluding_persistence`
+                      strips just the
+                      `ALTER SEQUENCE … SET LOGGED|UNLOGGED` line when
+                      the sequence has other diffs to emit but the
+                      owning table will still propagate the
+                      persistence flip.
+                    - Fixed issue #179: when a routine was dropped or
+                      its return type / arguments / argument defaults
+                      changed, `DROP FUNCTION ... CASCADE` silently
+                      removed every dependent linked through
+                      `pg_depend` — functional indexes, CHECK
+                      constraints, generated columns, column DEFAULTs,
+                      and RLS policies — and the comparer never
+                      re-emitted them, leaving the database missing
+                      those objects until a second `pgc compare` run.
+                      Added Phase 7 to
+                      `Comparer::compare_routines_and_views`: after the
+                      affected functions are recreated, restore each
+                      cascaded dependent from its TO-side definition.
+                      Generated columns and indexes use non-destructive
+                      `ADD COLUMN IF NOT EXISTS` / `CREATE INDEX IF NOT
+                      EXISTS`; constraints, policies, and DEFAULTs use
+                      idempotent `drop ... if exists` + create or
+                      `alter column set default`. The phase honours
+                      multiple safety gates: partition-child rules
+                      (skip inherited constraints, partition-inherited
+                      indexes, and all structural column changes —
+                      truly-local child constraints still re-emit);
+                      qualified and unqualified detection (deparsers
+                      drop the schema qualifier when the function is in
+                      `search_path`, both forms must require a `(` call
+                      gate so `ON schema.table` / `nextval(... ::
+                      regclass)` don't false-positive); UTF-8 boundary
+                      walking via `match_indices` for non-ASCII
+                      identifiers (`"русское_имя"`); quote-stripped
+                      affected-routine names so `quote_ident`-wrapped
+                      `"MyFunc"` matches the deparsed `myfunc(`; and a
+                      TO-side reference check so dependents already
+                      rewritten by `compare_tables()` are left alone
+                      (the broken `pg_depend` link means CASCADE leaves
+                      them intact, and the IF NOT EXISTS forms make the
+                      false-positive case a runtime no-op rather than a
+                      destructive drop — overloaded routines collapse
+                      together in the text matcher and would otherwise
+                      cascade-destroy unrelated indexes / FKs /
+                      constraints attached to a still-present column).
+                      `Routine::hash()` now includes
+                      `arguments_defaults` so a defaults-only change
+                      is *detected*. The migration is then emitted
+                      via `CREATE OR REPLACE FUNCTION` — defaults can
+                      be updated for the same identity signature and
+                      return type without a DROP+CREATE — so
+                      `emit_routine_diff` and Phase 7 explicitly
+                      exclude defaults-only diffs from the
+                      DROP-CASCADE path. The earlier draft of this
+                      entry described defaults as a DROP+CREATE
+                      requirement; that wording was wrong (PR #187
+                      review).
+                      Note: a v1.0.19 dump compared against a v1.0.20
+                      dump may flag every routine carrying defaults as
+                      changed even when the body is identical; rebuild
+                      the FROM dump under v1.0.20 to suppress the noise.
+
 2026-05-03      v1.0.19
 
                 Bug fixes:
