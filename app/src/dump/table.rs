@@ -275,13 +275,13 @@ impl Table {
 
         for (key, mut cols) in columns_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                cols.sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
+                cols.sort_by_key(|a| a.ordinal_position);
                 tables[i].columns = cols;
             }
         }
         for (key, mut idxs) in indexes_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                idxs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                idxs.sort_by_key(|a| a.name.to_lowercase());
                 tables[i].indexes = idxs;
             }
         }
@@ -292,7 +292,7 @@ impl Table {
         }
         for (key, mut trigs) in triggers_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                trigs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                trigs.sort_by_key(|a| a.name.to_lowercase());
                 tables[i].triggers = trigs;
             }
         }
@@ -1621,19 +1621,18 @@ impl Table {
                 return Some(found);
             }
             let new_col = new_c.auto_not_null_column(&to_table.raw_name)?;
-            self.constraints
-                .iter()
-                .find(|c| c.auto_not_null_column(&self.raw_name).as_deref() == Some(new_col.as_str()))
+            self.constraints.iter().find(|c| {
+                c.auto_not_null_column(&self.raw_name).as_deref() == Some(new_col.as_str())
+            })
         };
         let find_new = |old_c: &TableConstraint| -> Option<&TableConstraint> {
             if let Some(found) = to_table.constraints.iter().find(|c| c.name == old_c.name) {
                 return Some(found);
             }
             let old_col = old_c.auto_not_null_column(&self.raw_name)?;
-            to_table
-                .constraints
-                .iter()
-                .find(|c| c.auto_not_null_column(&to_table.raw_name).as_deref() == Some(old_col.as_str()))
+            to_table.constraints.iter().find(|c| {
+                c.auto_not_null_column(&to_table.raw_name).as_deref() == Some(old_col.as_str())
+            })
         };
 
         // Collect constraint changes; drop statements run before column drops
