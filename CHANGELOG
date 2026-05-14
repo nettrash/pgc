@@ -69,11 +69,24 @@
                       the function reaches the CASCADE step with the
                       `pg_depend` link already broken and PostgreSQL
                       leaves it intact; re-emitting in that case is
-                      wasted work for constraints / indexes / policies
-                      and *destructive* for generated columns —
-                      `DROP COLUMN IF EXISTS` cascades to indexes,
-                      FKs, and constraints attached to the column,
-                      none of which Phase 7 restores. `Routine::hash()`
+                      wasted work for constraints / indexes / policies.
+                      Generated-column and index recreates use the
+                      non-destructive `ADD COLUMN IF NOT EXISTS` and
+                      `CREATE INDEX IF NOT EXISTS` forms (no `DROP`
+                      first): Phase 7's affected-routine set keys on
+                      `(schema, name)` only — argument signature is
+                      not threaded through the text-based matcher,
+                      because a dependent expression like
+                      `compute(value)` carries no type info — so an
+                      overloaded routine where one overload survives
+                      the cascade can collapse to a false-positive
+                      match. An unconditional `DROP COLUMN` in that
+                      case would cascade through every index, FK, and
+                      constraint attached to the (still-present)
+                      column, none of which Phase 7 restores;
+                      `IF NOT EXISTS` makes the recreate a no-op when
+                      the object survived and a real create when it
+                      did not. `Routine::hash()`
                       now
                       incorporates `arguments_defaults` so
                       `Comparer::emit_routine_diff` and Phase 7's

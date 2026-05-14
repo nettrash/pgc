@@ -7128,22 +7128,27 @@ async fn issue179_signature_change_recreates_all_cascade_dependents() {
     );
 
     let idx_pos = script
-        .find("CREATE INDEX idx_compute ON test_deps.items")
-        .expect("functional index must be re-created after CASCADE");
+        .find("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items")
+        .expect("functional index must be re-created (CREATE INDEX IF NOT EXISTS) after CASCADE");
     assert!(create_pos < idx_pos);
+    // Index recreate is now non-destructive: no separate DROP INDEX is
+    // emitted (a false-positive match must not silently invalidate a
+    // surviving index — see Phase 7 / issue #179 review thread).
     assert!(
-        script.contains("drop index if exists test_deps.idx_compute;"),
-        "drop-if-exists guard for index missing"
+        !script.contains("drop index if exists test_deps.idx_compute;"),
+        "DROP INDEX must not be emitted; recreate uses CREATE INDEX IF NOT EXISTS"
     );
 
-    // Generated column: column itself is dropped, not just its expression.
+    // Generated column recreate is non-destructive: ADD COLUMN IF NOT
+    // EXISTS, no DROP COLUMN. A drop here would cascade to attached
+    // indexes / FKs / constraints that Phase 7 cannot restore.
     assert!(
-        script.contains("alter table test_deps.items drop column if exists gen_col;"),
-        "drop-if-exists guard for generated column missing"
+        !script.contains("alter table test_deps.items drop column if exists gen_col"),
+        "DROP COLUMN must not be emitted for generated column recreate"
     );
     assert!(
-        script.contains("alter table test_deps.items add column gen_col bigint generated always as (test_deps.compute(value)) stored;"),
-        "generated column must be re-added with TO type/expression"
+        script.contains("alter table test_deps.items add column if not exists gen_col bigint generated always as (test_deps.compute(value)) stored;"),
+        "generated column must be re-added (IF NOT EXISTS) with TO type/expression"
     );
 
     // Column DEFAULT: column survives, only the default is gone.
@@ -7357,13 +7362,13 @@ async fn issue179_unqualified_function_calls_are_detected() {
         script
     );
     assert!(
-        script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
         "unqualified index reference must trigger recreate: {}",
         script
     );
     assert!(
         script.contains(
-            "alter table test_deps.items add column gen_col bigint generated always as (compute(value)) stored;"
+            "alter table test_deps.items add column if not exists gen_col bigint generated always as (compute(value)) stored;"
         ),
         "unqualified generated-column reference must trigger recreate: {}",
         script
@@ -7695,12 +7700,12 @@ async fn issue179_to_side_gate_still_recreates_when_to_keeps_reference() {
         script
     );
     assert!(
-        script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
         "index recreate expected when TO still references the routine: {}",
         script
     );
     assert!(
-        script.contains("alter table test_deps.items add column gen_col"),
+        script.contains("alter table test_deps.items add column if not exists gen_col"),
         "generated column recreate expected when TO still references the routine: {}",
         script
     );
@@ -7716,6 +7721,133 @@ async fn issue179_to_side_gate_still_recreates_when_to_keeps_reference() {
         "policy recreate expected when TO still references the routine: {}",
         script
     );
+}
+
+#[tokio::test]
+async fn issue179_overload_collision_does_not_destroy_unrelated_column() {
+    // Phase 7's `affected` set keys on `(schema, name)` and ignores the
+    // argument signature, because text-based reference matching cannot
+    // distinguish overloads (`compute(value)` in a CHECK or generation
+    // expression carries no type info). When `compute(integer)` is
+    // dropped+recreated and `compute(text)` is unchanged, a dependent
+    // referencing `compute(text_value)` will text-match the affected
+    // set even though CASCADE never touched it. The recreate paths
+    // must therefore be non-destructive — a `DROP COLUMN IF EXISTS`
+    // for a generated column would cascade through every index / FK /
+    // constraint attached to the column, none of which Phase 7 knows
+    // how to restore. This test pins the non-destructive contract.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM: two overloads. `compute(integer)` will change return type
+    // (forces DROP+CREATE); `compute(text)` is unchanged.
+    let mut from_int = Routine::new(
+        "test_deps".to_string(),
+        Oid(900),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x integer".to_string(),
+        None,
+        None,
+        "SELECT x * 2;".to_string(),
+    );
+    from_int.hash();
+    let mut from_text = Routine::new(
+        "test_deps".to_string(),
+        Oid(901),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "integer".to_string(),
+        "x text".to_string(),
+        None,
+        None,
+        "SELECT length(x);".to_string(),
+    );
+    from_text.hash();
+    from_dump.routines.push(from_int);
+    from_dump.routines.push(from_text.clone());
+
+    // TO: same overloads, but `compute(integer)` now returns BIGINT.
+    let mut to_int = Routine::new(
+        "test_deps".to_string(),
+        Oid(900),
+        "compute".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "bigint".to_string(),
+        "x integer".to_string(),
+        None,
+        None,
+        "SELECT (x * 2)::bigint;".to_string(),
+    );
+    to_int.hash();
+    to_dump.routines.push(to_int);
+    to_dump.routines.push(from_text); // text overload unchanged
+
+    // Build a table whose generated column references `compute(text_value)`
+    // — i.e. the unchanged `compute(text)` overload. CASCADE never
+    // drops this column (the dropped function is `compute(integer)`),
+    // so Phase 7 must NOT emit a destructive recreate.
+    let make_table = || {
+        let mut text_col = int_column("test_deps", "items", "text_value", 1);
+        text_col.data_type = "text".to_string();
+        text_col.is_nullable = false;
+        let mut gen_col = int_column("test_deps", "items", "gen_col", 2);
+        gen_col.is_generated = "ALWAYS".to_string();
+        gen_col.generation_expression = Some("test_deps.compute(text_value)".to_string());
+        gen_col.generation_type = Some("s".to_string());
+        let mut table = Table::new(
+            "test_deps".to_string(),
+            "items".to_string(),
+            "test_deps".to_string(),
+            "items".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![text_col, gen_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        table.hash();
+        table
+    };
+    from_dump.tables.push(make_table());
+    to_dump.tables.push(make_table());
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // The integer overload is still cascaded.
+    assert!(
+        script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
+        "integer overload must still be DROP+CREATEd: {}",
+        script
+    );
+
+    // CRITICAL: Phase 7 must NOT emit a DROP COLUMN. The text matcher
+    // false-positives on the affected set (which collapses overloads
+    // by name), so without IF NOT EXISTS the unconditional drop would
+    // destroy the unrelated column. Pinning this prevents regression.
+    assert!(
+        !script.contains("drop column if exists gen_col"),
+        "overload collision must not emit DROP COLUMN — would cascade-destroy attached indexes/FKs: {}",
+        script
+    );
+    // The recreate that *is* emitted must use IF NOT EXISTS so the
+    // surviving column is left intact when the script runs.
+    if let Some(add_idx) = script.find("alter table test_deps.items add column") {
+        let snippet = &script[add_idx..(add_idx + 80).min(script.len())];
+        assert!(
+            snippet.contains("if not exists"),
+            "ADD COLUMN must use IF NOT EXISTS to be non-destructive on overload false-positives: {}",
+            snippet
+        );
+    }
 }
 
 #[tokio::test]
@@ -8006,7 +8138,7 @@ async fn issue179_partition_child_skips_inherited_dependents() {
         script
     );
     assert!(
-        script.contains("CREATE INDEX idx_compute ON test_deps.items "),
+        script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items "),
         "parent index must be re-created: {}",
         script
     );
@@ -8042,21 +8174,20 @@ async fn issue179_partition_child_skips_inherited_dependents() {
     );
 
     // Partition-inherited index: must not be re-emitted on the child.
+    // Match by the load-bearing fragment so the assertion holds whether
+    // the recreate uses `CREATE INDEX` or `CREATE INDEX IF NOT EXISTS`.
     assert!(
-        !script.contains("CREATE INDEX idx_compute ON test_deps.items_2026"),
+        !script.contains("idx_compute ON test_deps.items_2026"),
         "partition-inherited index must not be re-emitted on child: {}",
         script
     );
 
-    // Partition child's generated column must NOT be drop+add'd —
-    // PostgreSQL forbids dropping inherited columns from a partition.
+    // Partition child's generated column must NOT be added — PostgreSQL
+    // forbids modifying inherited columns directly on a partition.
+    // (Recreate paths never emit DROP COLUMN now; the add assertion
+    // below is the load-bearing one for partition-child safety.)
     assert!(
-        !script.contains("alter table test_deps.items_2026 drop column if exists gen_col"),
-        "partition child column must not be drop+add'd: {}",
-        script
-    );
-    assert!(
-        !script.contains("alter table test_deps.items_2026 add column gen_col"),
+        !script.contains("alter table test_deps.items_2026 add column if not exists gen_col"),
         "partition child column must not be re-added: {}",
         script
     );
@@ -8099,8 +8230,8 @@ async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
         "CHECK present in TO must be re-added after CASCADE"
     );
     assert!(
-        script.contains("CREATE INDEX idx_compute"),
-        "functional index present in TO must be re-created after CASCADE"
+        script.contains("CREATE INDEX IF NOT EXISTS idx_compute"),
+        "functional index present in TO must be re-created (IF NOT EXISTS) after CASCADE"
     );
     assert!(
         script.contains("create policy p_items on test_deps.items"),
@@ -8252,7 +8383,7 @@ async fn issue179_defaults_only_change_triggers_recreate() {
         script
     );
     assert!(
-        script.contains("CREATE INDEX idx_compute ON test_deps.items"),
+        script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
         "Phase 7 must recreate index on defaults-only change: {}",
         script
     );
