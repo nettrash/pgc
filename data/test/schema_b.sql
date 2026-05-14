@@ -1697,3 +1697,43 @@ CREATE USER MAPPING FOR PUBLIC
 -- test_pub_from_only: removed; test_pub_unchanged: same as FROM; test_pub_to_only: added
 CREATE PUBLICATION test_pub_unchanged FOR TABLE test_schema.users, test_schema.products;
 CREATE PUBLICATION test_pub_to_only FOR ALL TABLES;
+
+-- =============================================================================
+-- Issue #179 — DROP FUNCTION ... CASCADE recreate test (TO side)
+-- =============================================================================
+-- Function `cascade_compute(integer)` returns BIGINT here (was INTEGER in
+-- Schema A). This signature change forces `DROP FUNCTION ... CASCADE`,
+-- which silently removes the CHECK / functional index / generated column
+-- / column DEFAULT / RLS policy below — every dependent that
+-- `pg_depend` connects to the function. Phase 7 of
+-- `compare_routines_and_views` must re-emit each one. The dependent
+-- definitions below are intentionally identical (modulo the integer→
+-- bigint type bumps that follow from the new return type) to FROM, so
+-- the regular table/index/policy diffs would emit nothing for them —
+-- without Phase 7 the migration would leave them missing.
+CREATE FUNCTION test_schema.cascade_compute(x integer)
+RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
+    SELECT (x * 2)::bigint;
+$$;
+
+CREATE TABLE test_schema.cascade_items (
+    id      serial  PRIMARY KEY,
+    value   integer NOT NULL,
+    -- def_col type bumped integer → bigint to match the new return type;
+    -- the DEFAULT itself is still cascaded by DROP FUNCTION ... CASCADE.
+    def_col bigint  DEFAULT test_schema.cascade_compute(0),
+    -- gen_col type bumped integer → bigint; the column itself is
+    -- cascaded by DROP FUNCTION ... CASCADE (Postgres drops generated
+    -- columns wholesale, not just their expression) and must be re-added.
+    gen_col bigint  GENERATED ALWAYS AS (test_schema.cascade_compute(value)) STORED
+);
+
+ALTER TABLE test_schema.cascade_items
+    ADD CONSTRAINT chk_cascade_compute CHECK (test_schema.cascade_compute(value) > 0);
+
+CREATE INDEX idx_cascade_compute
+    ON test_schema.cascade_items (test_schema.cascade_compute(value));
+
+ALTER TABLE test_schema.cascade_items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pol_cascade_items ON test_schema.cascade_items
+    USING (test_schema.cascade_compute(value) > 0);
