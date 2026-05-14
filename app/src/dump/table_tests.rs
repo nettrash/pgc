@@ -2513,3 +2513,153 @@ fn build_indexes_bulk_query_filters_by_pg_class() {
         "expected pg_class classoid filter for table index comments"
     );
 }
+
+#[test]
+fn test_auto_generated_not_null_with_numeric_suffix_skips_constraint_keyword() {
+    // PG appends a numeric suffix to resolve cross-table auto-name collisions.
+    // The result is still semantically anonymous and should not be emitted
+    // with the CONSTRAINT keyword in the column definition.
+    let table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null1", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = table.get_script();
+    assert!(
+        script.contains("name text not null"),
+        "expected plain NOT NULL for auto-generated suffixed name: {script}"
+    );
+    assert!(
+        !script.contains("constraint users_name_not_null1"),
+        "auto-generated NOT NULL name with suffix should not use CONSTRAINT keyword: {script}"
+    );
+}
+
+#[test]
+fn test_auto_named_not_null_swap_produces_no_diff() {
+    // Reproduces the cross-table auto-name swap scenario:
+    // OLD has "users_name_not_null", NEW has "users_name_not_null1" on the
+    // same column. Both are auto-generated names — diff must be empty.
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null1", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        !script.contains("drop constraint users_name_not_null"),
+        "auto-name suffix swap must not emit a drop: {script}"
+    );
+    assert!(
+        !script.contains("add constraint users_name_not_null"),
+        "auto-name suffix swap must not emit an add: {script}"
+    );
+}
+
+#[test]
+fn test_named_to_auto_named_not_null_still_diffs() {
+    // A user-named NOT NULL ("name_must_exist") replaced with an auto-named
+    // one is a real change — diff should drop+add.
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("name_must_exist", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("drop constraint name_must_exist"),
+        "renaming away from a user-chosen name must still emit a drop: {script}"
+    );
+}
+
+#[test]
+fn fetch_columns_query_uses_pg_catalog_not_information_schema_columns() {
+    // information_schema.columns is filtered by `pg_has_role(...) OR
+    // has_column_privilege(...)`, so dumps taken by a role without
+    // privileges silently lose columns of tables it can't read. The
+    // query must read from pg_attribute directly.
+    let query = Table::build_columns_query("", "('public')");
+
+    assert!(
+        !query.contains("information_schema.columns"),
+        "build_columns_query must not read from information_schema.columns \
+            (privilege-filtered); use pg_attribute directly. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("FROM pg_attribute a"),
+        "expected pg_attribute as the column source. Query was:\n{query}"
+    );
+    assert!(
+        !query.contains("information_schema.view_column_usage"),
+        "related_views lookup must not use information_schema.view_column_usage \
+            (privilege-filtered); use pg_depend/pg_rewrite. Query was:\n{query}"
+    );
+}
