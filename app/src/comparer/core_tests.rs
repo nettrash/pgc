@@ -9278,3 +9278,215 @@ fn issue180_sequence_only_persistence_change_uses_hash_diff() {
         "a hashed field difference must block the persistence-only suppression"
     );
 }
+
+/// Build a view whose definition textually references `test_deps.compute`.
+/// Returns a regular or materialized view depending on `is_materialized`.
+fn issue189_view(name: &str, is_materialized: bool) -> View {
+    let mut view = View::new(
+        name.to_string(),
+        " SELECT test_deps.compute(value) AS c\n   FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    view.is_materialized = is_materialized;
+    view.hash();
+    view
+}
+
+#[tokio::test]
+async fn issue189_signature_change_recreates_byte_identical_view() {
+    // The view's hash is unchanged between FROM and TO, but the function
+    // it references undergoes a signature change (integer → bigint),
+    // forcing DROP FUNCTION ... CASCADE. PostgreSQL silently drops the
+    // view as part of the cascade. Phase 7 must re-emit the view so the
+    // migration leaves the database in a consistent state.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.views.push(issue189_view("v_things", false));
+    to_dump.views.push(issue189_view("v_things", false));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let drop_pos = script
+        .find("drop function if exists test_deps.compute (x integer) cascade;")
+        .expect("CASCADE drop must be emitted for the signature change");
+    let create_fn_pos = script
+        .find("create or replace function test_deps.compute(x integer) returns bigint")
+        .expect("function recreate must be emitted");
+    assert!(drop_pos < create_fn_pos);
+
+    let view_pos = script
+        .find("CREATE OR REPLACE VIEW test_deps.v_things")
+        .expect("byte-identical view must be re-emitted as CREATE OR REPLACE VIEW after CASCADE");
+    assert!(
+        create_fn_pos < view_pos,
+        "view recreate must run after the function recreate so the new signature is in place"
+    );
+}
+
+#[tokio::test]
+async fn issue189_signature_change_recreates_byte_identical_materialized_view() {
+    // Same scenario as the regular-view case but with a materialized
+    // view. PostgreSQL CASCADE drops these via `pg_depend` the same way,
+    // so Phase 7 must emit a `create materialized view if not exists`.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.views.push(issue189_view("mv_things", true));
+    to_dump.views.push(issue189_view("mv_things", true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("create materialized view if not exists test_deps.mv_things"),
+        "materialized view must be re-emitted with IF NOT EXISTS: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue189_view_not_referencing_routine_is_not_recreated() {
+    // A view that doesn't textually reference the CASCADE-affected
+    // routine must be left alone — re-emitting it would clutter the
+    // migration and could re-introduce a stale definition if the user
+    // has the same view in both dumps for unrelated reasons.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let mut unrelated_from = View::new(
+        "v_other".to_string(),
+        " SELECT value FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    unrelated_from.hash();
+    let mut unrelated_to = View::new(
+        "v_other".to_string(),
+        " SELECT value FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    unrelated_to.hash();
+    from_dump.views.push(unrelated_from);
+    to_dump.views.push(unrelated_to);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("v_other"),
+        "view that doesn't reference the cascaded routine must not be re-emitted: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue189_view_recreate_skipped_when_to_definition_no_longer_references_routine() {
+    // TO-side gate (PR #186): if the TO view's definition was rewritten
+    // to no longer call the affected routine, the CASCADE drop never
+    // touches it (no pg_depend link). `compare_routines_and_views`
+    // already emits the rewrite via the normal hash-diff path; Phase 7
+    // must stay silent so we don't re-emit the view twice.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.views.push(issue189_view("v_things", false));
+    // TO view: same name, but the definition no longer references the
+    // function — different hash, so Phase 5 handles it.
+    let mut to_view = View::new(
+        "v_things".to_string(),
+        " SELECT value AS c FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    to_view.hash();
+    to_dump.views.push(to_view);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // The view must appear exactly once (the normal hash-diff path), not
+    // a second time from Phase 7's recreate block.
+    let recreate_section_start = script.find("Recreate dependents dropped by CASCADE: Start");
+    if let Some(start) = recreate_section_start {
+        let recreate_end = script[start..]
+            .find("Recreate dependents dropped by CASCADE: End")
+            .map(|e| start + e)
+            .unwrap_or(script.len());
+        let recreate_section = &script[start..recreate_end];
+        assert!(
+            !recreate_section.contains("v_things"),
+            "Phase 7 must not re-emit a view whose TO definition no longer references the routine: {}",
+            recreate_section
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue189_view_recreate_skipped_when_routine_unchanged() {
+    // No CASCADE — no recreate. Mirrors
+    // `issue179_recreate_skipped_when_routine_unchanged` for views.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let routine = issue179_compute_routine("integer", "SELECT x * 2;");
+    from_dump.routines.push(routine.clone());
+    to_dump.routines.push(routine);
+
+    from_dump.views.push(issue189_view("v_things", false));
+    to_dump.views.push(issue189_view("v_things", false));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("Recreate dependents dropped by CASCADE"),
+        "no CASCADE drop happened — recreate phase must stay silent: {}",
+        script
+    );
+    assert!(
+        !script.contains("CREATE OR REPLACE VIEW test_deps.v_things"),
+        "view must not be re-emitted when the function is unchanged: {}",
+        script
+    );
+}
