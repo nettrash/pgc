@@ -2537,17 +2537,7 @@ impl Comparer {
                 self.script.push_str(&to_view.get_script());
             }
         } else {
-            let mut view_script = to_view.get_script();
-            if !view_script
-                .to_uppercase()
-                .contains("CREATE OR REPLACE VIEW")
-            {
-                const TARGET: &str = "create view";
-                const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
-                if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
-                    view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
-                }
-            }
+            let view_script = rewrite_create_view_to_create_or_replace(&to_view.get_script());
             let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
             let drop_was_active = self
                 .dropped_views
@@ -4893,20 +4883,22 @@ fn view_recreate_block(view: &View) -> String {
 }
 
 /// Rewrites the lowercase `create view ` prefix produced by
-/// `View::get_script` to `CREATE OR REPLACE VIEW `. If the script
-/// already contains `CREATE OR REPLACE VIEW` (e.g. an upstream rewrite)
-/// the script is returned unchanged.
+/// `View::get_script` to `CREATE OR REPLACE VIEW `. The check is
+/// anchored to the start of the script via `strip_prefix` rather than a
+/// whole-script `contains` / `find` scan: the view definition body
+/// `View::get_script` appends after the prefix can legitimately contain
+/// the literal text `create view` or `CREATE OR REPLACE VIEW` (e.g. a
+/// string literal in the select list), and a non-anchored matcher would
+/// either false-positive on the early-return branch (leaving the
+/// leading `create view` unrewritten) or rewrite a non-prefix
+/// occurrence. If the script already starts with `CREATE OR REPLACE
+/// VIEW` (upstream rewrite) or some other unanticipated leading form,
+/// it is returned unchanged.
 fn rewrite_create_view_to_create_or_replace(script: &str) -> String {
-    if script.to_uppercase().contains("CREATE OR REPLACE VIEW") {
-        return script.to_string();
+    if let Some(rest) = script.strip_prefix("create view ") {
+        return format!("CREATE OR REPLACE VIEW {}", rest);
     }
-    const TARGET: &str = "create view";
-    const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
-    let mut out = script.to_string();
-    if let Some(pos) = out.to_ascii_lowercase().find(TARGET) {
-        out.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
-    }
-    out
+    script.to_string()
 }
 
 /// Rewrites the lowercase `create materialized view ` prefix produced by

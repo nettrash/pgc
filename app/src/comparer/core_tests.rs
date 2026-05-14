@@ -9461,6 +9461,84 @@ async fn issue189_view_recreate_skipped_when_to_definition_no_longer_references_
     }
 }
 
+#[test]
+fn issue189_rewrite_create_view_anchored_to_prefix() {
+    // PR #195 review (Copilot): the helper must not be fooled by the
+    // literal text `CREATE OR REPLACE VIEW` appearing inside the view
+    // definition body that `View::get_script` appends after the
+    // `create view` prefix. A whole-script `contains` early-return
+    // would skip the rewrite and leave the leading `create view`
+    // unchanged, which is not idempotent against a surviving view.
+    let script = "create view public.v_with_literal as\n\
+                  SELECT 'CREATE OR REPLACE VIEW pretend.v AS SELECT 1' AS payload;\n\n";
+    let rewritten = rewrite_create_view_to_create_or_replace(script);
+    assert!(
+        rewritten.starts_with("CREATE OR REPLACE VIEW public.v_with_literal as\n"),
+        "leading `create view` must be rewritten even when the body \
+         contains the same phrase as a string literal: {}",
+        rewritten
+    );
+    // Already in the desired form — return unchanged (no double rewrite).
+    let already = "CREATE OR REPLACE VIEW public.v as\nSELECT 1;\n";
+    assert_eq!(rewrite_create_view_to_create_or_replace(already), already);
+}
+
+#[tokio::test]
+async fn issue189_view_definition_with_create_or_replace_literal_is_recreated() {
+    // End-to-end pin for the PR #195 reviewer concern: a view whose
+    // definition embeds the literal text `CREATE OR REPLACE VIEW` must
+    // still emit a properly idempotent `CREATE OR REPLACE VIEW` prefix
+    // when Phase 7 re-emits it after a CASCADE drop.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let definition = " SELECT test_deps.compute(value) AS c,\n        \
+                      'CREATE OR REPLACE VIEW evil.v AS SELECT 1' AS payload\n   \
+                      FROM test_deps.items;";
+    let mut from_view = View::new(
+        "v_things".to_string(),
+        definition.to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    from_view.hash();
+    let mut to_view = View::new(
+        "v_things".to_string(),
+        definition.to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    to_view.hash();
+    from_dump.views.push(from_view);
+    to_dump.views.push(to_view);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("CREATE OR REPLACE VIEW test_deps.v_things"),
+        "view recreate must emit `CREATE OR REPLACE VIEW` at the leading \
+         statement even when the body contains the same phrase: {}",
+        script
+    );
+    // The body's literal must survive unchanged — we do NOT want a
+    // rewrite that mangles a non-prefix occurrence.
+    assert!(
+        script.contains("'CREATE OR REPLACE VIEW evil.v AS SELECT 1'"),
+        "literal inside the view body must be left intact: {}",
+        script
+    );
+}
+
 #[tokio::test]
 async fn issue189_view_recreate_skipped_when_routine_unchanged() {
     // No CASCADE — no recreate. Mirrors
