@@ -7238,6 +7238,180 @@ async fn issue179_recreate_skipped_when_to_dependent_missing() {
     );
 }
 
+/// Build a partition child of `parent_table` whose dependents (CHECK
+/// constraint with `coninhcount=1`, `is_partition_index=true` index, a
+/// generated column, and a CHECK with `coninhcount=0` so we can prove
+/// the truly-local case is still emitted) all reference
+/// `test_deps.compute`. Used by the partition-child guard tests.
+fn issue179_items_partition_child(parent_qualified: &str) -> Table {
+    let mut value_col = int_column("test_deps", "items_2026", "value", 1);
+    value_col.is_nullable = false;
+
+    let mut gen_col = int_column("test_deps", "items_2026", "gen_col", 2);
+    gen_col.is_generated = "ALWAYS".to_string();
+    gen_col.generation_expression = Some("test_deps.compute(value)".to_string());
+    gen_col.generation_type = Some("s".to_string());
+
+    let inherited_check = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "chk_compute".to_string(),
+        table_name: "items_2026".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("CHECK (test_deps.compute(value) > 0)".to_string()),
+        coninhcount: 1,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+    let mut local_check = inherited_check.clone();
+    local_check.name = "chk_compute_local".to_string();
+    local_check.coninhcount = 0;
+
+    let inherited_idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items_2026".to_string(),
+        name: "idx_compute".to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef: "CREATE INDEX idx_compute ON test_deps.items_2026 USING btree (test_deps.compute(value))".to_string(),
+        is_partition_index: true,
+        comment: None,
+    };
+
+    let mut table = Table::new(
+        "test_deps".to_string(),
+        "items_2026".to_string(),
+        "test_deps".to_string(),
+        "items_2026".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col, gen_col],
+        vec![inherited_check, local_check],
+        vec![inherited_idx],
+        vec![],
+        None,
+    );
+    table.partition_of = Some(parent_qualified.to_string());
+    table.partition_bound = Some("FOR VALUES IN (1)".to_string());
+    table.hash();
+    table
+}
+
+#[tokio::test]
+async fn issue179_partition_child_skips_inherited_dependents() {
+    // FROM and TO each contain a partitioned parent + one partition
+    // child. The function signature changes, so CASCADE drops the
+    // parent-side dependents. Phase 7 must NOT emit recreates for the
+    // child's inherited objects (PostgreSQL forbids `ALTER TABLE child`
+    // on inherited columns/constraints/indexes), but it MUST still
+    // emit the truly-local CHECK constraint (`coninhcount = 0`).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    // Parent (partitioned) carries the dependent definitions on its own
+    // row — its recreate handles the propagation to children.
+    let mut parent_from =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    parent_from.name = "items".to_string();
+    parent_from.raw_name = "items".to_string();
+    parent_from.partition_key = Some("LIST (value)".to_string());
+    parent_from.hash();
+
+    let mut parent_to = issue179_items_table("bigint", "test_deps.compute(0)", "bigint");
+    parent_to.name = "items".to_string();
+    parent_to.raw_name = "items".to_string();
+    parent_to.partition_key = Some("LIST (value)".to_string());
+    parent_to.hash();
+
+    from_dump.tables.push(parent_from);
+    to_dump.tables.push(parent_to);
+
+    from_dump
+        .tables
+        .push(issue179_items_partition_child("test_deps.items"));
+    to_dump
+        .tables
+        .push(issue179_items_partition_child("test_deps.items"));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // Parent dependents (which Table::diff would diff normally) MUST
+    // be recreated against the parent.
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_compute"),
+        "parent CHECK must be re-added: {}",
+        script
+    );
+    assert!(
+        script.contains("CREATE INDEX idx_compute ON test_deps.items "),
+        "parent index must be re-created: {}",
+        script
+    );
+
+    // Inherited child constraint (coninhcount > 0) must NOT be re-added
+    // on the child — PostgreSQL would reject `ALTER TABLE child ADD
+    // CONSTRAINT` for an inherited constraint, and the parent's recreate
+    // already propagates. (Use exact-suffix match so we don't accidentally
+    // match `chk_compute_local` below.)
+    assert!(
+        !script.contains("alter table test_deps.items_2026 drop constraint if exists chk_compute;"),
+        "inherited child CHECK must not be re-emitted: {}",
+        script
+    );
+    assert!(
+        !script.contains("alter table test_deps.items_2026 add constraint chk_compute check"),
+        "inherited child CHECK must not be re-added: {}",
+        script
+    );
+
+    // Truly-local child constraint (coninhcount == 0) IS re-emitted.
+    assert!(
+        script.contains(
+            "alter table test_deps.items_2026 drop constraint if exists chk_compute_local;"
+        ),
+        "local child CHECK must be re-emitted: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_deps.items_2026 add constraint chk_compute_local"),
+        "local child CHECK must be re-added: {}",
+        script
+    );
+
+    // Partition-inherited index: must not be re-emitted on the child.
+    assert!(
+        !script.contains("CREATE INDEX idx_compute ON test_deps.items_2026"),
+        "partition-inherited index must not be re-emitted on child: {}",
+        script
+    );
+
+    // Partition child's generated column must NOT be drop+add'd —
+    // PostgreSQL forbids dropping inherited columns from a partition.
+    assert!(
+        !script.contains("alter table test_deps.items_2026 drop column if exists gen_col"),
+        "partition child column must not be drop+add'd: {}",
+        script
+    );
+    assert!(
+        !script.contains("alter table test_deps.items_2026 add column gen_col"),
+        "partition child column must not be re-added: {}",
+        script
+    );
+}
+
 #[tokio::test]
 async fn issue179_full_drop_recreates_dependents_when_to_keeps_them() {
     // Function is dropped from TO entirely, but the dependents remain

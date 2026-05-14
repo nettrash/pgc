@@ -21,6 +21,17 @@
                       column itself); column defaults are restored via
                       `alter column ... set default` (the column
                       survives, only the DEFAULT clause is dropped).
+                    - Phase 7 mirrors `Table::diff`'s partition-child
+                      safeguards: when both FROM and TO are partition
+                      children, inherited constraints (`coninhcount > 0`)
+                      and partition-inherited indexes
+                      (`is_partition_index = true`) are skipped on the
+                      child — the parent's recreate propagates them —
+                      and structural column changes are skipped entirely
+                      (PostgreSQL forbids `ALTER TABLE child DROP
+                      COLUMN` for inherited columns). Truly-local child
+                      constraints (`coninhcount == 0`) are still
+                      re-emitted.
 
 2026-05-03      v1.0.19
 

@@ -3275,6 +3275,26 @@ impl Comparer {
         let mut recreate: String = String::new();
 
         for from_table in &self.from.tables {
+            // If the table is gone in TO it is being dropped — there is
+            // no post-migration object to restore the dependents onto.
+            let Some(to_table) =
+                to_table_by_id.get(&(from_table.schema.as_str(), from_table.name.as_str()))
+            else {
+                continue;
+            };
+
+            // Mirror Table::diff's partition-child safeguards. When both
+            // FROM and TO are partition children, structural changes to
+            // inherited columns/constraints/indexes belong to the
+            // parent's recreate path: PostgreSQL forbids `ALTER TABLE
+            // child DROP COLUMN` for inherited columns, refuses direct
+            // ALTER on inherited constraints (`coninhcount > 0`), and
+            // partition-inherited indexes are managed by attaching to
+            // the parent's index. Re-emitting them on the child would
+            // produce a script PostgreSQL rejects.
+            let is_target_partition =
+                from_table.partition_of.is_some() && to_table.partition_of.is_some();
+
             // CHECK and EXCLUDE constraints can reference functions; FKs
             // and PKs cannot — skip them to avoid spurious matches in
             // their textual `definition` (e.g. a referenced table named
@@ -3291,11 +3311,6 @@ impl Comparer {
                 if !Self::definition_references_any(def, &affected) {
                     continue;
                 }
-                let Some(to_table) = to_table_by_id
-                    .get(&(constraint.schema.as_str(), constraint.table_name.as_str()))
-                else {
-                    continue;
-                };
                 let Some(to_constraint) = to_table
                     .constraints
                     .iter()
@@ -3303,6 +3318,12 @@ impl Comparer {
                 else {
                     continue;
                 };
+                // On partition children, inherited constraints
+                // (coninhcount > 0) propagate from the parent and must
+                // not be re-emitted locally.
+                if is_target_partition && to_constraint.coninhcount > 0 {
+                    continue;
+                }
                 let key = format!(
                     "constraint:{}.{}.{}",
                     to_constraint.schema, to_constraint.table_name, to_constraint.name
@@ -3318,18 +3339,22 @@ impl Comparer {
             }
 
             for index in &from_table.indexes {
+                // Partition-inherited indexes are recreated via the
+                // parent — a redundant CREATE INDEX on the child would
+                // collide with the inherited index name.
+                if index.is_partition_index {
+                    continue;
+                }
                 if !Self::definition_references_any(&index.indexdef, &affected) {
                     continue;
                 }
-                let Some(to_table) =
-                    to_table_by_id.get(&(index.schema.as_str(), index.table.as_str()))
-                else {
-                    continue;
-                };
                 let Some(to_index) = to_table.indexes.iter().find(|ti| ti.name == index.name)
                 else {
                     continue;
                 };
+                if to_index.is_partition_index {
+                    continue;
+                }
                 let key = format!("index:{}.{}", to_index.schema, to_index.name);
                 if !emitted_keys.insert(key) {
                     continue;
@@ -3341,60 +3366,64 @@ impl Comparer {
                 );
             }
 
-            for column in &from_table.columns {
-                let default_referenced = column
-                    .column_default
-                    .as_deref()
-                    .map(|d| Self::definition_references_any(d, &affected))
-                    .unwrap_or(false);
-                let generation_referenced = column.is_generated.eq_ignore_ascii_case("ALWAYS")
-                    && column
-                        .generation_expression
+            // Structural column changes (ADD / DROP / type) are forbidden
+            // on partition children — the parent owns the column shape.
+            // Skip the whole column scan in that case; the parent's
+            // recreate (handled when we iterate the parent table) will
+            // re-add the dependent.
+            if !is_target_partition {
+                for column in &from_table.columns {
+                    let default_referenced = column
+                        .column_default
                         .as_deref()
-                        .map(|e| Self::definition_references_any(e, &affected))
+                        .map(|d| Self::definition_references_any(d, &affected))
                         .unwrap_or(false);
+                    let generation_referenced = column.is_generated.eq_ignore_ascii_case("ALWAYS")
+                        && column
+                            .generation_expression
+                            .as_deref()
+                            .map(|e| Self::definition_references_any(e, &affected))
+                            .unwrap_or(false);
 
-                if !default_referenced && !generation_referenced {
-                    continue;
-                }
-                let Some(to_table) =
-                    to_table_by_id.get(&(column.schema.as_str(), column.table.as_str()))
-                else {
-                    continue;
-                };
-                let Some(to_column) = to_table.columns.iter().find(|tc| tc.name == column.name)
-                else {
-                    continue;
-                };
-
-                if generation_referenced {
-                    let key = format!(
-                        "column-generated:{}.{}.{}",
-                        to_column.schema, to_column.table, to_column.name
-                    );
-                    if emitted_keys.insert(key) {
-                        Self::emit_dependent_recreate(
-                            &mut recreate,
-                            self.use_drop,
-                            &column_recreate_block(to_column),
-                        );
+                    if !default_referenced && !generation_referenced {
+                        continue;
                     }
-                } else if default_referenced && let Some(default) = &to_column.column_default {
-                    let key = format!(
-                        "column-default:{}.{}.{}",
-                        to_column.schema, to_column.table, to_column.name
-                    );
-                    if emitted_keys.insert(key) {
-                        let stmt = format!(
-                            "alter table {}.{} alter column {} set default {};",
-                            to_column.schema, to_column.table, to_column.name, default
-                        )
-                        .with_empty_lines();
-                        Self::emit_dependent_recreate(&mut recreate, self.use_drop, &stmt);
+                    let Some(to_column) = to_table.columns.iter().find(|tc| tc.name == column.name)
+                    else {
+                        continue;
+                    };
+
+                    if generation_referenced {
+                        let key = format!(
+                            "column-generated:{}.{}.{}",
+                            to_column.schema, to_column.table, to_column.name
+                        );
+                        if emitted_keys.insert(key) {
+                            Self::emit_dependent_recreate(
+                                &mut recreate,
+                                self.use_drop,
+                                &column_recreate_block(to_column),
+                            );
+                        }
+                    } else if default_referenced && let Some(default) = &to_column.column_default {
+                        let key = format!(
+                            "column-default:{}.{}.{}",
+                            to_column.schema, to_column.table, to_column.name
+                        );
+                        if emitted_keys.insert(key) {
+                            let stmt = format!(
+                                "alter table {}.{} alter column {} set default {};",
+                                to_column.schema, to_column.table, to_column.name, default
+                            )
+                            .with_empty_lines();
+                            Self::emit_dependent_recreate(&mut recreate, self.use_drop, &stmt);
+                        }
                     }
                 }
             }
 
+            // RLS policies are not inherited via PARTITION OF — each
+            // partition has its own — so no partition-child skip applies.
             for policy in &from_table.policies {
                 let referenced = policy
                     .using_clause
@@ -3409,11 +3438,6 @@ impl Comparer {
                 if !referenced {
                     continue;
                 }
-                let Some(to_table) =
-                    to_table_by_id.get(&(policy.schema.as_str(), policy.table.as_str()))
-                else {
-                    continue;
-                };
                 let Some(to_policy) = to_table.policies.iter().find(|tp| tp.name == policy.name)
                 else {
                     continue;
