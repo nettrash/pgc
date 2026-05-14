@@ -1,6 +1,30 @@
 2026-05-14      v1.0.20
 
                 Bug fixes:
+                    - Fixed issue #181 (PG18 virtual generated columns):
+                      a STORED ↔ VIRTUAL flip with the same generation
+                      expression produced no script at all, because
+                      `TableColumn::get_alter_script`'s
+                      `generated_changed` predicate only considered
+                      `is_generated` and `generation_expression` and
+                      ignored `generation_type`. Now compares
+                      `effective_generation_type` as well, so the flip
+                      is detected. And a virtual generated column with
+                      a changed expression used to emit
+                      `ALTER COLUMN DROP EXPRESSION` + `ALTER COLUMN
+                      ADD GENERATED ALWAYS AS (...) VIRTUAL`, both of
+                      which PG18 rejects (DROP EXPRESSION is
+                      STORED-only; the ADD GENERATED form has no
+                      VIRTUAL variant). The fix routes every VIRTUAL
+                      participant — flips of `generation_type` in
+                      either direction, and expression changes on a
+                      VIRTUAL column — through the full
+                      `DROP COLUMN` + `ADD COLUMN ... GENERATED ALWAYS
+                      AS (...) VIRTUAL|STORED` round-trip, which is
+                      the only valid migration PG18 accepts. STORED →
+                      STORED expression changes keep the cheaper
+                      in-place `DROP EXPRESSION` + `ADD GENERATED ...
+                      STORED` form.
                     - Fixed issue #180: `ALTER TABLE ... SET LOGGED|
                       UNLOGGED` was emitted inline with the per-table
                       alter loop in alphabetical order, which

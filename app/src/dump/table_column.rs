@@ -545,31 +545,59 @@ impl TableColumn {
             self.build_identity_update_statements(existing, &mut statements);
         }
 
+        // Issue #181: `generation_type` (`s`/`v`) flips must also count
+        // as a change. PG18 introduced VIRTUAL generated columns and
+        // they CANNOT be ALTERed in place — neither
+        // `ALTER COLUMN DROP EXPRESSION` (which only works for
+        // STORED) nor `ALTER COLUMN ADD GENERATED ALWAYS AS (...)
+        // VIRTUAL` (invalid syntax) is valid. Without this check a
+        // STORED ↔ VIRTUAL flip with the same expression would be
+        // silently skipped.
+        let generation_type_changed = new_generated == "ALWAYS"
+            && old_generated == "ALWAYS"
+            && self.effective_generation_type() != existing.effective_generation_type();
         let generated_changed = new_generated != old_generated
             || (new_generated == "ALWAYS"
-                && self.generation_expression != existing.generation_expression);
+                && self.generation_expression != existing.generation_expression)
+            || generation_type_changed;
 
         if generated_changed {
             let new_is_generated = new_generated == "ALWAYS";
             let old_is_generated = old_generated != "NEVER";
 
-            if !old_is_generated && new_is_generated {
-                // Converting an existing column (especially with data) to GENERATED is not safely handled by a simple ALTER; drop and re-add instead.
+            // Whether either side is VIRTUAL — the in-place
+            // `DROP EXPRESSION` + `ADD GENERATED ... VIRTUAL` path
+            // PostgreSQL would otherwise be sent doesn't exist for
+            // VIRTUAL columns: DROP EXPRESSION rejects with
+            // `ALTER TABLE / DROP EXPRESSION is not supported for
+            // virtual generated columns`, and the ADD form never
+            // accepts VIRTUAL. The full DROP COLUMN + ADD COLUMN
+            // round-trip is the only correct migration. Flips of
+            // generation_type fall here for the same reason — even
+            // STORED → VIRTUAL with identical expression has no
+            // in-place ALTER. (Issue #181)
+            let needs_full_recreate = !old_is_generated && new_is_generated
+                || (old_is_generated
+                    && (existing.effective_generation_type() == "v"
+                        || self.effective_generation_type() == "v"));
+
+            if needs_full_recreate {
                 if use_drop {
                     statements.push(self.get_drop_script());
                     statements.push(self.get_add_script());
                 } else {
-                    let mut commented = String::from(
-                        "-- use_drop=false: converting column to generated requires drop/add; statements commented out\n",
-                    );
-
+                    let header = if !old_is_generated && new_is_generated {
+                        "-- use_drop=false: converting column to generated requires drop/add; statements commented out\n"
+                    } else {
+                        "-- use_drop=false: virtual generated column cannot be ALTERed in place (PG18+); drop/add required and statements commented out\n"
+                    };
+                    let mut commented = String::from(header);
                     for line in self.get_drop_script().lines() {
                         commented.push_str(&format!("-- {line}\n"));
                     }
                     for line in self.get_add_script().lines() {
                         commented.push_str(&format!("-- {line}\n"));
                     }
-
                     statements.push(commented);
                 }
             } else {
@@ -594,12 +622,12 @@ impl TableColumn {
                 if new_is_generated && let Some(expr) = &self.generation_expression {
                     let norm_expr = Self::normalized_generation_expression(expr);
                     let wrapped = format!("({norm_expr})");
-                    let gen_kind = match self.generation_type.as_deref() {
-                        Some("v") => "virtual",
-                        _ => "stored",
-                    };
+                    // We only reach this branch for STORED-side
+                    // additions — `needs_full_recreate` already
+                    // routed any VIRTUAL participant through the
+                    // drop+add path above.
                     let add_cmd = format!(
-                        "alter table {}.{} alter column {} add generated always as {wrapped} {gen_kind};",
+                        "alter table {}.{} alter column {} add generated always as {wrapped} stored;",
                         self.schema, self.table, self.name
                     ).with_empty_lines();
                     if use_drop || !old_is_generated {
@@ -1845,6 +1873,13 @@ mod tests {
 
     #[test]
     fn test_get_alter_script_update_virtual_generated_expression() {
+        // Issue #181: PG18 rejects `ALTER COLUMN DROP EXPRESSION` for
+        // VIRTUAL generated columns and has no `ALTER COLUMN ADD
+        // GENERATED ALWAYS AS (...) VIRTUAL` syntax. The only valid
+        // migration is a full `DROP COLUMN` + `ADD COLUMN ...
+        // GENERATED ALWAYS AS (...) VIRTUAL`. Pin that here — the
+        // previous test asserted the broken in-place ALTER form,
+        // which produced runtime errors against PG18.
         let mut existing = create_test_column();
         existing.is_generated = "ALWAYS".to_string();
         existing.generation_expression = Some("(id * 2)".to_string());
@@ -1858,12 +1893,123 @@ mod tests {
             .expect("expected alter statement for virtual expression change");
 
         assert!(
-            script.contains("drop expression"),
-            "expected drop expression: {script}"
+            script.contains("drop column test_column"),
+            "expected DROP COLUMN (virtual columns can't be ALTERed in place): {script}"
+        );
+        assert!(
+            !script.contains("drop expression"),
+            "must NOT emit `drop expression` for virtual columns (PG18 rejects it): {script}"
+        );
+        assert!(
+            script.contains("add column test_column"),
+            "expected ADD COLUMN to re-create the column: {script}"
         );
         assert!(
             script.contains("generated always as (id * 3) virtual"),
-            "expected virtual in re-add: {script}"
+            "expected new virtual generation expression in the re-add: {script}"
+        );
+    }
+
+    #[test]
+    fn issue181_stored_to_virtual_flip_emits_drop_and_add_column() {
+        // Issue #181 Bug 1: a STORED → VIRTUAL flip with the same
+        // generation expression must produce a migration. Before the
+        // fix the change-detection condition only inspected
+        // `is_generated` and `generation_expression`, so the flip was
+        // silently ignored. PG18 has no in-place ALTER for the
+        // storage kind so the only valid migration is DROP COLUMN +
+        // ADD COLUMN.
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+        existing.generation_type = Some("s".to_string());
+
+        let mut updated = existing.clone();
+        updated.generation_type = Some("v".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("STORED → VIRTUAL flip must emit a migration script");
+
+        assert!(
+            script.contains("drop column test_column"),
+            "expected DROP COLUMN: {script}"
+        );
+        assert!(
+            script.contains("add column test_column"),
+            "expected ADD COLUMN: {script}"
+        );
+        assert!(
+            script.contains("generated always as (id * 2) virtual"),
+            "expected the new VIRTUAL kind in the re-add: {script}"
+        );
+    }
+
+    #[test]
+    fn issue181_virtual_to_stored_flip_emits_drop_and_add_column() {
+        // Mirror of the case above, the other direction. Same
+        // requirement: PG18 has no in-place ALTER between VIRTUAL and
+        // STORED, so a full DROP+ADD is the only valid migration.
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+        existing.generation_type = Some("v".to_string());
+
+        let mut updated = existing.clone();
+        updated.generation_type = Some("s".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("VIRTUAL → STORED flip must emit a migration script");
+
+        assert!(
+            script.contains("drop column test_column"),
+            "expected DROP COLUMN: {script}"
+        );
+        assert!(
+            script.contains("add column test_column"),
+            "expected ADD COLUMN: {script}"
+        );
+        assert!(
+            script.contains("generated always as (id * 2) stored"),
+            "expected the new STORED kind in the re-add: {script}"
+        );
+        assert!(
+            !script.contains("drop expression"),
+            "must NOT emit `drop expression` (the VIRTUAL side rejects it): {script}"
+        );
+    }
+
+    #[test]
+    fn issue181_stored_expression_change_keeps_in_place_alter() {
+        // Sanity check: the in-place `DROP EXPRESSION` + `ADD
+        // GENERATED ... STORED` path is still used for the case that
+        // PG18 accepts — STORED → STORED with a new expression. Only
+        // VIRTUAL participants get routed to the heavier DROP COLUMN
+        // path.
+        let mut existing = create_test_column();
+        existing.is_generated = "ALWAYS".to_string();
+        existing.generation_expression = Some("(id * 2)".to_string());
+        existing.generation_type = Some("s".to_string());
+
+        let mut updated = existing.clone();
+        updated.generation_expression = Some("(id * 3)".to_string());
+
+        let script = updated
+            .get_alter_script(&existing, true)
+            .expect("STORED expression change must emit an alter");
+
+        assert!(
+            script.contains("drop expression"),
+            "STORED → STORED expression change still uses the in-place ALTER: {script}"
+        );
+        assert!(
+            script.contains("generated always as (id * 3) stored"),
+            "expected the new STORED expression to be re-added: {script}"
+        );
+        assert!(
+            !script.contains("drop column"),
+            "STORED expression change must not destroy the column: {script}"
         );
     }
 
