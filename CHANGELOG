@@ -1,6 +1,49 @@
 2026-05-14      v1.0.21
 
                 Bug fixes:
+                    - Fixed issue #188 (Phase 7 doesn't restore
+                      secondary dependents of CASCADE-dropped
+                      objects). When `DROP FUNCTION ... CASCADE`
+                      removed a generated column whose expression
+                      referenced the routine, PostgreSQL also
+                      silently dropped every index / FK / CHECK /
+                      EXCLUDE constraint / RLS policy attached to
+                      the column. Phase 7's text-based scanner only
+                      matched dependents whose own definition
+                      named the routine, so column-anchored
+                      secondary dependents were left missing until
+                      a second `pgc compare` run noticed the drift.
+                      The same gap existed for
+                      `TableColumn::get_alter_script`'s
+                      virtual-generated-column drop+add path
+                      (issue #181 / PR #186). Captured the relevant
+                      slice of `pg_catalog.pg_depend` at dump time
+                      into a new `Dump::column_dependents` field
+                      (additive, `#[serde(default)]` for backward
+                      compat with older dumps), populated by a
+                      three-branch UNION over pg_depend joined
+                      against pg_class / pg_constraint / pg_policy.
+                      Added `Comparer::recreate_column_dependents`
+                      which walks the graph for a given anchor
+                      column and re-emits each TO-side dependent
+                      via the existing `*_recreate_block` helpers,
+                      with a TO-side gate, partition-child guard,
+                      and dedup so a UNIQUE/PK constraint's backing
+                      index is not double-emitted. Wired it into
+                      Phase 7's generated-column branch and into
+                      `compare_tables` after the table alter for
+                      columns that route through the
+                      `needs_full_recreate` branch (new
+                      `TableColumn::would_drop_and_re_add`
+                      predicate), the latter wrapped in a labeled
+                      `/* Recreate dependents dropped by
+                      virtual-column rewrite */` block. New
+                      `cascade_col_dep_items` fixture in
+                      `data/test/schema_a.sql` / `schema_b.sql`
+                      covers a plain index and a CHECK constraint
+                      anchored on a CASCADE-dropped generated
+                      column.
+
                     - Fixed issue #189 (Phase 7 doesn't recreate
                       views silently dropped by `DROP FUNCTION ...
                       CASCADE`). PR #183's Phase 7 restored functional
