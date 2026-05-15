@@ -275,13 +275,13 @@ impl Table {
 
         for (key, mut cols) in columns_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                cols.sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
+                cols.sort_by_key(|a| a.ordinal_position);
                 tables[i].columns = cols;
             }
         }
         for (key, mut idxs) in indexes_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                idxs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                idxs.sort_by_key(|a| a.name.to_lowercase());
                 tables[i].indexes = idxs;
             }
         }
@@ -292,7 +292,7 @@ impl Table {
         }
         for (key, mut trigs) in triggers_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                trigs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                trigs.sort_by_key(|a| a.name.to_lowercase());
                 tables[i].triggers = trigs;
             }
         }
@@ -824,6 +824,22 @@ impl Table {
         schema_filter: &str,
     ) -> Result<HashMap<(String, String), (Option<String>, Option<String>, Option<String>)>, Error>
     {
+        // `pg_inherits` records BOTH declarative partition children
+        // (parent.relkind = 'p') AND classical-inheritance children
+        // (parent.relkind = 'r', child created with `INHERITS (...)`).
+        // The `partition_of` field is only meaningful for partition
+        // children — classical-inheritance parents are tracked
+        // separately in `inherits_from`. Without the `p.relkind = 'p'`
+        // guard, classical-inheritance children land with both fields
+        // set, which (a) makes `build_script` emit invalid
+        // `CREATE TABLE … PARTITION OF parent` for a non-partitioned
+        // parent, and (b) trips `column_type_change_forces_recreate`
+        // into a wholesale drop+recreate for column type changes
+        // PostgreSQL would happily ALTER in place. That second effect
+        // is what leaked a non-idempotent diff after migration:
+        // recreated tables inherit current default privileges, and a
+        // second `pgc compare` then emitted REVOKE statements for the
+        // newly-attached grants.
         let query = format!(
             "SELECT
                 n.nspname AS raw_schema,
@@ -836,7 +852,7 @@ impl Table {
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             LEFT JOIN pg_inherits i ON i.inhrelid = c.oid
-            LEFT JOIN pg_class p ON p.oid = i.inhparent
+            LEFT JOIN pg_class p ON p.oid = i.inhparent AND p.relkind = 'p'
             LEFT JOIN pg_namespace pn ON pn.oid = p.relnamespace
             WHERE n.nspname IN {schema_filter} AND c.relkind IN ('r','p')"
         );
@@ -1489,19 +1505,7 @@ impl Table {
                         continue;
                     }
 
-                    let type_changed = old_col.data_type != new_col.data_type
-                        || old_col.udt_name != new_col.udt_name
-                        || old_col.numeric_precision != new_col.numeric_precision
-                        || old_col.numeric_scale != new_col.numeric_scale
-                        || old_col.character_maximum_length != new_col.character_maximum_length;
-
-                    let is_partition_child = self.partition_of.is_some();
-                    let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
-                        let col_lower = new_col.name.to_lowercase();
-                        extract_partition_key_identifiers(pk).contains(&col_lower)
-                    });
-
-                    if type_changed && (is_partition_child || in_partition_key) {
+                    if self.column_type_change_forces_recreate(old_col, new_col) {
                         let drop_script = if use_drop {
                             self.get_drop_script()
                         } else {
@@ -1902,6 +1906,64 @@ impl Table {
     /// Get script for altering the table without triggers (for deferred trigger creation)
     pub fn get_alter_script_without_triggers(&self, to_table: &Table, use_drop: bool) -> String {
         self.build_alter_script(to_table, use_drop, false)
+    }
+
+    /// True when comparing `self` (FROM) against `to_table` (TO) would
+    /// force `build_alter_script` down a wholesale `DROP TABLE` +
+    /// `CREATE TABLE` path rather than an in-place ALTER. The comparer
+    /// uses this to drive the `recreated_tables` flag for grants
+    /// (issue #180) and to skip Path B column-dependent restoration
+    /// (issue #188) — when the table is recreated wholesale, all
+    /// dependents are already re-emitted as part of `CREATE TABLE`,
+    /// so the column-dependent graph walk would just duplicate work.
+    ///
+    /// Conditions mirror the early-return branches in
+    /// `build_alter_script`. `column_type_change_forces_recreate`
+    /// keeps the partition-key column check in a single helper so the
+    /// predicate and the SQL emission cannot drift apart.
+    pub fn will_be_dropped_and_recreated(&self, to_table: &Table) -> bool {
+        if self.partition_key != to_table.partition_key {
+            return true;
+        }
+        for new_col in &to_table.columns {
+            if let Some(old_col) = self.columns.iter().find(|c| c.name == new_col.name)
+                && self.column_type_change_forces_recreate(old_col, new_col)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True when a column's type changed *and* the column either
+    /// participates in this table's partition key or the table is a
+    /// partition child — both cases require dropping and recreating
+    /// the table (PostgreSQL forbids in-place type changes on
+    /// partition-key columns and on inherited columns of partition
+    /// children).
+    ///
+    /// Shared between `build_alter_script`'s emission path and
+    /// `will_be_dropped_and_recreated`'s predicate so the recreate
+    /// decision lives in exactly one place.
+    fn column_type_change_forces_recreate(
+        &self,
+        old_col: &TableColumn,
+        new_col: &TableColumn,
+    ) -> bool {
+        let type_changed = old_col.data_type != new_col.data_type
+            || old_col.udt_name != new_col.udt_name
+            || old_col.numeric_precision != new_col.numeric_precision
+            || old_col.numeric_scale != new_col.numeric_scale
+            || old_col.character_maximum_length != new_col.character_maximum_length;
+        if !type_changed {
+            return false;
+        }
+        let is_partition_child = self.partition_of.is_some();
+        let in_partition_key = self.partition_key.as_ref().is_some_and(|pk| {
+            let col_lower = new_col.name.to_lowercase();
+            extract_partition_key_identifiers(pk).contains(&col_lower)
+        });
+        is_partition_child || in_partition_key
     }
 
     /// Returns `Some(target_is_unlogged)` when this table's logging

@@ -1,5 +1,6 @@
 use crate::dump::cast::Cast;
 use crate::dump::collation::Collation;
+use crate::dump::column_dependent::{ColumnDependent, ColumnDependentKind};
 use crate::dump::default_privilege::DefaultPrivilege;
 use crate::dump::event_trigger::EventTrigger;
 use crate::dump::fdw::{ForeignDataWrapper, ForeignServer, UserMapping};
@@ -39,7 +40,7 @@ use zip::write::SimpleFileOptions;
 /// This constant is statically asserted to equal the actual arity of the
 /// [`fill_try_join!`] invocation in [`Dump::fill`]; adding or removing a
 /// branch without updating this value is a compile error.
-pub(crate) const FILL_SIBLING_BRANCH_COUNT: u32 = 12;
+pub(crate) const FILL_SIBLING_BRANCH_COUNT: u32 = 13;
 
 /// Invoke `tokio::try_join!` on the given sibling futures AND statically
 /// assert that the branch count matches [`FILL_SIBLING_BRANCH_COUNT`].
@@ -158,6 +159,15 @@ pub struct Dump {
     // List of user mappings in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_mappings: Vec<UserMapping>,
+
+    // Column → dependent-object edges from pg_depend. Powers Phase 7's
+    // restoration of secondary dependents (indexes/constraints/policies)
+    // that PostgreSQL silently CASCADE-drops along with a generated
+    // column. Empty in pre-issue-#188 dumps; the comparer degrades to the
+    // previous behaviour (the documented "run pgc compare twice"
+    // workaround) when the field is absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_dependents: Vec<ColumnDependent>,
 }
 
 impl Dump {
@@ -188,6 +198,7 @@ impl Dump {
             foreign_data_wrappers: Vec::new(),
             foreign_servers: Vec::new(),
             user_mappings: Vec::new(),
+            column_dependents: Vec::new(),
         }
     }
 
@@ -314,6 +325,7 @@ impl Dump {
                 Ok::<_, Error>((collations, ts_configs, ts_dicts, operators))
             }
         };
+        let column_dependents_fut = Self::fetch_column_dependents_standalone(pool, &schema_filter);
         let global_extras_fut = async {
             let casts = Self::fetch_casts_standalone(pool, &schema_filter).await?;
             let default_privileges =
@@ -352,6 +364,7 @@ impl Dump {
             event_triggers,
             schema_extras,
             global_extras,
+            column_dependents,
         ) = fill_try_join!(
             types_enums_fut,
             extensions_fut,
@@ -365,6 +378,7 @@ impl Dump {
             event_triggers_fut,
             schema_extras_fut,
             global_extras_fut,
+            column_dependents_fut,
         )?;
 
         let (types, enums) = types_enums;
@@ -395,6 +409,8 @@ impl Dump {
         self.foreign_data_wrappers = fdws;
         self.foreign_servers = servers;
         self.user_mappings = user_mappings;
+
+        self.column_dependents = column_dependents;
 
         Ok(())
     }
@@ -1903,6 +1919,144 @@ impl Dump {
             }
         }
         Vec::new()
+    }
+
+    /// Walk `pg_catalog.pg_depend` to harvest column → dependent edges
+    /// that PostgreSQL would CASCADE-drop when a column is dropped.
+    /// Powers Phase 7's restoration of secondary dependents (issue #188).
+    ///
+    /// Three UNION ALL branches, one per dependent kind:
+    ///   * `pg_class` → only `relkind IN ('i','I')` (indexes, partitioned
+    ///     indexes); other relations cannot have a column-level pg_depend
+    ///     edge anyway.
+    ///   * `pg_constraint` → CHECK, UNIQUE, EXCLUDE, and FOREIGN KEY
+    ///     constraints all reach here; PRIMARY KEY constraints would also
+    ///     appear, but their drop semantics are subsumed by the
+    ///     accompanying index dependency.
+    ///   * `pg_policy` → RLS policies that name the column in their
+    ///     USING/WITH CHECK clauses.
+    ///
+    /// Each branch excludes extension-owned dependents via the standard
+    /// `deptype = 'e'` anti-join, mirroring every other dump query, and
+    /// requires `refobjsubid > 0` so we only pick up *column-level*
+    /// edges (table-level edges have `refobjsubid = 0` and would
+    /// duplicate the index/constraint/policy table dependency).
+    async fn fetch_column_dependents_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<ColumnDependent>, Error> {
+        let query = format!(
+            "select
+                quote_ident(refnsp.nspname) as table_schema,
+                quote_ident(refcls.relname) as table_name,
+                quote_ident(refatt.attname) as column_name,
+                'index' as kind,
+                quote_ident(ix_nsp.nspname) as dep_schema,
+                quote_ident(ix_tbl.relname) as dep_table,
+                quote_ident(ix_cls.relname) as dep_name
+            from pg_catalog.pg_depend d
+            join pg_catalog.pg_class refcls on refcls.oid = d.refobjid
+            join pg_catalog.pg_namespace refnsp on refnsp.oid = refcls.relnamespace
+            join pg_catalog.pg_attribute refatt
+                on refatt.attrelid = d.refobjid and refatt.attnum = d.refobjsubid
+            join pg_catalog.pg_class ix_cls on ix_cls.oid = d.objid
+            join pg_catalog.pg_index ix on ix.indexrelid = ix_cls.oid
+            join pg_catalog.pg_class ix_tbl on ix_tbl.oid = ix.indrelid
+            join pg_catalog.pg_namespace ix_nsp on ix_nsp.oid = ix_tbl.relnamespace
+            where d.refclassid = 'pg_catalog.pg_class'::regclass
+              and d.classid = 'pg_catalog.pg_class'::regclass
+              and d.refobjsubid > 0
+              and d.deptype in ('a', 'n', 'i')
+              and ix_cls.relkind in ('i', 'I')
+              and refnsp.nspname in {schema_filter}
+              and refatt.attisdropped = false
+              and not exists (
+                  select 1 from pg_catalog.pg_depend ext
+                  where ext.objid = ix_cls.oid and ext.deptype = 'e'
+              )
+            union all
+            select
+                quote_ident(refnsp.nspname),
+                quote_ident(refcls.relname),
+                quote_ident(refatt.attname),
+                'constraint',
+                quote_ident(con_nsp.nspname),
+                quote_ident(con_tbl.relname),
+                quote_ident(con.conname)
+            from pg_catalog.pg_depend d
+            join pg_catalog.pg_class refcls on refcls.oid = d.refobjid
+            join pg_catalog.pg_namespace refnsp on refnsp.oid = refcls.relnamespace
+            join pg_catalog.pg_attribute refatt
+                on refatt.attrelid = d.refobjid and refatt.attnum = d.refobjsubid
+            join pg_catalog.pg_constraint con on con.oid = d.objid
+            join pg_catalog.pg_class con_tbl on con_tbl.oid = con.conrelid
+            join pg_catalog.pg_namespace con_nsp on con_nsp.oid = con_tbl.relnamespace
+            where d.refclassid = 'pg_catalog.pg_class'::regclass
+              and d.classid = 'pg_catalog.pg_constraint'::regclass
+              and d.refobjsubid > 0
+              and d.deptype in ('a', 'n', 'i')
+              and refnsp.nspname in {schema_filter}
+              and refatt.attisdropped = false
+              and not exists (
+                  select 1 from pg_catalog.pg_depend ext
+                  where ext.objid = con.oid and ext.deptype = 'e'
+              )
+            union all
+            select
+                quote_ident(refnsp.nspname),
+                quote_ident(refcls.relname),
+                quote_ident(refatt.attname),
+                'policy',
+                quote_ident(pol_nsp.nspname),
+                quote_ident(pol_tbl.relname),
+                quote_ident(pol.polname)
+            from pg_catalog.pg_depend d
+            join pg_catalog.pg_class refcls on refcls.oid = d.refobjid
+            join pg_catalog.pg_namespace refnsp on refnsp.oid = refcls.relnamespace
+            join pg_catalog.pg_attribute refatt
+                on refatt.attrelid = d.refobjid and refatt.attnum = d.refobjsubid
+            join pg_catalog.pg_policy pol on pol.oid = d.objid
+            join pg_catalog.pg_class pol_tbl on pol_tbl.oid = pol.polrelid
+            join pg_catalog.pg_namespace pol_nsp on pol_nsp.oid = pol_tbl.relnamespace
+            where d.refclassid = 'pg_catalog.pg_class'::regclass
+              and d.classid = 'pg_catalog.pg_policy'::regclass
+              and d.refobjsubid > 0
+              and d.deptype in ('a', 'n', 'i')
+              and refnsp.nspname in {schema_filter}
+              and refatt.attisdropped = false",
+            schema_filter = schema_filter
+        );
+
+        let rows = sqlx::query(query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch column dependents: {e}.")))?;
+
+        let mut dependents = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind_str: String = row.get("kind");
+            let kind = match kind_str.as_str() {
+                "index" => ColumnDependentKind::Index,
+                "constraint" => ColumnDependentKind::Constraint,
+                "policy" => ColumnDependentKind::Policy,
+                // The query is the only producer of this column, so any
+                // value other than the three literals above is a logic
+                // error here, not bad data — drop the row rather than
+                // letting an unknown kind propagate as a silent miss
+                // downstream.
+                _ => continue,
+            };
+            dependents.push(ColumnDependent {
+                schema: row.get("table_schema"),
+                table: row.get("table_name"),
+                column: row.get("column_name"),
+                kind,
+                dep_schema: row.get("dep_schema"),
+                dep_table: row.get("dep_table"),
+                dep_name: row.get("dep_name"),
+            });
+        }
+        Ok(dependents)
     }
 
     async fn fetch_rules_standalone(

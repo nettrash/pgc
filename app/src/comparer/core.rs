@@ -1,5 +1,6 @@
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
+use crate::dump::column_dependent::ColumnDependentKind;
 use crate::dump::table_column::TableColumn;
 use crate::dump::table_constraint::TableConstraint;
 use crate::dump::table_index::TableIndex;
@@ -1812,13 +1813,22 @@ impl Comparer {
                         self.trigger_post_script
                             .push_str(to_table.get_trigger_script().as_str());
                     } else {
+                        // Ask the table whether the alter path will
+                        // drop+recreate it wholesale (partition-key
+                        // change, partition-child column type change)
+                        // before emitting. This replaces the previous
+                        // substring scan of `alter_script` for
+                        // `"drop table if exists"`: a single
+                        // authoritative predicate that
+                        // `build_alter_script` itself uses, so the
+                        // comparer's gate and the SQL emission cannot
+                        // drift apart.
+                        let table_recreated = table.will_be_dropped_and_recreated(to_table);
+
                         let alter_script =
                             table.get_alter_script_without_triggers(to_table, self.use_drop);
 
-                        // If the generated alter script dropped + recreated this table
-                        // and the table is a partitioned parent, record it so its
-                        // children will be recreated instead of altered.
-                        if alter_script.to_lowercase().contains("drop table if exists") {
+                        if table_recreated {
                             // Mark for grants: same reasoning as the branch
                             // above — the dropped+recreated table inherits
                             // default privileges, so compare_grants must use
@@ -1832,6 +1842,51 @@ impl Comparer {
                         }
 
                         self.script.push_str(alter_script.as_str());
+
+                        // Issue #188 / Path B: when `get_alter_script`
+                        // routes a column through its
+                        // `needs_full_recreate` branch (PG18 VIRTUAL
+                        // flips, STORED↔VIRTUAL changes, or
+                        // non-generated → GENERATED), it emits
+                        // `DROP COLUMN` + `ADD COLUMN`. PostgreSQL
+                        // CASCADE-drops every index / FK / CHECK /
+                        // EXCLUDE constraint / RLS policy attached to
+                        // that column on the way out, and the
+                        // `ADD COLUMN` alone does not restore them.
+                        // Walk the column-dependent graph harvested
+                        // from `pg_depend` and re-emit each surviving
+                        // TO-side dependent. Skipped when the table
+                        // was dropped+recreated wholesale — the
+                        // re-`CREATE TABLE` already includes the
+                        // dependents.
+                        if !table_recreated {
+                            let mut col_dep_emitted: HashSet<String> = HashSet::new();
+                            let mut col_dep_recreate = String::new();
+                            for to_col in &to_table.columns {
+                                if let Some(from_col) =
+                                    table.columns.iter().find(|c| c.name == to_col.name)
+                                    && to_col.would_drop_and_re_add(from_col)
+                                {
+                                    self.recreate_column_dependents(
+                                        &to_col.schema,
+                                        &to_col.table,
+                                        &to_col.name,
+                                        &mut col_dep_emitted,
+                                        &mut col_dep_recreate,
+                                    );
+                                }
+                            }
+                            if !col_dep_recreate.is_empty() {
+                                self.script.append_block(
+                                    "\n/* ---> Recreate dependents dropped by virtual-column rewrite: Start ---- */",
+                                );
+                                self.script.push_str(&col_dep_recreate);
+                                self.script.append_block(
+                                    "/* ---> Recreate dependents dropped by virtual-column rewrite: End ------ */",
+                                );
+                            }
+                        }
+
                         self.trigger_post_script.push_str(
                             table
                                 .get_trigger_alter_script(to_table, self.use_drop)
@@ -3913,6 +3968,25 @@ impl Comparer {
                                 self.use_drop,
                                 &column_recreate_block(to_column),
                             );
+                            // Issue #188: the `ADD COLUMN IF NOT EXISTS`
+                            // restores the generated column itself, but
+                            // PostgreSQL had already CASCADE-dropped
+                            // every index / FK / CHECK / EXCLUDE
+                            // constraint / RLS policy attached to it
+                            // *because they referenced the column, not
+                            // the routine*. Walk the column-dependent
+                            // graph harvested from `pg_depend` at dump
+                            // time and re-emit each surviving TO-side
+                            // dependent. `emitted_keys` is shared so
+                            // anything Phase 7 already restored via its
+                            // routine-text scan is not double-emitted.
+                            self.recreate_column_dependents(
+                                &to_column.schema,
+                                &to_column.table,
+                                &to_column.name,
+                                &mut emitted_keys,
+                                &mut recreate,
+                            );
                         }
                     } else if default_referenced && let Some(default) = &to_column.column_default {
                         // TO-side gate: only re-set the DEFAULT when
@@ -4257,6 +4331,162 @@ impl Comparer {
                     .lines()
                     .map(|l| format!("-- {}\n", l))
                     .collect::<String>(),
+            );
+        }
+    }
+
+    /// Re-emit every TO-side dependent of `(table_schema, table_name,
+    /// column_name)` that PostgreSQL would have CASCADE-dropped when the
+    /// column was dropped. Uses the `column_dependents` graph harvested
+    /// from `pg_depend` at dump time (issue #188); fixes the gap where
+    /// the text-based Phase 7 scanner misses dependents that reference
+    /// the column rather than the routine driving the CASCADE chain.
+    ///
+    /// `emitted_keys` is shared with the caller so dependents already
+    /// emitted by Phase 7's routine-text scan (e.g., a functional index
+    /// that names both the routine *and* the column) are not double-
+    /// emitted.
+    ///
+    /// Anchor identifiers are matched against `Dump::column_dependents`
+    /// after case-insensitive comparison with quote-stripping; that is
+    /// because the dump query wraps identifiers via `quote_ident` (so
+    /// case-sensitive names land here as `"MixedCase"`) but Phase 7 and
+    /// `compare_tables` operate on the raw fields, which may be either
+    /// form depending on origin.
+    fn recreate_column_dependents(
+        &self,
+        table_schema: &str,
+        table_name: &str,
+        column_name: &str,
+        emitted_keys: &mut HashSet<String>,
+        out: &mut String,
+    ) {
+        let want_schema = table_schema.to_lowercase().replace('"', "");
+        let want_table = table_name.to_lowercase().replace('"', "");
+        let want_column = column_name.to_lowercase().replace('"', "");
+
+        // Two passes so FK constraints emit *after* the UNIQUE/PK
+        // target they reference. A single linear pass would let the
+        // pg_depend query's undefined output order produce a script
+        // where `ADD CONSTRAINT fk … FOREIGN KEY … REFERENCES …` runs
+        // before the matching `ADD CONSTRAINT … UNIQUE` is back, and
+        // PostgreSQL rejects FKs whose target lacks a unique
+        // constraint. Pass 1 emits indexes, non-FK constraints, and
+        // policies; pass 2 emits FKs against the now-restored unique
+        // targets.
+        let mut deferred_fks: Vec<&TableConstraint> = Vec::new();
+
+        for dep in &self.from.column_dependents {
+            if dep.schema.to_lowercase().replace('"', "") != want_schema
+                || dep.table.to_lowercase().replace('"', "") != want_table
+                || dep.column.to_lowercase().replace('"', "") != want_column
+            {
+                continue;
+            }
+
+            let Some(owner) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.schema == dep.dep_schema && t.name == dep.dep_table)
+            else {
+                continue;
+            };
+
+            match dep.kind {
+                ColumnDependentKind::Index => {
+                    let Some(to_index) = owner.indexes.iter().find(|i| i.name == dep.dep_name)
+                    else {
+                        continue;
+                    };
+                    if to_index.is_partition_index {
+                        continue;
+                    }
+                    // UNIQUE/PK/EXCLUDE constraints share their backing
+                    // index name. When such a constraint exists in TO,
+                    // the constraint branch below will recreate the
+                    // index — emitting both would race and the
+                    // `ADD CONSTRAINT … PRIMARY KEY` form rejects a
+                    // pre-existing index of the same name. Skip the
+                    // index emit and let the constraint do it.
+                    if owner.constraints.iter().any(|c| c.name == to_index.name) {
+                        continue;
+                    }
+                    let key = format!("index:{}.{}", to_index.schema, to_index.name);
+                    if !emitted_keys.insert(key) {
+                        continue;
+                    }
+                    Self::emit_dependent_recreate(
+                        out,
+                        self.use_drop,
+                        &index_recreate_block(to_index),
+                    );
+                }
+                ColumnDependentKind::Constraint => {
+                    let Some(to_constraint) =
+                        owner.constraints.iter().find(|c| c.name == dep.dep_name)
+                    else {
+                        continue;
+                    };
+                    // Partition-inherited constraints (coninhcount > 0)
+                    // propagate from the parent — re-emitting on the
+                    // child is the same rejection Phase 7 already
+                    // guards against in its routine-text scan.
+                    let is_target_partition_child = owner.partition_of.is_some();
+                    if is_target_partition_child && to_constraint.coninhcount > 0 {
+                        continue;
+                    }
+                    let key = format!(
+                        "constraint:{}.{}.{}",
+                        to_constraint.schema, to_constraint.table_name, to_constraint.name
+                    );
+                    if !emitted_keys.insert(key) {
+                        continue;
+                    }
+                    if to_constraint
+                        .constraint_type
+                        .eq_ignore_ascii_case("foreign key")
+                    {
+                        // Defer FK emission until pass 2 (after every
+                        // UNIQUE/PK in the same call has been restored).
+                        deferred_fks.push(to_constraint);
+                        continue;
+                    }
+                    Self::emit_dependent_recreate(
+                        out,
+                        self.use_drop,
+                        &constraint_recreate_block(to_constraint),
+                    );
+                }
+                ColumnDependentKind::Policy => {
+                    let Some(to_policy) = owner.policies.iter().find(|p| p.name == dep.dep_name)
+                    else {
+                        continue;
+                    };
+                    let key = format!(
+                        "policy:{}.{}.{}",
+                        to_policy.schema, to_policy.table, to_policy.name
+                    );
+                    if !emitted_keys.insert(key) {
+                        continue;
+                    }
+                    Self::emit_dependent_recreate(
+                        out,
+                        self.use_drop,
+                        &policy_recreate_block(to_policy),
+                    );
+                }
+            }
+        }
+
+        // Pass 2: FK constraints, now that any UNIQUE/PK target they
+        // reference (on the anchor column's table or any other table)
+        // has already been restored above.
+        for to_constraint in deferred_fks {
+            Self::emit_dependent_recreate(
+                out,
+                self.use_drop,
+                &constraint_recreate_block(to_constraint),
             );
         }
     }
