@@ -1742,6 +1742,36 @@ CREATE POLICY pol_cascade_items ON test_schema.cascade_items
     USING (test_schema.cascade_compute(value) > 0);
 
 -- =============================================================================
+-- Issue #188 — Secondary dependents of CASCADE-dropped generated column
+-- =============================================================================
+-- Function `cascade_compute_v2(integer)` returns BIGINT here (was INTEGER
+-- in Schema A). The DROP FUNCTION ... CASCADE removes the generated
+-- column `gen_total` from FROM, which in turn CASCADE-drops the plain
+-- index and CHECK constraint attached to it. Both objects' definitions
+-- here are byte-identical to Schema A (modulo the integer→bigint type
+-- bump on the column) — without the pg_depend graph, the comparer
+-- would emit nothing for them and the migrated database would be
+-- missing them.
+CREATE FUNCTION test_schema.cascade_compute_v2(x integer)
+RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
+    SELECT (x + 1)::bigint;
+$$;
+
+CREATE TABLE test_schema.cascade_col_dep_items (
+    id        serial  PRIMARY KEY,
+    value     integer NOT NULL,
+    -- gen_total type bumped integer → bigint to match the new return type;
+    -- the column itself is CASCADE-dropped by the function drop.
+    gen_total bigint  GENERATED ALWAYS AS (test_schema.cascade_compute_v2(value)) STORED
+);
+
+CREATE INDEX idx_cascade_col_dep_gen_total
+    ON test_schema.cascade_col_dep_items (gen_total);
+
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT chk_cascade_col_dep_gen_total CHECK (gen_total >= 0);
+
+-- =============================================================================
 -- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
 -- =============================================================================
 -- TO mirrors Schema A's FK chain (child -> parent -> grandparent) but

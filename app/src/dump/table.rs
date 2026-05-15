@@ -275,13 +275,13 @@ impl Table {
 
         for (key, mut cols) in columns_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                cols.sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position));
+                cols.sort_by_key(|a| a.ordinal_position);
                 tables[i].columns = cols;
             }
         }
         for (key, mut idxs) in indexes_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                idxs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                idxs.sort_by_key(|a| a.name.to_lowercase());
                 tables[i].indexes = idxs;
             }
         }
@@ -292,7 +292,7 @@ impl Table {
         }
         for (key, mut trigs) in triggers_by_key {
             if let Some(&i) = table_idx.get(&key) {
-                trigs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                trigs.sort_by_key(|a| a.name.to_lowercase());
                 tables[i].triggers = trigs;
             }
         }

@@ -145,6 +145,42 @@ impl TableColumn {
         }
     }
 
+    /// True when comparing `self` (the new TO-side column) against
+    /// `existing` (the FROM-side column) would route through the
+    /// `needs_full_recreate` branch in [`get_alter_script`] — i.e., the
+    /// migration is `DROP COLUMN` + `ADD COLUMN` rather than an
+    /// in-place ALTER. This is the Path B trigger from issue #188:
+    /// PostgreSQL CASCADE-drops every index / FK / CHECK / EXCLUDE
+    /// constraint / RLS policy attached to the column, and the
+    /// comparer must re-emit them afterwards.
+    ///
+    /// The predicate body is byte-identical to the in-method
+    /// computation in [`get_alter_script`]; both must move together.
+    pub fn would_drop_and_re_add(&self, existing: &TableColumn) -> bool {
+        let new_generated = Self::normalized_generated(&self.is_generated);
+        let old_generated = Self::normalized_generated(&existing.is_generated);
+
+        let generation_type_changed = new_generated == "ALWAYS"
+            && old_generated == "ALWAYS"
+            && self.effective_generation_type() != existing.effective_generation_type();
+        let generated_changed = new_generated != old_generated
+            || (new_generated == "ALWAYS"
+                && self.generation_expression != existing.generation_expression)
+            || generation_type_changed;
+
+        if !generated_changed {
+            return false;
+        }
+
+        let new_is_generated = new_generated == "ALWAYS";
+        let old_is_generated = old_generated != "NEVER";
+
+        (!old_is_generated && new_is_generated)
+            || (old_is_generated
+                && (existing.effective_generation_type() == "v"
+                    || self.effective_generation_type() == "v"))
+    }
+
     fn normalized_generation_expression(expr: &str) -> String {
         let mut trimmed = expr.trim();
         // Strip redundant outer parentheses to avoid emitted ((expr)) which some servers reject

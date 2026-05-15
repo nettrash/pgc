@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod cast;
 pub mod collation;
+pub mod column_dependent;
 pub mod core;
 pub mod default_privilege;
 pub mod event_trigger;

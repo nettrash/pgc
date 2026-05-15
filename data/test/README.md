@@ -448,6 +448,14 @@ Requires `wal_level = logical`. Comment out these statements if the test server 
 - The dependent definitions are intentionally identical (modulo the integer→bigint type bumps that follow from the new return type), so the regular table/index/policy diffs emit nothing for them. Phase 7 of `compare_routines_and_views` must re-emit each one — without it the migration leaves them missing and a second `pgc compare` run would notice the drift.
 - Generated columns are re-added via `alter table … add column` (Postgres drops generated columns wholesale on CASCADE); column DEFAULTs are restored via `alter column … set default` (the column survives, only the DEFAULT clause is dropped).
 
+#### Secondary Dependents of CASCADE-Dropped Columns (Issue #188)
+
+- `test_schema.cascade_compute_v2(integer)` returns `INTEGER` in FROM and `BIGINT` in TO. Same DROP+CREATE pattern as `cascade_compute`, but the dependents under test sit one hop further down the dependency chain: PostgreSQL CASCADE-drops the **generated column** `gen_total` (because its expression references the function), and that column drop in turn CASCADEs to objects attached to the column.
+- `test_schema.cascade_col_dep_items` carries two secondary dependents that the issue #179 text-based scanner cannot detect, because their definitions reference only the column, not the function:
+  - **Plain index on the generated column**: `idx_cascade_col_dep_gen_total ON (gen_total)` — no `cascade_compute_v2(...)` text anywhere in `pg_get_indexdef`.
+  - **CHECK constraint on the generated column**: `chk_cascade_col_dep_gen_total CHECK (gen_total >= 0)` — names only the column.
+- The fix walks the column-dependent graph harvested from `pg_catalog.pg_depend` at dump time (new `Dump::column_dependents` field). Phase 7 emits the column recreate (`ADD COLUMN IF NOT EXISTS gen_total …`) and then re-emits the index and CHECK constraint from the graph entries anchored on `gen_total`. The same machinery covers the `TableColumn::get_alter_script` virtual-generated-column drop+add path (issue #181) — column dependents are re-emitted right after the `DROP COLUMN` + `ADD COLUMN`, wrapped in a `/* Recreate dependents dropped by virtual-column rewrite */` block.
+
 ---
 
 ## Clear Command Test (`clear_test.sql`)
@@ -616,3 +624,4 @@ The comparison should detect and generate SQL for:
 - Creating, modifying, and dropping foreign servers and user mappings (OPTIONS changes, add/remove entries)
 - Creating, modifying, and dropping publications (FOR TABLE list, FOR ALL TABLES, publish operations)
 - Recreating dependents silently dropped by `DROP FUNCTION ... CASCADE` when a routine is fully dropped or its return type / argument list / argument defaults change (functional indexes, CHECK constraints, generated columns, column DEFAULT expressions, RLS policies — Issue #179)
+- Recreating _secondary_ dependents of a CASCADE-dropped generated column — indexes / CHECK constraints / RLS policies anchored on the column rather than the routine — driven by a `pg_catalog.pg_depend` snapshot captured at dump time; same machinery also runs after the virtual-generated-column drop+add path in `TableColumn::get_alter_script` (Issue #188)

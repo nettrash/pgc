@@ -1418,6 +1418,41 @@ CREATE POLICY pol_cascade_items ON test_schema.cascade_items
     USING (test_schema.cascade_compute(value) > 0);
 
 -- =============================================================================
+-- Issue #188 — Secondary dependents of CASCADE-dropped generated column
+-- =============================================================================
+-- Function `cascade_compute_v2(integer)` returns INTEGER here; Schema B
+-- bumps the return type to BIGINT. The CASCADE drop of the function
+-- removes the generated column `gen_total` AND every object PostgreSQL
+-- attached to that column via `pg_depend` — even objects whose own
+-- definition NEVER NAMES the function. Phase 7's text scanner can't
+-- find those secondary dependents; the comparer must walk the
+-- column-dependent graph harvested from `pg_depend` at dump time and
+-- re-emit them.
+CREATE FUNCTION test_schema.cascade_compute_v2(x integer)
+RETURNS integer LANGUAGE sql IMMUTABLE AS $$
+    SELECT x + 1;
+$$;
+
+CREATE TABLE test_schema.cascade_col_dep_items (
+    id        serial  PRIMARY KEY,
+    value     integer NOT NULL,
+    -- Generated column depends on cascade_compute_v2 → CASCADE drops it.
+    gen_total integer GENERATED ALWAYS AS (test_schema.cascade_compute_v2(value)) STORED
+);
+
+-- Plain index on the generated column — does NOT name the function.
+-- When the function drop cascades to gen_total, this index goes with
+-- it. Phase 7's routine-text scan can't find it; the pg_depend graph
+-- must.
+CREATE INDEX idx_cascade_col_dep_gen_total
+    ON test_schema.cascade_col_dep_items (gen_total);
+
+-- CHECK constraint on the generated column — names only the column.
+-- Same dependency-chain story as the index above.
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT chk_cascade_col_dep_gen_total CHECK (gen_total >= 0);
+
+-- =============================================================================
 -- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
 -- =============================================================================
 -- FROM has three LOGGED tables connected by a foreign-key chain
