@@ -8908,7 +8908,10 @@ fn issue180_parse_fk_referenced_table_word_boundary() {
     // FK column list. The matcher must be anchored to a word boundary
     // and the keyword must be followed by whitespace.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col_a) REFERENCES public.target(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col_a) REFERENCES public.target(id)",
+            "public",
+        ),
         Some(("public".to_string(), "target".to_string())),
         "happy-path FK definition must parse"
     );
@@ -8917,7 +8920,8 @@ fn issue180_parse_fk_referenced_table_word_boundary() {
     // before the real keyword and parse garbage.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"references \", col_b) REFERENCES public.target(id)"
+            "FOREIGN KEY (\"references \", col_b) REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
@@ -8926,7 +8930,8 @@ fn issue180_parse_fk_referenced_table_word_boundary() {
     // see this column first and try to parse what follows.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (references_count) REFERENCES public.target(id)"
+            "FOREIGN KEY (references_count) REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
@@ -8940,14 +8945,18 @@ fn issue180_parse_fk_referenced_table_quoted_identifier_with_dot() {
     // and the parsed pair is nonsensical.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (col) REFERENCES \"weird.schema\".\"t\"(id)"
+            "FOREIGN KEY (col) REFERENCES \"weird.schema\".\"t\"(id)",
+            "public",
         ),
         Some(("weird.schema".to_string(), "t".to_string()))
     );
     // Both halves quoted with embedded dots — the split must still
     // land on the dot OUTSIDE every quoted segment.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"a.b\".\"c.d\"(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"a.b\".\"c.d\"(id)",
+            "public",
+        ),
         Some(("a.b".to_string(), "c.d".to_string()))
     );
 }
@@ -8962,7 +8971,8 @@ fn pr187_parse_fk_skips_keyword_inside_quoted_column_name() {
     // identifier.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"my references col\") REFERENCES public.target(id)"
+            "FOREIGN KEY (\"my references col\") REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string())),
         "FK keyword must still be located even with `references` inside a quoted column name"
@@ -8976,7 +8986,10 @@ fn pr187_parse_fk_handles_dollar_in_identifier() {
     // target like `public.parent$table` is truncated to
     // `public.parent`.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES public.parent$table(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES public.parent$table(id)",
+            "public",
+        ),
         Some(("public".to_string(), "parent$table".to_string()))
     );
 }
@@ -9168,7 +9181,8 @@ fn issue180_parse_fk_referenced_table_handles_non_ascii_column_names() {
     // leaves the 2-byte `İ` alone, so byte offsets line up.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"\u{0130}d\") REFERENCES public.target(id)"
+            "FOREIGN KEY (\"\u{0130}d\") REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
@@ -9179,14 +9193,177 @@ fn issue180_parse_fk_referenced_table_handles_non_ascii_column_names() {
     // bytes lie outside the ASCII range.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"русское_имя\") REFERENCES public.target(id)"
+            "FOREIGN KEY (\"русское_имя\") REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
     // Same case in the qualified target identifier.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"тест\".\"target\"(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"тест\".\"target\"(id)",
+            "public",
+        ),
         Some(("тест".to_string(), "target".to_string()))
+    );
+}
+
+#[test]
+fn issue190_parse_fk_unqualified_target_falls_back_to_owner_schema() {
+    // Issue #190: `pg_get_constraintdef` omits the schema qualifier
+    // when the target is reachable via `search_path` — typical for
+    // tables in `public`. Pre-fix the parser returned `None` for these
+    // and the FK edge was silently dropped from the persistence-flip
+    // adjacency, leaving FK chains in `public` ordered alphabetically
+    // (the order PostgreSQL rejects).
+    //
+    // Plain unqualified target — same schema as the FK owner.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (parent_id) REFERENCES parent(id)",
+            "public",
+        ),
+        Some(("public".to_string(), "parent".to_string())),
+        "unqualified target must resolve to (owner_schema, target)"
+    );
+    // Quoted unqualified target — the quotes must be stripped to
+    // match the comparer's normalised `to_index_by_key` keys (which
+    // strip quotes on the index side too).
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"MixedCase\"(id)",
+            "public",
+        ),
+        Some(("public".to_string(), "MixedCase".to_string()))
+    );
+    // Quoted owner schema (e.g. mixed-case schema names land here as
+    // `"MySchema"` via `quote_ident`) — the fallback must strip the
+    // surrounding quotes from the owner schema too, otherwise the
+    // produced pair misses the index-side lookup keys.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES parent(id)",
+            "\"MySchema\"",
+        ),
+        Some(("MySchema".to_string(), "parent".to_string()))
+    );
+    // ON UPDATE / ON DELETE clauses follow the target — make sure
+    // they don't confuse the boundary scan.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES parent(id) ON DELETE CASCADE",
+            "public",
+        ),
+        Some(("public".to_string(), "parent".to_string()))
+    );
+}
+
+/// Issue #190 end-to-end: a FK chain in `public` whose deparsed
+/// definition uses unqualified target names must still be ordered
+/// leaves-first by `emit_persistence_changes`. Pre-fix the unqualified
+/// targets returned `None` from the parser, the adjacency went empty,
+/// and the SET UNLOGGED order fell back to alphabetical (`child`
+/// emitted *after* `parent` — exactly the order PostgreSQL rejects).
+#[tokio::test]
+async fn issue190_set_unlogged_orders_unqualified_public_fk_chain() {
+    // Builder that matches `issue180_logged_table` but emits FK
+    // definitions WITHOUT the schema qualifier — the
+    // `pg_get_constraintdef` output shape that exposes the issue.
+    fn make_table(name: &str, is_unlogged: bool, fk_target: Option<(&str, &str)>) -> Table {
+        let mut id_col = int_column("public", name, "id", 1);
+        id_col.is_nullable = false;
+        let mut constraints: Vec<TableConstraint> = vec![TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        }];
+
+        let mut columns = vec![id_col];
+        if let Some((fk_col, fk_table)) = fk_target {
+            let mut ref_col = int_column("public", name, fk_col, 2);
+            ref_col.is_nullable = true;
+            columns.push(ref_col);
+            // Unqualified `REFERENCES parent(id)` — no `public.`
+            // qualifier. This is what `pg_get_constraintdef` returns
+            // when the target is reachable via `search_path`.
+            constraints.push(TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: format!("{name}_{fk_col}_fkey"),
+                table_name: name.to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some(format!("FOREIGN KEY ({fk_col}) REFERENCES {fk_table}(id)")),
+                coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
+                comment: None,
+            });
+        }
+
+        let mut table = Table::new(
+            "public".to_string(),
+            name.to_string(),
+            "public".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            columns,
+            constraints,
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    // FROM: child → parent in public, both LOGGED.
+    // TO:   same chain, both UNLOGGED. The FK must survive in TO
+    // unchanged (live edge) so the adjacency considers it.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(make_table("parent", false, None));
+    from_dump
+        .tables
+        .push(make_table("child", false, Some(("parent_id", "parent"))));
+    to_dump.tables.push(make_table("parent", true, None));
+    to_dump
+        .tables
+        .push(make_table("child", true, Some(("parent_id", "parent"))));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    let child_pos = script
+        .find("alter table public.child set unlogged;")
+        .expect("child SET UNLOGGED must be emitted");
+    let parent_pos = script
+        .find("alter table public.parent set unlogged;")
+        .expect("parent SET UNLOGGED must be emitted");
+    assert!(
+        child_pos < parent_pos,
+        "child (referrer) must SET UNLOGGED BEFORE parent (referenced); \
+         got child@{} parent@{} — alphabetical order would put `child` \
+         after `parent` and PostgreSQL would reject the SET on `parent` \
+         while `child` is still LOGGED:\n{}",
+        child_pos,
+        parent_pos,
+        script
     );
 }
 
@@ -9276,5 +9453,1671 @@ fn issue180_sequence_only_persistence_change_uses_hash_diff() {
     assert!(
         !to_persistence_and_cache.is_only_persistence_change(&from),
         "a hashed field difference must block the persistence-only suppression"
+    );
+}
+
+/// Build a view whose definition textually references `test_deps.compute`.
+/// Returns a regular or materialized view depending on `is_materialized`.
+fn issue189_view(name: &str, is_materialized: bool) -> View {
+    let mut view = View::new(
+        name.to_string(),
+        " SELECT test_deps.compute(value) AS c\n   FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    view.is_materialized = is_materialized;
+    view.hash();
+    view
+}
+
+#[tokio::test]
+async fn issue189_signature_change_recreates_byte_identical_view() {
+    // The view's hash is unchanged between FROM and TO, but the function
+    // it references undergoes a signature change (integer → bigint),
+    // forcing DROP FUNCTION ... CASCADE. PostgreSQL silently drops the
+    // view as part of the cascade. Phase 7 must re-emit the view so the
+    // migration leaves the database in a consistent state.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.views.push(issue189_view("v_things", false));
+    to_dump.views.push(issue189_view("v_things", false));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let drop_pos = script
+        .find("drop function if exists test_deps.compute (x integer) cascade;")
+        .expect("CASCADE drop must be emitted for the signature change");
+    let create_fn_pos = script
+        .find("create or replace function test_deps.compute(x integer) returns bigint")
+        .expect("function recreate must be emitted");
+    assert!(drop_pos < create_fn_pos);
+
+    let view_pos = script
+        .find("CREATE OR REPLACE VIEW test_deps.v_things")
+        .expect("byte-identical view must be re-emitted as CREATE OR REPLACE VIEW after CASCADE");
+    assert!(
+        create_fn_pos < view_pos,
+        "view recreate must run after the function recreate so the new signature is in place"
+    );
+}
+
+#[tokio::test]
+async fn issue189_signature_change_recreates_byte_identical_materialized_view() {
+    // Same scenario as the regular-view case but with a materialized
+    // view. PostgreSQL CASCADE drops these via `pg_depend` the same way,
+    // so Phase 7 must emit a `create materialized view if not exists`.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.views.push(issue189_view("mv_things", true));
+    to_dump.views.push(issue189_view("mv_things", true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("create materialized view if not exists test_deps.mv_things"),
+        "materialized view must be re-emitted with IF NOT EXISTS: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue189_view_not_referencing_routine_is_not_recreated() {
+    // A view that doesn't textually reference the CASCADE-affected
+    // routine must be left alone — re-emitting it would clutter the
+    // migration and could re-introduce a stale definition if the user
+    // has the same view in both dumps for unrelated reasons.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let mut unrelated_from = View::new(
+        "v_other".to_string(),
+        " SELECT value FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    unrelated_from.hash();
+    let mut unrelated_to = View::new(
+        "v_other".to_string(),
+        " SELECT value FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    unrelated_to.hash();
+    from_dump.views.push(unrelated_from);
+    to_dump.views.push(unrelated_to);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("v_other"),
+        "view that doesn't reference the cascaded routine must not be re-emitted: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue189_view_recreate_skipped_when_to_definition_no_longer_references_routine() {
+    // TO-side gate (PR #186): if the TO view's definition was rewritten
+    // to no longer call the affected routine, the CASCADE drop never
+    // touches it (no pg_depend link). `compare_routines_and_views`
+    // already emits the rewrite via the normal hash-diff path; Phase 7
+    // must stay silent so we don't re-emit the view twice.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    from_dump.views.push(issue189_view("v_things", false));
+    // TO view: same name, but the definition no longer references the
+    // function — different hash, so Phase 5 handles it.
+    let mut to_view = View::new(
+        "v_things".to_string(),
+        " SELECT value AS c FROM test_deps.items;".to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    to_view.hash();
+    to_dump.views.push(to_view);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // The view must appear exactly once (the normal hash-diff path), not
+    // a second time from Phase 7's recreate block.
+    let recreate_section_start = script.find("Recreate dependents dropped by CASCADE: Start");
+    if let Some(start) = recreate_section_start {
+        let recreate_end = script[start..]
+            .find("Recreate dependents dropped by CASCADE: End")
+            .map(|e| start + e)
+            .unwrap_or(script.len());
+        let recreate_section = &script[start..recreate_end];
+        assert!(
+            !recreate_section.contains("v_things"),
+            "Phase 7 must not re-emit a view whose TO definition no longer references the routine: {}",
+            recreate_section
+        );
+    }
+}
+
+#[test]
+fn issue189_rewrite_create_view_anchored_to_prefix() {
+    // PR #195 review (Copilot): the helper must not be fooled by the
+    // literal text `CREATE OR REPLACE VIEW` appearing inside the view
+    // definition body that `View::get_script` appends after the
+    // `create view` prefix. A whole-script `contains` early-return
+    // would skip the rewrite and leave the leading `create view`
+    // unchanged, which is not idempotent against a surviving view.
+    let script = "create view public.v_with_literal as\n\
+                  SELECT 'CREATE OR REPLACE VIEW pretend.v AS SELECT 1' AS payload;\n\n";
+    let rewritten = rewrite_create_view_to_create_or_replace(script);
+    assert!(
+        rewritten.starts_with("CREATE OR REPLACE VIEW public.v_with_literal as\n"),
+        "leading `create view` must be rewritten even when the body \
+         contains the same phrase as a string literal: {}",
+        rewritten
+    );
+    // Already in the desired form — return unchanged (no double rewrite).
+    let already = "CREATE OR REPLACE VIEW public.v as\nSELECT 1;\n";
+    assert_eq!(rewrite_create_view_to_create_or_replace(already), already);
+}
+
+#[tokio::test]
+async fn issue189_view_definition_with_create_or_replace_literal_is_recreated() {
+    // End-to-end pin for the PR #195 reviewer concern: a view whose
+    // definition embeds the literal text `CREATE OR REPLACE VIEW` must
+    // still emit a properly idempotent `CREATE OR REPLACE VIEW` prefix
+    // when Phase 7 re-emits it after a CASCADE drop.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let definition = " SELECT test_deps.compute(value) AS c,\n        \
+                      'CREATE OR REPLACE VIEW evil.v AS SELECT 1' AS payload\n   \
+                      FROM test_deps.items;";
+    let mut from_view = View::new(
+        "v_things".to_string(),
+        definition.to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    from_view.hash();
+    let mut to_view = View::new(
+        "v_things".to_string(),
+        definition.to_string(),
+        "test_deps".to_string(),
+        vec!["test_deps.items".to_string()],
+    );
+    to_view.hash();
+    from_dump.views.push(from_view);
+    to_dump.views.push(to_view);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("CREATE OR REPLACE VIEW test_deps.v_things"),
+        "view recreate must emit `CREATE OR REPLACE VIEW` at the leading \
+         statement even when the body contains the same phrase: {}",
+        script
+    );
+    // The body's literal must survive unchanged — we do NOT want a
+    // rewrite that mangles a non-prefix occurrence.
+    assert!(
+        script.contains("'CREATE OR REPLACE VIEW evil.v AS SELECT 1'"),
+        "literal inside the view body must be left intact: {}",
+        script
+    );
+}
+
+#[tokio::test]
+async fn issue189_view_recreate_skipped_when_routine_unchanged() {
+    // No CASCADE — no recreate. Mirrors
+    // `issue179_recreate_skipped_when_routine_unchanged` for views.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let routine = issue179_compute_routine("integer", "SELECT x * 2;");
+    from_dump.routines.push(routine.clone());
+    to_dump.routines.push(routine);
+
+    from_dump.views.push(issue189_view("v_things", false));
+    to_dump.views.push(issue189_view("v_things", false));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("Recreate dependents dropped by CASCADE"),
+        "no CASCADE drop happened — recreate phase must stay silent: {}",
+        script
+    );
+    assert!(
+        !script.contains("CREATE OR REPLACE VIEW test_deps.v_things"),
+        "view must not be re-emitted when the function is unchanged: {}",
+        script
+    );
+}
+
+// ============================================================
+// Issue #188 — pg_depend-driven secondary dependent restoration
+// ============================================================
+
+use crate::dump::column_dependent::{ColumnDependent, ColumnDependentKind};
+
+/// Phase 7 / Path A: A routine signature change CASCADE-drops a
+/// generated column. PostgreSQL also drops a plain index on that
+/// column *because the index depends on the column, not the routine*.
+/// The text-based scanner cannot see the dependency. The
+/// `column_dependents` graph must drive a recreate of the index.
+#[tokio::test]
+async fn issue188_phase7_restores_plain_index_on_generated_column() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    // Add a plain index ON the generated column (no function reference)
+    // to both sides. PostgreSQL would CASCADE-drop it along with the
+    // column; Phase 7's text scan does not detect this case.
+    let plain_idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "idx_gen_col".to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef: "CREATE INDEX idx_gen_col ON test_deps.items USING btree (gen_col)".to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let mut from_table =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    from_table.indexes.push(plain_idx.clone());
+    from_table.hash();
+    from_dump.tables.push(from_table);
+
+    let mut to_table = issue179_items_table("bigint", "test_deps.compute(0)", "bigint");
+    to_table.indexes.push(plain_idx);
+    to_table.hash();
+    to_dump.tables.push(to_table);
+
+    // pg_depend at dump time recorded that `idx_gen_col` depends on
+    // `gen_col`. Without this, the text scanner has no way to discover
+    // the secondary dependency.
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Index,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "idx_gen_col".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("CREATE INDEX IF NOT EXISTS idx_gen_col ON test_deps.items"),
+        "plain index on generated column must be re-emitted from pg_depend graph: {}",
+        script
+    );
+}
+
+/// Phase 7 / Path A: same idea for a CHECK constraint that references
+/// the generated column but does not name the routine.
+#[tokio::test]
+async fn issue188_phase7_restores_check_constraint_on_generated_column() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let chk_on_col = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "chk_gen_positive".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        // References only the generated column — no function name.
+        definition: Some("CHECK (gen_col > 0)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let mut from_table =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    from_table.constraints.push(chk_on_col.clone());
+    from_table.hash();
+    from_dump.tables.push(from_table);
+
+    let mut to_table = issue179_items_table("bigint", "test_deps.compute(0)", "bigint");
+    to_table.constraints.push(chk_on_col);
+    to_table.hash();
+    to_dump.tables.push(to_table);
+
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "chk_gen_positive".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter table test_deps.items add constraint chk_gen_positive"),
+        "CHECK constraint anchored on generated column must be re-emitted: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_deps.items drop constraint if exists chk_gen_positive;"),
+        "drop-if-exists guard for column-anchored CHECK constraint missing: {}",
+        script
+    );
+}
+
+/// Phase 7 / Path A: TO-side gate. When the dependent is intentionally
+/// removed in TO, we must NOT resurrect it via the pg_depend graph.
+#[tokio::test]
+async fn issue188_phase7_skips_dependent_absent_from_to() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    // FROM has the plain index; TO deliberately omits it.
+    let plain_idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "idx_gen_col".to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef: "CREATE INDEX idx_gen_col ON test_deps.items USING btree (gen_col)".to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let mut from_table =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    from_table.indexes.push(plain_idx);
+    from_table.hash();
+    from_dump.tables.push(from_table);
+
+    // TO-side table does NOT include `idx_gen_col`.
+    to_dump.tables.push(issue179_items_table(
+        "bigint",
+        "test_deps.compute(0)",
+        "bigint",
+    ));
+
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Index,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "idx_gen_col".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("idx_gen_col"),
+        "index absent from TO must not be resurrected from pg_depend: {}",
+        script
+    );
+}
+
+/// Phase 7 / Path A: a UNIQUE/PK constraint and its backing index both
+/// appear in `pg_depend`. The constraint emission already recreates the
+/// index, so the dedup logic must skip the index branch when the same
+/// name exists as a constraint on the TO-side table.
+#[tokio::test]
+async fn issue188_phase7_skips_index_backing_constraint() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let uniq_constraint = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "items_gen_col_key".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "UNIQUE".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("UNIQUE (gen_col)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+    // Backing index has the same name as the constraint.
+    let uniq_idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "items_gen_col_key".to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef: "CREATE UNIQUE INDEX items_gen_col_key ON test_deps.items USING btree (gen_col)"
+            .to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let mut from_table =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    from_table.constraints.push(uniq_constraint.clone());
+    from_table.indexes.push(uniq_idx.clone());
+    from_table.hash();
+    from_dump.tables.push(from_table);
+
+    let mut to_table = issue179_items_table("bigint", "test_deps.compute(0)", "bigint");
+    to_table.constraints.push(uniq_constraint);
+    to_table.indexes.push(uniq_idx);
+    to_table.hash();
+    to_dump.tables.push(to_table);
+
+    // pg_depend records BOTH edges.
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Index,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "items_gen_col_key".to_string(),
+    });
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "items_gen_col_key".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    // The constraint emission must fire …
+    assert!(
+        script.contains("alter table test_deps.items add constraint items_gen_col_key"),
+        "UNIQUE constraint must be re-emitted: {}",
+        script
+    );
+    // … and the backing-index CREATE must NOT also be emitted (the
+    // constraint creates the index implicitly).
+    assert!(
+        !script.contains("CREATE UNIQUE INDEX IF NOT EXISTS items_gen_col_key"),
+        "backing index must be skipped when a same-named constraint emission already recreates it: {}",
+        script
+    );
+}
+
+/// Path B: a STORED → VIRTUAL flip routes the column through the
+/// `DROP COLUMN` + `ADD COLUMN` branch in `TableColumn::get_alter_script`
+/// (issue #181). PostgreSQL CASCADE-drops a plain index attached to the
+/// column. `compare_tables` must walk the column-dependent graph and
+/// emit the recreate.
+#[tokio::test]
+async fn issue188_path_b_virtual_flip_restores_dependent_index() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    let value_col = {
+        let mut c = int_column("test_deps", "items", "value", 1);
+        c.is_nullable = false;
+        c
+    };
+
+    let mut from_gen_col = int_column("test_deps", "items", "gen_col", 2);
+    from_gen_col.data_type = "integer".to_string();
+    from_gen_col.is_generated = "ALWAYS".to_string();
+    from_gen_col.generation_expression = Some("(value * 2)".to_string());
+    from_gen_col.generation_type = Some("s".to_string()); // STORED in FROM
+
+    let mut to_gen_col = from_gen_col.clone();
+    to_gen_col.generation_type = Some("v".to_string()); // VIRTUAL in TO
+
+    let plain_idx = TableIndex {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        name: "idx_gen_col".to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef: "CREATE INDEX idx_gen_col ON test_deps.items USING btree (gen_col)".to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+
+    let mut from_table = Table::new(
+        "test_deps".to_string(),
+        "items".to_string(),
+        "test_deps".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col.clone(), from_gen_col],
+        vec![],
+        vec![plain_idx.clone()],
+        vec![],
+        None,
+    );
+    from_table.hash();
+    from_dump.tables.push(from_table);
+
+    let mut to_table = Table::new(
+        "test_deps".to_string(),
+        "items".to_string(),
+        "test_deps".to_string(),
+        "items".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![value_col, to_gen_col],
+        vec![],
+        vec![plain_idx],
+        vec![],
+        None,
+    );
+    to_table.hash();
+    to_dump.tables.push(to_table);
+
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Index,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "idx_gen_col".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // The drop+add for the column must fire (Path B trigger).
+    assert!(
+        script.contains("drop column"),
+        "STORED→VIRTUAL flip should DROP COLUMN: {}",
+        script
+    );
+    // The recreate block must include the dependent index.
+    assert!(
+        script.contains("Recreate dependents dropped by virtual-column rewrite"),
+        "labeled recreate block must wrap Path B dependents: {}",
+        script
+    );
+    assert!(
+        script.contains("CREATE INDEX IF NOT EXISTS idx_gen_col ON test_deps.items"),
+        "plain index on virtually-recreated column must be re-emitted: {}",
+        script
+    );
+}
+
+/// Phase 7 / Path A: an FK on a *different* table referencing the
+/// generated column on the anchor table. The pg_depend row's
+/// `refobjid` points at the parent table (where the column lives) but
+/// `con.conrelid` points at the child (where the FK lives) — the
+/// `dep_schema`/`dep_table` in `ColumnDependent` must be the child's,
+/// not the anchor's. Locks in correct behaviour for the asymmetric
+/// `conrelid` vs `refobjid` case (PR #196 review).
+#[tokio::test]
+async fn issue188_phase7_restores_fk_on_different_table() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    // Parent table: the standard issue179 items table — gen_col is
+    // the anchor whose CASCADE drop the test exercises.
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)::integer",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table(
+        "bigint",
+        "test_deps.compute(0)",
+        "bigint",
+    ));
+
+    // Child table: separate table whose FK references gen_col on the
+    // parent. The FK's own definition contains no function name; the
+    // text scanner cannot see this dependency. The pg_depend graph
+    // must drive the re-emission.
+    let make_child = |ref_type: &str| {
+        let mut id_col = int_column("test_deps", "items_child", "id", 1);
+        id_col.is_nullable = false;
+
+        let mut ref_col = int_column("test_deps", "items_child", "ref_gen", 2);
+        ref_col.data_type = ref_type.to_string();
+
+        let fk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_deps".to_string(),
+            name: "fk_items_child_ref_gen".to_string(),
+            table_name: "items_child".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(
+                "FOREIGN KEY (ref_gen) REFERENCES test_deps.items (gen_col)".to_string(),
+            ),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut t = Table::new(
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![fk],
+            vec![],
+            vec![],
+            None,
+        );
+        t.hash();
+        t
+    };
+    from_dump.tables.push(make_child("integer"));
+    to_dump.tables.push(make_child("bigint"));
+
+    // Anchor is the parent column (gen_col on items). dep_table is
+    // the *child* (items_child) because the FK constraint's
+    // `conrelid` points at the child, not the parent where the
+    // depended-on column lives.
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items_child".to_string(),
+        dep_name: "fk_items_child_ref_gen".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter table test_deps.items_child add constraint fk_items_child_ref_gen"),
+        "FK on a different table must be re-emitted via pg_depend graph: {}",
+        script
+    );
+    assert!(
+        script.contains(
+            "alter table test_deps.items_child drop constraint if exists fk_items_child_ref_gen;"
+        ),
+        "drop-if-exists guard for cross-table FK missing: {}",
+        script
+    );
+}
+
+/// Phase 7 / Path A: when the anchor column has both a UNIQUE
+/// constraint and an FK on another table referencing it, the FK must
+/// be emitted *after* the UNIQUE constraint — PostgreSQL rejects
+/// `ADD CONSTRAINT … FOREIGN KEY` when the referenced columns lack a
+/// unique constraint. Two-pass ordering in `recreate_column_dependents`.
+#[tokio::test]
+async fn issue188_phase7_emits_fk_after_unique_target() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let uniq_constraint = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "items_gen_col_uniq".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "UNIQUE".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("UNIQUE (gen_col)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let mut from_items =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    from_items.constraints.push(uniq_constraint.clone());
+    from_items.hash();
+    from_dump.tables.push(from_items);
+
+    let mut to_items = issue179_items_table("bigint", "test_deps.compute(0)", "bigint");
+    to_items.constraints.push(uniq_constraint);
+    to_items.hash();
+    to_dump.tables.push(to_items);
+
+    let make_child = |ref_type: &str| {
+        let mut id_col = int_column("test_deps", "items_child", "id", 1);
+        id_col.is_nullable = false;
+        let mut ref_col = int_column("test_deps", "items_child", "ref_gen", 2);
+        ref_col.data_type = ref_type.to_string();
+
+        let fk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_deps".to_string(),
+            name: "fk_items_child_ref_gen".to_string(),
+            table_name: "items_child".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(
+                "FOREIGN KEY (ref_gen) REFERENCES test_deps.items (gen_col)".to_string(),
+            ),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut t = Table::new(
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![fk],
+            vec![],
+            vec![],
+            None,
+        );
+        t.hash();
+        t
+    };
+    from_dump.tables.push(make_child("integer"));
+    to_dump.tables.push(make_child("bigint"));
+
+    // FK first in the column_dependents vec — the helper must defer
+    // it regardless of input order so it lands after the UNIQUE.
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items_child".to_string(),
+        dep_name: "fk_items_child_ref_gen".to_string(),
+    });
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "items_gen_col_uniq".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let uniq_pos = script
+        .find("add constraint items_gen_col_uniq")
+        .expect("UNIQUE constraint must be re-emitted");
+    let fk_pos = script
+        .find("add constraint fk_items_child_ref_gen")
+        .expect("FK constraint must be re-emitted");
+    assert!(
+        uniq_pos < fk_pos,
+        "FK must be emitted AFTER its UNIQUE target; got uniq@{} fk@{}: {}",
+        uniq_pos,
+        fk_pos,
+        script
+    );
+}
+
+/// Regression for the inheritance_child idempotency bug — pgc was
+/// dumping classical-inheritance children with `partition_of` wrongly
+/// set (because `pg_inherits` records both partition and classical
+/// inheritance), which made `column_type_change_forces_recreate` fire
+/// and trigger a wholesale drop+recreate. After migration the
+/// recreated child silently picked up the *current* default
+/// privileges, leaving stray REVOKE statements in the next
+/// `pgc compare` pass.
+///
+/// This test pins down the post-fix invariant: a classical-inheritance
+/// child (`partition_of = None`, `inherits_from = [parent]`) with a
+/// column type change must NOT be flagged for wholesale recreate.
+/// The dump-side fix that produces this shape (filtering
+/// `pg_inherits` joins by `parent.relkind = 'p'`) lives in
+/// `fetch_partition_info_bulk` and cannot be unit-tested without a
+/// live PostgreSQL connection, but the comparer-side gate has its own
+/// expectations and those are what this test enforces.
+#[tokio::test]
+async fn inheritance_child_classical_inheritance_does_not_force_recreate() {
+    let make_inheritance_child = |child_data_type: &str, max_len: Option<i32>| {
+        let mut child_col = int_column("test_deps", "inheritance_child", "child_data", 1);
+        child_col.data_type = child_data_type.to_string();
+        child_col.character_maximum_length = max_len;
+
+        let mut t = Table::new(
+            "test_deps".to_string(),
+            "inheritance_child".to_string(),
+            "test_deps".to_string(),
+            "inheritance_child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![child_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        // Classical inheritance: parent is a regular table; partition_of
+        // stays None, inherits_from carries the parent reference. With
+        // the pre-fix dump query, partition_of would have been
+        // erroneously set here too — that mis-shape is exactly what
+        // this test forbids.
+        t.inherits_from = vec!["test_deps.inheritance_parent".to_string()];
+        t.hash();
+        t
+    };
+
+    let from_table = make_inheritance_child("text", None);
+    let to_table = make_inheritance_child("character varying", Some(255));
+
+    // The comparer-side predicate must NOT classify this column change
+    // as a wholesale recreate. PostgreSQL accepts in-place
+    // `ALTER TABLE … ALTER COLUMN child_data TYPE varchar(255)` on a
+    // classical-inheritance child, and dropping the child wholesale
+    // would leak default-privilege grants onto the recreated table.
+    assert!(
+        !from_table.will_be_dropped_and_recreated(&to_table),
+        "classical-inheritance child with column type change must NOT \
+         be flagged for wholesale recreate (partition_of: {:?}, \
+         inherits_from: {:?})",
+        from_table.partition_of,
+        from_table.inherits_from,
+    );
+
+    // Sanity counter-test: same column change on a real partition
+    // child (partition_of = Some, inherits_from = []) SHOULD force
+    // wholesale recreate — PG forbids in-place type changes on
+    // partition-key columns and partition-inherited columns.
+    let mut from_partition_child = make_inheritance_child("text", None);
+    from_partition_child.inherits_from = Vec::new();
+    from_partition_child.partition_of = Some("test_deps.parent_partitioned".to_string());
+    let mut to_partition_child = make_inheritance_child("character varying", Some(255));
+    to_partition_child.inherits_from = Vec::new();
+    to_partition_child.partition_of = Some("test_deps.parent_partitioned".to_string());
+    assert!(
+        from_partition_child.will_be_dropped_and_recreated(&to_partition_child),
+        "real partition child with column type change MUST be flagged \
+         for wholesale recreate"
+    );
+}
+
+/// Issue #191: a mutual FK cycle (`A → B` and `B → A`) flipping
+/// persistence in the same direction has NO valid SET LOGGED|UNLOGGED
+/// order — `SET UNLOGGED A` requires B to already be UNLOGGED and
+/// vice versa. Pre-fix `kahn_toposort`'s fallback appended cyclic
+/// nodes alphabetically, the migration emitted the SETs in that
+/// order, and PostgreSQL rejected the second SET at apply time with
+/// the same `could not change table … to logged/unlogged` error
+/// issue #180 was meant to eliminate. Fix: detect the cycle, drop
+/// every FK whose endpoints both sit in the cyclic set BEFORE the
+/// SETs, then re-add them from their TO definitions AFTER. The
+/// post-fix migration is therefore: DROP cycle FKs → SET both
+/// (any order) → ADD cycle FKs.
+#[tokio::test]
+async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
+    fn make_cycle_table(name: &str, is_unlogged: bool, fk: (&str, &str, &str)) -> Table {
+        let (fk_col, target_schema, target_table) = fk;
+
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+
+        let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+        ref_col.is_nullable = true;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        // Deferrable FK — PostgreSQL only permits mutual FK cycles
+        // when both FKs are deferrable; without DEFERRABLE the cycle
+        // can't be inserted/seeded in the first place.
+        let fk_constraint = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: true,
+            initially_deferred: true,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut table = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![pk, fk_constraint],
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    // FROM: both LOGGED, mutual deferrable FKs.
+    // TO:   both UNLOGGED, same FKs (live edges — unchanged).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(make_cycle_table("a", false, ("b_id", "test_cycle", "b")));
+    from_dump
+        .tables
+        .push(make_cycle_table("b", false, ("a_id", "test_cycle", "a")));
+    to_dump
+        .tables
+        .push(make_cycle_table("a", true, ("b_id", "test_cycle", "b")));
+    to_dump
+        .tables
+        .push(make_cycle_table("b", true, ("a_id", "test_cycle", "a")));
+
+    // `use_drop=true` — this test validates the *active* cycle-break
+    // path (drops and re-adds emitted live). The `use_drop=false`
+    // semantics are covered separately by
+    // `issue191_pr198_use_drop_false_comments_out_cycle_break`.
+    // PR #198 review: an earlier revision used `use_drop=false` here
+    // and the substring-based `script.find` assertions were
+    // false-positives — they matched the commented-out `-- alter
+    // table … drop constraint …` lines and never actually verified
+    // the live path.
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Cycle-break banner must appear so the choice is loud.
+    assert!(
+        script.contains("Persistence-flip FK cycle (issue #191)"),
+        "cycle banner must mark the drop+SET+add block: {}",
+        script
+    );
+
+    // Both cycle FKs must be dropped BEFORE either SET UNLOGGED.
+    // Anchor each `find` to a leading newline so the assertion
+    // distinguishes the live statement from a commented `-- alter
+    // table …` prefix — this is the PR #198 review fix.
+    let drop_a_pos = script
+        .find("\nalter table test_cycle.a drop constraint a_b_id_fkey;")
+        .expect("FK a_b_id_fkey must be dropped before SET (live, not commented)");
+    let drop_b_pos = script
+        .find("\nalter table test_cycle.b drop constraint b_a_id_fkey;")
+        .expect("FK b_a_id_fkey must be dropped before SET (live, not commented)");
+    assert!(
+        !script.contains("-- alter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
+    assert!(
+        !script.contains("-- alter table test_cycle.b drop constraint b_a_id_fkey;"),
+        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
+    let set_a_pos = script
+        .find("\nalter table test_cycle.a set unlogged;")
+        .expect("a SET UNLOGGED must be emitted");
+    let set_b_pos = script
+        .find("\nalter table test_cycle.b set unlogged;")
+        .expect("b SET UNLOGGED must be emitted");
+    assert!(
+        drop_a_pos < set_a_pos && drop_a_pos < set_b_pos,
+        "FK a_b_id_fkey drop must precede every SET: drop@{} a@{} b@{}\n{}",
+        drop_a_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+    assert!(
+        drop_b_pos < set_a_pos && drop_b_pos < set_b_pos,
+        "FK b_a_id_fkey drop must precede every SET: drop@{} a@{} b@{}\n{}",
+        drop_b_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+
+    // Both cycle FKs must be re-added AFTER every SET so the post-
+    // migration state matches TO. PR #198 review: the re-emit path
+    // now goes through `TableConstraint::get_script()`, which
+    // lowercases SQL keywords outside literals — match on the
+    // lowercase form. The newline anchor again separates live ADDs
+    // from any `-- alter table … add constraint …` form.
+    let add_a_pos = script
+        .find("\nalter table test_cycle.a add constraint a_b_id_fkey foreign key")
+        .expect("FK a_b_id_fkey must be re-added after SET (live, not commented)");
+    let add_b_pos = script
+        .find("\nalter table test_cycle.b add constraint b_a_id_fkey foreign key")
+        .expect("FK b_a_id_fkey must be re-added after SET (live, not commented)");
+    assert!(
+        !script.contains("-- alter table test_cycle.a add constraint a_b_id_fkey"),
+        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
+    assert!(
+        !script.contains("-- alter table test_cycle.b add constraint b_a_id_fkey"),
+        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
+    assert!(
+        add_a_pos > set_a_pos && add_a_pos > set_b_pos,
+        "FK a_b_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
+        add_a_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+    assert!(
+        add_b_pos > set_a_pos && add_b_pos > set_b_pos,
+        "FK b_a_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
+        add_b_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+}
+
+/// Issue #191 counter-test: an acyclic FK chain (no cycle) must NOT
+/// emit cycle-break drops/re-adds. Locks the cycle path to only the
+/// cycle case so we don't regress and start dropping FKs on every
+/// persistence flip.
+#[tokio::test]
+async fn issue191_persistence_flip_acyclic_chain_does_not_drop_fks() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", false, None));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        false,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+    to_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", true, None));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        true,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("Persistence-flip FK cycle"),
+        "acyclic chain must not trip the cycle-break path: {}",
+        script
+    );
+    assert!(
+        !script.contains("drop constraint child_parent_id_fkey"),
+        "live FK on an acyclic chain must not be dropped: {}",
+        script
+    );
+}
+
+/// Issue #191 / PR #198 review: when a cycle exists alongside an
+/// edge that's *blocked by* the cycle but not in it (e.g. `A ↔ B`
+/// plus `A → C` from outside the cycle, with all three flipping
+/// persistence in the same direction), Kahn's "couldn't-be-ordered"
+/// remainder includes C — even though C is not part of any directed
+/// cycle. Pre-refinement the comparer treated the entire remainder
+/// as cycle participants and dropped the `A → C` FK alongside the
+/// true cycle edges, making the migration more destructive than
+/// needed. Tarjan's SCC narrows the cycle set to nodes in
+/// strongly-connected components of size >= 2, so only the true
+/// cycle edges get dropped.
+#[tokio::test]
+async fn issue191_pr198_cycle_detection_excludes_blocked_non_cycle_nodes() {
+    fn build(name: &str, is_unlogged: bool, fk: Option<(&str, &str, &str)>) -> Table {
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut constraints = vec![pk];
+        let mut columns = vec![id_col];
+
+        if let Some((fk_col, target_schema, target_table)) = fk {
+            let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+            ref_col.is_nullable = true;
+            columns.push(ref_col);
+            constraints.push(TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "test_cycle".to_string(),
+                name: format!("{name}_{fk_col}_fkey"),
+                table_name: name.to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: true,
+                initially_deferred: true,
+                definition: Some(format!(
+                    "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+                )),
+                coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
+                comment: None,
+            });
+        }
+
+        let mut t = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            columns,
+            constraints,
+            vec![],
+            vec![],
+            None,
+        );
+        t.is_unlogged = is_unlogged;
+        t.hash();
+        t
+    }
+
+    // Build three tables:
+    //   a ↔ b   (cycle: a → b and b → a)
+    //   a → c   (non-cycle: a depends on c, but c does not depend on a)
+    // All three flip LOGGED → UNLOGGED. The cycle set is {a, b}; the
+    // FK `a_c_id_fkey` is NOT in any cycle and must survive the
+    // cycle break.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM: all LOGGED. `a` has TWO FKs: a → b (cycle), a → c (not).
+    let mut a_from = build("a", false, Some(("b_id", "test_cycle", "b")));
+    a_from.columns.push({
+        let mut c_id = int_column("test_cycle", "a", "c_id", 3);
+        c_id.is_nullable = true;
+        c_id
+    });
+    a_from.constraints.push(TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_cycle".to_string(),
+        name: "a_c_id_fkey".to_string(),
+        table_name: "a".to_string(),
+        constraint_type: "FOREIGN KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("FOREIGN KEY (c_id) REFERENCES test_cycle.c(id)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    });
+    a_from.hash();
+    from_dump.tables.push(a_from);
+    from_dump
+        .tables
+        .push(build("b", false, Some(("a_id", "test_cycle", "a"))));
+    from_dump.tables.push(build("c", false, None));
+
+    // TO: all UNLOGGED. Same constraint shapes.
+    let mut a_to = build("a", true, Some(("b_id", "test_cycle", "b")));
+    a_to.columns.push({
+        let mut c_id = int_column("test_cycle", "a", "c_id", 3);
+        c_id.is_nullable = true;
+        c_id
+    });
+    a_to.constraints.push(TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_cycle".to_string(),
+        name: "a_c_id_fkey".to_string(),
+        table_name: "a".to_string(),
+        constraint_type: "FOREIGN KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("FOREIGN KEY (c_id) REFERENCES test_cycle.c(id)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    });
+    a_to.hash();
+    to_dump.tables.push(a_to);
+    to_dump
+        .tables
+        .push(build("b", true, Some(("a_id", "test_cycle", "a"))));
+    to_dump.tables.push(build("c", true, None));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Cycle banner must appear (a↔b cycle is present).
+    assert!(
+        script.contains("Persistence-flip FK cycle (issue #191)"),
+        "cycle banner must appear for the a↔b cycle: {}",
+        script
+    );
+    // True cycle FKs must be dropped.
+    assert!(
+        script.contains("alter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "true cycle FK a_b_id_fkey must be dropped: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_cycle.b drop constraint b_a_id_fkey;"),
+        "true cycle FK b_a_id_fkey must be dropped: {}",
+        script
+    );
+    // The non-cycle FK (a → c) is merely *blocked by* the cycle in
+    // Kahn's remainder but is not part of any directed cycle. With
+    // SCC-based detection it must NOT be dropped.
+    assert!(
+        !script.contains("drop constraint a_c_id_fkey"),
+        "non-cycle FK a_c_id_fkey (a → c) must NOT be dropped: {}",
+        script
+    );
+}
+
+/// Issue #191 / PR #198 review: when `use_drop=false`, the cycle-
+/// break drops and re-adds must be commented out, with a loud banner
+/// explaining that the SETs will fail without manual intervention.
+/// The user has explicitly asked the comparer to surface destructive
+/// statements for review rather than emit them live.
+#[tokio::test]
+async fn issue191_pr198_use_drop_false_comments_out_cycle_break() {
+    fn make_cycle_table(name: &str, is_unlogged: bool, fk: (&str, &str, &str)) -> Table {
+        let (fk_col, target_schema, target_table) = fk;
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+        let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+        ref_col.is_nullable = true;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+        let fk_constraint = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: true,
+            initially_deferred: true,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut table = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![pk, fk_constraint],
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(make_cycle_table("a", false, ("b_id", "test_cycle", "b")));
+    from_dump
+        .tables
+        .push(make_cycle_table("b", false, ("a_id", "test_cycle", "a")));
+    to_dump
+        .tables
+        .push(make_cycle_table("a", true, ("b_id", "test_cycle", "b")));
+    to_dump
+        .tables
+        .push(make_cycle_table("b", true, ("a_id", "test_cycle", "a")));
+
+    // use_drop=false — drops and re-adds must be commented out.
+    // `use_comments=true` so the banner and commented-out lines
+    // survive `get_script`'s output (which strips comments under
+    // `use_comments=false`).
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Loud banner specifically calls out use_drop=false semantics.
+    assert!(
+        script.contains("use_drop=false"),
+        "banner must mention use_drop=false: {}",
+        script
+    );
+    // DROP CONSTRAINT lines must be commented out (i.e. they appear
+    // only as `-- alter table ... drop constraint ...;`).
+    assert!(
+        !script.contains("\nalter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "live DROP CONSTRAINT must NOT be emitted under use_drop=false: {}",
+        script
+    );
+    assert!(
+        script.contains("-- alter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "commented DROP CONSTRAINT must be emitted under use_drop=false: {}",
+        script
+    );
+    // ADD CONSTRAINT lines must also be commented out so re-running
+    // with use_drop=true after manual review produces a clean diff.
+    assert!(
+        !script.contains("\nalter table test_cycle.a add constraint a_b_id_fkey foreign key"),
+        "live ADD CONSTRAINT must NOT be emitted under use_drop=false: {}",
+        script
+    );
+    assert!(
+        script.contains("-- alter table test_cycle.a add constraint a_b_id_fkey foreign key"),
+        "commented ADD CONSTRAINT must be emitted under use_drop=false: {}",
+        script
+    );
+    // SET statements are NOT destructive and stay live, matching how
+    // SETs are handled elsewhere when use_drop=false (the cycle case
+    // is highlighted by the banner above).
+    assert!(
+        script.contains("alter table test_cycle.a set unlogged;"),
+        "SET UNLOGGED must remain live under use_drop=false: {}",
+        script
+    );
+}
+
+/// Issue #191 / PR #198 review: the cycle-break re-emit path goes
+/// through `TableConstraint::get_script()`, which appends
+/// `COMMENT ON CONSTRAINT ...` when the FK has a comment. Verify
+/// the comment survives the drop+SET+re-add round-trip — i.e. the
+/// emitted re-add carries the `comment on constraint` clause from
+/// the TO-side metadata so the post-migration schema matches TO.
+#[tokio::test]
+async fn issue191_pr198_cycle_fk_comment_survives_round_trip() {
+    fn cycle_table_with_comment(name: &str, is_unlogged: bool, fk: (&str, &str, &str)) -> Table {
+        let (fk_col, target_schema, target_table) = fk;
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+        let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+        ref_col.is_nullable = true;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+        let fk_constraint = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: true,
+            initially_deferred: true,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: Some(format!("FK {name} → {target_table} (cycle annotated)")),
+        };
+
+        let mut table = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![pk, fk_constraint],
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(cycle_table_with_comment(
+        "a",
+        false,
+        ("b_id", "test_cycle", "b"),
+    ));
+    from_dump.tables.push(cycle_table_with_comment(
+        "b",
+        false,
+        ("a_id", "test_cycle", "a"),
+    ));
+    to_dump.tables.push(cycle_table_with_comment(
+        "a",
+        true,
+        ("b_id", "test_cycle", "b"),
+    ));
+    to_dump.tables.push(cycle_table_with_comment(
+        "b",
+        true,
+        ("a_id", "test_cycle", "a"),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // The re-add must include the `comment on constraint` clause —
+    // proof that the cycle-break path round-trips full
+    // `TableConstraint` metadata via `get_script()`, not just the
+    // raw `(schema, table, name, definition)` tuple.
+    assert!(
+        script.contains(
+            "comment on constraint a_b_id_fkey on test_cycle.a is 'FK a → b (cycle annotated)';"
+        ),
+        "FK comment on a_b_id_fkey must be re-emitted after the SET: {}",
+        script
+    );
+    assert!(
+        script.contains(
+            "comment on constraint b_a_id_fkey on test_cycle.b is 'FK b → a (cycle annotated)';"
+        ),
+        "FK comment on b_a_id_fkey must be re-emitted after the SET: {}",
+        script
     );
 }

@@ -1,3 +1,315 @@
+2026-05-15      v1.0.21
+
+                Bug fixes:
+                    - Fixed issue #191 (persistence-ordering silently
+                      emits arbitrary order on FK cycles). A mutual
+                      FK cycle (`A → B` and `B → A`, valid in
+                      PostgreSQL when both FKs are deferrable)
+                      flipping persistence in the same direction has
+                      no valid SET LOGGED|UNLOGGED order —
+                      `SET UNLOGGED A` requires B to already be
+                      UNLOGGED and vice versa. Pre-fix
+                      `kahn_toposort`'s fallback silently appended
+                      cyclic nodes in alphabetical order, the
+                      migration emitted the SETs in that order, and
+                      PostgreSQL rejected the second SET at apply
+                      time with the same `could not change table …
+                      to logged/unlogged` error issue #180 was meant
+                      to eliminate. Added
+                      `kahn_toposort_detect_cycle` returning both
+                      the deterministic order and the set of
+                      nodes whose in-degree never hit zero; threaded
+                      that signal through
+                      `topo_order_within_subset_detect_cycle` (the
+                      now-only variant — the cycle-blind wrapper was
+                      removed since both call sites in
+                      `emit_persistence_changes` care about cycles).
+                      Adjacency build now also records every
+                      `(referrer, target) → TableConstraint` edge
+                      so the cycle-break can find the underlying FK
+                      objects to drop. When a cycle is present in
+                      either SET direction the phase now emits a
+                      labeled banner, drops every FK whose endpoints
+                      sit in the cyclic set BEFORE the SET
+                      statements, runs the SETs (their order no
+                      longer matters because the cycle is broken),
+                      and re-emits the FKs from their TO-side
+                      definitions AFTER the SETs — the same
+                      drop-and-recreate pattern PostgreSQL itself
+                      recommends for migrations across deferrable
+                      cycles. Two new tests:
+                      `issue191_persistence_flip_breaks_mutual_fk_cycle`
+                      builds a 2-table deferrable cycle in
+                      `test_cycle`, flips both LOGGED → UNLOGGED,
+                      and asserts the script emits the cycle
+                      banner, drops both FKs before any SET, runs
+                      both SETs, and re-adds both FKs after; a
+                      counter-test
+                      (`issue191_persistence_flip_acyclic_chain_does_not_drop_fks`)
+                      locks the cycle path to actual cycles so
+                      we don't regress and start dropping FKs on
+                      every persistence flip. Companion integration
+                      fixture `test_order.cycle_a` /
+                      `test_order.cycle_b` with mutual
+                      `DEFERRABLE INITIALLY DEFERRED` FKs added to
+                      `data/test/schema_a.sql` /
+                      `data/test/schema_b.sql` so the round-trip
+                      under CI exercises the real
+                      `pg_get_constraintdef` deparser output (the
+                      drop+SET+re-add path against actual PG, not
+                      just the unit-test's assumed string shape).
+                      Per PR #198 review feedback: (a) narrowed
+                      the cycle set to Tarjan SCCs of size >= 2 —
+                      the raw `kahn_toposort_detect_cycle`
+                      remainder also catches nodes *blocked by* a
+                      cycle (e.g. `C` in `A↔B + A→C`), so dropping
+                      every remainder edge was more destructive
+                      than needed; added iterative
+                      `strongly_connected_components` (Tarjan,
+                      work-stack form to avoid recursion-stack
+                      blow-up) and the
+                      `topo_order_within_subset_detect_cycle` now
+                      narrows the cyclic set via SCCs before
+                      returning. (b) The cycle re-emit path now
+                      stores `TableConstraint` clones (not
+                      `(schema, table, name, definition)` tuples)
+                      and re-emits via
+                      `TableConstraint::get_script()` — preserving
+                      `COMMENT ON CONSTRAINT` and any other
+                      metadata `get_script()` carries that the raw
+                      definition string doesn't. (c) Gated the
+                      cycle-break drops AND re-adds behind
+                      `use_drop`: when `use_drop=false` the phase
+                      emits a loud banner explaining the cycle
+                      requires manual intervention (the SETs that
+                      follow will fail at apply time without the
+                      drops) and comments out the drop and add
+                      lines, matching how the rest of the file
+                      honours `use_drop=false`. Three additional
+                      regression tests:
+                      `issue191_pr198_cycle_detection_excludes_blocked_non_cycle_nodes`
+                      builds `A↔B + A→C` and asserts the non-
+                      cycle `A→C` FK is NOT dropped;
+                      `issue191_pr198_use_drop_false_comments_out_cycle_break`
+                      asserts the banner mentions `use_drop=false`,
+                      drops/re-adds are commented, SETs stay live;
+                      `issue191_pr198_cycle_fk_comment_survives_round_trip`
+                      attaches a comment to each cycle FK and
+                      verifies the re-emitted `COMMENT ON
+                      CONSTRAINT` clause survives the drop+SET+
+                      re-add sandwich.
+
+                    - Fixed issue #190 (persistence-ordering FK
+                      adjacency misses unqualified FK targets in
+                      `pg_get_constraintdef` output).
+                      `Comparer::emit_persistence_changes`
+                      (PR #184 / issue #180) builds an FK adjacency
+                      across TO-side tables by parsing each FK
+                      constraint's deparsed definition with
+                      `parse_fk_referenced_table`. The parser
+                      returned `None` when the referenced
+                      identifier was unqualified — and
+                      `pg_get_constraintdef` routinely emits
+                      `REFERENCES table(col)` without the schema
+                      prefix when the target is reachable via
+                      `search_path` (typically the `public`
+                      schema). The missing edge dropped the FK
+                      from the adjacency and the SET LOGGED /
+                      SET UNLOGGED order fell back to alphabetical,
+                      which PostgreSQL rejects with the
+                      `could not change table … to logged/unlogged`
+                      error whenever a referencing table sorts
+                      before the referenced one (`child` <
+                      `parent`). CI never caught it because every
+                      FK-chain fixture lives in an explicit
+                      `test_order` schema. Added an `owner_schema`
+                      parameter to `parse_fk_referenced_table` and
+                      a fallback that resolves an unqualified
+                      target as `(owner_schema, target)` — the
+                      simplest and commonest case where the FK
+                      target lives in the same schema as the FK
+                      itself; the call site in
+                      `emit_persistence_changes` now threads
+                      `&to_table.schema` through. Two new tests:
+                      a unit test that pins the parser fallback
+                      (qualified target still wins; unqualified
+                      target with quoted/mixed-case owner schema
+                      resolves correctly; trailing
+                      `ON DELETE CASCADE` clauses don't confuse
+                      the boundary scan) and an end-to-end test
+                      that builds a `public.child → public.parent`
+                      FK chain with unqualified `REFERENCES
+                      parent(id)` definitions, flips both tables
+                      LOGGED → UNLOGGED, and asserts the child
+                      SET UNLOGGED is emitted BEFORE the parent.
+                      Companion integration fixture
+                      `public.persistence_chain_parent` /
+                      `public.persistence_chain_child` added to
+                      `data/test/schema_a.sql` /
+                      `data/test/schema_b.sql` so the real
+                      `pg_get_constraintdef` deparser path is
+                      exercised under CI (the role's default
+                      `search_path` of `"$user", public` is what
+                      causes PG to omit the qualifier — every
+                      pre-existing FK-chain fixture lives in an
+                      explicit `test_order` schema where the
+                      qualifier is always emitted, which is why CI
+                      hadn't caught this).
+                      Known limitation documented in the parser's
+                      doc comment: dump-time per-role /
+                      per-database `search_path` settings beyond
+                      the owner schema are not captured, so an FK
+                      that references a `public` table from a
+                      non-`public` schema with `public` on the
+                      search_path will still escape this fallback;
+                      capturing that would require new dump-side
+                      state and is left for a follow-up.
+
+                    - Fixed a non-idempotent migration affecting
+                      classical-inheritance children
+                      (`CREATE TABLE … INHERITS (parent)`). The
+                      dump-side partition-info query
+                      (`fetch_partition_info_bulk` in `dump/table.rs`)
+                      joined `pg_inherits` without filtering by the
+                      parent's `relkind`, so classical-inheritance
+                      children landed with `partition_of` set to
+                      their parent — the same shape a true partition
+                      child has. That mis-classification flowed into
+                      `column_type_change_forces_recreate`, which
+                      drop+recreated the child for any in-place
+                      `ALTER COLUMN TYPE` change. The recreated
+                      table silently inherited the current default
+                      privileges (`ALTER DEFAULT PRIVILEGES IN
+                      SCHEMA …`), so a second `pgc compare` after
+                      applying the migration produced stray
+                      `REVOKE … ON TABLE child FROM grantee`
+                      statements — the migration was not idempotent.
+                      Added an `AND p.relkind = 'p'` predicate to
+                      the `LEFT JOIN pg_class p ON p.oid =
+                      i.inhparent` join so only declarative-
+                      partition parents contribute to `partition_of`;
+                      classical-inheritance parents continue to flow
+                      through the already-correct `inherits_from`
+                      collection, which filters on
+                      `pg_partitioned_table` from the opposite
+                      direction. Added a regression unit test that
+                      builds a Table with `partition_of=None`,
+                      `inherits_from=[parent]` and asserts
+                      `will_be_dropped_and_recreated` returns false
+                      for an in-place column type change, plus a
+                      sanity counter-test that a true partition
+                      child still forces wholesale recreate.
+
+                    - Fixed issue #188 (Phase 7 doesn't restore
+                      secondary dependents of CASCADE-dropped
+                      objects). When `DROP FUNCTION ... CASCADE`
+                      removed a generated column whose expression
+                      referenced the routine, PostgreSQL also
+                      silently dropped every index / FK / CHECK /
+                      EXCLUDE constraint / RLS policy attached to
+                      the column. Phase 7's text-based scanner only
+                      matched dependents whose own definition
+                      named the routine, so column-anchored
+                      secondary dependents were left missing until
+                      a second `pgc compare` run noticed the drift.
+                      The same gap existed for
+                      `TableColumn::get_alter_script`'s
+                      virtual-generated-column drop+add path
+                      (issue #181 / PR #186). Captured the relevant
+                      slice of `pg_catalog.pg_depend` at dump time
+                      into a new `Dump::column_dependents` field
+                      (additive, `#[serde(default)]` for backward
+                      compat with older dumps), populated by a
+                      three-branch UNION over pg_depend joined
+                      against pg_class / pg_constraint / pg_policy.
+                      Added `Comparer::recreate_column_dependents`
+                      which walks the graph for a given anchor
+                      column and re-emits each TO-side dependent
+                      via the existing `*_recreate_block` helpers,
+                      with a TO-side gate, partition-child guard,
+                      and dedup so a UNIQUE/PK constraint's backing
+                      index is not double-emitted. Wired it into
+                      Phase 7's generated-column branch and into
+                      `compare_tables` after the table alter for
+                      columns that route through the
+                      `needs_full_recreate` branch (new
+                      `TableColumn::would_drop_and_re_add`
+                      predicate), the latter wrapped in a labeled
+                      `/* Recreate dependents dropped by
+                      virtual-column rewrite */` block. Per PR #196
+                      review feedback: (a) made
+                      `would_drop_and_re_add` the single source of
+                      truth — `get_alter_script` now calls the
+                      predicate instead of re-deriving the boolean,
+                      so Path B detection cannot drift from the
+                      emission site; (b) replaced the brittle
+                      `alter_script.contains("drop table if exists")`
+                      substring-sniff in `compare_tables` with a new
+                      `Table::will_be_dropped_and_recreated`
+                      predicate that `build_alter_script` itself uses
+                      via the shared
+                      `column_type_change_forces_recreate` helper —
+                      one authoritative decision point for both the
+                      grants `recreated_tables` flag and the Path B
+                      column-dependent gate; (c) added FK coverage
+                      to lock in the asymmetric `conrelid` vs
+                      `refobjid` case (FK on a different table
+                      referencing the anchor column) plus two-pass
+                      ordering in `recreate_column_dependents` so
+                      FKs always emit after any UNIQUE/PK target on
+                      the same column. New
+                      `cascade_col_dep_items` /
+                      `cascade_col_dep_children` fixtures in
+                      `data/test/schema_a.sql` / `schema_b.sql`
+                      cover a plain index, CHECK constraint, UNIQUE
+                      constraint, and cross-table FK anchored on a
+                      CASCADE-dropped generated column.
+
+                    - Fixed issue #189 (Phase 7 doesn't recreate
+                      views silently dropped by `DROP FUNCTION ...
+                      CASCADE`). PR #183's Phase 7 restored functional
+                      indexes, CHECK constraints, generated columns,
+                      column DEFAULTs, and RLS policies after a
+                      CASCADE drop, but skipped views — a view whose
+                      definition referenced the cascaded routine and
+                      was byte-identical between FROM and TO had its
+                      hash matched in
+                      `compare_routines_and_views`, was never
+                      re-emitted, and disappeared from the database
+                      until a second `pgc compare` run noticed the
+                      drift. Extended
+                      `Comparer::recreate_routine_dependents` with a
+                      view scan that runs `definition_references_any`
+                      over `from_view.definition`, applies the same
+                      TO-side gate (PR #186) against
+                      `to_view.definition` so views already rewritten
+                      by another phase are left alone, and skips views
+                      already present in `dropped_views` (Phase 5
+                      handles those via the drop-and-recreate path).
+                      Regular views emit `CREATE OR REPLACE VIEW`
+                      (idempotent: no-op if the view survived CASCADE,
+                      a real create if it did not); materialized views
+                      emit `CREATE MATERIALIZED VIEW IF NOT EXISTS`
+                      for the same reason — Phase 7's text-based
+                      matcher can false-positive on a view that
+                      PostgreSQL never actually dropped, and an
+                      unconditional CREATE would fail against a
+                      surviving view.
+
+                Enhancements:
+                    - Resolved issue #192 (separate tests into
+                      `_tests.rs` files): every dump/, comparer/,
+                      config/, and utils/ source file that used to
+                      embed `#[cfg(test)] mod tests { ... }` at the
+                      bottom now declares a sibling test module via
+                      `#[cfg(test)] #[path = "<name>_tests.rs"] mod
+                      tests;`, with the test bodies moved verbatim
+                      into the new `<name>_tests.rs` files. This
+                      matches the existing convention already used
+                      by `comparer/core.rs` and `comparer/core_tests.rs`
+                      and keeps production code files readable
+                      without changing what `cargo test` runs.
+
 2026-05-14      v1.0.20
 
                 Bug fixes:

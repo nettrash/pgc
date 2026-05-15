@@ -1,5 +1,6 @@
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
+use crate::dump::column_dependent::ColumnDependentKind;
 use crate::dump::table_column::TableColumn;
 use crate::dump::table_constraint::TableConstraint;
 use crate::dump::table_index::TableIndex;
@@ -449,6 +450,31 @@ impl Comparer {
         depends_on: &[HashSet<usize>],
         sort_key: impl Fn(usize) -> K,
     ) -> Vec<usize> {
+        Self::kahn_toposort_detect_cycle(n, depends_on, sort_key).0
+    }
+
+    /// Like [`kahn_toposort`], but also returns the set of nodes that
+    /// could not be ordered acyclically — i.e. nodes whose in-degree
+    /// never reached zero during the BFS. Those nodes still appear in
+    /// the returned `Vec` (appended in `sort_key` order so the result
+    /// is deterministic for callers that don't care about cycles), but
+    /// the second return value lets a caller act on the cycle —
+    /// `emit_persistence_changes` uses it to drop FKs that form a
+    /// SET-ordering deadlock and re-add them after the SET statements
+    /// (issue #191).
+    ///
+    /// **Important**: the returned cyclic set contains every node
+    /// Kahn was unable to remove — that includes nodes *blocked by*
+    /// a cycle (e.g. `C` in `A↔B + A→C`), not only nodes *in* a
+    /// cycle. Callers that need to act on *true* cycle members
+    /// should pair this with [`strongly_connected_components`] —
+    /// `topo_order_within_subset_detect_cycle` does exactly that
+    /// (PR #198 review).
+    fn kahn_toposort_detect_cycle<K: Ord>(
+        n: usize,
+        depends_on: &[HashSet<usize>],
+        sort_key: impl Fn(usize) -> K,
+    ) -> (Vec<usize>, HashSet<usize>) {
         let mut in_degree: Vec<usize> = depends_on.iter().map(|d| d.len()).collect();
         let mut reverse_adj: Vec<Vec<usize>> = vec![vec![]; n];
         for (i, deps) in depends_on.iter().enumerate() {
@@ -477,14 +503,113 @@ impl Comparer {
             queue.extend(newly_free);
         }
 
+        let mut cyclic: HashSet<usize> = HashSet::new();
         if sorted.len() < n {
             let in_sorted: HashSet<usize> = sorted.iter().copied().collect();
             let mut remaining: Vec<usize> = (0..n).filter(|i| !in_sorted.contains(i)).collect();
             remaining.sort_by_key(|a| sort_key(*a));
+            cyclic.extend(remaining.iter().copied());
             sorted.extend(remaining);
         }
 
-        sorted
+        (sorted, cyclic)
+    }
+
+    /// Tarjan's strongly-connected-components algorithm, iterative
+    /// form to avoid stack overflow on adversarial graphs. Returns
+    /// each SCC as a `Vec<usize>` of node indices into the same
+    /// `0..n` space `depends_on` uses. Singleton SCCs (size 1) are
+    /// included; callers that want *cycle* membership specifically
+    /// should keep only SCCs of size >= 2 (self-loops never occur
+    /// in the FK-adjacency call site, which filters `j != i`).
+    ///
+    /// Used by `topo_order_within_subset_detect_cycle` to narrow
+    /// Kahn's "couldn't-be-ordered" remainder down to nodes that
+    /// actually participate in a directed cycle, rather than nodes
+    /// merely *blocked by* one (PR #198 review).
+    fn strongly_connected_components(n: usize, depends_on: &[HashSet<usize>]) -> Vec<Vec<usize>> {
+        // Iterative Tarjan with an explicit work stack. Each work-
+        // stack frame is `(node v, neighbours_remaining: Vec<usize>)`
+        // — a snapshot of v's outgoing edges, popped one at a time so
+        // we can suspend processing of v when we descend into a
+        // neighbour and resume exactly where we left off after the
+        // neighbour's frame finishes. The post-enter book-keeping
+        // (assigning index/lowlink, pushing onto `tarjan_stack`,
+        // marking `on_stack`) runs once per node at the point we
+        // push its frame onto `work` — either in the outer
+        // `for start in 0..n` loop for roots, or in the
+        // `index[w].is_none()` branch for descents.
+        let mut index_counter: usize = 0;
+        let mut tarjan_stack: Vec<usize> = Vec::new();
+        let mut on_stack = vec![false; n];
+        let mut index: Vec<Option<usize>> = vec![None; n];
+        let mut lowlink = vec![0usize; n];
+        let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+        // Each work-stack entry is (v, neighbours_remaining).
+        // `neighbours_remaining` is a `Vec<usize>` snapshot of the
+        // outgoing edges from v, popped one-at-a-time so we can
+        // suspend processing of v when we recurse into a neighbour.
+        let mut work: Vec<(usize, Vec<usize>)> = Vec::new();
+
+        for start in 0..n {
+            if index[start].is_some() {
+                continue;
+            }
+            // Enter `start`.
+            index[start] = Some(index_counter);
+            lowlink[start] = index_counter;
+            index_counter += 1;
+            tarjan_stack.push(start);
+            on_stack[start] = true;
+            work.push((start, depends_on[start].iter().copied().collect()));
+
+            while let Some((v, neighbours)) = work.last_mut() {
+                let v = *v;
+                if let Some(w) = neighbours.pop() {
+                    if index[w].is_none() {
+                        // Recurse into w.
+                        index[w] = Some(index_counter);
+                        lowlink[w] = index_counter;
+                        index_counter += 1;
+                        tarjan_stack.push(w);
+                        on_stack[w] = true;
+                        work.push((w, depends_on[w].iter().copied().collect()));
+                    } else if on_stack[w] {
+                        // Back-edge into the current SCC candidate.
+                        let w_idx = index[w].expect("on_stack implies index is set");
+                        lowlink[v] = lowlink[v].min(w_idx);
+                    }
+                    // Tree-edge to a fully-processed node in a
+                    // different SCC: ignore (don't update lowlink).
+                } else {
+                    // All neighbours exhausted; pop and propagate
+                    // lowlink up to the parent (if any).
+                    let v_lowlink = lowlink[v];
+                    let v_index = index[v].expect("entered node has an index");
+                    if v_lowlink == v_index {
+                        // v is an SCC root; pop the SCC off
+                        // `tarjan_stack`.
+                        let mut scc = Vec::new();
+                        while let Some(w) = tarjan_stack.pop() {
+                            on_stack[w] = false;
+                            scc.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        sccs.push(scc);
+                    }
+                    work.pop();
+                    if let Some((parent, _)) = work.last() {
+                        let parent = *parent;
+                        lowlink[parent] = lowlink[parent].min(v_lowlink);
+                    }
+                }
+            }
+        }
+
+        sccs
     }
 
     /// Returns the fully-quoted key used to match a table's `partition_of` reference.
@@ -1812,13 +1937,22 @@ impl Comparer {
                         self.trigger_post_script
                             .push_str(to_table.get_trigger_script().as_str());
                     } else {
+                        // Ask the table whether the alter path will
+                        // drop+recreate it wholesale (partition-key
+                        // change, partition-child column type change)
+                        // before emitting. This replaces the previous
+                        // substring scan of `alter_script` for
+                        // `"drop table if exists"`: a single
+                        // authoritative predicate that
+                        // `build_alter_script` itself uses, so the
+                        // comparer's gate and the SQL emission cannot
+                        // drift apart.
+                        let table_recreated = table.will_be_dropped_and_recreated(to_table);
+
                         let alter_script =
                             table.get_alter_script_without_triggers(to_table, self.use_drop);
 
-                        // If the generated alter script dropped + recreated this table
-                        // and the table is a partitioned parent, record it so its
-                        // children will be recreated instead of altered.
-                        if alter_script.to_lowercase().contains("drop table if exists") {
+                        if table_recreated {
                             // Mark for grants: same reasoning as the branch
                             // above — the dropped+recreated table inherits
                             // default privileges, so compare_grants must use
@@ -1832,6 +1966,51 @@ impl Comparer {
                         }
 
                         self.script.push_str(alter_script.as_str());
+
+                        // Issue #188 / Path B: when `get_alter_script`
+                        // routes a column through its
+                        // `needs_full_recreate` branch (PG18 VIRTUAL
+                        // flips, STORED↔VIRTUAL changes, or
+                        // non-generated → GENERATED), it emits
+                        // `DROP COLUMN` + `ADD COLUMN`. PostgreSQL
+                        // CASCADE-drops every index / FK / CHECK /
+                        // EXCLUDE constraint / RLS policy attached to
+                        // that column on the way out, and the
+                        // `ADD COLUMN` alone does not restore them.
+                        // Walk the column-dependent graph harvested
+                        // from `pg_depend` and re-emit each surviving
+                        // TO-side dependent. Skipped when the table
+                        // was dropped+recreated wholesale — the
+                        // re-`CREATE TABLE` already includes the
+                        // dependents.
+                        if !table_recreated {
+                            let mut col_dep_emitted: HashSet<String> = HashSet::new();
+                            let mut col_dep_recreate = String::new();
+                            for to_col in &to_table.columns {
+                                if let Some(from_col) =
+                                    table.columns.iter().find(|c| c.name == to_col.name)
+                                    && to_col.would_drop_and_re_add(from_col)
+                                {
+                                    self.recreate_column_dependents(
+                                        &to_col.schema,
+                                        &to_col.table,
+                                        &to_col.name,
+                                        &mut col_dep_emitted,
+                                        &mut col_dep_recreate,
+                                    );
+                                }
+                            }
+                            if !col_dep_recreate.is_empty() {
+                                self.script.append_block(
+                                    "\n/* ---> Recreate dependents dropped by virtual-column rewrite: Start ---- */",
+                                );
+                                self.script.push_str(&col_dep_recreate);
+                                self.script.append_block(
+                                    "/* ---> Recreate dependents dropped by virtual-column rewrite: End ------ */",
+                                );
+                            }
+                        }
+
                         self.trigger_post_script.push_str(
                             table
                                 .get_trigger_alter_script(to_table, self.use_drop)
@@ -1894,6 +2073,23 @@ impl Comparer {
     /// constraints alone) so we don't impose ordering for FKs that
     /// won't exist at the SET point and so we don't miss ordering
     /// for FKs that DO exist but will later be dropped+re-added.
+    ///
+    /// **FK-cycle handling** (issue #191): a mutual FK cycle
+    /// (`A → B` and `B → A`, valid in PostgreSQL when both FKs are
+    /// deferrable) flipping persistence in the same direction has no
+    /// valid SET order — `SET UNLOGGED A` requires B to already be
+    /// UNLOGGED and vice versa. Pre-fix, `kahn_toposort` silently
+    /// appended cyclic nodes alphabetically and the migration failed
+    /// at apply time with the same `could not change table …` error
+    /// issue #180 was meant to eliminate. The fix detects cycles via
+    /// `kahn_toposort_detect_cycle`, drops every FK whose endpoints
+    /// are both inside the cyclic set BEFORE the SET statements, and
+    /// re-emits those FKs from their TO-side definitions AFTER the
+    /// SETs — the same drop-and-recreate pattern PostgreSQL itself
+    /// recommends for migrations involving deferrable cycles. Unchanged
+    /// FKs that survive the cycle break are dropped+re-added inline by
+    /// this phase so `compare_foreign_keys` (which only emits modified
+    /// or new FKs) does not need to know about the cycle.
     fn emit_persistence_changes(&mut self) {
         let from_table_map: HashMap<(&str, &str), &Table> = self
             .from
@@ -1949,7 +2145,20 @@ impl Comparer {
         // doc comment above this method for the timing rationale.
         // `fk_targets[i]` holds the indices of tables that table `i`
         // references via FK — i.e. `i` *depends on* those.
+        //
+        // `edge_fks` records, for each `(referrer_idx, target_idx)`
+        // edge, the underlying TO-side constraint(s) that produced it.
+        // The persistence-flip cycle break (issue #191) reaches in
+        // here to find which FKs to drop+re-add when the SET ordering
+        // is a deadlock. Stored as cloned `TableConstraint`s so the
+        // data outlives the immutable borrow of `self.to.tables` (the
+        // `self.script` mutations later in the function would
+        // otherwise conflict) AND so the re-emit path can call
+        // `TableConstraint::get_script()` — preserving the comment
+        // and any other metadata that the raw `definition` string
+        // doesn't carry (PR #198 review).
         let mut fk_targets: Vec<HashSet<usize>> = vec![HashSet::new(); self.to.tables.len()];
+        let mut edge_fks: HashMap<(usize, usize), Vec<TableConstraint>> = HashMap::new();
         for (i, to_table) in self.to.tables.iter().enumerate() {
             // Lift the matching FROM table once so the FK lookup
             // doesn't pay a per-constraint hashmap miss.
@@ -1990,14 +2199,108 @@ impl Comparer {
                 if !live {
                     continue;
                 }
-                if let Some((schema, name)) = Self::parse_fk_referenced_table(def)
+                // Issue #190: pass the constraint owner's schema so
+                // `pg_get_constraintdef` output that omitted the
+                // schema qualifier (typical for `public` reachable via
+                // search_path) still resolves to a valid TO-side table
+                // index. Without this, the FK edge is missing from the
+                // adjacency and a persistence flip in `public` falls
+                // back to alphabetical SET order — exactly the order
+                // PostgreSQL rejects.
+                if let Some((schema, name)) = Self::parse_fk_referenced_table(def, &to_table.schema)
                     && let Some(&j) = to_index_by_key.get(&(schema, name))
                     && j != i
                 {
                     fk_targets[i].insert(j);
+                    edge_fks.entry((i, j)).or_default().push(c.clone());
                 }
             }
         }
+
+        // Issue #191: collect FKs whose endpoints both sit inside a
+        // SET subset's true cyclic set (Tarjan SCC of size >= 2;
+        // see `topo_order_within_subset_detect_cycle`). Dropping
+        // these breaks the ordering deadlock so the SET statements
+        // can run in any order; we re-add the same FKs from their
+        // TO `TableConstraint` clones afterwards. Returns each FK
+        // exactly once even when the same edge appears in both
+        // directions of a 2-node cycle.
+        let collect_cycle_fks = |fk_targets: &[HashSet<usize>],
+                                 cyclic_abs: &HashSet<usize>|
+         -> Vec<TableConstraint> {
+            let mut out: Vec<TableConstraint> = Vec::new();
+            let mut seen: HashSet<(String, String, String)> = HashSet::new();
+            // Iterate in a deterministic order so the emitted script
+            // is stable from run to run.
+            let mut cyclic_sorted: Vec<usize> = cyclic_abs.iter().copied().collect();
+            cyclic_sorted.sort_unstable();
+            for i in cyclic_sorted {
+                let mut targets: Vec<usize> = fk_targets[i].iter().copied().collect();
+                targets.sort_unstable();
+                for j in targets {
+                    if !cyclic_abs.contains(&j) {
+                        continue;
+                    }
+                    if let Some(fks) = edge_fks.get(&(i, j)) {
+                        for fk in fks {
+                            let key = (fk.schema.clone(), fk.table_name.clone(), fk.name.clone());
+                            if seen.insert(key) {
+                                out.push(fk.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        // Issue #191 + PR #198 review: emit the cycle-break sandwich
+        // around `set_kind` SETs. `use_drop=true` runs the drops and
+        // re-adds live (the normal cycle-break path). `use_drop=false`
+        // honours the user's destructive-op review mode by commenting
+        // out both the drops and the re-adds — the SET statements
+        // themselves stay live (matching every other SET in this
+        // phase), but a loud banner warns that without the drops the
+        // SETs will FAIL at apply time. The re-emit uses
+        // `TableConstraint::get_script()` so a FK comment
+        // (`COMMENT ON CONSTRAINT ...`) survives the round-trip.
+        let emit_cycle_sandwich = |out: &mut String,
+                                   use_drop: bool,
+                                   tables: &[Table],
+                                   ordered: Vec<usize>,
+                                   cycle_fks: &[TableConstraint],
+                                   set_kind: &str| {
+            if !cycle_fks.is_empty() {
+                let banner = if use_drop {
+                    "/* Persistence-flip FK cycle (issue #191): dropping cycle FKs to break the SET-ordering deadlock; re-added after the SET block below. */"
+                } else {
+                    "/* Persistence-flip FK cycle (issue #191): use_drop=false — cycle-break DROP/ADD statements commented out below. The SET statements that follow WILL FAIL at apply time until the cycle FKs are dropped (re-run with use_drop=true, or run the commented statements by hand). */"
+                };
+                out.append_block(banner);
+                for fk in cycle_fks {
+                    Self::emit_drop(out, use_drop, &fk.get_drop_script());
+                }
+            }
+            for table_idx in ordered {
+                let table = &tables[table_idx];
+                out.append_block(&format!(
+                    "alter table {}.{} set {};",
+                    table.schema, table.name, set_kind
+                ));
+            }
+            for fk in cycle_fks {
+                let script = fk.get_script();
+                if use_drop {
+                    out.push_str(&script);
+                } else {
+                    // Pair the add-side with the commented drop above
+                    // so use_drop=false produces an inert block.
+                    for line in script.lines() {
+                        out.push_str(&format!("-- {line}\n"));
+                    }
+                }
+            }
+        };
 
         // For SET UNLOGGED we want leaves (referencers) first. The
         // generic toposort returns `dependencies before dependents`
@@ -2005,47 +2308,74 @@ impl Comparer {
         // its output to get the dependent-first order this direction
         // requires.
         if !to_unlogged.is_empty() {
-            for table_idx in
-                Self::topo_order_within_subset(&to_unlogged, &fk_targets, &self.to.tables, true)
-            {
-                let table = &self.to.tables[table_idx];
-                self.script.append_block(&format!(
-                    "alter table {}.{} set unlogged;",
-                    table.schema, table.name
-                ));
-            }
+            let (ordered, cyclic_abs) = Self::topo_order_within_subset_detect_cycle(
+                &to_unlogged,
+                &fk_targets,
+                &self.to.tables,
+                true,
+            );
+            let cycle_fks = collect_cycle_fks(&fk_targets, &cyclic_abs);
+            emit_cycle_sandwich(
+                &mut self.script,
+                self.use_drop,
+                &self.to.tables,
+                ordered,
+                &cycle_fks,
+                "unlogged",
+            );
         }
 
         // For SET LOGGED we want roots (referenced tables) first —
         // forward topo order is exactly what we need.
         if !to_logged.is_empty() {
-            for table_idx in
-                Self::topo_order_within_subset(&to_logged, &fk_targets, &self.to.tables, false)
-            {
-                let table = &self.to.tables[table_idx];
-                self.script.append_block(&format!(
-                    "alter table {}.{} set logged;",
-                    table.schema, table.name
-                ));
-            }
+            let (ordered, cyclic_abs) = Self::topo_order_within_subset_detect_cycle(
+                &to_logged,
+                &fk_targets,
+                &self.to.tables,
+                false,
+            );
+            let cycle_fks = collect_cycle_fks(&fk_targets, &cyclic_abs);
+            emit_cycle_sandwich(
+                &mut self.script,
+                self.use_drop,
+                &self.to.tables,
+                ordered,
+                &cycle_fks,
+                "logged",
+            );
         }
     }
 
     /// Order `subset` (absolute indices into `tables`) by FK
-    /// dependencies restricted to the subset itself. Edges to tables
-    /// outside the subset are ignored: a table the migration isn't
-    /// flipping doesn't constrain the SET ordering — only PostgreSQL's
-    /// runtime check against the live state does, and that's the
-    /// user's problem (they would have to add the missing flip to the
-    /// migration). With `dependents_first = true` returns reverse-topo
-    /// (leaves first — `SET UNLOGGED`); else forward-topo (roots
-    /// first — `SET LOGGED`). Result is a permutation of `subset`.
-    fn topo_order_within_subset(
+    /// dependencies restricted to the subset itself, and also return
+    /// the set of absolute table indices that participate in a cycle.
+    /// Edges to tables outside the subset are ignored: a table the
+    /// migration isn't flipping doesn't constrain the SET ordering —
+    /// only PostgreSQL's runtime check against the live state does,
+    /// and that's the user's problem (they would have to add the
+    /// missing flip to the migration). With `dependents_first = true`
+    /// returns reverse-topo (leaves first — `SET UNLOGGED`); else
+    /// forward-topo (roots first — `SET LOGGED`). The ordered result
+    /// is a permutation of `subset`. The cyclic set lets callers
+    /// break the SET-ordering deadlock (issue #191): drop the FKs
+    /// whose endpoints both sit in the cyclic set, run the SETs, and
+    /// re-add the FKs from their TO definitions. When the FK graph
+    /// restricted to `subset` is acyclic the cyclic set is empty.
+    ///
+    /// PR #198 review: the cyclic set is computed via
+    /// [`strongly_connected_components`] (Tarjan), not the raw Kahn
+    /// remainder. The remainder would include nodes merely *blocked
+    /// by* a cycle (e.g. `C` in `A↔B + A→C`), and treating them as
+    /// cycle participants would drop FKs that are not actually in
+    /// any cycle — making migrations more destructive than needed.
+    /// Filtering to SCCs of size >= 2 keeps the drop surgical to
+    /// the true cycle edges.
+    fn topo_order_within_subset_detect_cycle(
         subset: &[usize],
         fk_targets: &[HashSet<usize>],
         tables: &[Table],
         dependents_first: bool,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, HashSet<usize>) {
         let n = subset.len();
         let pos_in_subset: HashMap<usize, usize> = subset
             .iter()
@@ -2064,14 +2394,30 @@ impl Comparer {
             }
         }
 
-        let mut sorted = Self::kahn_toposort(n, &depends_on, |i| {
+        let (mut sorted, _kahn_remainder) = Self::kahn_toposort_detect_cycle(n, &depends_on, |i| {
             let t = &tables[subset[i]];
             (t.schema.to_lowercase(), t.name.to_lowercase())
         });
         if dependents_first {
             sorted.reverse();
         }
-        sorted.into_iter().map(|pos| subset[pos]).collect()
+
+        // Narrow the cycle set to *true* SCC members (size >= 2).
+        // Self-loops are impossible here — `fk_targets` is built
+        // with the `j != i` guard in `emit_persistence_changes` — so
+        // a singleton SCC always means an acyclic node.
+        let sccs = Self::strongly_connected_components(n, &depends_on);
+        let mut true_cyclic_pos: HashSet<usize> = HashSet::new();
+        for scc in sccs {
+            if scc.len() >= 2 {
+                true_cyclic_pos.extend(scc);
+            }
+        }
+
+        let ordered_abs: Vec<usize> = sorted.into_iter().map(|pos| subset[pos]).collect();
+        let cyclic_abs: HashSet<usize> =
+            true_cyclic_pos.into_iter().map(|pos| subset[pos]).collect();
+        (ordered_abs, cyclic_abs)
     }
 
     /// Pull the `schema.name` of the table targeted by an FK constraint
@@ -2100,7 +2446,26 @@ impl Comparer {
     /// `to_ascii_lowercase` is byte-length-preserving (only ASCII
     /// letters change, every other byte is left intact) and the
     /// keyword `references` is pure ASCII, so it's the right tool.
-    fn parse_fk_referenced_table(def: &str) -> Option<(String, String)> {
+    /// Parse the referenced `(schema, table)` pair out of a FOREIGN KEY
+    /// constraint's deparsed definition. `owner_schema` is the schema of
+    /// the table that *owns* the constraint and is used to resolve
+    /// unqualified targets (issue #190): `pg_get_constraintdef` may omit
+    /// the schema qualifier when the target is reachable via
+    /// `search_path` — most commonly the `public` schema — and without
+    /// this fallback the FK edge is missed by
+    /// `emit_persistence_changes`, leaving FK-chained persistence flips
+    /// in `public` ordered alphabetically (which PostgreSQL rejects with
+    /// the `could not change table … to logged/unlogged` error).
+    ///
+    /// The fallback resolves to `(owner_schema, target)`, matching
+    /// PostgreSQL's own search_path resolution for the simplest and
+    /// commonest case where the FK target lives in the same schema as
+    /// the FK. Per-role / per-database `search_path` settings beyond
+    /// the owner schema are not currently captured at dump time, so an
+    /// FK referencing a `public` table from a non-`public` schema (with
+    /// `public` on the search path) will still escape this fallback;
+    /// that path is documented as a known limitation.
+    fn parse_fk_referenced_table(def: &str, owner_schema: &str) -> Option<(String, String)> {
         let lower = def.to_ascii_lowercase();
         let bytes = lower.as_bytes();
         let kw = b"references";
@@ -2195,7 +2560,27 @@ impl Comparer {
             }
         }
         let target = &after[..end];
-        Self::split_qualified_name_quote_aware(target)
+        match Self::split_qualified_name_quote_aware(target) {
+            Some(pair) => Some(pair),
+            None => {
+                // No dot outside quotes — unqualified target. Resolve
+                // against the constraint's owning schema (issue #190).
+                // `trim_matches('"')` on both halves mirrors what
+                // `split_qualified_name_quote_aware` already does for
+                // the schema-qualified path: callers (and the existing
+                // tests) expect pre-stripped strings, and dump-time
+                // identifiers are stored as `quote_ident`-wrapped
+                // forms (`MySchema` → `"MySchema"`) which would
+                // otherwise miss the comparer's normalised lookup
+                // keys.
+                let name = target.trim_matches('"').to_string();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some((owner_schema.trim_matches('"').to_string(), name))
+                }
+            }
+        }
     }
 
     /// Split a `schema.name` identifier at the first dot that lives
@@ -2537,17 +2922,7 @@ impl Comparer {
                 self.script.push_str(&to_view.get_script());
             }
         } else {
-            let mut view_script = to_view.get_script();
-            if !view_script
-                .to_uppercase()
-                .contains("CREATE OR REPLACE VIEW")
-            {
-                const TARGET: &str = "create view";
-                const REPLACEMENT: &str = "CREATE OR REPLACE VIEW";
-                if let Some(pos) = view_script.to_ascii_lowercase().find(TARGET) {
-                    view_script.replace_range(pos..pos + TARGET.len(), REPLACEMENT);
-                }
-            }
+            let view_script = rewrite_create_view_to_create_or_replace(&to_view.get_script());
             let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
             let drop_was_active = self
                 .dropped_views
@@ -3620,9 +3995,10 @@ impl Comparer {
         // `DROP ... CASCADE` and PostgreSQL removes every object whose
         // `pg_depend` entry points at that function: functional indexes,
         // CHECK constraints, generated columns, column DEFAULT
-        // expressions and RLS policies. The rest of the comparer never
-        // re-emits those dependents because they were unchanged between
-        // FROM and TO. See issue #179.
+        // expressions, RLS policies and views (regular + materialized).
+        // The rest of the comparer never re-emits those dependents
+        // because they were unchanged between FROM and TO. See issues
+        // #179 (non-view dependents) and #189 (views).
         self.recreate_routine_dependents();
 
         self.script
@@ -3633,14 +4009,15 @@ impl Comparer {
     /// Re-emit objects that PostgreSQL silently dropped via
     /// `DROP FUNCTION ... CASCADE` so they are present in the database
     /// after the migration applies. Targets functional indexes, CHECK
-    /// constraints, generated columns, column DEFAULT expressions and
-    /// RLS policies that reference any routine being dropped+recreated
-    /// or fully dropped. Detection is text-based against the FROM-side
-    /// definition; the recreated form comes from TO so any reshape of
-    /// the dependent (e.g. a column type change) is preserved. Issued
-    /// statements are idempotent (`drop ... if exists` followed by the
-    /// CREATE) so they are safe even when other diff phases also
-    /// emitted the object.
+    /// constraints, generated columns, column DEFAULT expressions, RLS
+    /// policies and views (regular + materialized) that reference any
+    /// routine being dropped+recreated or fully dropped. Detection is
+    /// text-based against the FROM-side definition; the recreated form
+    /// comes from TO so any reshape of the dependent (e.g. a column
+    /// type change) is preserved. Issued statements are idempotent
+    /// (`drop ... if exists` followed by the CREATE, or `CREATE OR
+    /// REPLACE` / `IF NOT EXISTS` for views) so they are safe even
+    /// when other diff phases also emitted the object.
     fn recreate_routine_dependents(&mut self) {
         // Collect (schema_lc, name_lc) for every routine whose drop will
         // CASCADE: routines absent from TO, plus routines whose signature
@@ -3921,6 +4298,25 @@ impl Comparer {
                                 self.use_drop,
                                 &column_recreate_block(to_column),
                             );
+                            // Issue #188: the `ADD COLUMN IF NOT EXISTS`
+                            // restores the generated column itself, but
+                            // PostgreSQL had already CASCADE-dropped
+                            // every index / FK / CHECK / EXCLUDE
+                            // constraint / RLS policy attached to it
+                            // *because they referenced the column, not
+                            // the routine*. Walk the column-dependent
+                            // graph harvested from `pg_depend` at dump
+                            // time and re-emit each surviving TO-side
+                            // dependent. `emitted_keys` is shared so
+                            // anything Phase 7 already restored via its
+                            // routine-text scan is not double-emitted.
+                            self.recreate_column_dependents(
+                                &to_column.schema,
+                                &to_column.table,
+                                &to_column.name,
+                                &mut emitted_keys,
+                                &mut recreate,
+                            );
                         }
                     } else if default_referenced && let Some(default) = &to_column.column_default {
                         // TO-side gate: only re-set the DEFAULT when
@@ -3996,6 +4392,53 @@ impl Comparer {
                     &policy_recreate_block(to_policy),
                 );
             }
+        }
+
+        // Views (regular and materialized) whose definition references an
+        // affected routine are also CASCADE-dropped by PostgreSQL — issue
+        // #189 / PR #187 review. The hash check in
+        // `compare_routines_and_views` skips byte-identical views, so this
+        // is the only place where an unchanged view referencing a
+        // signature-changed function gets re-emitted.
+        let to_view_by_id: HashMap<(&str, &str), &View> = self
+            .to
+            .views
+            .iter()
+            .map(|v| ((v.schema.as_str(), v.name.as_str()), v))
+            .collect();
+
+        for from_view in &self.from.views {
+            if !Self::definition_references_any(&from_view.definition, &affected) {
+                continue;
+            }
+            let Some(to_view) =
+                to_view_by_id.get(&(from_view.schema.as_str(), from_view.name.as_str()))
+            else {
+                continue;
+            };
+            // TO-side gate: if the TO definition no longer references the
+            // affected routine, `compare_tables`/Phase 5 has already
+            // rewritten the view or its function dependency is gone — the
+            // CASCADE leaves it intact (or another phase re-emits it).
+            if !Self::definition_references_any(&to_view.definition, &affected) {
+                continue;
+            }
+            // Phase 5 already emits the view when `dropped_views`
+            // contains it (drop-and-recreate path triggered by a
+            // referenced table changing) — don't duplicate that work.
+            let normalized_view = Self::normalized_view_key(&to_view.schema, &to_view.name);
+            if self.dropped_views.contains_key(&normalized_view) {
+                continue;
+            }
+            let key = format!("view:{}.{}", to_view.schema, to_view.name);
+            if !emitted_keys.insert(key) {
+                continue;
+            }
+            Self::emit_dependent_recreate(
+                &mut recreate,
+                self.use_drop,
+                &view_recreate_block(to_view),
+            );
         }
 
         if !recreate.is_empty() {
@@ -4218,6 +4661,162 @@ impl Comparer {
                     .lines()
                     .map(|l| format!("-- {}\n", l))
                     .collect::<String>(),
+            );
+        }
+    }
+
+    /// Re-emit every TO-side dependent of `(table_schema, table_name,
+    /// column_name)` that PostgreSQL would have CASCADE-dropped when the
+    /// column was dropped. Uses the `column_dependents` graph harvested
+    /// from `pg_depend` at dump time (issue #188); fixes the gap where
+    /// the text-based Phase 7 scanner misses dependents that reference
+    /// the column rather than the routine driving the CASCADE chain.
+    ///
+    /// `emitted_keys` is shared with the caller so dependents already
+    /// emitted by Phase 7's routine-text scan (e.g., a functional index
+    /// that names both the routine *and* the column) are not double-
+    /// emitted.
+    ///
+    /// Anchor identifiers are matched against `Dump::column_dependents`
+    /// after case-insensitive comparison with quote-stripping; that is
+    /// because the dump query wraps identifiers via `quote_ident` (so
+    /// case-sensitive names land here as `"MixedCase"`) but Phase 7 and
+    /// `compare_tables` operate on the raw fields, which may be either
+    /// form depending on origin.
+    fn recreate_column_dependents(
+        &self,
+        table_schema: &str,
+        table_name: &str,
+        column_name: &str,
+        emitted_keys: &mut HashSet<String>,
+        out: &mut String,
+    ) {
+        let want_schema = table_schema.to_lowercase().replace('"', "");
+        let want_table = table_name.to_lowercase().replace('"', "");
+        let want_column = column_name.to_lowercase().replace('"', "");
+
+        // Two passes so FK constraints emit *after* the UNIQUE/PK
+        // target they reference. A single linear pass would let the
+        // pg_depend query's undefined output order produce a script
+        // where `ADD CONSTRAINT fk … FOREIGN KEY … REFERENCES …` runs
+        // before the matching `ADD CONSTRAINT … UNIQUE` is back, and
+        // PostgreSQL rejects FKs whose target lacks a unique
+        // constraint. Pass 1 emits indexes, non-FK constraints, and
+        // policies; pass 2 emits FKs against the now-restored unique
+        // targets.
+        let mut deferred_fks: Vec<&TableConstraint> = Vec::new();
+
+        for dep in &self.from.column_dependents {
+            if dep.schema.to_lowercase().replace('"', "") != want_schema
+                || dep.table.to_lowercase().replace('"', "") != want_table
+                || dep.column.to_lowercase().replace('"', "") != want_column
+            {
+                continue;
+            }
+
+            let Some(owner) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.schema == dep.dep_schema && t.name == dep.dep_table)
+            else {
+                continue;
+            };
+
+            match dep.kind {
+                ColumnDependentKind::Index => {
+                    let Some(to_index) = owner.indexes.iter().find(|i| i.name == dep.dep_name)
+                    else {
+                        continue;
+                    };
+                    if to_index.is_partition_index {
+                        continue;
+                    }
+                    // UNIQUE/PK/EXCLUDE constraints share their backing
+                    // index name. When such a constraint exists in TO,
+                    // the constraint branch below will recreate the
+                    // index — emitting both would race and the
+                    // `ADD CONSTRAINT … PRIMARY KEY` form rejects a
+                    // pre-existing index of the same name. Skip the
+                    // index emit and let the constraint do it.
+                    if owner.constraints.iter().any(|c| c.name == to_index.name) {
+                        continue;
+                    }
+                    let key = format!("index:{}.{}", to_index.schema, to_index.name);
+                    if !emitted_keys.insert(key) {
+                        continue;
+                    }
+                    Self::emit_dependent_recreate(
+                        out,
+                        self.use_drop,
+                        &index_recreate_block(to_index),
+                    );
+                }
+                ColumnDependentKind::Constraint => {
+                    let Some(to_constraint) =
+                        owner.constraints.iter().find(|c| c.name == dep.dep_name)
+                    else {
+                        continue;
+                    };
+                    // Partition-inherited constraints (coninhcount > 0)
+                    // propagate from the parent — re-emitting on the
+                    // child is the same rejection Phase 7 already
+                    // guards against in its routine-text scan.
+                    let is_target_partition_child = owner.partition_of.is_some();
+                    if is_target_partition_child && to_constraint.coninhcount > 0 {
+                        continue;
+                    }
+                    let key = format!(
+                        "constraint:{}.{}.{}",
+                        to_constraint.schema, to_constraint.table_name, to_constraint.name
+                    );
+                    if !emitted_keys.insert(key) {
+                        continue;
+                    }
+                    if to_constraint
+                        .constraint_type
+                        .eq_ignore_ascii_case("foreign key")
+                    {
+                        // Defer FK emission until pass 2 (after every
+                        // UNIQUE/PK in the same call has been restored).
+                        deferred_fks.push(to_constraint);
+                        continue;
+                    }
+                    Self::emit_dependent_recreate(
+                        out,
+                        self.use_drop,
+                        &constraint_recreate_block(to_constraint),
+                    );
+                }
+                ColumnDependentKind::Policy => {
+                    let Some(to_policy) = owner.policies.iter().find(|p| p.name == dep.dep_name)
+                    else {
+                        continue;
+                    };
+                    let key = format!(
+                        "policy:{}.{}.{}",
+                        to_policy.schema, to_policy.table, to_policy.name
+                    );
+                    if !emitted_keys.insert(key) {
+                        continue;
+                    }
+                    Self::emit_dependent_recreate(
+                        out,
+                        self.use_drop,
+                        &policy_recreate_block(to_policy),
+                    );
+                }
+            }
+        }
+
+        // Pass 2: FK constraints, now that any UNIQUE/PK target they
+        // reference (on the anchor column's table or any other table)
+        // has already been restored above.
+        for to_constraint in deferred_fks {
+            Self::emit_dependent_recreate(
+                out,
+                self.use_drop,
+                &constraint_recreate_block(to_constraint),
             );
         }
     }
@@ -4824,6 +5423,54 @@ fn inject_if_not_exists_into_create_index(script: &str) -> String {
 /// is safe and unambiguous.
 fn inject_if_not_exists_into_add_column(script: &str) -> String {
     script.replacen("add column ", "add column if not exists ", 1)
+}
+
+/// Idempotent recreate block for a view that may have been silently
+/// dropped by `DROP FUNCTION ... CASCADE`. Regular views use
+/// `CREATE OR REPLACE VIEW` (a no-op when the view still exists with the
+/// same definition; a create when CASCADE removed it). Materialized
+/// views use `CREATE MATERIALIZED VIEW IF NOT EXISTS` for the same
+/// reason — Phase 7's text-based matching can false-positive on a view
+/// that PostgreSQL never actually dropped, and an unconditional CREATE
+/// would fail against a surviving view.
+fn view_recreate_block(view: &View) -> String {
+    let script = view.get_script();
+    if view.is_materialized {
+        inject_if_not_exists_into_create_materialized_view(&script)
+    } else {
+        rewrite_create_view_to_create_or_replace(&script)
+    }
+}
+
+/// Rewrites the lowercase `create view ` prefix produced by
+/// `View::get_script` to `CREATE OR REPLACE VIEW `. The check is
+/// anchored to the start of the script via `strip_prefix` rather than a
+/// whole-script `contains` / `find` scan: the view definition body
+/// `View::get_script` appends after the prefix can legitimately contain
+/// the literal text `create view` or `CREATE OR REPLACE VIEW` (e.g. a
+/// string literal in the select list), and a non-anchored matcher would
+/// either false-positive on the early-return branch (leaving the
+/// leading `create view` unrewritten) or rewrite a non-prefix
+/// occurrence. If the script already starts with `CREATE OR REPLACE
+/// VIEW` (upstream rewrite) or some other unanticipated leading form,
+/// it is returned unchanged.
+fn rewrite_create_view_to_create_or_replace(script: &str) -> String {
+    if let Some(rest) = script.strip_prefix("create view ") {
+        return format!("CREATE OR REPLACE VIEW {}", rest);
+    }
+    script.to_string()
+}
+
+/// Rewrites the lowercase `create materialized view ` prefix produced by
+/// `View::get_script` to `create materialized view if not exists `. The
+/// prefix is generated by us in known lowercase form so a single
+/// `replacen` against the first hit is safe and unambiguous.
+fn inject_if_not_exists_into_create_materialized_view(script: &str) -> String {
+    script.replacen(
+        "create materialized view ",
+        "create materialized view if not exists ",
+        1,
+    )
 }
 
 /// `drop policy if exists` + `create policy` block from the TO-side policy.

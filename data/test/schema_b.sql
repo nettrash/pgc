@@ -1742,6 +1742,51 @@ CREATE POLICY pol_cascade_items ON test_schema.cascade_items
     USING (test_schema.cascade_compute(value) > 0);
 
 -- =============================================================================
+-- Issue #188 — Secondary dependents of CASCADE-dropped generated column
+-- =============================================================================
+-- Function `cascade_compute_v2(integer)` returns BIGINT here (was INTEGER
+-- in Schema A). The DROP FUNCTION ... CASCADE removes the generated
+-- column `gen_total` from FROM, which in turn CASCADE-drops the plain
+-- index and CHECK constraint attached to it. Both objects' definitions
+-- here are byte-identical to Schema A (modulo the integer→bigint type
+-- bump on the column) — without the pg_depend graph, the comparer
+-- would emit nothing for them and the migrated database would be
+-- missing them.
+CREATE FUNCTION test_schema.cascade_compute_v2(x integer)
+RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
+    SELECT (x + 1)::bigint;
+$$;
+
+CREATE TABLE test_schema.cascade_col_dep_items (
+    id        serial  PRIMARY KEY,
+    value     integer NOT NULL,
+    -- gen_total type bumped integer → bigint to match the new return type;
+    -- the column itself is CASCADE-dropped by the function drop.
+    gen_total bigint  GENERATED ALWAYS AS (test_schema.cascade_compute_v2(value)) STORED
+);
+
+CREATE INDEX idx_cascade_col_dep_gen_total
+    ON test_schema.cascade_col_dep_items (gen_total);
+
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT chk_cascade_col_dep_gen_total CHECK (gen_total >= 0);
+
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT uq_cascade_col_dep_gen_total UNIQUE (gen_total);
+
+CREATE TABLE test_schema.cascade_col_dep_children (
+    id        serial  PRIMARY KEY,
+    -- ref_total type bumped integer → bigint to match the new
+    -- gen_total type on the parent. FK target type must match.
+    ref_total bigint
+);
+
+ALTER TABLE test_schema.cascade_col_dep_children
+    ADD CONSTRAINT fk_cascade_col_dep_children_ref_total
+        FOREIGN KEY (ref_total)
+        REFERENCES test_schema.cascade_col_dep_items (gen_total);
+
+-- =============================================================================
 -- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
 -- =============================================================================
 -- TO mirrors Schema A's FK chain (child -> parent -> grandparent) but
@@ -1770,4 +1815,50 @@ CREATE UNLOGGED TABLE test_order.parent (
 CREATE UNLOGGED TABLE test_order.child (
     id serial PRIMARY KEY,
     parent_id integer REFERENCES test_order.parent(id)
+);
+
+-- =============================================================================
+-- Issue #191 — Persistence-ordering with mutual FK cycle
+-- =============================================================================
+-- Mirrors the cycle pair in Schema A but flipped to UNLOGGED. The
+-- mutual deferrable FKs `cycle_a ↔ cycle_b` are unchanged between
+-- FROM and TO (live edges), so they remain on the FK adjacency at
+-- the SET phase. With both endpoints in the cyclic set, the comparer
+-- must DROP both FKs before either SET UNLOGGED, run the SETs in any
+-- order, and re-ADD the FKs from the TO definitions.
+CREATE UNLOGGED TABLE test_order.cycle_a (
+    id serial PRIMARY KEY,
+    b_id integer
+);
+
+CREATE UNLOGGED TABLE test_order.cycle_b (
+    id serial PRIMARY KEY,
+    a_id integer
+);
+
+ALTER TABLE test_order.cycle_a
+    ADD CONSTRAINT cycle_a_b_id_fkey
+    FOREIGN KEY (b_id) REFERENCES test_order.cycle_b(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE test_order.cycle_b
+    ADD CONSTRAINT cycle_b_a_id_fkey
+    FOREIGN KEY (a_id) REFERENCES test_order.cycle_a(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+-- =============================================================================
+-- Issue #190 — Persistence-ordering FK adjacency with unqualified FK targets
+-- =============================================================================
+-- Mirrors the LOGGED pair in Schema A but flipped to UNLOGGED. The FK
+-- references `public.persistence_chain_parent(id)` via the unqualified
+-- form `pg_get_constraintdef` produces when `public` is on the
+-- search_path; the comparer must restore the FK edge against the FK
+-- owner's schema (`public`) so the SET UNLOGGED order is leaves-first.
+CREATE UNLOGGED TABLE public.persistence_chain_parent (
+    id serial PRIMARY KEY
+);
+
+CREATE UNLOGGED TABLE public.persistence_chain_child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES public.persistence_chain_parent(id)
 );

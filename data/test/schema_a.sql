@@ -1418,6 +1418,65 @@ CREATE POLICY pol_cascade_items ON test_schema.cascade_items
     USING (test_schema.cascade_compute(value) > 0);
 
 -- =============================================================================
+-- Issue #188 — Secondary dependents of CASCADE-dropped generated column
+-- =============================================================================
+-- Function `cascade_compute_v2(integer)` returns INTEGER here; Schema B
+-- bumps the return type to BIGINT. The CASCADE drop of the function
+-- removes the generated column `gen_total` AND every object PostgreSQL
+-- attached to that column via `pg_depend` — even objects whose own
+-- definition NEVER NAMES the function. Phase 7's text scanner can't
+-- find those secondary dependents; the comparer must walk the
+-- column-dependent graph harvested from `pg_depend` at dump time and
+-- re-emit them.
+CREATE FUNCTION test_schema.cascade_compute_v2(x integer)
+RETURNS integer LANGUAGE sql IMMUTABLE AS $$
+    SELECT x + 1;
+$$;
+
+CREATE TABLE test_schema.cascade_col_dep_items (
+    id        serial  PRIMARY KEY,
+    value     integer NOT NULL,
+    -- Generated column depends on cascade_compute_v2 → CASCADE drops it.
+    gen_total integer GENERATED ALWAYS AS (test_schema.cascade_compute_v2(value)) STORED
+);
+
+-- Plain index on the generated column — does NOT name the function.
+-- When the function drop cascades to gen_total, this index goes with
+-- it. Phase 7's routine-text scan can't find it; the pg_depend graph
+-- must.
+CREATE INDEX idx_cascade_col_dep_gen_total
+    ON test_schema.cascade_col_dep_items (gen_total);
+
+-- CHECK constraint on the generated column — names only the column.
+-- Same dependency-chain story as the index above.
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT chk_cascade_col_dep_gen_total CHECK (gen_total >= 0);
+
+-- UNIQUE constraint on the generated column — required so a foreign
+-- key on a separate table can target gen_total. Its backing index
+-- shares the constraint name and is recorded as a separate pg_depend
+-- edge; the comparer dedup must skip emitting the backing index
+-- because the ADD CONSTRAINT ... UNIQUE form recreates it implicitly.
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT uq_cascade_col_dep_gen_total UNIQUE (gen_total);
+
+-- Child table whose FK references gen_total on the parent. The FK's
+-- `conrelid` points at this child, but its pg_depend row anchors on
+-- the parent column — the asymmetric case PR #196 review called out.
+-- When CASCADE drops gen_total via the function rewrite, this FK is
+-- silently dropped too; the column-dependent graph must restore it,
+-- AFTER the UNIQUE target above is back (two-pass ordering).
+CREATE TABLE test_schema.cascade_col_dep_children (
+    id        serial  PRIMARY KEY,
+    ref_total integer
+);
+
+ALTER TABLE test_schema.cascade_col_dep_children
+    ADD CONSTRAINT fk_cascade_col_dep_children_ref_total
+        FOREIGN KEY (ref_total)
+        REFERENCES test_schema.cascade_col_dep_items (gen_total);
+
+-- =============================================================================
 -- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
 -- =============================================================================
 -- FROM has three LOGGED tables connected by a foreign-key chain
@@ -1457,3 +1516,68 @@ CREATE TABLE test_order.child (
     parent_id integer REFERENCES test_order.parent(id)
 );
 
+-- =============================================================================
+-- Issue #191 — Persistence-ordering with mutual FK cycle
+-- =============================================================================
+-- Two tables with mutual deferrable FKs: `cycle_a → cycle_b` and
+-- `cycle_b → cycle_a`. PostgreSQL only permits this shape when both
+-- FKs are DEFERRABLE INITIALLY DEFERRED (otherwise the first INSERT
+-- on either side would have nothing to reference). The cycle has NO
+-- valid SET LOGGED|UNLOGGED order: `SET UNLOGGED cycle_a` requires
+-- cycle_b to already be UNLOGGED, and vice versa. Pre-fix the
+-- comparer's `kahn_toposort` silently fell back to alphabetical for
+-- the cyclic remainder, the migration emitted the SETs in that order,
+-- and PostgreSQL rejected the second SET at apply time.
+--
+-- The fix detects the cycle, drops both FKs BEFORE the SET block,
+-- runs both SETs (order no longer matters), and re-emits the FKs
+-- from their TO definitions AFTER. Schema B flips both tables to
+-- UNLOGGED so this fixture exercises the drop+SET+re-add pattern
+-- end-to-end against a real `pg_get_constraintdef` output.
+CREATE TABLE test_order.cycle_a (
+    id serial PRIMARY KEY,
+    b_id integer
+);
+
+CREATE TABLE test_order.cycle_b (
+    id serial PRIMARY KEY,
+    a_id integer
+);
+
+ALTER TABLE test_order.cycle_a
+    ADD CONSTRAINT cycle_a_b_id_fkey
+    FOREIGN KEY (b_id) REFERENCES test_order.cycle_b(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE test_order.cycle_b
+    ADD CONSTRAINT cycle_b_a_id_fkey
+    FOREIGN KEY (a_id) REFERENCES test_order.cycle_a(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+-- =============================================================================
+-- Issue #190 — Persistence-ordering FK adjacency with unqualified FK targets
+-- =============================================================================
+-- Companion case to the test_order chain above, but anchored in `public`.
+-- The role pgc connects as inherits the default search_path
+-- (`"$user", public`), so `pg_get_constraintdef` omits the schema
+-- qualifier on FK targets in `public` — the deparsed text is
+-- `REFERENCES persistence_chain_parent(id)`, not
+-- `REFERENCES public.persistence_chain_parent(id)`. Pre-fix the comparer's
+-- `parse_fk_referenced_table` returned None for the unqualified form, the
+-- FK edge was missing from the persistence-flip adjacency, and the SET
+-- ordering fell back to alphabetical — which PostgreSQL rejects with
+-- `could not change table "persistence_chain_parent" to unlogged because
+-- it is referenced by ...`. The CI gap that hid this bug was that every
+-- existing FK-chain fixture lives in an explicit `test_order` schema,
+-- where `pg_get_constraintdef` qualifies the target.
+--
+-- Schema B mirrors this pair but flipped to UNLOGGED; the migration's SET
+-- UNLOGGED must emit `child` before `parent`.
+CREATE TABLE public.persistence_chain_parent (
+    id serial PRIMARY KEY
+);
+
+CREATE TABLE public.persistence_chain_child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES public.persistence_chain_parent(id)
+);

@@ -137,7 +137,7 @@ jobs:
         FROM_USER=postgres
         FROM_PASSWORD=postgres
         FROM_DATABASE=a
-        FROM_SCHEME=test_schema|shared_schema|new_reporting_schema|data|test_order
+        FROM_SCHEME=test_schema|shared_schema|new_reporting_schema|data|test_order|public
         FROM_SSL=false
         FROM_DUMP=/tmp/a.dump
         TO_HOST=127.0.0.1
@@ -145,7 +145,7 @@ jobs:
         TO_USER=postgres
         TO_PASSWORD=postgres
         TO_DATABASE=b
-        TO_SCHEME=test_schema|shared_schema|new_reporting_schema|data|test_order
+        TO_SCHEME=test_schema|shared_schema|new_reporting_schema|data|test_order|public
         TO_SSL=false
         TO_DUMP=/tmp/b.dump
         OUTPUT=/tmp/output.sql
