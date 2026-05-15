@@ -58,6 +58,46 @@
                       `pg_get_constraintdef` deparser output (the
                       drop+SET+re-add path against actual PG, not
                       just the unit-test's assumed string shape).
+                      Per PR #198 review feedback: (a) narrowed
+                      the cycle set to Tarjan SCCs of size >= 2 —
+                      the raw `kahn_toposort_detect_cycle`
+                      remainder also catches nodes *blocked by* a
+                      cycle (e.g. `C` in `A↔B + A→C`), so dropping
+                      every remainder edge was more destructive
+                      than needed; added iterative
+                      `strongly_connected_components` (Tarjan,
+                      work-stack form to avoid recursion-stack
+                      blow-up) and the
+                      `topo_order_within_subset_detect_cycle` now
+                      narrows the cyclic set via SCCs before
+                      returning. (b) The cycle re-emit path now
+                      stores `TableConstraint` clones (not
+                      `(schema, table, name, definition)` tuples)
+                      and re-emits via
+                      `TableConstraint::get_script()` — preserving
+                      `COMMENT ON CONSTRAINT` and any other
+                      metadata `get_script()` carries that the raw
+                      definition string doesn't. (c) Gated the
+                      cycle-break drops AND re-adds behind
+                      `use_drop`: when `use_drop=false` the phase
+                      emits a loud banner explaining the cycle
+                      requires manual intervention (the SETs that
+                      follow will fail at apply time without the
+                      drops) and comments out the drop and add
+                      lines, matching how the rest of the file
+                      honours `use_drop=false`. Three additional
+                      regression tests:
+                      `issue191_pr198_cycle_detection_excludes_blocked_non_cycle_nodes`
+                      builds `A↔B + A→C` and asserts the non-
+                      cycle `A→C` FK is NOT dropped;
+                      `issue191_pr198_use_drop_false_comments_out_cycle_break`
+                      asserts the banner mentions `use_drop=false`,
+                      drops/re-adds are commented, SETs stay live;
+                      `issue191_pr198_cycle_fk_comment_survives_round_trip`
+                      attaches a comment to each cycle FK and
+                      verifies the re-emitted `COMMENT ON
+                      CONSTRAINT` clause survives the drop+SET+
+                      re-add sandwich.
 
                     - Fixed issue #190 (persistence-ordering FK
                       adjacency misses unqualified FK targets in

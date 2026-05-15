@@ -462,6 +462,14 @@ impl Comparer {
     /// `emit_persistence_changes` uses it to drop FKs that form a
     /// SET-ordering deadlock and re-add them after the SET statements
     /// (issue #191).
+    ///
+    /// **Important**: the returned cyclic set contains every node
+    /// Kahn was unable to remove — that includes nodes *blocked by*
+    /// a cycle (e.g. `C` in `A↔B + A→C`), not only nodes *in* a
+    /// cycle. Callers that need to act on *true* cycle members
+    /// should pair this with [`strongly_connected_components`] —
+    /// `topo_order_within_subset_detect_cycle` does exactly that
+    /// (PR #198 review).
     fn kahn_toposort_detect_cycle<K: Ord>(
         n: usize,
         depends_on: &[HashSet<usize>],
@@ -505,6 +513,96 @@ impl Comparer {
         }
 
         (sorted, cyclic)
+    }
+
+    /// Tarjan's strongly-connected-components algorithm, iterative
+    /// form to avoid stack overflow on adversarial graphs. Returns
+    /// each SCC as a `Vec<usize>` of node indices into the same
+    /// `0..n` space `depends_on` uses. Singleton SCCs (size 1) are
+    /// included; callers that want *cycle* membership specifically
+    /// should keep only SCCs of size >= 2 (self-loops never occur
+    /// in the FK-adjacency call site, which filters `j != i`).
+    ///
+    /// Used by `topo_order_within_subset_detect_cycle` to narrow
+    /// Kahn's "couldn't-be-ordered" remainder down to nodes that
+    /// actually participate in a directed cycle, rather than nodes
+    /// merely *blocked by* one (PR #198 review).
+    fn strongly_connected_components(n: usize, depends_on: &[HashSet<usize>]) -> Vec<Vec<usize>> {
+        // Iterative Tarjan with an explicit work stack. Each frame
+        // tracks (node v, iterator state over its neighbours);
+        // `started` marks the post-enter book-keeping (index,
+        // lowlink, push-on-stack) we only want to run once per node.
+        let mut index_counter: usize = 0;
+        let mut tarjan_stack: Vec<usize> = Vec::new();
+        let mut on_stack = vec![false; n];
+        let mut index: Vec<Option<usize>> = vec![None; n];
+        let mut lowlink = vec![0usize; n];
+        let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+        // Each work-stack entry is (v, neighbours_remaining).
+        // `neighbours_remaining` is a `Vec<usize>` snapshot of the
+        // outgoing edges from v, popped one-at-a-time so we can
+        // suspend processing of v when we recurse into a neighbour.
+        let mut work: Vec<(usize, Vec<usize>)> = Vec::new();
+
+        for start in 0..n {
+            if index[start].is_some() {
+                continue;
+            }
+            // Enter `start`.
+            index[start] = Some(index_counter);
+            lowlink[start] = index_counter;
+            index_counter += 1;
+            tarjan_stack.push(start);
+            on_stack[start] = true;
+            work.push((start, depends_on[start].iter().copied().collect()));
+
+            while let Some((v, neighbours)) = work.last_mut() {
+                let v = *v;
+                if let Some(w) = neighbours.pop() {
+                    if index[w].is_none() {
+                        // Recurse into w.
+                        index[w] = Some(index_counter);
+                        lowlink[w] = index_counter;
+                        index_counter += 1;
+                        tarjan_stack.push(w);
+                        on_stack[w] = true;
+                        work.push((w, depends_on[w].iter().copied().collect()));
+                    } else if on_stack[w] {
+                        // Back-edge into the current SCC candidate.
+                        let w_idx = index[w].expect("on_stack implies index is set");
+                        lowlink[v] = lowlink[v].min(w_idx);
+                    }
+                    // Tree-edge to a fully-processed node in a
+                    // different SCC: ignore (don't update lowlink).
+                } else {
+                    // All neighbours exhausted; pop and propagate
+                    // lowlink up to the parent (if any).
+                    let v_lowlink = lowlink[v];
+                    let v_index = index[v].expect("entered node has an index");
+                    if v_lowlink == v_index {
+                        // v is an SCC root; pop the SCC off
+                        // `tarjan_stack`.
+                        let mut scc = Vec::new();
+                        while let Some(w) = tarjan_stack.pop() {
+                            on_stack[w] = false;
+                            scc.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        sccs.push(scc);
+                    }
+                    work.pop();
+                    if let Some((parent, _)) = work.last() {
+                        let parent = *parent;
+                        lowlink[parent] = lowlink[parent].min(v_lowlink);
+                    }
+                }
+            }
+        }
+
+        sccs
     }
 
     /// Returns the fully-quoted key used to match a table's `partition_of` reference.
@@ -2045,13 +2143,15 @@ impl Comparer {
         // edge, the underlying TO-side constraint(s) that produced it.
         // The persistence-flip cycle break (issue #191) reaches in
         // here to find which FKs to drop+re-add when the SET ordering
-        // is a deadlock. Stored as owned `(schema, table, name,
-        // definition)` tuples so the data outlives the immutable
-        // borrow of `self.to.tables` (the `self.script` mutations
-        // later in the function would otherwise conflict).
-        type FkRef = (String, String, String, Option<String>);
+        // is a deadlock. Stored as cloned `TableConstraint`s so the
+        // data outlives the immutable borrow of `self.to.tables` (the
+        // `self.script` mutations later in the function would
+        // otherwise conflict) AND so the re-emit path can call
+        // `TableConstraint::get_script()` — preserving the comment
+        // and any other metadata that the raw `definition` string
+        // doesn't carry (PR #198 review).
         let mut fk_targets: Vec<HashSet<usize>> = vec![HashSet::new(); self.to.tables.len()];
-        let mut edge_fks: HashMap<(usize, usize), Vec<FkRef>> = HashMap::new();
+        let mut edge_fks: HashMap<(usize, usize), Vec<TableConstraint>> = HashMap::new();
         for (i, to_table) in self.to.tables.iter().enumerate() {
             // Lift the matching FROM table once so the FK lookup
             // doesn't pay a per-constraint hashmap miss.
@@ -2105,49 +2205,95 @@ impl Comparer {
                     && j != i
                 {
                     fk_targets[i].insert(j);
-                    edge_fks.entry((i, j)).or_default().push((
-                        c.schema.clone(),
-                        c.table_name.clone(),
-                        c.name.clone(),
-                        c.definition.clone(),
-                    ));
+                    edge_fks.entry((i, j)).or_default().push(c.clone());
                 }
             }
         }
 
         // Issue #191: collect FKs whose endpoints both sit inside a
-        // SET subset's cyclic remainder. Dropping these breaks the
-        // ordering deadlock so the SET statements that follow can run
-        // in any (alphabetical) order, then we re-add them from the
-        // TO definitions. Returns each FK exactly once even when the
-        // same edge appears in both directions of a 2-node cycle.
-        let collect_cycle_fks =
-            |fk_targets: &[HashSet<usize>], cyclic_abs: &HashSet<usize>| -> Vec<FkRef> {
-                let mut out: Vec<FkRef> = Vec::new();
-                let mut seen: HashSet<(String, String, String)> = HashSet::new();
-                // Iterate in a deterministic order so the emitted script
-                // is stable from run to run.
-                let mut cyclic_sorted: Vec<usize> = cyclic_abs.iter().copied().collect();
-                cyclic_sorted.sort_unstable();
-                for i in cyclic_sorted {
-                    let mut targets: Vec<usize> = fk_targets[i].iter().copied().collect();
-                    targets.sort_unstable();
-                    for j in targets {
-                        if !cyclic_abs.contains(&j) {
-                            continue;
-                        }
-                        if let Some(fks) = edge_fks.get(&(i, j)) {
-                            for fk in fks {
-                                let key = (fk.0.clone(), fk.1.clone(), fk.2.clone());
-                                if seen.insert(key) {
-                                    out.push(fk.clone());
-                                }
+        // SET subset's true cyclic set (Tarjan SCC of size >= 2;
+        // see `topo_order_within_subset_detect_cycle`). Dropping
+        // these breaks the ordering deadlock so the SET statements
+        // can run in any order; we re-add the same FKs from their
+        // TO `TableConstraint` clones afterwards. Returns each FK
+        // exactly once even when the same edge appears in both
+        // directions of a 2-node cycle.
+        let collect_cycle_fks = |fk_targets: &[HashSet<usize>],
+                                 cyclic_abs: &HashSet<usize>|
+         -> Vec<TableConstraint> {
+            let mut out: Vec<TableConstraint> = Vec::new();
+            let mut seen: HashSet<(String, String, String)> = HashSet::new();
+            // Iterate in a deterministic order so the emitted script
+            // is stable from run to run.
+            let mut cyclic_sorted: Vec<usize> = cyclic_abs.iter().copied().collect();
+            cyclic_sorted.sort_unstable();
+            for i in cyclic_sorted {
+                let mut targets: Vec<usize> = fk_targets[i].iter().copied().collect();
+                targets.sort_unstable();
+                for j in targets {
+                    if !cyclic_abs.contains(&j) {
+                        continue;
+                    }
+                    if let Some(fks) = edge_fks.get(&(i, j)) {
+                        for fk in fks {
+                            let key = (fk.schema.clone(), fk.table_name.clone(), fk.name.clone());
+                            if seen.insert(key) {
+                                out.push(fk.clone());
                             }
                         }
                     }
                 }
-                out
-            };
+            }
+            out
+        };
+
+        // Issue #191 + PR #198 review: emit the cycle-break sandwich
+        // around `set_kind` SETs. `use_drop=true` runs the drops and
+        // re-adds live (the normal cycle-break path). `use_drop=false`
+        // honours the user's destructive-op review mode by commenting
+        // out both the drops and the re-adds — the SET statements
+        // themselves stay live (matching every other SET in this
+        // phase), but a loud banner warns that without the drops the
+        // SETs will FAIL at apply time. The re-emit uses
+        // `TableConstraint::get_script()` so a FK comment
+        // (`COMMENT ON CONSTRAINT ...`) survives the round-trip.
+        let emit_cycle_sandwich = |out: &mut String,
+                                   use_drop: bool,
+                                   tables: &[Table],
+                                   ordered: Vec<usize>,
+                                   cycle_fks: &[TableConstraint],
+                                   set_kind: &str| {
+            if !cycle_fks.is_empty() {
+                let banner = if use_drop {
+                    "/* Persistence-flip FK cycle (issue #191): dropping cycle FKs to break the SET-ordering deadlock; re-added after the SET block below. */"
+                } else {
+                    "/* Persistence-flip FK cycle (issue #191): use_drop=false — cycle-break DROP/ADD statements commented out below. The SET statements that follow WILL FAIL at apply time until the cycle FKs are dropped (re-run with use_drop=true, or run the commented statements by hand). */"
+                };
+                out.append_block(banner);
+                for fk in cycle_fks {
+                    Self::emit_drop(out, use_drop, &fk.get_drop_script());
+                }
+            }
+            for table_idx in ordered {
+                let table = &tables[table_idx];
+                out.append_block(&format!(
+                    "alter table {}.{} set {};",
+                    table.schema, table.name, set_kind
+                ));
+            }
+            for fk in cycle_fks {
+                let script = fk.get_script();
+                if use_drop {
+                    out.push_str(&script);
+                } else {
+                    // Pair the add-side with the commented drop above
+                    // so use_drop=false produces an inert block.
+                    for line in script.lines() {
+                        out.push_str(&format!("-- {line}\n"));
+                    }
+                }
+            }
+        };
 
         // For SET UNLOGGED we want leaves (referencers) first. The
         // generic toposort returns `dependencies before dependents`
@@ -2162,32 +2308,14 @@ impl Comparer {
                 true,
             );
             let cycle_fks = collect_cycle_fks(&fk_targets, &cyclic_abs);
-            if !cycle_fks.is_empty() {
-                self.script.append_block(
-                    "/* Persistence-flip FK cycle (issue #191): dropping cycle FKs to break the SET-ordering deadlock; re-added after the SET block below. */",
-                );
-                for (sch, tbl, nm, _def) in &cycle_fks {
-                    self.script.append_block(&format!(
-                        "alter table {}.{} drop constraint {};",
-                        sch, tbl, nm
-                    ));
-                }
-            }
-            for table_idx in ordered {
-                let table = &self.to.tables[table_idx];
-                self.script.append_block(&format!(
-                    "alter table {}.{} set unlogged;",
-                    table.schema, table.name
-                ));
-            }
-            for (sch, tbl, nm, def) in &cycle_fks {
-                if let Some(definition) = def {
-                    self.script.append_block(&format!(
-                        "alter table {}.{} add constraint {} {};",
-                        sch, tbl, nm, definition
-                    ));
-                }
-            }
+            emit_cycle_sandwich(
+                &mut self.script,
+                self.use_drop,
+                &self.to.tables,
+                ordered,
+                &cycle_fks,
+                "unlogged",
+            );
         }
 
         // For SET LOGGED we want roots (referenced tables) first —
@@ -2200,32 +2328,14 @@ impl Comparer {
                 false,
             );
             let cycle_fks = collect_cycle_fks(&fk_targets, &cyclic_abs);
-            if !cycle_fks.is_empty() {
-                self.script.append_block(
-                    "/* Persistence-flip FK cycle (issue #191): dropping cycle FKs to break the SET-ordering deadlock; re-added after the SET block below. */",
-                );
-                for (sch, tbl, nm, _def) in &cycle_fks {
-                    self.script.append_block(&format!(
-                        "alter table {}.{} drop constraint {};",
-                        sch, tbl, nm
-                    ));
-                }
-            }
-            for table_idx in ordered {
-                let table = &self.to.tables[table_idx];
-                self.script.append_block(&format!(
-                    "alter table {}.{} set logged;",
-                    table.schema, table.name
-                ));
-            }
-            for (sch, tbl, nm, def) in &cycle_fks {
-                if let Some(definition) = def {
-                    self.script.append_block(&format!(
-                        "alter table {}.{} add constraint {} {};",
-                        sch, tbl, nm, definition
-                    ));
-                }
-            }
+            emit_cycle_sandwich(
+                &mut self.script,
+                self.use_drop,
+                &self.to.tables,
+                ordered,
+                &cycle_fks,
+                "logged",
+            );
         }
     }
 
@@ -2244,6 +2354,15 @@ impl Comparer {
     /// whose endpoints both sit in the cyclic set, run the SETs, and
     /// re-add the FKs from their TO definitions. When the FK graph
     /// restricted to `subset` is acyclic the cyclic set is empty.
+    ///
+    /// PR #198 review: the cyclic set is computed via
+    /// [`strongly_connected_components`] (Tarjan), not the raw Kahn
+    /// remainder. The remainder would include nodes merely *blocked
+    /// by* a cycle (e.g. `C` in `A↔B + A→C`), and treating them as
+    /// cycle participants would drop FKs that are not actually in
+    /// any cycle — making migrations more destructive than needed.
+    /// Filtering to SCCs of size >= 2 keeps the drop surgical to
+    /// the true cycle edges.
     fn topo_order_within_subset_detect_cycle(
         subset: &[usize],
         fk_targets: &[HashSet<usize>],
@@ -2268,15 +2387,29 @@ impl Comparer {
             }
         }
 
-        let (mut sorted, cyclic_pos) = Self::kahn_toposort_detect_cycle(n, &depends_on, |i| {
+        let (mut sorted, _kahn_remainder) = Self::kahn_toposort_detect_cycle(n, &depends_on, |i| {
             let t = &tables[subset[i]];
             (t.schema.to_lowercase(), t.name.to_lowercase())
         });
         if dependents_first {
             sorted.reverse();
         }
+
+        // Narrow the cycle set to *true* SCC members (size >= 2).
+        // Self-loops are impossible here — `fk_targets` is built
+        // with the `j != i` guard in `emit_persistence_changes` — so
+        // a singleton SCC always means an acyclic node.
+        let sccs = Self::strongly_connected_components(n, &depends_on);
+        let mut true_cyclic_pos: HashSet<usize> = HashSet::new();
+        for scc in sccs {
+            if scc.len() >= 2 {
+                true_cyclic_pos.extend(scc);
+            }
+        }
+
         let ordered_abs: Vec<usize> = sorted.into_iter().map(|pos| subset[pos]).collect();
-        let cyclic_abs: HashSet<usize> = cyclic_pos.into_iter().map(|pos| subset[pos]).collect();
+        let cyclic_abs: HashSet<usize> =
+            true_cyclic_pos.into_iter().map(|pos| subset[pos]).collect();
         (ordered_abs, cyclic_abs)
     }
 

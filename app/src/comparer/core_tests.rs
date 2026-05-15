@@ -10602,12 +10602,15 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
     );
 
     // Both cycle FKs must be re-added AFTER every SET so the post-
-    // migration state matches TO.
+    // migration state matches TO. PR #198 review: the re-emit path
+    // now goes through `TableConstraint::get_script()`, which
+    // lowercases SQL keywords outside literals — match on the
+    // lowercase form.
     let add_a_pos = script
-        .find("alter table test_cycle.a add constraint a_b_id_fkey FOREIGN KEY")
+        .find("alter table test_cycle.a add constraint a_b_id_fkey foreign key")
         .expect("FK a_b_id_fkey must be re-added after SET");
     let add_b_pos = script
-        .find("alter table test_cycle.b add constraint b_a_id_fkey FOREIGN KEY")
+        .find("alter table test_cycle.b add constraint b_a_id_fkey foreign key")
         .expect("FK b_a_id_fkey must be re-added after SET");
     assert!(
         add_a_pos > set_a_pos && add_a_pos > set_b_pos,
@@ -10666,6 +10669,422 @@ async fn issue191_persistence_flip_acyclic_chain_does_not_drop_fks() {
     assert!(
         !script.contains("drop constraint child_parent_id_fkey"),
         "live FK on an acyclic chain must not be dropped: {}",
+        script
+    );
+}
+
+/// Issue #191 / PR #198 review: when a cycle exists alongside an
+/// edge that's *blocked by* the cycle but not in it (e.g. `A ↔ B`
+/// plus `A → C` from outside the cycle, with all three flipping
+/// persistence in the same direction), Kahn's "couldn't-be-ordered"
+/// remainder includes C — even though C is not part of any directed
+/// cycle. Pre-refinement the comparer treated the entire remainder
+/// as cycle participants and dropped the `A → C` FK alongside the
+/// true cycle edges, making the migration more destructive than
+/// needed. Tarjan's SCC narrows the cycle set to nodes in
+/// strongly-connected components of size >= 2, so only the true
+/// cycle edges get dropped.
+#[tokio::test]
+async fn issue191_pr198_cycle_detection_excludes_blocked_non_cycle_nodes() {
+    fn build(name: &str, is_unlogged: bool, fk: Option<(&str, &str, &str)>) -> Table {
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut constraints = vec![pk];
+        let mut columns = vec![id_col];
+
+        if let Some((fk_col, target_schema, target_table)) = fk {
+            let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+            ref_col.is_nullable = true;
+            columns.push(ref_col);
+            constraints.push(TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "test_cycle".to_string(),
+                name: format!("{name}_{fk_col}_fkey"),
+                table_name: name.to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: true,
+                initially_deferred: true,
+                definition: Some(format!(
+                    "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+                )),
+                coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
+                comment: None,
+            });
+        }
+
+        let mut t = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            columns,
+            constraints,
+            vec![],
+            vec![],
+            None,
+        );
+        t.is_unlogged = is_unlogged;
+        t.hash();
+        t
+    }
+
+    // Build three tables:
+    //   a ↔ b   (cycle: a → b and b → a)
+    //   a → c   (non-cycle: a depends on c, but c does not depend on a)
+    // All three flip LOGGED → UNLOGGED. The cycle set is {a, b}; the
+    // FK `a_c_id_fkey` is NOT in any cycle and must survive the
+    // cycle break.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // FROM: all LOGGED. `a` has TWO FKs: a → b (cycle), a → c (not).
+    let mut a_from = build("a", false, Some(("b_id", "test_cycle", "b")));
+    a_from.columns.push({
+        let mut c_id = int_column("test_cycle", "a", "c_id", 3);
+        c_id.is_nullable = true;
+        c_id
+    });
+    a_from.constraints.push(TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_cycle".to_string(),
+        name: "a_c_id_fkey".to_string(),
+        table_name: "a".to_string(),
+        constraint_type: "FOREIGN KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("FOREIGN KEY (c_id) REFERENCES test_cycle.c(id)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    });
+    a_from.hash();
+    from_dump.tables.push(a_from);
+    from_dump
+        .tables
+        .push(build("b", false, Some(("a_id", "test_cycle", "a"))));
+    from_dump.tables.push(build("c", false, None));
+
+    // TO: all UNLOGGED. Same constraint shapes.
+    let mut a_to = build("a", true, Some(("b_id", "test_cycle", "b")));
+    a_to.columns.push({
+        let mut c_id = int_column("test_cycle", "a", "c_id", 3);
+        c_id.is_nullable = true;
+        c_id
+    });
+    a_to.constraints.push(TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_cycle".to_string(),
+        name: "a_c_id_fkey".to_string(),
+        table_name: "a".to_string(),
+        constraint_type: "FOREIGN KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("FOREIGN KEY (c_id) REFERENCES test_cycle.c(id)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    });
+    a_to.hash();
+    to_dump.tables.push(a_to);
+    to_dump
+        .tables
+        .push(build("b", true, Some(("a_id", "test_cycle", "a"))));
+    to_dump.tables.push(build("c", true, None));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Cycle banner must appear (a↔b cycle is present).
+    assert!(
+        script.contains("Persistence-flip FK cycle (issue #191)"),
+        "cycle banner must appear for the a↔b cycle: {}",
+        script
+    );
+    // True cycle FKs must be dropped.
+    assert!(
+        script.contains("alter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "true cycle FK a_b_id_fkey must be dropped: {}",
+        script
+    );
+    assert!(
+        script.contains("alter table test_cycle.b drop constraint b_a_id_fkey;"),
+        "true cycle FK b_a_id_fkey must be dropped: {}",
+        script
+    );
+    // The non-cycle FK (a → c) is merely *blocked by* the cycle in
+    // Kahn's remainder but is not part of any directed cycle. With
+    // SCC-based detection it must NOT be dropped.
+    assert!(
+        !script.contains("drop constraint a_c_id_fkey"),
+        "non-cycle FK a_c_id_fkey (a → c) must NOT be dropped: {}",
+        script
+    );
+}
+
+/// Issue #191 / PR #198 review: when `use_drop=false`, the cycle-
+/// break drops and re-adds must be commented out, with a loud banner
+/// explaining that the SETs will fail without manual intervention.
+/// The user has explicitly asked the comparer to surface destructive
+/// statements for review rather than emit them live.
+#[tokio::test]
+async fn issue191_pr198_use_drop_false_comments_out_cycle_break() {
+    fn make_cycle_table(name: &str, is_unlogged: bool, fk: (&str, &str, &str)) -> Table {
+        let (fk_col, target_schema, target_table) = fk;
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+        let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+        ref_col.is_nullable = true;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+        let fk_constraint = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: true,
+            initially_deferred: true,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut table = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![pk, fk_constraint],
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(make_cycle_table("a", false, ("b_id", "test_cycle", "b")));
+    from_dump
+        .tables
+        .push(make_cycle_table("b", false, ("a_id", "test_cycle", "a")));
+    to_dump
+        .tables
+        .push(make_cycle_table("a", true, ("b_id", "test_cycle", "b")));
+    to_dump
+        .tables
+        .push(make_cycle_table("b", true, ("a_id", "test_cycle", "a")));
+
+    // use_drop=false — drops and re-adds must be commented out.
+    // `use_comments=true` so the banner and commented-out lines
+    // survive `get_script`'s output (which strips comments under
+    // `use_comments=false`).
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Loud banner specifically calls out use_drop=false semantics.
+    assert!(
+        script.contains("use_drop=false"),
+        "banner must mention use_drop=false: {}",
+        script
+    );
+    // DROP CONSTRAINT lines must be commented out (i.e. they appear
+    // only as `-- alter table ... drop constraint ...;`).
+    assert!(
+        !script.contains("\nalter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "live DROP CONSTRAINT must NOT be emitted under use_drop=false: {}",
+        script
+    );
+    assert!(
+        script.contains("-- alter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "commented DROP CONSTRAINT must be emitted under use_drop=false: {}",
+        script
+    );
+    // ADD CONSTRAINT lines must also be commented out so re-running
+    // with use_drop=true after manual review produces a clean diff.
+    assert!(
+        !script.contains("\nalter table test_cycle.a add constraint a_b_id_fkey foreign key"),
+        "live ADD CONSTRAINT must NOT be emitted under use_drop=false: {}",
+        script
+    );
+    assert!(
+        script.contains("-- alter table test_cycle.a add constraint a_b_id_fkey foreign key"),
+        "commented ADD CONSTRAINT must be emitted under use_drop=false: {}",
+        script
+    );
+    // SET statements are NOT destructive and stay live, matching how
+    // SETs are handled elsewhere when use_drop=false (the cycle case
+    // is highlighted by the banner above).
+    assert!(
+        script.contains("alter table test_cycle.a set unlogged;"),
+        "SET UNLOGGED must remain live under use_drop=false: {}",
+        script
+    );
+}
+
+/// Issue #191 / PR #198 review: the cycle-break re-emit path goes
+/// through `TableConstraint::get_script()`, which appends
+/// `COMMENT ON CONSTRAINT ...` when the FK has a comment. Verify
+/// the comment survives the drop+SET+re-add round-trip — i.e. the
+/// emitted re-add carries the `comment on constraint` clause from
+/// the TO-side metadata so the post-migration schema matches TO.
+#[tokio::test]
+async fn issue191_pr198_cycle_fk_comment_survives_round_trip() {
+    fn cycle_table_with_comment(name: &str, is_unlogged: bool, fk: (&str, &str, &str)) -> Table {
+        let (fk_col, target_schema, target_table) = fk;
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+        let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+        ref_col.is_nullable = true;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+        let fk_constraint = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: true,
+            initially_deferred: true,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: Some(format!("FK {name} → {target_table} (cycle annotated)")),
+        };
+
+        let mut table = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![pk, fk_constraint],
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(cycle_table_with_comment(
+        "a",
+        false,
+        ("b_id", "test_cycle", "b"),
+    ));
+    from_dump.tables.push(cycle_table_with_comment(
+        "b",
+        false,
+        ("a_id", "test_cycle", "a"),
+    ));
+    to_dump.tables.push(cycle_table_with_comment(
+        "a",
+        true,
+        ("b_id", "test_cycle", "b"),
+    ));
+    to_dump.tables.push(cycle_table_with_comment(
+        "b",
+        true,
+        ("a_id", "test_cycle", "a"),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // The re-add must include the `comment on constraint` clause —
+    // proof that the cycle-break path round-trips full
+    // `TableConstraint` metadata via `get_script()`, not just the
+    // raw `(schema, table, name, definition)` tuple.
+    assert!(
+        script.contains(
+            "comment on constraint a_b_id_fkey on test_cycle.a is 'FK a → b (cycle annotated)';"
+        ),
+        "FK comment on a_b_id_fkey must be re-emitted after the SET: {}",
+        script
+    );
+    assert!(
+        script.contains(
+            "comment on constraint b_a_id_fkey on test_cycle.b is 'FK b → a (cycle annotated)';"
+        ),
+        "FK comment on b_a_id_fkey must be re-emitted after the SET: {}",
         script
     );
 }
