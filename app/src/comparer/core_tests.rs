@@ -8908,7 +8908,10 @@ fn issue180_parse_fk_referenced_table_word_boundary() {
     // FK column list. The matcher must be anchored to a word boundary
     // and the keyword must be followed by whitespace.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col_a) REFERENCES public.target(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col_a) REFERENCES public.target(id)",
+            "public",
+        ),
         Some(("public".to_string(), "target".to_string())),
         "happy-path FK definition must parse"
     );
@@ -8917,7 +8920,8 @@ fn issue180_parse_fk_referenced_table_word_boundary() {
     // before the real keyword and parse garbage.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"references \", col_b) REFERENCES public.target(id)"
+            "FOREIGN KEY (\"references \", col_b) REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
@@ -8926,7 +8930,8 @@ fn issue180_parse_fk_referenced_table_word_boundary() {
     // see this column first and try to parse what follows.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (references_count) REFERENCES public.target(id)"
+            "FOREIGN KEY (references_count) REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
@@ -8940,14 +8945,18 @@ fn issue180_parse_fk_referenced_table_quoted_identifier_with_dot() {
     // and the parsed pair is nonsensical.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (col) REFERENCES \"weird.schema\".\"t\"(id)"
+            "FOREIGN KEY (col) REFERENCES \"weird.schema\".\"t\"(id)",
+            "public",
         ),
         Some(("weird.schema".to_string(), "t".to_string()))
     );
     // Both halves quoted with embedded dots — the split must still
     // land on the dot OUTSIDE every quoted segment.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"a.b\".\"c.d\"(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"a.b\".\"c.d\"(id)",
+            "public",
+        ),
         Some(("a.b".to_string(), "c.d".to_string()))
     );
 }
@@ -8962,7 +8971,8 @@ fn pr187_parse_fk_skips_keyword_inside_quoted_column_name() {
     // identifier.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"my references col\") REFERENCES public.target(id)"
+            "FOREIGN KEY (\"my references col\") REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string())),
         "FK keyword must still be located even with `references` inside a quoted column name"
@@ -8976,7 +8986,10 @@ fn pr187_parse_fk_handles_dollar_in_identifier() {
     // target like `public.parent$table` is truncated to
     // `public.parent`.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES public.parent$table(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES public.parent$table(id)",
+            "public",
+        ),
         Some(("public".to_string(), "parent$table".to_string()))
     );
 }
@@ -9168,7 +9181,8 @@ fn issue180_parse_fk_referenced_table_handles_non_ascii_column_names() {
     // leaves the 2-byte `İ` alone, so byte offsets line up.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"\u{0130}d\") REFERENCES public.target(id)"
+            "FOREIGN KEY (\"\u{0130}d\") REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
@@ -9179,14 +9193,177 @@ fn issue180_parse_fk_referenced_table_handles_non_ascii_column_names() {
     // bytes lie outside the ASCII range.
     assert_eq!(
         Comparer::parse_fk_referenced_table(
-            "FOREIGN KEY (\"русское_имя\") REFERENCES public.target(id)"
+            "FOREIGN KEY (\"русское_имя\") REFERENCES public.target(id)",
+            "public",
         ),
         Some(("public".to_string(), "target".to_string()))
     );
     // Same case in the qualified target identifier.
     assert_eq!(
-        Comparer::parse_fk_referenced_table("FOREIGN KEY (col) REFERENCES \"тест\".\"target\"(id)"),
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"тест\".\"target\"(id)",
+            "public",
+        ),
         Some(("тест".to_string(), "target".to_string()))
+    );
+}
+
+#[test]
+fn issue190_parse_fk_unqualified_target_falls_back_to_owner_schema() {
+    // Issue #190: `pg_get_constraintdef` omits the schema qualifier
+    // when the target is reachable via `search_path` — typical for
+    // tables in `public`. Pre-fix the parser returned `None` for these
+    // and the FK edge was silently dropped from the persistence-flip
+    // adjacency, leaving FK chains in `public` ordered alphabetically
+    // (the order PostgreSQL rejects).
+    //
+    // Plain unqualified target — same schema as the FK owner.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (parent_id) REFERENCES parent(id)",
+            "public",
+        ),
+        Some(("public".to_string(), "parent".to_string())),
+        "unqualified target must resolve to (owner_schema, target)"
+    );
+    // Quoted unqualified target — the quotes must be stripped to
+    // match the comparer's normalised `to_index_by_key` keys (which
+    // strip quotes on the index side too).
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES \"MixedCase\"(id)",
+            "public",
+        ),
+        Some(("public".to_string(), "MixedCase".to_string()))
+    );
+    // Quoted owner schema (e.g. mixed-case schema names land here as
+    // `"MySchema"` via `quote_ident`) — the fallback must strip the
+    // surrounding quotes from the owner schema too, otherwise the
+    // produced pair misses the index-side lookup keys.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES parent(id)",
+            "\"MySchema\"",
+        ),
+        Some(("MySchema".to_string(), "parent".to_string()))
+    );
+    // ON UPDATE / ON DELETE clauses follow the target — make sure
+    // they don't confuse the boundary scan.
+    assert_eq!(
+        Comparer::parse_fk_referenced_table(
+            "FOREIGN KEY (col) REFERENCES parent(id) ON DELETE CASCADE",
+            "public",
+        ),
+        Some(("public".to_string(), "parent".to_string()))
+    );
+}
+
+/// Issue #190 end-to-end: a FK chain in `public` whose deparsed
+/// definition uses unqualified target names must still be ordered
+/// leaves-first by `emit_persistence_changes`. Pre-fix the unqualified
+/// targets returned `None` from the parser, the adjacency went empty,
+/// and the SET UNLOGGED order fell back to alphabetical (`child`
+/// emitted *after* `parent` — exactly the order PostgreSQL rejects).
+#[tokio::test]
+async fn issue190_set_unlogged_orders_unqualified_public_fk_chain() {
+    // Builder that matches `issue180_logged_table` but emits FK
+    // definitions WITHOUT the schema qualifier — the
+    // `pg_get_constraintdef` output shape that exposes the issue.
+    fn make_table(name: &str, is_unlogged: bool, fk_target: Option<(&str, &str)>) -> Table {
+        let mut id_col = int_column("public", name, "id", 1);
+        id_col.is_nullable = false;
+        let mut constraints: Vec<TableConstraint> = vec![TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "public".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        }];
+
+        let mut columns = vec![id_col];
+        if let Some((fk_col, fk_table)) = fk_target {
+            let mut ref_col = int_column("public", name, fk_col, 2);
+            ref_col.is_nullable = true;
+            columns.push(ref_col);
+            // Unqualified `REFERENCES parent(id)` — no `public.`
+            // qualifier. This is what `pg_get_constraintdef` returns
+            // when the target is reachable via `search_path`.
+            constraints.push(TableConstraint {
+                catalog: "postgres".to_string(),
+                schema: "public".to_string(),
+                name: format!("{name}_{fk_col}_fkey"),
+                table_name: name.to_string(),
+                constraint_type: "FOREIGN KEY".to_string(),
+                is_deferrable: false,
+                initially_deferred: false,
+                definition: Some(format!("FOREIGN KEY ({fk_col}) REFERENCES {fk_table}(id)")),
+                coninhcount: 0,
+                is_enforced: true,
+                no_inherit: false,
+                nulls_not_distinct: false,
+                comment: None,
+            });
+        }
+
+        let mut table = Table::new(
+            "public".to_string(),
+            name.to_string(),
+            "public".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            columns,
+            constraints,
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    // FROM: child → parent in public, both LOGGED.
+    // TO:   same chain, both UNLOGGED. The FK must survive in TO
+    // unchanged (live edge) so the adjacency considers it.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(make_table("parent", false, None));
+    from_dump
+        .tables
+        .push(make_table("child", false, Some(("parent_id", "parent"))));
+    to_dump.tables.push(make_table("parent", true, None));
+    to_dump
+        .tables
+        .push(make_table("child", true, Some(("parent_id", "parent"))));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    let child_pos = script
+        .find("alter table public.child set unlogged;")
+        .expect("child SET UNLOGGED must be emitted");
+    let parent_pos = script
+        .find("alter table public.parent set unlogged;")
+        .expect("parent SET UNLOGGED must be emitted");
+    assert!(
+        child_pos < parent_pos,
+        "child (referrer) must SET UNLOGGED BEFORE parent (referenced); \
+         got child@{} parent@{} — alphabetical order would put `child` \
+         after `parent` and PostgreSQL would reject the SET on `parent` \
+         while `child` is still LOGGED:\n{}",
+        child_pos,
+        parent_pos,
+        script
     );
 }
 

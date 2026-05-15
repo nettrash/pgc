@@ -1816,3 +1816,20 @@ CREATE UNLOGGED TABLE test_order.child (
     id serial PRIMARY KEY,
     parent_id integer REFERENCES test_order.parent(id)
 );
+
+-- =============================================================================
+-- Issue #190 — Persistence-ordering FK adjacency with unqualified FK targets
+-- =============================================================================
+-- Mirrors the LOGGED pair in Schema A but flipped to UNLOGGED. The FK
+-- references `public.persistence_chain_parent(id)` via the unqualified
+-- form `pg_get_constraintdef` produces when `public` is on the
+-- search_path; the comparer must restore the FK edge against the FK
+-- owner's schema (`public`) so the SET UNLOGGED order is leaves-first.
+CREATE UNLOGGED TABLE public.persistence_chain_parent (
+    id serial PRIMARY KEY
+);
+
+CREATE UNLOGGED TABLE public.persistence_chain_child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES public.persistence_chain_parent(id)
+);
