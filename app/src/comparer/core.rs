@@ -528,10 +528,17 @@ impl Comparer {
     /// actually participate in a directed cycle, rather than nodes
     /// merely *blocked by* one (PR #198 review).
     fn strongly_connected_components(n: usize, depends_on: &[HashSet<usize>]) -> Vec<Vec<usize>> {
-        // Iterative Tarjan with an explicit work stack. Each frame
-        // tracks (node v, iterator state over its neighbours);
-        // `started` marks the post-enter book-keeping (index,
-        // lowlink, push-on-stack) we only want to run once per node.
+        // Iterative Tarjan with an explicit work stack. Each work-
+        // stack frame is `(node v, neighbours_remaining: Vec<usize>)`
+        // — a snapshot of v's outgoing edges, popped one at a time so
+        // we can suspend processing of v when we descend into a
+        // neighbour and resume exactly where we left off after the
+        // neighbour's frame finishes. The post-enter book-keeping
+        // (assigning index/lowlink, pushing onto `tarjan_stack`,
+        // marking `on_stack`) runs once per node at the point we
+        // push its frame onto `work` — either in the outer
+        // `for start in 0..n` loop for roots, or in the
+        // `index[w].is_none()` branch for descents.
         let mut index_counter: usize = 0;
         let mut tarjan_stack: Vec<usize> = Vec::new();
         let mut on_stack = vec![false; n];

@@ -10560,7 +10560,16 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
         .tables
         .push(make_cycle_table("b", true, ("a_id", "test_cycle", "a")));
 
-    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    // `use_drop=true` — this test validates the *active* cycle-break
+    // path (drops and re-adds emitted live). The `use_drop=false`
+    // semantics are covered separately by
+    // `issue191_pr198_use_drop_false_comments_out_cycle_break`.
+    // PR #198 review: an earlier revision used `use_drop=false` here
+    // and the substring-based `script.find` assertions were
+    // false-positives — they matched the commented-out `-- alter
+    // table … drop constraint …` lines and never actually verified
+    // the live path.
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
     comparer.compare_tables().await.unwrap();
     let script = comparer.get_script();
 
@@ -10572,17 +10581,30 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
     );
 
     // Both cycle FKs must be dropped BEFORE either SET UNLOGGED.
+    // Anchor each `find` to a leading newline so the assertion
+    // distinguishes the live statement from a commented `-- alter
+    // table …` prefix — this is the PR #198 review fix.
     let drop_a_pos = script
-        .find("alter table test_cycle.a drop constraint a_b_id_fkey;")
-        .expect("FK a_b_id_fkey must be dropped before SET");
+        .find("\nalter table test_cycle.a drop constraint a_b_id_fkey;")
+        .expect("FK a_b_id_fkey must be dropped before SET (live, not commented)");
     let drop_b_pos = script
-        .find("alter table test_cycle.b drop constraint b_a_id_fkey;")
-        .expect("FK b_a_id_fkey must be dropped before SET");
+        .find("\nalter table test_cycle.b drop constraint b_a_id_fkey;")
+        .expect("FK b_a_id_fkey must be dropped before SET (live, not commented)");
+    assert!(
+        !script.contains("-- alter table test_cycle.a drop constraint a_b_id_fkey;"),
+        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
+    assert!(
+        !script.contains("-- alter table test_cycle.b drop constraint b_a_id_fkey;"),
+        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
     let set_a_pos = script
-        .find("alter table test_cycle.a set unlogged;")
+        .find("\nalter table test_cycle.a set unlogged;")
         .expect("a SET UNLOGGED must be emitted");
     let set_b_pos = script
-        .find("alter table test_cycle.b set unlogged;")
+        .find("\nalter table test_cycle.b set unlogged;")
         .expect("b SET UNLOGGED must be emitted");
     assert!(
         drop_a_pos < set_a_pos && drop_a_pos < set_b_pos,
@@ -10605,13 +10627,24 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
     // migration state matches TO. PR #198 review: the re-emit path
     // now goes through `TableConstraint::get_script()`, which
     // lowercases SQL keywords outside literals — match on the
-    // lowercase form.
+    // lowercase form. The newline anchor again separates live ADDs
+    // from any `-- alter table … add constraint …` form.
     let add_a_pos = script
-        .find("alter table test_cycle.a add constraint a_b_id_fkey foreign key")
-        .expect("FK a_b_id_fkey must be re-added after SET");
+        .find("\nalter table test_cycle.a add constraint a_b_id_fkey foreign key")
+        .expect("FK a_b_id_fkey must be re-added after SET (live, not commented)");
     let add_b_pos = script
-        .find("alter table test_cycle.b add constraint b_a_id_fkey foreign key")
-        .expect("FK b_a_id_fkey must be re-added after SET");
+        .find("\nalter table test_cycle.b add constraint b_a_id_fkey foreign key")
+        .expect("FK b_a_id_fkey must be re-added after SET (live, not commented)");
+    assert!(
+        !script.contains("-- alter table test_cycle.a add constraint a_b_id_fkey"),
+        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
+    assert!(
+        !script.contains("-- alter table test_cycle.b add constraint b_a_id_fkey"),
+        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
+        script
+    );
     assert!(
         add_a_pos > set_a_pos && add_a_pos > set_b_pos,
         "FK a_b_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
