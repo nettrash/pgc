@@ -1813,13 +1813,22 @@ impl Comparer {
                         self.trigger_post_script
                             .push_str(to_table.get_trigger_script().as_str());
                     } else {
+                        // Ask the table whether the alter path will
+                        // drop+recreate it wholesale (partition-key
+                        // change, partition-child column type change)
+                        // before emitting. This replaces the previous
+                        // substring scan of `alter_script` for
+                        // `"drop table if exists"`: a single
+                        // authoritative predicate that
+                        // `build_alter_script` itself uses, so the
+                        // comparer's gate and the SQL emission cannot
+                        // drift apart.
+                        let table_recreated = table.will_be_dropped_and_recreated(to_table);
+
                         let alter_script =
                             table.get_alter_script_without_triggers(to_table, self.use_drop);
 
-                        // If the generated alter script dropped + recreated this table
-                        // and the table is a partitioned parent, record it so its
-                        // children will be recreated instead of altered.
-                        if alter_script.to_lowercase().contains("drop table if exists") {
+                        if table_recreated {
                             // Mark for grants: same reasoning as the branch
                             // above — the dropped+recreated table inherits
                             // default privileges, so compare_grants must use
@@ -1850,7 +1859,7 @@ impl Comparer {
                         // was dropped+recreated wholesale — the
                         // re-`CREATE TABLE` already includes the
                         // dependents.
-                        if !alter_script.to_lowercase().contains("drop table if exists") {
+                        if !table_recreated {
                             let mut col_dep_emitted: HashSet<String> = HashSet::new();
                             let mut col_dep_recreate = String::new();
                             for to_col in &to_table.columns {
@@ -4356,6 +4365,17 @@ impl Comparer {
         let want_table = table_name.to_lowercase().replace('"', "");
         let want_column = column_name.to_lowercase().replace('"', "");
 
+        // Two passes so FK constraints emit *after* the UNIQUE/PK
+        // target they reference. A single linear pass would let the
+        // pg_depend query's undefined output order produce a script
+        // where `ADD CONSTRAINT fk … FOREIGN KEY … REFERENCES …` runs
+        // before the matching `ADD CONSTRAINT … UNIQUE` is back, and
+        // PostgreSQL rejects FKs whose target lacks a unique
+        // constraint. Pass 1 emits indexes, non-FK constraints, and
+        // policies; pass 2 emits FKs against the now-restored unique
+        // targets.
+        let mut deferred_fks: Vec<&TableConstraint> = Vec::new();
+
         for dep in &self.from.column_dependents {
             if dep.schema.to_lowercase().replace('"', "") != want_schema
                 || dep.table.to_lowercase().replace('"', "") != want_table
@@ -4423,6 +4443,15 @@ impl Comparer {
                     if !emitted_keys.insert(key) {
                         continue;
                     }
+                    if to_constraint
+                        .constraint_type
+                        .eq_ignore_ascii_case("foreign key")
+                    {
+                        // Defer FK emission until pass 2 (after every
+                        // UNIQUE/PK in the same call has been restored).
+                        deferred_fks.push(to_constraint);
+                        continue;
+                    }
                     Self::emit_dependent_recreate(
                         out,
                         self.use_drop,
@@ -4448,6 +4477,17 @@ impl Comparer {
                     );
                 }
             }
+        }
+
+        // Pass 2: FK constraints, now that any UNIQUE/PK target they
+        // reference (on the anchor column's table or any other table)
+        // has already been restored above.
+        for to_constraint in deferred_fks {
+            Self::emit_dependent_recreate(
+                out,
+                self.use_drop,
+                &constraint_recreate_block(to_constraint),
+            );
         }
     }
 

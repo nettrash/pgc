@@ -154,8 +154,9 @@ impl TableColumn {
     /// constraint / RLS policy attached to the column, and the
     /// comparer must re-emit them afterwards.
     ///
-    /// The predicate body is byte-identical to the in-method
-    /// computation in [`get_alter_script`]; both must move together.
+    /// `get_alter_script` calls this method to gate the actual
+    /// drop+add emission, so the predicate body and the SQL emission
+    /// share a single source of truth — they cannot drift apart.
     pub fn would_drop_and_re_add(&self, existing: &TableColumn) -> bool {
         let new_generated = Self::normalized_generated(&self.is_generated);
         let old_generated = Self::normalized_generated(&existing.is_generated);
@@ -601,21 +602,20 @@ impl TableColumn {
             let new_is_generated = new_generated == "ALWAYS";
             let old_is_generated = old_generated != "NEVER";
 
-            // Whether either side is VIRTUAL — the in-place
-            // `DROP EXPRESSION` + `ADD GENERATED ... VIRTUAL` path
-            // PostgreSQL would otherwise be sent doesn't exist for
-            // VIRTUAL columns: DROP EXPRESSION rejects with
-            // `ALTER TABLE / DROP EXPRESSION is not supported for
-            // virtual generated columns`, and the ADD form never
-            // accepts VIRTUAL. The full DROP COLUMN + ADD COLUMN
-            // round-trip is the only correct migration. Flips of
-            // generation_type fall here for the same reason — even
-            // STORED → VIRTUAL with identical expression has no
-            // in-place ALTER. (Issue #181)
-            let needs_full_recreate = !old_is_generated && new_is_generated
-                || (old_is_generated
-                    && (existing.effective_generation_type() == "v"
-                        || self.effective_generation_type() == "v"));
+            // The drop+add gate lives in `would_drop_and_re_add` so the
+            // comparer's Path B detection (issue #188) cannot drift
+            // from this emission site. The predicate inlines the same
+            // `generated_changed` short-circuit above, so calling it
+            // here is redundant but safe — and it keeps the invariant
+            // enforced by code, not by a comment. Rationale: PG18+
+            // VIRTUAL generated columns reject in-place ALTER
+            // (`DROP EXPRESSION` only works for STORED; the
+            // `ADD GENERATED ... VIRTUAL` form is invalid syntax), so
+            // any participant that is VIRTUAL on either side — plus
+            // the non-generated→GENERATED transition — has no choice
+            // but the full DROP COLUMN + ADD COLUMN round-trip.
+            // (Issue #181)
+            let needs_full_recreate = self.would_drop_and_re_add(existing);
 
             if needs_full_recreate {
                 if use_drop {

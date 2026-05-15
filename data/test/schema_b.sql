@@ -1771,6 +1771,21 @@ CREATE INDEX idx_cascade_col_dep_gen_total
 ALTER TABLE test_schema.cascade_col_dep_items
     ADD CONSTRAINT chk_cascade_col_dep_gen_total CHECK (gen_total >= 0);
 
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT uq_cascade_col_dep_gen_total UNIQUE (gen_total);
+
+CREATE TABLE test_schema.cascade_col_dep_children (
+    id        serial  PRIMARY KEY,
+    -- ref_total type bumped integer → bigint to match the new
+    -- gen_total type on the parent. FK target type must match.
+    ref_total bigint
+);
+
+ALTER TABLE test_schema.cascade_col_dep_children
+    ADD CONSTRAINT fk_cascade_col_dep_children_ref_total
+        FOREIGN KEY (ref_total)
+        REFERENCES test_schema.cascade_col_dep_items (gen_total);
+
 -- =============================================================================
 -- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
 -- =============================================================================

@@ -1,6 +1,41 @@
 2026-05-14      v1.0.21
 
                 Bug fixes:
+                    - Fixed a non-idempotent migration affecting
+                      classical-inheritance children
+                      (`CREATE TABLE … INHERITS (parent)`). The
+                      dump-side partition-info query
+                      (`fetch_partition_info_bulk` in `dump/table.rs`)
+                      joined `pg_inherits` without filtering by the
+                      parent's `relkind`, so classical-inheritance
+                      children landed with `partition_of` set to
+                      their parent — the same shape a true partition
+                      child has. That mis-classification flowed into
+                      `column_type_change_forces_recreate`, which
+                      drop+recreated the child for any in-place
+                      `ALTER COLUMN TYPE` change. The recreated
+                      table silently inherited the current default
+                      privileges (`ALTER DEFAULT PRIVILEGES IN
+                      SCHEMA …`), so a second `pgc compare` after
+                      applying the migration produced stray
+                      `REVOKE … ON TABLE child FROM grantee`
+                      statements — the migration was not idempotent.
+                      Added an `AND p.relkind = 'p'` predicate to
+                      the `LEFT JOIN pg_class p ON p.oid =
+                      i.inhparent` join so only declarative-
+                      partition parents contribute to `partition_of`;
+                      classical-inheritance parents continue to flow
+                      through the already-correct `inherits_from`
+                      collection, which filters on
+                      `pg_partitioned_table` from the opposite
+                      direction. Added a regression unit test that
+                      builds a Table with `partition_of=None`,
+                      `inherits_from=[parent]` and asserts
+                      `will_be_dropped_and_recreated` returns false
+                      for an in-place column type change, plus a
+                      sanity counter-test that a true partition
+                      child still forces wholesale recreate.
+
                     - Fixed issue #188 (Phase 7 doesn't restore
                       secondary dependents of CASCADE-dropped
                       objects). When `DROP FUNCTION ... CASCADE`
@@ -37,12 +72,34 @@
                       `TableColumn::would_drop_and_re_add`
                       predicate), the latter wrapped in a labeled
                       `/* Recreate dependents dropped by
-                      virtual-column rewrite */` block. New
-                      `cascade_col_dep_items` fixture in
+                      virtual-column rewrite */` block. Per PR #196
+                      review feedback: (a) made
+                      `would_drop_and_re_add` the single source of
+                      truth — `get_alter_script` now calls the
+                      predicate instead of re-deriving the boolean,
+                      so Path B detection cannot drift from the
+                      emission site; (b) replaced the brittle
+                      `alter_script.contains("drop table if exists")`
+                      substring-sniff in `compare_tables` with a new
+                      `Table::will_be_dropped_and_recreated`
+                      predicate that `build_alter_script` itself uses
+                      via the shared
+                      `column_type_change_forces_recreate` helper —
+                      one authoritative decision point for both the
+                      grants `recreated_tables` flag and the Path B
+                      column-dependent gate; (c) added FK coverage
+                      to lock in the asymmetric `conrelid` vs
+                      `refobjid` case (FK on a different table
+                      referencing the anchor column) plus two-pass
+                      ordering in `recreate_column_dependents` so
+                      FKs always emit after any UNIQUE/PK target on
+                      the same column. New
+                      `cascade_col_dep_items` /
+                      `cascade_col_dep_children` fixtures in
                       `data/test/schema_a.sql` / `schema_b.sql`
-                      covers a plain index and a CHECK constraint
-                      anchored on a CASCADE-dropped generated
-                      column.
+                      cover a plain index, CHECK constraint, UNIQUE
+                      constraint, and cross-table FK anchored on a
+                      CASCADE-dropped generated column.
 
                     - Fixed issue #189 (Phase 7 doesn't recreate
                       views silently dropped by `DROP FUNCTION ...

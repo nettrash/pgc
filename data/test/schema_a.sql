@@ -1452,6 +1452,30 @@ CREATE INDEX idx_cascade_col_dep_gen_total
 ALTER TABLE test_schema.cascade_col_dep_items
     ADD CONSTRAINT chk_cascade_col_dep_gen_total CHECK (gen_total >= 0);
 
+-- UNIQUE constraint on the generated column — required so a foreign
+-- key on a separate table can target gen_total. Its backing index
+-- shares the constraint name and is recorded as a separate pg_depend
+-- edge; the comparer dedup must skip emitting the backing index
+-- because the ADD CONSTRAINT ... UNIQUE form recreates it implicitly.
+ALTER TABLE test_schema.cascade_col_dep_items
+    ADD CONSTRAINT uq_cascade_col_dep_gen_total UNIQUE (gen_total);
+
+-- Child table whose FK references gen_total on the parent. The FK's
+-- `conrelid` points at this child, but its pg_depend row anchors on
+-- the parent column — the asymmetric case PR #196 review called out.
+-- When CASCADE drops gen_total via the function rewrite, this FK is
+-- silently dropped too; the column-dependent graph must restore it,
+-- AFTER the UNIQUE target above is back (two-pass ordering).
+CREATE TABLE test_schema.cascade_col_dep_children (
+    id        serial  PRIMARY KEY,
+    ref_total integer
+);
+
+ALTER TABLE test_schema.cascade_col_dep_children
+    ADD CONSTRAINT fk_cascade_col_dep_children_ref_total
+        FOREIGN KEY (ref_total)
+        REFERENCES test_schema.cascade_col_dep_items (gen_total);
+
 -- =============================================================================
 -- Issue #180 — FK-ordered SET LOGGED/UNLOGGED + redundant owned-sequence ALTER
 -- =============================================================================

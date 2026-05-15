@@ -9965,3 +9965,325 @@ async fn issue188_path_b_virtual_flip_restores_dependent_index() {
         script
     );
 }
+
+/// Phase 7 / Path A: an FK on a *different* table referencing the
+/// generated column on the anchor table. The pg_depend row's
+/// `refobjid` points at the parent table (where the column lives) but
+/// `con.conrelid` points at the child (where the FK lives) — the
+/// `dep_schema`/`dep_table` in `ColumnDependent` must be the child's,
+/// not the anchor's. Locks in correct behaviour for the asymmetric
+/// `conrelid` vs `refobjid` case (PR #196 review).
+#[tokio::test]
+async fn issue188_phase7_restores_fk_on_different_table() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    // Parent table: the standard issue179 items table — gen_col is
+    // the anchor whose CASCADE drop the test exercises.
+    from_dump.tables.push(issue179_items_table(
+        "integer",
+        "test_deps.compute(0)::integer",
+        "integer",
+    ));
+    to_dump.tables.push(issue179_items_table(
+        "bigint",
+        "test_deps.compute(0)",
+        "bigint",
+    ));
+
+    // Child table: separate table whose FK references gen_col on the
+    // parent. The FK's own definition contains no function name; the
+    // text scanner cannot see this dependency. The pg_depend graph
+    // must drive the re-emission.
+    let make_child = |ref_type: &str| {
+        let mut id_col = int_column("test_deps", "items_child", "id", 1);
+        id_col.is_nullable = false;
+
+        let mut ref_col = int_column("test_deps", "items_child", "ref_gen", 2);
+        ref_col.data_type = ref_type.to_string();
+
+        let fk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_deps".to_string(),
+            name: "fk_items_child_ref_gen".to_string(),
+            table_name: "items_child".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(
+                "FOREIGN KEY (ref_gen) REFERENCES test_deps.items (gen_col)".to_string(),
+            ),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut t = Table::new(
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![fk],
+            vec![],
+            vec![],
+            None,
+        );
+        t.hash();
+        t
+    };
+    from_dump.tables.push(make_child("integer"));
+    to_dump.tables.push(make_child("bigint"));
+
+    // Anchor is the parent column (gen_col on items). dep_table is
+    // the *child* (items_child) because the FK constraint's
+    // `conrelid` points at the child, not the parent where the
+    // depended-on column lives.
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items_child".to_string(),
+        dep_name: "fk_items_child_ref_gen".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("alter table test_deps.items_child add constraint fk_items_child_ref_gen"),
+        "FK on a different table must be re-emitted via pg_depend graph: {}",
+        script
+    );
+    assert!(
+        script.contains(
+            "alter table test_deps.items_child drop constraint if exists fk_items_child_ref_gen;"
+        ),
+        "drop-if-exists guard for cross-table FK missing: {}",
+        script
+    );
+}
+
+/// Phase 7 / Path A: when the anchor column has both a UNIQUE
+/// constraint and an FK on another table referencing it, the FK must
+/// be emitted *after* the UNIQUE constraint — PostgreSQL rejects
+/// `ADD CONSTRAINT … FOREIGN KEY` when the referenced columns lack a
+/// unique constraint. Two-pass ordering in `recreate_column_dependents`.
+#[tokio::test]
+async fn issue188_phase7_emits_fk_after_unique_target() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump
+        .routines
+        .push(issue179_compute_routine("integer", "SELECT x * 2;"));
+    to_dump.routines.push(issue179_compute_routine(
+        "bigint",
+        "SELECT (x * 2)::bigint;",
+    ));
+
+    let uniq_constraint = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "test_deps".to_string(),
+        name: "items_gen_col_uniq".to_string(),
+        table_name: "items".to_string(),
+        constraint_type: "UNIQUE".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("UNIQUE (gen_col)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+
+    let mut from_items =
+        issue179_items_table("integer", "test_deps.compute(0)::integer", "integer");
+    from_items.constraints.push(uniq_constraint.clone());
+    from_items.hash();
+    from_dump.tables.push(from_items);
+
+    let mut to_items = issue179_items_table("bigint", "test_deps.compute(0)", "bigint");
+    to_items.constraints.push(uniq_constraint);
+    to_items.hash();
+    to_dump.tables.push(to_items);
+
+    let make_child = |ref_type: &str| {
+        let mut id_col = int_column("test_deps", "items_child", "id", 1);
+        id_col.is_nullable = false;
+        let mut ref_col = int_column("test_deps", "items_child", "ref_gen", 2);
+        ref_col.data_type = ref_type.to_string();
+
+        let fk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_deps".to_string(),
+            name: "fk_items_child_ref_gen".to_string(),
+            table_name: "items_child".to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some(
+                "FOREIGN KEY (ref_gen) REFERENCES test_deps.items (gen_col)".to_string(),
+            ),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut t = Table::new(
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "test_deps".to_string(),
+            "items_child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![fk],
+            vec![],
+            vec![],
+            None,
+        );
+        t.hash();
+        t
+    };
+    from_dump.tables.push(make_child("integer"));
+    to_dump.tables.push(make_child("bigint"));
+
+    // FK first in the column_dependents vec — the helper must defer
+    // it regardless of input order so it lands after the UNIQUE.
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items_child".to_string(),
+        dep_name: "fk_items_child_ref_gen".to_string(),
+    });
+    from_dump.column_dependents.push(ColumnDependent {
+        schema: "test_deps".to_string(),
+        table: "items".to_string(),
+        column: "gen_col".to_string(),
+        kind: ColumnDependentKind::Constraint,
+        dep_schema: "test_deps".to_string(),
+        dep_table: "items".to_string(),
+        dep_name: "items_gen_col_uniq".to_string(),
+    });
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let uniq_pos = script
+        .find("add constraint items_gen_col_uniq")
+        .expect("UNIQUE constraint must be re-emitted");
+    let fk_pos = script
+        .find("add constraint fk_items_child_ref_gen")
+        .expect("FK constraint must be re-emitted");
+    assert!(
+        uniq_pos < fk_pos,
+        "FK must be emitted AFTER its UNIQUE target; got uniq@{} fk@{}: {}",
+        uniq_pos,
+        fk_pos,
+        script
+    );
+}
+
+/// Regression for the inheritance_child idempotency bug — pgc was
+/// dumping classical-inheritance children with `partition_of` wrongly
+/// set (because `pg_inherits` records both partition and classical
+/// inheritance), which made `column_type_change_forces_recreate` fire
+/// and trigger a wholesale drop+recreate. After migration the
+/// recreated child silently picked up the *current* default
+/// privileges, leaving stray REVOKE statements in the next
+/// `pgc compare` pass.
+///
+/// This test pins down the post-fix invariant: a classical-inheritance
+/// child (`partition_of = None`, `inherits_from = [parent]`) with a
+/// column type change must NOT be flagged for wholesale recreate.
+/// The dump-side fix that produces this shape (filtering
+/// `pg_inherits` joins by `parent.relkind = 'p'`) lives in
+/// `fetch_partition_info_bulk` and cannot be unit-tested without a
+/// live PostgreSQL connection, but the comparer-side gate has its own
+/// expectations and those are what this test enforces.
+#[tokio::test]
+async fn inheritance_child_classical_inheritance_does_not_force_recreate() {
+    let make_inheritance_child = |child_data_type: &str, max_len: Option<i32>| {
+        let mut child_col = int_column("test_deps", "inheritance_child", "child_data", 1);
+        child_col.data_type = child_data_type.to_string();
+        child_col.character_maximum_length = max_len;
+
+        let mut t = Table::new(
+            "test_deps".to_string(),
+            "inheritance_child".to_string(),
+            "test_deps".to_string(),
+            "inheritance_child".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![child_col],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        // Classical inheritance: parent is a regular table; partition_of
+        // stays None, inherits_from carries the parent reference. With
+        // the pre-fix dump query, partition_of would have been
+        // erroneously set here too — that mis-shape is exactly what
+        // this test forbids.
+        t.inherits_from = vec!["test_deps.inheritance_parent".to_string()];
+        t.hash();
+        t
+    };
+
+    let from_table = make_inheritance_child("text", None);
+    let to_table = make_inheritance_child("character varying", Some(255));
+
+    // The comparer-side predicate must NOT classify this column change
+    // as a wholesale recreate. PostgreSQL accepts in-place
+    // `ALTER TABLE … ALTER COLUMN child_data TYPE varchar(255)` on a
+    // classical-inheritance child, and dropping the child wholesale
+    // would leak default-privilege grants onto the recreated table.
+    assert!(
+        !from_table.will_be_dropped_and_recreated(&to_table),
+        "classical-inheritance child with column type change must NOT \
+         be flagged for wholesale recreate (partition_of: {:?}, \
+         inherits_from: {:?})",
+        from_table.partition_of,
+        from_table.inherits_from,
+    );
+
+    // Sanity counter-test: same column change on a real partition
+    // child (partition_of = Some, inherits_from = []) SHOULD force
+    // wholesale recreate — PG forbids in-place type changes on
+    // partition-key columns and partition-inherited columns.
+    let mut from_partition_child = make_inheritance_child("text", None);
+    from_partition_child.inherits_from = Vec::new();
+    from_partition_child.partition_of = Some("test_deps.parent_partitioned".to_string());
+    let mut to_partition_child = make_inheritance_child("character varying", Some(255));
+    to_partition_child.inherits_from = Vec::new();
+    to_partition_child.partition_of = Some("test_deps.parent_partitioned".to_string());
+    assert!(
+        from_partition_child.will_be_dropped_and_recreated(&to_partition_child),
+        "real partition child with column type change MUST be flagged \
+         for wholesale recreate"
+    );
+}
