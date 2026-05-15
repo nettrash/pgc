@@ -2045,7 +2045,15 @@ impl Comparer {
                 if !live {
                     continue;
                 }
-                if let Some((schema, name)) = Self::parse_fk_referenced_table(def)
+                // Issue #190: pass the constraint owner's schema so
+                // `pg_get_constraintdef` output that omitted the
+                // schema qualifier (typical for `public` reachable via
+                // search_path) still resolves to a valid TO-side table
+                // index. Without this, the FK edge is missing from the
+                // adjacency and a persistence flip in `public` falls
+                // back to alphabetical SET order — exactly the order
+                // PostgreSQL rejects.
+                if let Some((schema, name)) = Self::parse_fk_referenced_table(def, &to_table.schema)
                     && let Some(&j) = to_index_by_key.get(&(schema, name))
                     && j != i
                 {
@@ -2155,7 +2163,26 @@ impl Comparer {
     /// `to_ascii_lowercase` is byte-length-preserving (only ASCII
     /// letters change, every other byte is left intact) and the
     /// keyword `references` is pure ASCII, so it's the right tool.
-    fn parse_fk_referenced_table(def: &str) -> Option<(String, String)> {
+    /// Parse the referenced `(schema, table)` pair out of a FOREIGN KEY
+    /// constraint's deparsed definition. `owner_schema` is the schema of
+    /// the table that *owns* the constraint and is used to resolve
+    /// unqualified targets (issue #190): `pg_get_constraintdef` may omit
+    /// the schema qualifier when the target is reachable via
+    /// `search_path` — most commonly the `public` schema — and without
+    /// this fallback the FK edge is missed by
+    /// `emit_persistence_changes`, leaving FK-chained persistence flips
+    /// in `public` ordered alphabetically (which PostgreSQL rejects with
+    /// the `could not change table … to logged/unlogged` error).
+    ///
+    /// The fallback resolves to `(owner_schema, target)`, matching
+    /// PostgreSQL's own search_path resolution for the simplest and
+    /// commonest case where the FK target lives in the same schema as
+    /// the FK. Per-role / per-database `search_path` settings beyond
+    /// the owner schema are not currently captured at dump time, so an
+    /// FK referencing a `public` table from a non-`public` schema (with
+    /// `public` on the search path) will still escape this fallback;
+    /// that path is documented as a known limitation.
+    fn parse_fk_referenced_table(def: &str, owner_schema: &str) -> Option<(String, String)> {
         let lower = def.to_ascii_lowercase();
         let bytes = lower.as_bytes();
         let kw = b"references";
@@ -2250,7 +2277,27 @@ impl Comparer {
             }
         }
         let target = &after[..end];
-        Self::split_qualified_name_quote_aware(target)
+        match Self::split_qualified_name_quote_aware(target) {
+            Some(pair) => Some(pair),
+            None => {
+                // No dot outside quotes — unqualified target. Resolve
+                // against the constraint's owning schema (issue #190).
+                // `trim_matches('"')` on both halves mirrors what
+                // `split_qualified_name_quote_aware` already does for
+                // the schema-qualified path: callers (and the existing
+                // tests) expect pre-stripped strings, and dump-time
+                // identifiers are stored as `quote_ident`-wrapped
+                // forms (`MySchema` → `"MySchema"`) which would
+                // otherwise miss the comparer's normalised lookup
+                // keys.
+                let name = target.trim_matches('"').to_string();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some((owner_schema.trim_matches('"').to_string(), name))
+                }
+            }
+        }
     }
 
     /// Split a `schema.name` identifier at the first dot that lives

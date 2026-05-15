@@ -1,6 +1,59 @@
 2026-05-14      v1.0.21
 
                 Bug fixes:
+                    - Fixed issue #190 (persistence-ordering FK
+                      adjacency misses unqualified FK targets in
+                      `pg_get_constraintdef` output).
+                      `Comparer::emit_persistence_changes`
+                      (PR #184 / issue #180) builds an FK adjacency
+                      across TO-side tables by parsing each FK
+                      constraint's deparsed definition with
+                      `parse_fk_referenced_table`. The parser
+                      returned `None` when the referenced
+                      identifier was unqualified — and
+                      `pg_get_constraintdef` routinely emits
+                      `REFERENCES table(col)` without the schema
+                      prefix when the target is reachable via
+                      `search_path` (typically the `public`
+                      schema). The missing edge dropped the FK
+                      from the adjacency and the SET LOGGED /
+                      SET UNLOGGED order fell back to alphabetical,
+                      which PostgreSQL rejects with the
+                      `could not change table … to logged/unlogged`
+                      error whenever a referencing table sorts
+                      before the referenced one (`child` <
+                      `parent`). CI never caught it because every
+                      FK-chain fixture lives in an explicit
+                      `test_order` schema. Added an `owner_schema`
+                      parameter to `parse_fk_referenced_table` and
+                      a fallback that resolves an unqualified
+                      target as `(owner_schema, target)` — the
+                      simplest and commonest case where the FK
+                      target lives in the same schema as the FK
+                      itself; the call site in
+                      `emit_persistence_changes` now threads
+                      `&to_table.schema` through. Two new tests:
+                      a unit test that pins the parser fallback
+                      (qualified target still wins; unqualified
+                      target with quoted/mixed-case owner schema
+                      resolves correctly; trailing
+                      `ON DELETE CASCADE` clauses don't confuse
+                      the boundary scan) and an end-to-end test
+                      that builds a `public.child → public.parent`
+                      FK chain with unqualified `REFERENCES
+                      parent(id)` definitions, flips both tables
+                      LOGGED → UNLOGGED, and asserts the child
+                      SET UNLOGGED is emitted BEFORE the parent.
+                      Known limitation documented in the parser's
+                      doc comment: dump-time per-role /
+                      per-database `search_path` settings beyond
+                      the owner schema are not captured, so an FK
+                      that references a `public` table from a
+                      non-`public` schema with `public` on the
+                      search_path will still escape this fallback;
+                      capturing that would require new dump-side
+                      state and is left for a follow-up.
+
                     - Fixed a non-idempotent migration affecting
                       classical-inheritance children
                       (`CREATE TABLE … INHERITS (parent)`). The
