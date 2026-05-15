@@ -450,6 +450,23 @@ impl Comparer {
         depends_on: &[HashSet<usize>],
         sort_key: impl Fn(usize) -> K,
     ) -> Vec<usize> {
+        Self::kahn_toposort_detect_cycle(n, depends_on, sort_key).0
+    }
+
+    /// Like [`kahn_toposort`], but also returns the set of nodes that
+    /// could not be ordered acyclically — i.e. nodes whose in-degree
+    /// never reached zero during the BFS. Those nodes still appear in
+    /// the returned `Vec` (appended in `sort_key` order so the result
+    /// is deterministic for callers that don't care about cycles), but
+    /// the second return value lets a caller act on the cycle —
+    /// `emit_persistence_changes` uses it to drop FKs that form a
+    /// SET-ordering deadlock and re-add them after the SET statements
+    /// (issue #191).
+    fn kahn_toposort_detect_cycle<K: Ord>(
+        n: usize,
+        depends_on: &[HashSet<usize>],
+        sort_key: impl Fn(usize) -> K,
+    ) -> (Vec<usize>, HashSet<usize>) {
         let mut in_degree: Vec<usize> = depends_on.iter().map(|d| d.len()).collect();
         let mut reverse_adj: Vec<Vec<usize>> = vec![vec![]; n];
         for (i, deps) in depends_on.iter().enumerate() {
@@ -478,14 +495,16 @@ impl Comparer {
             queue.extend(newly_free);
         }
 
+        let mut cyclic: HashSet<usize> = HashSet::new();
         if sorted.len() < n {
             let in_sorted: HashSet<usize> = sorted.iter().copied().collect();
             let mut remaining: Vec<usize> = (0..n).filter(|i| !in_sorted.contains(i)).collect();
             remaining.sort_by_key(|a| sort_key(*a));
+            cyclic.extend(remaining.iter().copied());
             sorted.extend(remaining);
         }
 
-        sorted
+        (sorted, cyclic)
     }
 
     /// Returns the fully-quoted key used to match a table's `partition_of` reference.
@@ -1949,6 +1968,23 @@ impl Comparer {
     /// constraints alone) so we don't impose ordering for FKs that
     /// won't exist at the SET point and so we don't miss ordering
     /// for FKs that DO exist but will later be dropped+re-added.
+    ///
+    /// **FK-cycle handling** (issue #191): a mutual FK cycle
+    /// (`A → B` and `B → A`, valid in PostgreSQL when both FKs are
+    /// deferrable) flipping persistence in the same direction has no
+    /// valid SET order — `SET UNLOGGED A` requires B to already be
+    /// UNLOGGED and vice versa. Pre-fix, `kahn_toposort` silently
+    /// appended cyclic nodes alphabetically and the migration failed
+    /// at apply time with the same `could not change table …` error
+    /// issue #180 was meant to eliminate. The fix detects cycles via
+    /// `kahn_toposort_detect_cycle`, drops every FK whose endpoints
+    /// are both inside the cyclic set BEFORE the SET statements, and
+    /// re-emits those FKs from their TO-side definitions AFTER the
+    /// SETs — the same drop-and-recreate pattern PostgreSQL itself
+    /// recommends for migrations involving deferrable cycles. Unchanged
+    /// FKs that survive the cycle break are dropped+re-added inline by
+    /// this phase so `compare_foreign_keys` (which only emits modified
+    /// or new FKs) does not need to know about the cycle.
     fn emit_persistence_changes(&mut self) {
         let from_table_map: HashMap<(&str, &str), &Table> = self
             .from
@@ -2004,7 +2040,18 @@ impl Comparer {
         // doc comment above this method for the timing rationale.
         // `fk_targets[i]` holds the indices of tables that table `i`
         // references via FK — i.e. `i` *depends on* those.
+        //
+        // `edge_fks` records, for each `(referrer_idx, target_idx)`
+        // edge, the underlying TO-side constraint(s) that produced it.
+        // The persistence-flip cycle break (issue #191) reaches in
+        // here to find which FKs to drop+re-add when the SET ordering
+        // is a deadlock. Stored as owned `(schema, table, name,
+        // definition)` tuples so the data outlives the immutable
+        // borrow of `self.to.tables` (the `self.script` mutations
+        // later in the function would otherwise conflict).
+        type FkRef = (String, String, String, Option<String>);
         let mut fk_targets: Vec<HashSet<usize>> = vec![HashSet::new(); self.to.tables.len()];
+        let mut edge_fks: HashMap<(usize, usize), Vec<FkRef>> = HashMap::new();
         for (i, to_table) in self.to.tables.iter().enumerate() {
             // Lift the matching FROM table once so the FK lookup
             // doesn't pay a per-constraint hashmap miss.
@@ -2058,9 +2105,49 @@ impl Comparer {
                     && j != i
                 {
                     fk_targets[i].insert(j);
+                    edge_fks.entry((i, j)).or_default().push((
+                        c.schema.clone(),
+                        c.table_name.clone(),
+                        c.name.clone(),
+                        c.definition.clone(),
+                    ));
                 }
             }
         }
+
+        // Issue #191: collect FKs whose endpoints both sit inside a
+        // SET subset's cyclic remainder. Dropping these breaks the
+        // ordering deadlock so the SET statements that follow can run
+        // in any (alphabetical) order, then we re-add them from the
+        // TO definitions. Returns each FK exactly once even when the
+        // same edge appears in both directions of a 2-node cycle.
+        let collect_cycle_fks =
+            |fk_targets: &[HashSet<usize>], cyclic_abs: &HashSet<usize>| -> Vec<FkRef> {
+                let mut out: Vec<FkRef> = Vec::new();
+                let mut seen: HashSet<(String, String, String)> = HashSet::new();
+                // Iterate in a deterministic order so the emitted script
+                // is stable from run to run.
+                let mut cyclic_sorted: Vec<usize> = cyclic_abs.iter().copied().collect();
+                cyclic_sorted.sort_unstable();
+                for i in cyclic_sorted {
+                    let mut targets: Vec<usize> = fk_targets[i].iter().copied().collect();
+                    targets.sort_unstable();
+                    for j in targets {
+                        if !cyclic_abs.contains(&j) {
+                            continue;
+                        }
+                        if let Some(fks) = edge_fks.get(&(i, j)) {
+                            for fk in fks {
+                                let key = (fk.0.clone(), fk.1.clone(), fk.2.clone());
+                                if seen.insert(key) {
+                                    out.push(fk.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            };
 
         // For SET UNLOGGED we want leaves (referencers) first. The
         // generic toposort returns `dependencies before dependents`
@@ -2068,47 +2155,101 @@ impl Comparer {
         // its output to get the dependent-first order this direction
         // requires.
         if !to_unlogged.is_empty() {
-            for table_idx in
-                Self::topo_order_within_subset(&to_unlogged, &fk_targets, &self.to.tables, true)
-            {
+            let (ordered, cyclic_abs) = Self::topo_order_within_subset_detect_cycle(
+                &to_unlogged,
+                &fk_targets,
+                &self.to.tables,
+                true,
+            );
+            let cycle_fks = collect_cycle_fks(&fk_targets, &cyclic_abs);
+            if !cycle_fks.is_empty() {
+                self.script.append_block(
+                    "/* Persistence-flip FK cycle (issue #191): dropping cycle FKs to break the SET-ordering deadlock; re-added after the SET block below. */",
+                );
+                for (sch, tbl, nm, _def) in &cycle_fks {
+                    self.script.append_block(&format!(
+                        "alter table {}.{} drop constraint {};",
+                        sch, tbl, nm
+                    ));
+                }
+            }
+            for table_idx in ordered {
                 let table = &self.to.tables[table_idx];
                 self.script.append_block(&format!(
                     "alter table {}.{} set unlogged;",
                     table.schema, table.name
                 ));
             }
+            for (sch, tbl, nm, def) in &cycle_fks {
+                if let Some(definition) = def {
+                    self.script.append_block(&format!(
+                        "alter table {}.{} add constraint {} {};",
+                        sch, tbl, nm, definition
+                    ));
+                }
+            }
         }
 
         // For SET LOGGED we want roots (referenced tables) first —
         // forward topo order is exactly what we need.
         if !to_logged.is_empty() {
-            for table_idx in
-                Self::topo_order_within_subset(&to_logged, &fk_targets, &self.to.tables, false)
-            {
+            let (ordered, cyclic_abs) = Self::topo_order_within_subset_detect_cycle(
+                &to_logged,
+                &fk_targets,
+                &self.to.tables,
+                false,
+            );
+            let cycle_fks = collect_cycle_fks(&fk_targets, &cyclic_abs);
+            if !cycle_fks.is_empty() {
+                self.script.append_block(
+                    "/* Persistence-flip FK cycle (issue #191): dropping cycle FKs to break the SET-ordering deadlock; re-added after the SET block below. */",
+                );
+                for (sch, tbl, nm, _def) in &cycle_fks {
+                    self.script.append_block(&format!(
+                        "alter table {}.{} drop constraint {};",
+                        sch, tbl, nm
+                    ));
+                }
+            }
+            for table_idx in ordered {
                 let table = &self.to.tables[table_idx];
                 self.script.append_block(&format!(
                     "alter table {}.{} set logged;",
                     table.schema, table.name
                 ));
             }
+            for (sch, tbl, nm, def) in &cycle_fks {
+                if let Some(definition) = def {
+                    self.script.append_block(&format!(
+                        "alter table {}.{} add constraint {} {};",
+                        sch, tbl, nm, definition
+                    ));
+                }
+            }
         }
     }
 
     /// Order `subset` (absolute indices into `tables`) by FK
-    /// dependencies restricted to the subset itself. Edges to tables
-    /// outside the subset are ignored: a table the migration isn't
-    /// flipping doesn't constrain the SET ordering — only PostgreSQL's
-    /// runtime check against the live state does, and that's the
-    /// user's problem (they would have to add the missing flip to the
-    /// migration). With `dependents_first = true` returns reverse-topo
-    /// (leaves first — `SET UNLOGGED`); else forward-topo (roots
-    /// first — `SET LOGGED`). Result is a permutation of `subset`.
-    fn topo_order_within_subset(
+    /// dependencies restricted to the subset itself, and also return
+    /// the set of absolute table indices that participate in a cycle.
+    /// Edges to tables outside the subset are ignored: a table the
+    /// migration isn't flipping doesn't constrain the SET ordering —
+    /// only PostgreSQL's runtime check against the live state does,
+    /// and that's the user's problem (they would have to add the
+    /// missing flip to the migration). With `dependents_first = true`
+    /// returns reverse-topo (leaves first — `SET UNLOGGED`); else
+    /// forward-topo (roots first — `SET LOGGED`). The ordered result
+    /// is a permutation of `subset`. The cyclic set lets callers
+    /// break the SET-ordering deadlock (issue #191): drop the FKs
+    /// whose endpoints both sit in the cyclic set, run the SETs, and
+    /// re-add the FKs from their TO definitions. When the FK graph
+    /// restricted to `subset` is acyclic the cyclic set is empty.
+    fn topo_order_within_subset_detect_cycle(
         subset: &[usize],
         fk_targets: &[HashSet<usize>],
         tables: &[Table],
         dependents_first: bool,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, HashSet<usize>) {
         let n = subset.len();
         let pos_in_subset: HashMap<usize, usize> = subset
             .iter()
@@ -2127,14 +2268,16 @@ impl Comparer {
             }
         }
 
-        let mut sorted = Self::kahn_toposort(n, &depends_on, |i| {
+        let (mut sorted, cyclic_pos) = Self::kahn_toposort_detect_cycle(n, &depends_on, |i| {
             let t = &tables[subset[i]];
             (t.schema.to_lowercase(), t.name.to_lowercase())
         });
         if dependents_first {
             sorted.reverse();
         }
-        sorted.into_iter().map(|pos| subset[pos]).collect()
+        let ordered_abs: Vec<usize> = sorted.into_iter().map(|pos| subset[pos]).collect();
+        let cyclic_abs: HashSet<usize> = cyclic_pos.into_iter().map(|pos| subset[pos]).collect();
+        (ordered_abs, cyclic_abs)
     }
 
     /// Pull the `schema.name` of the table targeted by an FK constraint

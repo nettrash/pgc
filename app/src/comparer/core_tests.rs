@@ -10464,3 +10464,208 @@ async fn inheritance_child_classical_inheritance_does_not_force_recreate() {
          for wholesale recreate"
     );
 }
+
+/// Issue #191: a mutual FK cycle (`A → B` and `B → A`) flipping
+/// persistence in the same direction has NO valid SET LOGGED|UNLOGGED
+/// order — `SET UNLOGGED A` requires B to already be UNLOGGED and
+/// vice versa. Pre-fix `kahn_toposort`'s fallback appended cyclic
+/// nodes alphabetically, the migration emitted the SETs in that
+/// order, and PostgreSQL rejected the second SET at apply time with
+/// the same `could not change table … to logged/unlogged` error
+/// issue #180 was meant to eliminate. Fix: detect the cycle, drop
+/// every FK whose endpoints both sit in the cyclic set BEFORE the
+/// SETs, then re-add them from their TO definitions AFTER. The
+/// post-fix migration is therefore: DROP cycle FKs → SET both
+/// (any order) → ADD cycle FKs.
+#[tokio::test]
+async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
+    fn make_cycle_table(name: &str, is_unlogged: bool, fk: (&str, &str, &str)) -> Table {
+        let (fk_col, target_schema, target_table) = fk;
+
+        let mut id_col = int_column("test_cycle", name, "id", 1);
+        id_col.is_nullable = false;
+
+        let mut ref_col = int_column("test_cycle", name, fk_col, 2);
+        ref_col.is_nullable = true;
+
+        let pk = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_pkey"),
+            table_name: name.to_string(),
+            constraint_type: "PRIMARY KEY".to_string(),
+            is_deferrable: false,
+            initially_deferred: false,
+            definition: Some("PRIMARY KEY (id)".to_string()),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        // Deferrable FK — PostgreSQL only permits mutual FK cycles
+        // when both FKs are deferrable; without DEFERRABLE the cycle
+        // can't be inserted/seeded in the first place.
+        let fk_constraint = TableConstraint {
+            catalog: "postgres".to_string(),
+            schema: "test_cycle".to_string(),
+            name: format!("{name}_{fk_col}_fkey"),
+            table_name: name.to_string(),
+            constraint_type: "FOREIGN KEY".to_string(),
+            is_deferrable: true,
+            initially_deferred: true,
+            definition: Some(format!(
+                "FOREIGN KEY ({fk_col}) REFERENCES {target_schema}.{target_table}(id) DEFERRABLE INITIALLY DEFERRED"
+            )),
+            coninhcount: 0,
+            is_enforced: true,
+            no_inherit: false,
+            nulls_not_distinct: false,
+            comment: None,
+        };
+
+        let mut table = Table::new(
+            "test_cycle".to_string(),
+            name.to_string(),
+            "test_cycle".to_string(),
+            name.to_string(),
+            "postgres".to_string(),
+            None,
+            vec![id_col, ref_col],
+            vec![pk, fk_constraint],
+            vec![],
+            vec![],
+            None,
+        );
+        table.is_unlogged = is_unlogged;
+        table.hash();
+        table
+    }
+
+    // FROM: both LOGGED, mutual deferrable FKs.
+    // TO:   both UNLOGGED, same FKs (live edges — unchanged).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(make_cycle_table("a", false, ("b_id", "test_cycle", "b")));
+    from_dump
+        .tables
+        .push(make_cycle_table("b", false, ("a_id", "test_cycle", "a")));
+    to_dump
+        .tables
+        .push(make_cycle_table("a", true, ("b_id", "test_cycle", "b")));
+    to_dump
+        .tables
+        .push(make_cycle_table("b", true, ("a_id", "test_cycle", "a")));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    // Cycle-break banner must appear so the choice is loud.
+    assert!(
+        script.contains("Persistence-flip FK cycle (issue #191)"),
+        "cycle banner must mark the drop+SET+add block: {}",
+        script
+    );
+
+    // Both cycle FKs must be dropped BEFORE either SET UNLOGGED.
+    let drop_a_pos = script
+        .find("alter table test_cycle.a drop constraint a_b_id_fkey;")
+        .expect("FK a_b_id_fkey must be dropped before SET");
+    let drop_b_pos = script
+        .find("alter table test_cycle.b drop constraint b_a_id_fkey;")
+        .expect("FK b_a_id_fkey must be dropped before SET");
+    let set_a_pos = script
+        .find("alter table test_cycle.a set unlogged;")
+        .expect("a SET UNLOGGED must be emitted");
+    let set_b_pos = script
+        .find("alter table test_cycle.b set unlogged;")
+        .expect("b SET UNLOGGED must be emitted");
+    assert!(
+        drop_a_pos < set_a_pos && drop_a_pos < set_b_pos,
+        "FK a_b_id_fkey drop must precede every SET: drop@{} a@{} b@{}\n{}",
+        drop_a_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+    assert!(
+        drop_b_pos < set_a_pos && drop_b_pos < set_b_pos,
+        "FK b_a_id_fkey drop must precede every SET: drop@{} a@{} b@{}\n{}",
+        drop_b_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+
+    // Both cycle FKs must be re-added AFTER every SET so the post-
+    // migration state matches TO.
+    let add_a_pos = script
+        .find("alter table test_cycle.a add constraint a_b_id_fkey FOREIGN KEY")
+        .expect("FK a_b_id_fkey must be re-added after SET");
+    let add_b_pos = script
+        .find("alter table test_cycle.b add constraint b_a_id_fkey FOREIGN KEY")
+        .expect("FK b_a_id_fkey must be re-added after SET");
+    assert!(
+        add_a_pos > set_a_pos && add_a_pos > set_b_pos,
+        "FK a_b_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
+        add_a_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+    assert!(
+        add_b_pos > set_a_pos && add_b_pos > set_b_pos,
+        "FK b_a_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
+        add_b_pos,
+        set_a_pos,
+        set_b_pos,
+        script
+    );
+}
+
+/// Issue #191 counter-test: an acyclic FK chain (no cycle) must NOT
+/// emit cycle-break drops/re-adds. Locks the cycle path to only the
+/// cycle case so we don't regress and start dropping FKs on every
+/// persistence flip.
+#[tokio::test]
+async fn issue191_persistence_flip_acyclic_chain_does_not_drop_fks() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", false, None));
+    from_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        false,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+    to_dump
+        .tables
+        .push(issue180_logged_table("test_order", "parent", true, None));
+    to_dump.tables.push(issue180_logged_table(
+        "test_order",
+        "child",
+        true,
+        Some(("parent_id", "test_order", "parent")),
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        !script.contains("Persistence-flip FK cycle"),
+        "acyclic chain must not trip the cycle-break path: {}",
+        script
+    );
+    assert!(
+        !script.contains("drop constraint child_parent_id_fkey"),
+        "live FK on an acyclic chain must not be dropped: {}",
+        script
+    );
+}

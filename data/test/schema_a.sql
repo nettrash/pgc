@@ -1517,6 +1517,44 @@ CREATE TABLE test_order.child (
 );
 
 -- =============================================================================
+-- Issue #191 — Persistence-ordering with mutual FK cycle
+-- =============================================================================
+-- Two tables with mutual deferrable FKs: `cycle_a → cycle_b` and
+-- `cycle_b → cycle_a`. PostgreSQL only permits this shape when both
+-- FKs are DEFERRABLE INITIALLY DEFERRED (otherwise the first INSERT
+-- on either side would have nothing to reference). The cycle has NO
+-- valid SET LOGGED|UNLOGGED order: `SET UNLOGGED cycle_a` requires
+-- cycle_b to already be UNLOGGED, and vice versa. Pre-fix the
+-- comparer's `kahn_toposort` silently fell back to alphabetical for
+-- the cyclic remainder, the migration emitted the SETs in that order,
+-- and PostgreSQL rejected the second SET at apply time.
+--
+-- The fix detects the cycle, drops both FKs BEFORE the SET block,
+-- runs both SETs (order no longer matters), and re-emits the FKs
+-- from their TO definitions AFTER. Schema B flips both tables to
+-- UNLOGGED so this fixture exercises the drop+SET+re-add pattern
+-- end-to-end against a real `pg_get_constraintdef` output.
+CREATE TABLE test_order.cycle_a (
+    id serial PRIMARY KEY,
+    b_id integer
+);
+
+CREATE TABLE test_order.cycle_b (
+    id serial PRIMARY KEY,
+    a_id integer
+);
+
+ALTER TABLE test_order.cycle_a
+    ADD CONSTRAINT cycle_a_b_id_fkey
+    FOREIGN KEY (b_id) REFERENCES test_order.cycle_b(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE test_order.cycle_b
+    ADD CONSTRAINT cycle_b_a_id_fkey
+    FOREIGN KEY (a_id) REFERENCES test_order.cycle_a(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+-- =============================================================================
 -- Issue #190 — Persistence-ordering FK adjacency with unqualified FK targets
 -- =============================================================================
 -- Companion case to the test_order chain above, but anchored in `public`.

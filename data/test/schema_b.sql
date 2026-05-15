@@ -1818,6 +1818,35 @@ CREATE UNLOGGED TABLE test_order.child (
 );
 
 -- =============================================================================
+-- Issue #191 — Persistence-ordering with mutual FK cycle
+-- =============================================================================
+-- Mirrors the cycle pair in Schema A but flipped to UNLOGGED. The
+-- mutual deferrable FKs `cycle_a ↔ cycle_b` are unchanged between
+-- FROM and TO (live edges), so they remain on the FK adjacency at
+-- the SET phase. With both endpoints in the cyclic set, the comparer
+-- must DROP both FKs before either SET UNLOGGED, run the SETs in any
+-- order, and re-ADD the FKs from the TO definitions.
+CREATE UNLOGGED TABLE test_order.cycle_a (
+    id serial PRIMARY KEY,
+    b_id integer
+);
+
+CREATE UNLOGGED TABLE test_order.cycle_b (
+    id serial PRIMARY KEY,
+    a_id integer
+);
+
+ALTER TABLE test_order.cycle_a
+    ADD CONSTRAINT cycle_a_b_id_fkey
+    FOREIGN KEY (b_id) REFERENCES test_order.cycle_b(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE test_order.cycle_b
+    ADD CONSTRAINT cycle_b_a_id_fkey
+    FOREIGN KEY (a_id) REFERENCES test_order.cycle_a(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+-- =============================================================================
 -- Issue #190 — Persistence-ordering FK adjacency with unqualified FK targets
 -- =============================================================================
 -- Mirrors the LOGGED pair in Schema A but flipped to UNLOGGED. The FK
