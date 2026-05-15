@@ -1516,3 +1516,30 @@ CREATE TABLE test_order.child (
     parent_id integer REFERENCES test_order.parent(id)
 );
 
+-- =============================================================================
+-- Issue #190 — Persistence-ordering FK adjacency with unqualified FK targets
+-- =============================================================================
+-- Companion case to the test_order chain above, but anchored in `public`.
+-- The role pgc connects as inherits the default search_path
+-- (`"$user", public`), so `pg_get_constraintdef` omits the schema
+-- qualifier on FK targets in `public` — the deparsed text is
+-- `REFERENCES persistence_chain_parent(id)`, not
+-- `REFERENCES public.persistence_chain_parent(id)`. Pre-fix the comparer's
+-- `parse_fk_referenced_table` returned None for the unqualified form, the
+-- FK edge was missing from the persistence-flip adjacency, and the SET
+-- ordering fell back to alphabetical — which PostgreSQL rejects with
+-- `could not change table "persistence_chain_parent" to unlogged because
+-- it is referenced by ...`. The CI gap that hid this bug was that every
+-- existing FK-chain fixture lives in an explicit `test_order` schema,
+-- where `pg_get_constraintdef` qualifies the target.
+--
+-- Schema B mirrors this pair but flipped to UNLOGGED; the migration's SET
+-- UNLOGGED must emit `child` before `parent`.
+CREATE TABLE public.persistence_chain_parent (
+    id serial PRIMARY KEY
+);
+
+CREATE TABLE public.persistence_chain_child (
+    id serial PRIMARY KEY,
+    parent_id integer REFERENCES public.persistence_chain_parent(id)
+);

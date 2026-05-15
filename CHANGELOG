@@ -44,6 +44,19 @@
                       parent(id)` definitions, flips both tables
                       LOGGED → UNLOGGED, and asserts the child
                       SET UNLOGGED is emitted BEFORE the parent.
+                      Companion integration fixture
+                      `public.persistence_chain_parent` /
+                      `public.persistence_chain_child` added to
+                      `data/test/schema_a.sql` /
+                      `data/test/schema_b.sql` so the real
+                      `pg_get_constraintdef` deparser path is
+                      exercised under CI (the role's default
+                      `search_path` of `"$user", public` is what
+                      causes PG to omit the qualifier — every
+                      pre-existing FK-chain fixture lives in an
+                      explicit `test_order` schema where the
+                      qualifier is always emitted, which is why CI
+                      hadn't caught this).
                       Known limitation documented in the parser's
                       doc comment: dump-time per-role /
                       per-database `search_path` settings beyond
