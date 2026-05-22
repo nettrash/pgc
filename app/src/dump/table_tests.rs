@@ -2526,6 +2526,57 @@ fn fetch_columns_query_uses_pg_catalog_not_information_schema_columns() {
         "related_views lookup must not use information_schema.view_column_usage \
             (privilege-filtered); use pg_depend/pg_rewrite. Query was:\n{query}"
     );
+
+    // ---- column_default: identity & generated columns must be suppressed ----
+    //
+    // information_schema.columns returns NULL for generated columns, and
+    // identity columns don't usually have a pg_attrdef row (the sequence
+    // is linked via pg_depend with deptype='i'). The new query must not
+    // accidentally surface a `nextval(...)` literal for identity columns
+    // or a default expression alongside `GENERATED ALWAYS AS (...)` for
+    // generated columns — both would produce invalid CREATE TABLE output
+    // and false diffs against dumps that originated from the old query.
+    assert!(
+        !query.to_lowercase().contains("nextval("),
+        "column_default must not hardcode nextval(); identity sequences \
+            are linked through pg_depend(deptype='i'), not pg_attrdef. \
+            Query was:\n{query}"
+    );
+    assert!(
+        query.contains("a.attgenerated <> ''")
+            && query.contains("a.attidentity <> ''")
+            && query.contains("THEN NULL"),
+        "column_default CASE must NULL out defaults for both generated \
+            (attgenerated <> '') and identity (attidentity <> '') columns \
+            so the dump never emits `GENERATED ... AS (...) DEFAULT ...` \
+            or `IDENTITY ... DEFAULT nextval(...)`. Query was:\n{query}"
+    );
+
+    // ---- formatted_data_type: domain columns keep their domain name ----
+    //
+    // Domain-typed columns must render as the domain (e.g.
+    // `myschema.my_domain`), not the underlying base type, so dumps round
+    // trip without losing the domain reference. The CASE has a dedicated
+    // `WHEN t.typtype = 'd'` branch that resolves through
+    // format_type(a.atttypid, a.atttypmod), which expands to the domain's
+    // own qualified name. Lock that branch and its inputs down so the
+    // logic can't silently regress to the base type.
+    assert!(
+        query.contains("t.typtype = 'd'"),
+        "formatted_data_type CASE must branch on t.typtype='d' to render \
+            domain-typed columns. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("LEFT JOIN pg_type bt ON t.typtype = 'd' AND bt.oid = t.typbasetype"),
+        "expected a LEFT JOIN to pg_type bt on t.typbasetype so the domain \
+            branch can introspect the base type. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("format_type(a.atttypid, a.atttypmod)"),
+        "formatted_data_type must reach format_type(a.atttypid, a.atttypmod) \
+            so the domain's own qualified name (not the base type) is \
+            emitted for domain-typed columns. Query was:\n{query}"
+    );
 }
 
 #[test]

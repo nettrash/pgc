@@ -345,7 +345,7 @@ impl Table {
                 quote_ident(a.attname) as column_name,
                 a.attnum::int4 as ordinal_position,
                 CASE
-                    WHEN a.attgenerated <> '' THEN NULL
+                    WHEN a.attgenerated <> '' OR a.attidentity <> '' THEN NULL
                     ELSE pg_get_expr(ad.adbin, ad.adrelid)
                 END as column_default,
                 CASE
@@ -363,7 +363,7 @@ impl Table {
                         OR (t.typtype <> 'd' AND nt.nspname <> 'pg_catalog')
                     )
                     THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
-                    WHEN t.typtype = 'd' THEN pg_catalog.format_type(t.typbasetype, NULL)
+                    WHEN t.typtype = 'd' THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
                     ELSE pg_catalog.format_type(a.atttypid, NULL)
                 END AS formatted_data_type,
                 information_schema._pg_char_max_length(
