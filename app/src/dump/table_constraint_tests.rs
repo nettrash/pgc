@@ -1704,3 +1704,57 @@ fn test_auto_not_null_column_truncated_to_63_bytes() {
     let c = nn_constraint(&with_suffix, &column);
     assert_eq!(c.auto_not_null_column(&table), Some(column));
 }
+
+#[test]
+fn test_auto_not_null_column_truncated_with_collision_suffix_reclips_head() {
+    // Cover the `clipped_base = &base[..(PG_NAMEDATALEN_MAX - suffix_len)]`
+    // re-clipping arm: when the un-truncated base already exceeds 63 bytes,
+    // appending a 1- or 2-digit collision suffix forces PG to clip the head
+    // even further so the whole name still fits in NAMEDATALEN-1 = 63 bytes.
+    // The previous truncation test only covered (a) plain truncation with no
+    // suffix and (b) truncation + suffix that happened to total exactly 63
+    // bytes, neither of which exercises the re-clipping arithmetic.
+    let table = "x".repeat(28);
+    let column = "y".repeat(27);
+    let full_base = format!("{}_{}_not_null", table, column);
+    assert_eq!(
+        full_base.len(),
+        65,
+        "fixture must be just over 63 bytes to force re-clipping"
+    );
+
+    // 1-digit collision suffix `1`: PG re-clips head to 62 bytes, total 63.
+    let mut name_one: String = full_base.chars().take(62).collect();
+    name_one.push('1');
+    assert_eq!(name_one.len(), 63);
+    let c = nn_constraint(&name_one, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column.clone()),
+        "head re-clipped to 62 bytes with 1-digit collision suffix should match"
+    );
+
+    // 2-digit collision suffix `42`: PG re-clips head to 61 bytes, total 63.
+    let mut name_two: String = full_base.chars().take(61).collect();
+    name_two.push_str("42");
+    assert_eq!(name_two.len(), 63);
+    let c = nn_constraint(&name_two, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column.clone()),
+        "head re-clipped to 61 bytes with 2-digit collision suffix should match"
+    );
+
+    // Negative control: a name that is a byte-prefix of `base` but with a
+    // non-digit tail must NOT be treated as auto-named (rejects user-chosen
+    // names like `xxxxx..._not_null_v2` that happen to share a prefix).
+    let mut user_named: String = full_base.chars().take(60).collect();
+    user_named.push_str("_v2");
+    assert_eq!(user_named.len(), 63);
+    let c = nn_constraint(&user_named, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        None,
+        "non-digit tail must not be classified as auto-generated"
+    );
+}

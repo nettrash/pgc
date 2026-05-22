@@ -1589,12 +1589,30 @@ CREATE TABLE public.persistence_chain_child (
 -- When two tables in the same schema generate the same base name (e.g.
 -- `nn_coll_a.b_c` and `nn_coll_a_b.c` both produce
 -- `nn_coll_a_b_c_not_null`), PostgreSQL appends a numeric `_N` suffix to
--- one of them. Which table receives the suffix is non-deterministic across
--- databases, so a naïve constraint-name comparison would emit a false
--- DROP/ADD pair on every dump.
+-- one of them. `ChooseConstraintName` is deterministic for a given
+-- CREATE TABLE order, but the order varies between databases in the wild
+-- (migrations replay in different sequences, restores re-emit DDL in
+-- catalog order, etc.), so the comparer must treat such names as
+-- semantically equivalent.
 --
--- This fixture is intentionally identical in schema_a.sql and schema_b.sql:
--- the comparer must produce ZERO diffs for these tables.
+-- IMPORTANT — load-bearing asymmetry: the CREATE TABLE order in
+-- schema_a.sql is the REVERSE of schema_b.sql. Because PG probes
+-- `nn_coll_a_b_c_not_null` first and only appends `_1` on collision, the
+-- two databases end up with the suffix attached to *different* tables:
+--
+--   Schema A (nn_coll_a created first):
+--     test_schema.nn_coll_a   .b_c  →  nn_coll_a_b_c_not_null
+--     test_schema.nn_coll_a_b .c    →  nn_coll_a_b_c_not_null_1
+--
+--   Schema B (nn_coll_a_b created first):
+--     test_schema.nn_coll_a_b .c    →  nn_coll_a_b_c_not_null
+--     test_schema.nn_coll_a   .b_c  →  nn_coll_a_b_c_not_null_1
+--
+-- Do NOT "clean this up" by aligning the CREATE order — the asymmetry
+-- IS the test. With the fix in place the comparer must still produce
+-- ZERO diffs for both tables; reverting to symmetric order would make
+-- PG assign identical names in both DBs and silently regress this
+-- regression test back to a no-op.
 CREATE TABLE test_schema.nn_coll_a (
     id serial PRIMARY KEY,
     b_c integer NOT NULL

@@ -1582,6 +1582,24 @@ impl Table {
             if let Some(old_constraint) = find_old(new_constraint) {
                 // Auto-named NOT NULL on the same column is semantically a no-op
                 // regardless of the numeric suffix PG chose for the name.
+                //
+                // The field set checked here intentionally mirrors
+                // `TableConstraint::PartialEq` *minus* the schema/name/table_name
+                // identifiers (which we have already established describe the
+                // same constraint via `find_old`) and the `definition` string
+                // (whose only NOT NULL payload is the column name, also already
+                // matched).
+                //
+                // `coninhcount` is deliberately NOT included: it is not part of
+                // `TableConstraint::PartialEq` or `add_to_hasher` either, and
+                // inherited NOT NULL constraints on partition children are
+                // filtered out earlier by the
+                // `is_target_partition && coninhcount > 0` guard, so a change
+                // in `coninhcount` cannot reach this branch in the
+                // partitioned-table case. For plain `CREATE TABLE ... INHERITS`
+                // hierarchies a `coninhcount` flip would still be silently
+                // accepted, but that matches the existing behavior for every
+                // other constraint type and is intentionally out of scope here.
                 let both_auto_nn = old_constraint.auto_not_null_column(&self.name).is_some()
                     && new_constraint
                         .auto_not_null_column(&to_table.name)
