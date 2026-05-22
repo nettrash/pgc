@@ -335,6 +335,38 @@ impl Table {
         // `information_schema._pg_*` helper functions: they're plain SQL
         // helpers that the standard view itself uses internally, and unlike
         // the view they aren't privilege-filtered.
+        //
+        // SAFETY of hardcoded fields. The following columns below are
+        // returned as constants rather than derived from pg_catalog:
+        //
+        //   - `interval_precision`, `character_set_catalog`,
+        //     `character_set_schema`, `character_set_name`,
+        //     `scope_catalog`, `scope_schema`, `scope_name`,
+        //     `maximum_cardinality`, `dtd_identifier`  → all `NULL`
+        //   - `is_self_referencing`                       → `'NO'`
+        //   - `is_updatable`                              → `'YES'`
+        //
+        // None of these appear in `TableColumn::add_to_hasher`
+        // (app/src/dump/table_column.rs ~L313–L353 — the explicit
+        // "skip catalog/charset/related_views and other descriptive-only
+        // fields" comment), and none are read by
+        // `TableColumn::get_alter_script`. They participate in `PartialEq`
+        // for round-trip dump equality only — a mismatch on any of them
+        // produces zero ALTER SQL because no get_alter_script branch
+        // emits a statement for them.
+        //
+        // Information_schema itself derived several of these (character_set_*,
+        // scope_*, maximum_cardinality, dtd_identifier, is_self_referencing)
+        // from the SQL standard's character-set / structured-type machinery
+        // that PostgreSQL does not implement, so they were already constant
+        // on every dump from the old query path; the new path returns the
+        // same constants.
+        //
+        // `is_updatable` was per-row in the old query (info_schema's view
+        // computes it from view privileges), but it isn't read anywhere in
+        // pgc, so hardcoding 'YES' is safe. Keep this list in sync with
+        // `add_to_hasher` if any of these fields ever start driving SQL
+        // emission.
         format!(
             "SELECT
                 current_database()::text as table_catalog,
@@ -426,7 +458,7 @@ impl Table {
                 NULL::text as scope_schema,
                 NULL::text as scope_name,
                 NULL::int4 as maximum_cardinality,
-                a.attnum::text as dtd_identifier,
+                NULL::text as dtd_identifier,
                 'NO' as is_self_referencing,
                 CASE WHEN a.attidentity IN ('a', 'd') THEN 'YES' ELSE 'NO' END as is_identity,
                 CASE a.attidentity

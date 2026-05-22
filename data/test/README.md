@@ -629,3 +629,23 @@ The comparison should detect and generate SQL for:
 - Creating, modifying, and dropping publications (FOR TABLE list, FOR ALL TABLES, publish operations)
 - Recreating dependents silently dropped by `DROP FUNCTION ... CASCADE` when a routine is fully dropped or its return type / argument list / argument defaults change (functional indexes, CHECK constraints, generated columns, column DEFAULT expressions, RLS policies — Issue #179)
 - Recreating _secondary_ dependents of a CASCADE-dropped generated column — indexes / CHECK constraints / RLS policies anchored on the column rather than the routine — driven by a `pg_catalog.pg_depend` snapshot captured at dump time; same machinery also runs after the virtual-generated-column drop+add path in `TableColumn::get_alter_script` (Issue #188)
+
+
+## Role privileges for the dumping user
+
+The `pgc` dump path reads table column metadata directly from
+`pg_catalog` (`pg_attribute`, `pg_attrdef`, `pg_depend`, `pg_sequence`,
+`pg_collation`, `pg_rewrite`) rather than from the
+privilege-filtered `information_schema.columns` /
+`information_schema.view_column_usage` views. As a result, fixture
+authors do not need to grant `SELECT` on every fixture table to the
+role running `pgc` — the column list, column defaults, identity
+metadata, generation expressions, and view dependency lookups are
+**privilege-independent**.
+
+This also means that any role with `CONNECT` on the database and
+`USAGE` on the relevant schemas can produce a faithful dump; a
+non-owner role no longer silently loses columns belonging to tables
+it cannot `SELECT` from. Keep this in mind when adding fixtures that
+exercise grant-related behaviour: the column introspection path itself
+is not the place to test row-level filtering.
