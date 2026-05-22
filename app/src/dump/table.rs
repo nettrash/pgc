@@ -1047,7 +1047,7 @@ impl Table {
                     let def = c.definition.as_deref()?;
                     let def_lower = def.to_lowercase();
                     let col_name = def_lower.strip_prefix("not null ")?.trim().to_string();
-                    if c.auto_not_null_column(&self.raw_name).is_some() {
+                    if c.auto_not_null_column(&self.name).is_some() {
                         None
                     } else {
                         Some((col_name, c))
@@ -1555,18 +1555,18 @@ impl Table {
             if let Some(found) = self.constraints.iter().find(|c| c.name == new_c.name) {
                 return Some(found);
             }
-            let new_col = new_c.auto_not_null_column(&to_table.raw_name)?;
-            self.constraints.iter().find(|c| {
-                c.auto_not_null_column(&self.raw_name).as_deref() == Some(new_col.as_str())
-            })
+            let new_col = new_c.auto_not_null_column(&to_table.name)?;
+            self.constraints
+                .iter()
+                .find(|c| c.auto_not_null_column(&self.name).as_deref() == Some(new_col.as_str()))
         };
         let find_new = |old_c: &TableConstraint| -> Option<&TableConstraint> {
             if let Some(found) = to_table.constraints.iter().find(|c| c.name == old_c.name) {
                 return Some(found);
             }
-            let old_col = old_c.auto_not_null_column(&self.raw_name)?;
+            let old_col = old_c.auto_not_null_column(&self.name)?;
             to_table.constraints.iter().find(|c| {
-                c.auto_not_null_column(&to_table.raw_name).as_deref() == Some(old_col.as_str())
+                c.auto_not_null_column(&to_table.name).as_deref() == Some(old_col.as_str())
             })
         };
 
@@ -1582,11 +1582,9 @@ impl Table {
             if let Some(old_constraint) = find_old(new_constraint) {
                 // Auto-named NOT NULL on the same column is semantically a no-op
                 // regardless of the numeric suffix PG chose for the name.
-                let both_auto_nn = old_constraint
-                    .auto_not_null_column(&self.raw_name)
-                    .is_some()
+                let both_auto_nn = old_constraint.auto_not_null_column(&self.name).is_some()
                     && new_constraint
-                        .auto_not_null_column(&to_table.raw_name)
+                        .auto_not_null_column(&to_table.name)
                         .is_some();
                 let nn_equivalent = both_auto_nn
                     && old_constraint.is_enforced == new_constraint.is_enforced

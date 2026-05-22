@@ -604,12 +604,21 @@ impl TableConstraint {
         // truncates by bytes, so compare byte prefixes (identifiers here are
         // typically ASCII, but `starts_with` on bytes is correct either way).
         const PG_NAMEDATALEN_MAX: usize = 63;
-        if base.len() > PG_NAMEDATALEN_MAX
-            && cname.len() <= PG_NAMEDATALEN_MAX
-            && !head.is_empty()
-            && base.as_bytes().starts_with(head.as_bytes())
-        {
-            return Some(col);
+        if base.len() > PG_NAMEDATALEN_MAX && !head.is_empty() {
+            // PG clips identifiers by *bytes* to NAMEDATALEN-1, but on a UTF-8
+            // character boundary (pg_mbcliplen).
+            let suffix_len = suffix.len();
+            if suffix_len < PG_NAMEDATALEN_MAX && cname.len() <= PG_NAMEDATALEN_MAX {
+                let max_head_bytes = PG_NAMEDATALEN_MAX - suffix_len;
+                let mut cut = max_head_bytes.min(base.len());
+                while cut > 0 && !base.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let clipped_base = &base[..cut];
+                if head == clipped_base {
+                    return Some(col);
+                }
+            }
         }
 
         None
