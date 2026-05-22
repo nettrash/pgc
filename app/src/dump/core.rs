@@ -1474,10 +1474,28 @@ impl Dump {
                 let column_comments = col_comments_map
                     .remove(&(schema.clone(), name.clone()))
                     .unwrap_or_default();
+                let definition: Option<String> = row.get("view_definition");
+                let definition = match definition {
+                    Some(d) => d,
+                    None => {
+                        // A NULL view_definition usually means the current role
+                        // lacks privileges to read the view body (information_schema
+                        // is privilege-filtered). Serializing an empty body would
+                        // silently emit a broken `CREATE VIEW ... AS ;` statement,
+                        // so fail loudly and name the affected object.
+                        return Err(Error::other(format!(
+                            "Failed to read view definition for {}.{}: \
+                             view_definition is NULL. The connecting role likely \
+                             lacks SELECT privileges on this view. Grant the role \
+                             access or run the dump under a more privileged role.",
+                            schema, name
+                        )));
+                    }
+                };
                 let mut view = View {
                     schema,
                     name,
-                    definition: row.get("view_definition"),
+                    definition,
                     table_relation: row.get("table_relation"),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
@@ -1529,10 +1547,28 @@ impl Dump {
                     }
                 });
                 let tablespace: Option<String> = row.get("tablespace_name");
+                let definition: Option<String> = row.get("view_definition");
+                let definition = match definition {
+                    Some(d) => d,
+                    None => {
+                        // A NULL materialized view definition indicates a
+                        // catalog/permissions problem (pg_matviews.definition is
+                        // privilege-filtered). Emitting an empty body would
+                        // produce a broken `CREATE MATERIALIZED VIEW ... AS ;`,
+                        // so fail loudly and name the affected object.
+                        return Err(Error::other(format!(
+                            "Failed to read materialized view definition for {}.{}: \
+                             definition is NULL. The connecting role likely lacks \
+                             SELECT privileges on this materialized view. Grant the \
+                             role access or run the dump under a more privileged role.",
+                            schema, name
+                        )));
+                    }
+                };
                 let mut view = View {
                     schema,
                     name,
-                    definition: row.get("view_definition"),
+                    definition,
                     table_relation: row.get("table_relation"),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
