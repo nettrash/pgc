@@ -1581,3 +1581,26 @@ CREATE TABLE public.persistence_chain_child (
     id serial PRIMARY KEY,
     parent_id integer REFERENCES public.persistence_chain_parent(id)
 );
+
+-- =============================================================================
+-- Auto-named NOT NULL collision fixture
+-- =============================================================================
+-- Issue: PG18 emits NOT NULL as named constraints (`{table}_{col}_not_null`).
+-- When two tables in the same schema generate the same base name (e.g.
+-- `nn_coll_a.b_c` and `nn_coll_a_b.c` both produce
+-- `nn_coll_a_b_c_not_null`), PostgreSQL appends a numeric `_N` suffix to
+-- one of them. Which table receives the suffix is non-deterministic across
+-- databases, so a naïve constraint-name comparison would emit a false
+-- DROP/ADD pair on every dump.
+--
+-- This fixture is intentionally identical in schema_a.sql and schema_b.sql:
+-- the comparer must produce ZERO diffs for these tables.
+CREATE TABLE test_schema.nn_coll_a (
+    id serial PRIMARY KEY,
+    b_c integer NOT NULL
+);
+
+CREATE TABLE test_schema.nn_coll_a_b (
+    id serial PRIMARY KEY,
+    c integer NOT NULL
+);

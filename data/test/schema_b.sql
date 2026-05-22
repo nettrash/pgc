@@ -1862,3 +1862,21 @@ CREATE UNLOGGED TABLE public.persistence_chain_child (
     id serial PRIMARY KEY,
     parent_id integer REFERENCES public.persistence_chain_parent(id)
 );
+
+-- =============================================================================
+-- Auto-named NOT NULL collision fixture (mirror of Schema A)
+-- =============================================================================
+-- See schema_a.sql for full context. Tables are intentionally identical
+-- here: the comparer must produce ZERO diffs against Schema A for this
+-- pair, even though PostgreSQL may assign different `_N` collision
+-- suffixes to the underlying NOT NULL constraints between the two
+-- databases.
+CREATE TABLE test_schema.nn_coll_a (
+    id serial PRIMARY KEY,
+    b_c integer NOT NULL
+);
+
+CREATE TABLE test_schema.nn_coll_a_b (
+    id serial PRIMARY KEY,
+    c integer NOT NULL
+);
