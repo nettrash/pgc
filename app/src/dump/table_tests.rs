@@ -2505,6 +2505,30 @@ fn fetch_columns_query_casts_attstattarget_to_int4() {
 }
 
 #[test]
+fn fetch_columns_query_uses_pg_catalog_not_information_schema_columns() {
+    // information_schema.columns is filtered by `pg_has_role(...) OR
+    // has_column_privilege(...)`, so dumps taken by a role without
+    // privileges silently lose columns of tables it can't read. The
+    // query must read from pg_attribute directly.
+    let query = Table::build_columns_query("", "('public')");
+
+    assert!(
+        !query.contains("information_schema.columns"),
+        "build_columns_query must not read from information_schema.columns \
+            (privilege-filtered); use pg_attribute directly. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("FROM pg_attribute a"),
+        "expected pg_attribute as the column source. Query was:\n{query}"
+    );
+    assert!(
+        !query.contains("information_schema.view_column_usage"),
+        "related_views lookup must not use information_schema.view_column_usage \
+            (privilege-filtered); use pg_depend/pg_rewrite. Query was:\n{query}"
+    );
+}
+
+#[test]
 fn build_indexes_bulk_query_filters_by_pg_class() {
     let query = Table::build_indexes_bulk_query("('public')");
 
