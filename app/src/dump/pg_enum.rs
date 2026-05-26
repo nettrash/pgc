@@ -9,3 +9,7 @@ pub struct PgEnum {
     pub enumsortorder: f32, // Sort order of the enum value
     pub enumlabel: String,  // Label of the enum value
 }
+
+#[cfg(test)]
+#[path = "pg_enum_tests.rs"]
+mod tests;
