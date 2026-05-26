@@ -1575,12 +1575,8 @@ impl Dump {
         Ok(views)
     }
 
-    /// Unwrap a view_definition column value, returning a descriptive error
-    /// when NULL. A NULL definition usually means the current role lacks
-    /// privileges to read the view body (information_schema.views and
-    /// pg_matviews are both privilege-filtered). Emitting an empty body would
-    /// produce a broken `CREATE [MATERIALIZED] VIEW ... AS ;` statement, so
-    /// fail loudly and name the affected object.
+    /// `information_schema.views` and `pg_matviews` are privilege-filtered:
+    /// a NULL definition means the role can't read the body.
     fn require_view_definition(
         definition: Option<String>,
         schema: &str,

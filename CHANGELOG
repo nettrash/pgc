@@ -130,6 +130,16 @@
                       regular-view error wording, and the
                       materialized-view error wording so the two
                       branches cannot drift again.
+                    - Resolved issue #204 (trim verbose inline
+                      comments added in #202). Replaced the
+                      `Dump::require_view_definition` docstring with
+                      a two-line note that keeps the non-obvious
+                      WHY (`information_schema.views` and
+                      `pg_matviews` are privilege-filtered, so NULL
+                      means the role can't read the body) and drops
+                      the redundant explanation of what the function
+                      does — both the function body and the error
+                      message already document that.
 
 2026-05-15      v1.0.21
 
