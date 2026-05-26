@@ -1758,3 +1758,43 @@ fn test_auto_not_null_column_truncated_with_collision_suffix_reclips_head() {
         "non-digit tail must not be classified as auto-generated"
     );
 }
+
+#[test]
+fn test_auto_not_null_column_reclips_when_base_fits_but_suffix_overflows() {
+    // PR #208 review: the truncation branch must also fire when the
+    // un-suffixed base fits in exactly 63 bytes but appending the numeric
+    // collision suffix would overflow. Previously the branch only ran when
+    // `base.len() > 63`, so an auto-generated name like `base[..62] + "1"`
+    // (with `base.len() == 63`) was misclassified as user-named and the
+    // comparer emitted false-positive DROP/ADD diffs for it.
+    let table = "a".repeat(27);
+    let column = "b".repeat(26);
+    let full_base = format!("{}_{}_not_null", table, column);
+    assert_eq!(
+        full_base.len(),
+        63,
+        "fixture must hit the exact NAMEDATALEN-1 boundary"
+    );
+
+    // 1-digit collision suffix `1`: PG re-clips base to 62 bytes, total 63.
+    let mut name_one: String = full_base.chars().take(62).collect();
+    name_one.push('1');
+    assert_eq!(name_one.len(), 63);
+    let c = nn_constraint(&name_one, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column.clone()),
+        "base.len() == 63 with a 1-digit suffix must be recognized as auto-named"
+    );
+
+    // 2-digit collision suffix `42`: PG re-clips base to 61 bytes, total 63.
+    let mut name_two: String = full_base.chars().take(61).collect();
+    name_two.push_str("42");
+    assert_eq!(name_two.len(), 63);
+    let c = nn_constraint(&name_two, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column),
+        "base.len() == 63 with a 2-digit suffix must be recognized as auto-named"
+    );
+}

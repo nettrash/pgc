@@ -1139,18 +1139,24 @@ impl Table {
             }
 
             // 2. Add column definitions
-            // Build a map from column name (lowered) to named NOT NULL constraint.
-            // A NOT NULL constraint is "named" if its name differs from PG's
-            // auto-generated default "{table}_{col}_not_null" (or that name with
-            // a numeric suffix that PG appends to resolve cross-table collisions).
+            // Build a map from quote-aware normalized column name to named
+            // NOT NULL constraint. A NOT NULL constraint is "named" if its
+            // name differs from PG's auto-generated default
+            // "{table}_{col}_not_null" (or that name with a numeric suffix
+            // that PG appends to resolve cross-table collisions).
+            //
+            // Identifiers are normalized via `TableConstraint::parse_pg_identifier`:
+            // quoted identifiers preserve case (so "A" and "a" stay distinct
+            // columns), unquoted identifiers fold to lowercase to match PG's
+            // identifier folding rules.
             let named_nn_constraints: HashMap<String, &TableConstraint> = self
                 .constraints
                 .iter()
                 .filter(|c| c.constraint_type.eq_ignore_ascii_case("not null"))
                 .filter_map(|c| {
                     let def = c.definition.as_deref()?;
-                    let def_lower = def.to_lowercase();
-                    let col_name = def_lower.strip_prefix("not null ")?.trim().to_string();
+                    let col_raw = TableConstraint::strip_not_null_prefix(def)?;
+                    let col_name = TableConstraint::parse_pg_identifier(col_raw)?;
                     if c.auto_not_null_column(&self.name).is_some() {
                         None
                     } else {
@@ -1175,7 +1181,8 @@ impl Table {
                     // If there is a named NOT NULL constraint for this column,
                     // replace the plain "not null" with "constraint <name> not null"
                     // (plus any modifier flags like NO INHERIT / NOT ENFORCED).
-                    if let Some(nn) = named_nn_constraints.get(&column.name.to_lowercase())
+                    let column_key = TableConstraint::normalize_identifier_for_name(&column.name);
+                    if let Some(nn) = named_nn_constraints.get(&column_key)
                         && col_part.ends_with("not null")
                     {
                         col_part.truncate(col_part.len() - "not null".len());

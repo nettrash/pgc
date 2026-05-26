@@ -1588,25 +1588,25 @@ CREATE TABLE public.persistence_chain_child (
 -- Issue: PG18 emits NOT NULL as named constraints (`{table}_{col}_not_null`).
 -- When two tables in the same schema generate the same base name (e.g.
 -- `nn_coll_a.b_c` and `nn_coll_a_b.c` both produce
--- `nn_coll_a_b_c_not_null`), PostgreSQL appends a numeric `_N` suffix to
--- one of them. `ChooseConstraintName` is deterministic for a given
--- CREATE TABLE order, but the order varies between databases in the wild
--- (migrations replay in different sequences, restores re-emit DDL in
--- catalog order, etc.), so the comparer must treat such names as
--- semantically equivalent.
+-- `nn_coll_a_b_c_not_null`), PostgreSQL appends numeric digits directly
+-- to the `not_null` label (NOT with an underscore) to disambiguate.
+-- `ChooseConstraintName` is deterministic for a given CREATE TABLE order,
+-- but the order varies between databases in the wild (migrations replay
+-- in different sequences, restores re-emit DDL in catalog order, etc.),
+-- so the comparer must treat such names as semantically equivalent.
 --
 -- IMPORTANT — load-bearing asymmetry: the CREATE TABLE order in
 -- schema_a.sql is the REVERSE of schema_b.sql. Because PG probes
--- `nn_coll_a_b_c_not_null` first and only appends `_1` on collision, the
+-- `nn_coll_a_b_c_not_null` first and only appends `1` on collision, the
 -- two databases end up with the suffix attached to *different* tables:
 --
 --   Schema A (nn_coll_a created first):
 --     test_schema.nn_coll_a   .b_c  →  nn_coll_a_b_c_not_null
---     test_schema.nn_coll_a_b .c    →  nn_coll_a_b_c_not_null_1
+--     test_schema.nn_coll_a_b .c    →  nn_coll_a_b_c_not_null1
 --
 --   Schema B (nn_coll_a_b created first):
 --     test_schema.nn_coll_a_b .c    →  nn_coll_a_b_c_not_null
---     test_schema.nn_coll_a   .b_c  →  nn_coll_a_b_c_not_null_1
+--     test_schema.nn_coll_a   .b_c  →  nn_coll_a_b_c_not_null1
 --
 -- Do NOT "clean this up" by aligning the CREATE order — the asymmetry
 -- IS the test. With the fix in place the comparer must still produce

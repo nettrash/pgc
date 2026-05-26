@@ -1871,13 +1871,14 @@ CREATE UNLOGGED TABLE public.persistence_chain_child (
 -- IMPORTANT — load-bearing asymmetry: the CREATE TABLE statements
 -- below appear in the REVERSE order from schema_a.sql. PG's
 -- `ChooseConstraintName` is deterministic for a given creation order,
--- so reversing the order forces PG to assign the `_1` collision suffix
--- to the OPPOSITE table relative to Schema A:
+-- so reversing the order forces PG to assign the numeric collision
+-- suffix (digits appended directly to `not_null`, no underscore) to
+-- the OPPOSITE table relative to Schema A:
 --
---   Schema A: nn_coll_a   .b_c → ..._not_null   (no suffix)
---             nn_coll_a_b .c   → ..._not_null_1 (suffix)
---   Schema B: nn_coll_a_b .c   → ..._not_null   (no suffix)
---             nn_coll_a   .b_c → ..._not_null_1 (suffix)
+--   Schema A: nn_coll_a   .b_c → ..._not_null  (no suffix)
+--             nn_coll_a_b .c   → ..._not_null1 (suffix)
+--   Schema B: nn_coll_a_b .c   → ..._not_null  (no suffix)
+--             nn_coll_a   .b_c → ..._not_null1 (suffix)
 --
 -- This asymmetry is the WHOLE POINT of the regression test: with
 -- identical CREATE order PG would assign identical names in both DBs
