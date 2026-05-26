@@ -37,3 +37,7 @@ pub struct ColumnDependent {
     /// Dependent object's name.
     pub dep_name: String,
 }
+
+#[cfg(test)]
+#[path = "column_dependent_tests.rs"]
+mod tests;

@@ -1474,10 +1474,16 @@ impl Dump {
                 let column_comments = col_comments_map
                     .remove(&(schema.clone(), name.clone()))
                     .unwrap_or_default();
+                let definition = Self::require_view_definition(
+                    row.get("view_definition"),
+                    &schema,
+                    &name,
+                    false,
+                )?;
                 let mut view = View {
                     schema,
                     name,
-                    definition: row.get("view_definition"),
+                    definition,
                     table_relation: row.get("table_relation"),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
@@ -1529,10 +1535,16 @@ impl Dump {
                     }
                 });
                 let tablespace: Option<String> = row.get("tablespace_name");
+                let definition = Self::require_view_definition(
+                    row.get("view_definition"),
+                    &schema,
+                    &name,
+                    true,
+                )?;
                 let mut view = View {
                     schema,
                     name,
-                    definition: row.get("view_definition"),
+                    definition,
                     table_relation: row.get("table_relation"),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
@@ -1561,6 +1573,32 @@ impl Dump {
         }
 
         Ok(views)
+    }
+
+    /// `information_schema.views` and `pg_matviews` are privilege-filtered:
+    /// a NULL definition means the role can't read the body.
+    fn require_view_definition(
+        definition: Option<String>,
+        schema: &str,
+        name: &str,
+        is_materialized: bool,
+    ) -> Result<String, Error> {
+        match definition {
+            Some(d) => Ok(d),
+            None => {
+                let kind = if is_materialized {
+                    "materialized view"
+                } else {
+                    "view"
+                };
+                Err(Error::other(format!(
+                    "Failed to read {kind} definition for {schema}.{name}: \
+                     view_definition is NULL. The connecting role likely \
+                     lacks SELECT privileges on this {kind}. Grant the role \
+                     access or run the dump under a more privileged role."
+                )))
+            }
+        }
     }
 
     fn build_regular_views_query(schema_filter: &str) -> String {

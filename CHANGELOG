@@ -1,3 +1,146 @@
+2026-05-26      v1.0.22
+
+                Bug fixes:
+                    - Rewrote `Table::build_columns_query` to read
+                      column metadata directly from `pg_catalog`
+                      (`pg_attribute`, `pg_attrdef`, `pg_depend`,
+                      `pg_sequence`, `pg_collation`, `pg_rewrite`)
+                      instead of from `information_schema.columns`
+                      and `information_schema.view_column_usage`.
+                      Those standard views are privilege-filtered
+                      via `pg_has_role(...) OR
+                      has_column_privilege(...)`, so a dump taken by
+                      a role that was not the table owner and did
+                      not have `SELECT` on every column silently
+                      produced an empty / truncated column list —
+                      strictly worse than a panic, because the
+                      downstream comparer then emitted destructive
+                      `ALTER TABLE ... DROP COLUMN` deltas against a
+                      schema that still had every column in place.
+                      The new query has no privilege filter, so the
+                      dump is faithful regardless of which role
+                      runs `pgc`. Typmod-derived metrics still go
+                      through `information_schema._pg_*` helpers
+                      (plain SQL, not privilege-filtered). Fields
+                      that are not consumed by SQL emission
+                      (`is_updatable`, `character_set_*`, `scope_*`,
+                      `maximum_cardinality`, `interval_precision`,
+                      `is_self_referencing`, `dtd_identifier`) are
+                      returned as constants and explicitly
+                      documented as safe at the top of
+                      `build_columns_query`.
+                    - Fixed false positive diffs for auto-named NOT
+                      NULL constraints. PostgreSQL 17+ records every
+                      `NOT NULL` column constraint as a named
+                      `pg_constraint` row using the pattern
+                      `{table}_{col}_not_null`. When two tables in
+                      the same schema collide on the base name
+                      (e.g. `processing_result.status_id` and
+                      `processing_result_status.id` both producing
+                      `processing_result_status_id_not_null`), PG
+                      appends a numeric collision suffix to one of
+                      them. Which side receives the suffix depends
+                      on creation order, so two semantically
+                      identical databases populated by migrations
+                      that ran in different orders ended up with
+                      the suffix attached to different tables, and
+                      the comparer emitted a destructive DROP/ADD
+                      pair on every dump. The fix detects
+                      auto-generated NOT NULL names (handling the
+                      63-byte identifier truncation and the
+                      re-clipping that PG performs when appending
+                      the suffix would otherwise overflow), and
+                      matches such constraints by column instead of
+                      name.
+
+                Behavioural verification:
+                    - Unit-test coverage in
+                      `app/src/dump/table_tests.rs` was extended
+                      with `fetch_columns_query_pins_load_bearing_field_semantics`,
+                      which structurally pins the pg_catalog
+                      expressions for every load-bearing field
+                      (identity_*, is_identity, is_generated,
+                      generation_expression, is_nullable,
+                      column_default, formatted_data_type CASE
+                      arms, related_views path, and the outer
+                      relkind filter). The previous test only
+                      asserted the query did not reference
+                      `information_schema.columns`.
+                    - Manual verification path: dump the project's
+                      own `data/test/schema_a.sql` against PG14
+                      through PG18 with the new query, then `diff`
+                      the serialized `Dump.tables[*].columns`
+                      against a dump produced by the v1.0.21
+                      query. Expected delta: zero, except for
+                      `dtd_identifier` (now `None` everywhere — see
+                      hardcoded-fields note above; `dtd_identifier`
+                      does not drive any SQL emission so the
+                      change is invisible at the migration level).
+                      `is_updatable` may also differ on views: the
+                      old query computed it from view privileges,
+                      the new query hardcodes `'YES'`. Same caveat
+                      — `is_updatable` is not consumed downstream.
+
+                Caveats:
+                    - Composite types (`relkind = 'c'`) are
+                      intentionally excluded from the column query;
+                      composite attributes are dumped via a
+                      separate path in `core.rs` and would otherwise
+                      double-emit.
+                    - PG18 virtual generated columns
+                      (`attgenerated = 'v'`) are correctly handled:
+                      the `generation_expression` branch fires on
+                      `attgenerated <> ''`, which covers both
+                      stored (`'s'`) and virtual (`'v'`); the raw
+                      `attgenerated` character survives as a
+                      separate column so virtual vs stored stays
+                      differentiable (see PR #185).
+                    - A user-chosen constraint name that happens to
+                      follow the exact
+                      `{table}_{col}_not_null[_digits]` pattern is
+                      now treated as auto-generated: `CREATE TABLE`
+                      will emit a plain `NOT NULL` on the column
+                      rather than `CONSTRAINT <name> NOT NULL`, and
+                      a rename diff against another `..._not_null`
+                      variant on the same column is suppressed. In
+                      practice users either pick distinctive names
+                      (e.g. `..._not_null_v2`, which has a non-digit
+                      tail and is correctly rejected) or do not name
+                      the constraint at all, so this misclassification
+                      should be extremely rare. If you specifically
+                      need to preserve a custom name that matches the
+                      pattern, rename the constraint to something
+                      that does not end in `_not_null` or
+                      `_not_null<digits>`.
+
+                Enhancements:
+                    - Resolved issue #203 (deduplicate view definition
+                      NULL-check in dump core). The NULL-check for the
+                      `view_definition` column was previously repeated
+                      verbatim in the regular-view and materialized-view
+                      arms of `Dump::fetch_views_standalone`. Both arms
+                      now route through a new
+                      `Dump::require_view_definition` private helper
+                      that returns the unwrapped definition or an
+                      `Error::other` naming the affected
+                      `schema.name` and the privilege hint. The helper
+                      takes `Option<String>` (not a `PgRow`) so it is
+                      independently unit-testable; three new tests in
+                      `core_tests.rs` pin the Some-passthrough, the
+                      regular-view error wording, and the
+                      materialized-view error wording so the two
+                      branches cannot drift again.
+                    - Resolved issue #204 (trim verbose inline
+                      comments added in #202). Replaced the
+                      `Dump::require_view_definition` docstring with
+                      a two-line note that keeps the non-obvious
+                      WHY (`information_schema.views` and
+                      `pg_matviews` are privilege-filtered, so NULL
+                      means the role can't read the body) and drops
+                      the redundant explanation of what the function
+                      does — both the function body and the error
+                      message already document that.
+
 2026-05-15      v1.0.21
 
                 Bug fixes:

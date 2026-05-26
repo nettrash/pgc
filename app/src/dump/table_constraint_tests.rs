@@ -1609,3 +1609,192 @@ fn test_serde_default_enforced() {
     let c: TableConstraint = serde_json::from_str(json).unwrap();
     assert!(c.is_enforced, "missing is_enforced should default to true");
 }
+
+fn nn_constraint(name: &str, column: &str) -> TableConstraint {
+    TableConstraint {
+        catalog: "db".to_string(),
+        schema: "public".to_string(),
+        name: name.to_string(),
+        table_name: "t".to_string(),
+        constraint_type: "NOT NULL".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some(format!("NOT NULL {column}")),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    }
+}
+
+#[test]
+fn test_auto_not_null_column_exact_match() {
+    let c = nn_constraint("users_email_not_null", "email");
+    assert_eq!(c.auto_not_null_column("users"), Some("email".to_string()));
+}
+
+#[test]
+fn test_auto_not_null_column_with_numeric_suffix() {
+    let c = nn_constraint("users_email_not_null1", "email");
+    assert_eq!(c.auto_not_null_column("users"), Some("email".to_string()));
+
+    let c = nn_constraint("users_email_not_null42", "email");
+    assert_eq!(c.auto_not_null_column("users"), Some("email".to_string()));
+}
+
+#[test]
+fn test_auto_not_null_column_user_named() {
+    let c = nn_constraint("email_must_exist", "email");
+    assert_eq!(c.auto_not_null_column("users"), None);
+}
+
+#[test]
+fn test_auto_not_null_column_non_numeric_suffix_is_user_named() {
+    // "_not_null_v2" is not an auto-generated suffix (PG only appends digits)
+    let c = nn_constraint("users_email_not_null_v2", "email");
+    assert_eq!(c.auto_not_null_column("users"), None);
+}
+
+#[test]
+fn test_auto_not_null_column_non_not_null_returns_none() {
+    let mut c = nn_constraint("users_email_not_null", "email");
+    c.constraint_type = "CHECK".to_string();
+    assert_eq!(c.auto_not_null_column("users"), None);
+}
+
+#[test]
+fn test_auto_not_null_column_preserves_case_for_quoted_columns() {
+    // Quoted "A" and "a" are distinct columns in PostgreSQL; their
+    // auto-generated NOT NULL names must NOT be conflated.
+    //
+    // The `name` field arrives from `quote_ident(conname)`, so a constraint
+    // whose stored bytes contain uppercase characters is delivered to us
+    // quoted (e.g. `"t_A_not_null"`); the column in the definition string
+    // arrives quoted too. Lowercase-only names come without quotes.
+    let c_upper = nn_constraint("\"t_A_not_null\"", "\"A\"");
+    assert_eq!(c_upper.auto_not_null_column("t"), Some("A".to_string()));
+
+    let c_lower = nn_constraint("t_a_not_null", "a");
+    assert_eq!(c_lower.auto_not_null_column("t"), Some("a".to_string()));
+
+    // A lowercase auto-name must not match a quoted uppercase column.
+    let c_mismatch = nn_constraint("t_a_not_null", "\"A\"");
+    assert_eq!(c_mismatch.auto_not_null_column("t"), None);
+}
+
+#[test]
+fn test_auto_not_null_column_truncated_to_63_bytes() {
+    // Build a base name longer than PG's 63-byte limit so the recorded
+    // constraint name is a truncated prefix.
+    let table = "a".repeat(50);
+    let column = "b".repeat(50);
+    let full_base = format!("{}_{}_not_null", table, column);
+    assert!(full_base.len() > 63);
+
+    // PG truncates to 63 bytes — emulate that.
+    let truncated: String = full_base.chars().take(63).collect();
+    let c = nn_constraint(&truncated, &column);
+    assert_eq!(c.auto_not_null_column(&table), Some(column.clone()));
+
+    // Truncated + numeric collision suffix.
+    let mut with_suffix: String = full_base.chars().take(61).collect();
+    with_suffix.push_str("42");
+    assert_eq!(with_suffix.len(), 63);
+    let c = nn_constraint(&with_suffix, &column);
+    assert_eq!(c.auto_not_null_column(&table), Some(column));
+}
+
+#[test]
+fn test_auto_not_null_column_truncated_with_collision_suffix_reclips_head() {
+    // Cover the `clipped_base = &base[..(PG_NAMEDATALEN_MAX - suffix_len)]`
+    // re-clipping arm: when the un-truncated base already exceeds 63 bytes,
+    // appending a 1- or 2-digit collision suffix forces PG to clip the head
+    // even further so the whole name still fits in NAMEDATALEN-1 = 63 bytes.
+    // The previous truncation test only covered (a) plain truncation with no
+    // suffix and (b) truncation + suffix that happened to total exactly 63
+    // bytes, neither of which exercises the re-clipping arithmetic.
+    let table = "x".repeat(28);
+    let column = "y".repeat(27);
+    let full_base = format!("{}_{}_not_null", table, column);
+    assert_eq!(
+        full_base.len(),
+        65,
+        "fixture must be just over 63 bytes to force re-clipping"
+    );
+
+    // 1-digit collision suffix `1`: PG re-clips head to 62 bytes, total 63.
+    let mut name_one: String = full_base.chars().take(62).collect();
+    name_one.push('1');
+    assert_eq!(name_one.len(), 63);
+    let c = nn_constraint(&name_one, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column.clone()),
+        "head re-clipped to 62 bytes with 1-digit collision suffix should match"
+    );
+
+    // 2-digit collision suffix `42`: PG re-clips head to 61 bytes, total 63.
+    let mut name_two: String = full_base.chars().take(61).collect();
+    name_two.push_str("42");
+    assert_eq!(name_two.len(), 63);
+    let c = nn_constraint(&name_two, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column.clone()),
+        "head re-clipped to 61 bytes with 2-digit collision suffix should match"
+    );
+
+    // Negative control: a name that is a byte-prefix of `base` but with a
+    // non-digit tail must NOT be treated as auto-named (rejects user-chosen
+    // names like `xxxxx..._not_null_v2` that happen to share a prefix).
+    let mut user_named: String = full_base.chars().take(60).collect();
+    user_named.push_str("_v2");
+    assert_eq!(user_named.len(), 63);
+    let c = nn_constraint(&user_named, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        None,
+        "non-digit tail must not be classified as auto-generated"
+    );
+}
+
+#[test]
+fn test_auto_not_null_column_reclips_when_base_fits_but_suffix_overflows() {
+    // PR #208 review: the truncation branch must also fire when the
+    // un-suffixed base fits in exactly 63 bytes but appending the numeric
+    // collision suffix would overflow. Previously the branch only ran when
+    // `base.len() > 63`, so an auto-generated name like `base[..62] + "1"`
+    // (with `base.len() == 63`) was misclassified as user-named and the
+    // comparer emitted false-positive DROP/ADD diffs for it.
+    let table = "a".repeat(27);
+    let column = "b".repeat(26);
+    let full_base = format!("{}_{}_not_null", table, column);
+    assert_eq!(
+        full_base.len(),
+        63,
+        "fixture must hit the exact NAMEDATALEN-1 boundary"
+    );
+
+    // 1-digit collision suffix `1`: PG re-clips base to 62 bytes, total 63.
+    let mut name_one: String = full_base.chars().take(62).collect();
+    name_one.push('1');
+    assert_eq!(name_one.len(), 63);
+    let c = nn_constraint(&name_one, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column.clone()),
+        "base.len() == 63 with a 1-digit suffix must be recognized as auto-named"
+    );
+
+    // 2-digit collision suffix `42`: PG re-clips base to 61 bytes, total 63.
+    let mut name_two: String = full_base.chars().take(61).collect();
+    name_two.push_str("42");
+    assert_eq!(name_two.len(), 63);
+    let c = nn_constraint(&name_two, &column);
+    assert_eq!(
+        c.auto_not_null_column(&table),
+        Some(column),
+        "base.len() == 63 with a 2-digit suffix must be recognized as auto-named"
+    );
+}

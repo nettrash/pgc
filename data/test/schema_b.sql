@@ -1862,3 +1862,38 @@ CREATE UNLOGGED TABLE public.persistence_chain_child (
     id serial PRIMARY KEY,
     parent_id integer REFERENCES public.persistence_chain_parent(id)
 );
+
+-- =============================================================================
+-- Auto-named NOT NULL collision fixture (intentionally REVERSED order)
+-- =============================================================================
+-- See schema_a.sql for full context.
+--
+-- IMPORTANT — load-bearing asymmetry: the CREATE TABLE statements
+-- below appear in the REVERSE order from schema_a.sql. PG's
+-- `ChooseConstraintName` is deterministic for a given creation order,
+-- so reversing the order forces PG to assign the numeric collision
+-- suffix (digits appended directly to `not_null`, no underscore) to
+-- the OPPOSITE table relative to Schema A:
+--
+--   Schema A: nn_coll_a   .b_c → ..._not_null  (no suffix)
+--             nn_coll_a_b .c   → ..._not_null1 (suffix)
+--   Schema B: nn_coll_a_b .c   → ..._not_null  (no suffix)
+--             nn_coll_a   .b_c → ..._not_null1 (suffix)
+--
+-- This asymmetry is the WHOLE POINT of the regression test: with
+-- identical CREATE order PG would assign identical names in both DBs
+-- and a naïve comparer would also produce zero diffs (false pass).
+-- Do not align the order with schema_a.sql.
+--
+-- The comparer (post-fix) must still produce ZERO diffs for these
+-- tables despite the suffixed constraint living on a different table
+-- on each side.
+CREATE TABLE test_schema.nn_coll_a_b (
+    id serial PRIMARY KEY,
+    c integer NOT NULL
+);
+
+CREATE TABLE test_schema.nn_coll_a (
+    id serial PRIMARY KEY,
+    b_c integer NOT NULL
+);

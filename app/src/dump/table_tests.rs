@@ -2505,11 +2505,446 @@ fn fetch_columns_query_casts_attstattarget_to_int4() {
 }
 
 #[test]
+fn fetch_columns_query_uses_pg_catalog_not_information_schema_columns() {
+    // information_schema.columns is filtered by `pg_has_role(...) OR
+    // has_column_privilege(...)`, so dumps taken by a role without
+    // privileges silently lose columns of tables it can't read. The
+    // query must read from pg_attribute directly.
+    let query = Table::build_columns_query("", "('public')");
+
+    assert!(
+        !query.contains("information_schema.columns"),
+        "build_columns_query must not read from information_schema.columns \
+            (privilege-filtered); use pg_attribute directly. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("FROM pg_attribute a"),
+        "expected pg_attribute as the column source. Query was:\n{query}"
+    );
+    assert!(
+        !query.contains("information_schema.view_column_usage"),
+        "related_views lookup must not use information_schema.view_column_usage \
+            (privilege-filtered); use pg_depend/pg_rewrite. Query was:\n{query}"
+    );
+
+    // ---- column_default: identity & generated columns must be suppressed ----
+    //
+    // information_schema.columns returns NULL for generated columns, and
+    // identity columns don't usually have a pg_attrdef row (the sequence
+    // is linked via pg_depend with deptype='i'). The new query must not
+    // accidentally surface a `nextval(...)` literal for identity columns
+    // or a default expression alongside `GENERATED ALWAYS AS (...)` for
+    // generated columns — both would produce invalid CREATE TABLE output
+    // and false diffs against dumps that originated from the old query.
+    assert!(
+        !query.to_lowercase().contains("nextval("),
+        "column_default must not hardcode nextval(); identity sequences \
+            are linked through pg_depend(deptype='i'), not pg_attrdef. \
+            Query was:\n{query}"
+    );
+    assert!(
+        query.contains("a.attgenerated <> ''")
+            && query.contains("a.attidentity <> ''")
+            && query.contains("THEN NULL"),
+        "column_default CASE must NULL out defaults for both generated \
+            (attgenerated <> '') and identity (attidentity <> '') columns \
+            so the dump never emits `GENERATED ... AS (...) DEFAULT ...` \
+            or `IDENTITY ... DEFAULT nextval(...)`. Query was:\n{query}"
+    );
+
+    // ---- formatted_data_type: domain columns keep their domain name ----
+    //
+    // Domain-typed columns must render as the domain (e.g.
+    // `myschema.my_domain`), not the underlying base type, so dumps round
+    // trip without losing the domain reference. The CASE has a dedicated
+    // `WHEN t.typtype = 'd'` branch that resolves through
+    // format_type(a.atttypid, a.atttypmod), which expands to the domain's
+    // own qualified name. Lock that branch and its inputs down so the
+    // logic can't silently regress to the base type.
+    assert!(
+        query.contains("t.typtype = 'd'"),
+        "formatted_data_type CASE must branch on t.typtype='d' to render \
+            domain-typed columns. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("LEFT JOIN pg_type bt ON t.typtype = 'd' AND bt.oid = t.typbasetype"),
+        "expected a LEFT JOIN to pg_type bt on t.typbasetype so the domain \
+            branch can introspect the base type. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("format_type(a.atttypid, a.atttypmod)"),
+        "formatted_data_type must reach format_type(a.atttypid, a.atttypmod) \
+            so the domain's own qualified name (not the base type) is \
+            emitted for domain-typed columns. Query was:\n{query}"
+    );
+}
+
+/// Pin field-level semantics of `build_columns_query` so the rewrite from
+/// `information_schema.columns` to `pg_catalog` cannot silently regress on
+/// the columns that actually drive SQL generation in
+/// `TableColumn::get_alter_script` (data_type, column_default, is_nullable,
+/// is_identity, identity_*, is_generated, generation_expression).
+///
+/// This is a structural-but-load-bearing test: it does not run the SQL,
+/// but it asserts that the exact pg_catalog expressions the owner walked
+/// through field-by-field in the review remain in place. If a future change
+/// rewires any of these derivations the test fires and forces a deliberate
+/// update.
+///
+/// For a true behavioral check the project relies on the CI dump-and-compare
+/// matrix against `data/test/schema_a.sql` / `schema_b.sql`, plus the
+/// manual verification recorded in the CHANGELOG entry for this PR.
+#[test]
+fn fetch_columns_query_pins_load_bearing_field_semantics() {
+    let query = Table::build_columns_query("", "('public')");
+
+    // ---- identity columns: metadata sourced from pg_sequence ps ----
+    //
+    // Identity sequences are linked to the column via pg_depend with
+    // deptype='i'. The new query joins pg_depend → pg_class (relkind='S')
+    // → pg_sequence and reads seqstart / seqincrement / seqmax / seqmin /
+    // seqcycle. All identity_* fields are gated on attidentity IN ('a','d')
+    // so non-identity columns receive NULL (matching information_schema's
+    // behavior).
+    for (field, expr) in [
+        ("identity_start", "ps.seqstart::text"),
+        ("identity_increment", "ps.seqincrement::text"),
+        ("identity_maximum", "ps.seqmax::text"),
+        ("identity_minimum", "ps.seqmin::text"),
+    ] {
+        let snippet = format!("WHEN a.attidentity IN ('a', 'd') THEN {expr}");
+        assert!(
+            query.contains(&snippet),
+            "{field} must derive from pg_sequence via attidentity gate. \
+                Expected snippet:\n  {snippet}\nQuery was:\n{query}"
+        );
+    }
+    assert!(
+        query.contains(
+            "CASE WHEN a.attidentity IN ('a', 'd') THEN 'YES' ELSE 'NO' END as is_identity"
+        ),
+        "is_identity must be derived from attidentity. Query was:\n{query}"
+    );
+    assert!(
+        query.contains("WHEN 'a' THEN 'ALWAYS'") && query.contains("WHEN 'd' THEN 'BY DEFAULT'"),
+        "identity_generation must map attidentity 'a'→ALWAYS, 'd'→BY DEFAULT. \
+            Query was:\n{query}"
+    );
+    assert!(
+        query.contains("LEFT JOIN pg_depend ident_dep")
+            && query.contains("AND ident_dep.deptype = 'i'")
+            && query.contains(
+                "LEFT JOIN pg_class seq ON seq.oid = ident_dep.objid AND seq.relkind = 'S'"
+            )
+            && query.contains("LEFT JOIN pg_sequence ps ON ps.seqrelid = seq.oid"),
+        "identity sequence lookup must be pg_depend(deptype='i') → \
+            pg_class(relkind='S') → pg_sequence. Query was:\n{query}"
+    );
+
+    // ---- generated columns: expression via pg_get_expr, gated on attgenerated ----
+    //
+    // `c.generation_expression` from information_schema is replaced by
+    // pg_get_expr(ad.adbin, ad.adrelid) gated on attgenerated <> ''. PG18
+    // virtual generated columns (attgenerated='v') still match this gate
+    // and pg_attrdef holds the expression for them too, so virtual/stored
+    // remain differentiable via the separate `attgenerated::text` column.
+    assert!(
+        query.contains(
+            "CASE WHEN a.attgenerated <> '' THEN 'ALWAYS' ELSE 'NEVER' END as is_generated"
+        ),
+        "is_generated must be derived from attgenerated <> ''. Query was:\n{query}"
+    );
+    assert!(
+        query.contains(
+            "CASE WHEN a.attgenerated <> '' THEN pg_get_expr(ad.adbin, ad.adrelid) ELSE NULL END as generation_expression"
+        ),
+        "generation_expression must use pg_get_expr gated on attgenerated. \
+            Query was:\n{query}"
+    );
+    assert!(
+        query.contains("a.attgenerated::text as attgenerated"),
+        "attgenerated raw char must survive so stored ('s') vs virtual ('v') \
+            stays differentiable for PG18 virtual-generated tracking \
+            (see PR #185). Query was:\n{query}"
+    );
+
+    // ---- is_nullable: attnotnull OR domain typnotnull ----
+    //
+    // information_schema.columns.is_nullable returns 'NO' when either the
+    // column is declared NOT NULL or the column's type is a domain whose
+    // base is NOT NULL. The new query must reproduce both halves.
+    assert!(
+        query.contains("WHEN a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) THEN 'NO'"),
+        "is_nullable must consider both attnotnull and domain typnotnull \
+            so domain-of-not-null preserves nullability semantics. \
+            Query was:\n{query}"
+    );
+
+    // ---- typmod-derived metrics: _pg_* helpers, not privilege-filtered ----
+    //
+    // _pg_char_max_length / _pg_numeric_precision / _pg_numeric_scale /
+    // _pg_datetime_precision / _pg_interval_type are plain SQL helpers used
+    // internally by information_schema.columns. They are safe to call
+    // because they are not gated by has_column_privilege; only the .columns
+    // view itself wraps them in a privilege filter.
+    for helper in [
+        "_pg_char_max_length",
+        "_pg_char_octet_length",
+        "_pg_numeric_precision",
+        "_pg_numeric_precision_radix",
+        "_pg_numeric_scale",
+        "_pg_datetime_precision",
+        "_pg_interval_type",
+    ] {
+        let call = format!("information_schema.{helper}(");
+        assert!(
+            query.contains(&call),
+            "typmod-derived metric must use the public helper \
+                `information_schema.{helper}` (not privilege-filtered). \
+                Query was:\n{query}"
+        );
+    }
+    assert!(
+        query.contains("information_schema._pg_truetypid(a, t)")
+            && query.contains("information_schema._pg_truetypmod(a, t)"),
+        "_pg_* helpers must receive truetypid / truetypmod (a, t) so domain \
+            columns resolve through to their base type's typmod. \
+            Query was:\n{query}"
+    );
+
+    // ---- formatted_data_type: 4-arm CASE preserving information_schema layout ----
+    //
+    // The CASE mirrors information_schema.columns.data_type's four-way logic
+    // (domain vs non-domain × array vs non-array × pg_catalog vs user
+    // namespace). The first arm covers arrays (incl. domain-of-array), the
+    // second covers user-namespace types, the third is the domain catch-all
+    // (returns the domain's own qualified name), and the else falls back to
+    // format_type(atttypid, NULL) for built-in scalars.
+    assert!(
+        query.contains("(t.typtype = 'd' AND bt.typelem <> 0 AND bt.typlen = -1)")
+            && query.contains("(t.typtype <> 'd' AND t.typelem <> 0 AND t.typlen = -1)"),
+        "formatted_data_type CASE must have an array arm that covers both \
+            domain-of-array (via bt.typelem) and direct array \
+            (via t.typelem). Query was:\n{query}"
+    );
+    assert!(
+        query.contains("nbt.nspname <> 'pg_catalog'")
+            && query.contains("nt.nspname <> 'pg_catalog'"),
+        "formatted_data_type CASE must distinguish pg_catalog vs user \
+            namespace for both domain (nbt) and non-domain (nt) types. \
+            Query was:\n{query}"
+    );
+    assert!(
+        query.contains("ELSE pg_catalog.format_type(a.atttypid, NULL)"),
+        "formatted_data_type fallback for built-in scalars must drop typmod \
+            so e.g. 'integer' is emitted without precision qualifier. \
+            Query was:\n{query}"
+    );
+
+    // ---- column_default: suppressed for generated AND identity columns ----
+    //
+    // Already covered by the previous test, re-asserted here so this test
+    // forms a single point of truth for the load-bearing CASE branches.
+    assert!(
+        query.contains("WHEN a.attgenerated <> '' OR a.attidentity <> '' THEN NULL"),
+        "column_default CASE must NULL out defaults for BOTH generated \
+            and identity columns to avoid bogus `DEFAULT nextval(...)` or \
+            `DEFAULT <expr>` alongside `GENERATED ALWAYS AS ...`. \
+            Query was:\n{query}"
+    );
+
+    // ---- related_views: pg_depend(deptype='n') + pg_rewrite, no info_schema ----
+    //
+    // The unified pg_depend + pg_rewrite walk replaces the old UNION ALL
+    // over information_schema.view_column_usage + pg_depend. The relkind
+    // filter must include BOTH regular ('v') and materialized ('m') views
+    // (the old code split them across two queries; the new code merges).
+    assert!(
+        query.contains("AND vc.relkind IN ('v', 'm')"),
+        "related_views must include both regular views ('v') and \
+            materialized views ('m'). Query was:\n{query}"
+    );
+    assert!(
+        query.contains("AND dep.deptype = 'n'"),
+        "related_views must filter pg_depend by deptype='n' (normal \
+            dependency) — that is the link a view's parsed rule body \
+            records against the source column. Query was:\n{query}"
+    );
+
+    // ---- relkind filter on the outer FROM ----
+    //
+    // Match information_schema.columns's implicit filter: regular ('r'),
+    // view ('v'), matview ('m'), foreign ('f'), partitioned table ('p').
+    // Composite types ('c') are dumped via a separate path in core.rs
+    // (pg_type, not pg_class) and are intentionally excluded here so we do
+    // not double-emit composite attributes.
+    assert!(
+        query.contains("c.relkind IN ('r','v','m','f','p')"),
+        "outer relkind filter must mirror information_schema.columns \
+            (regular/view/matview/foreign/partitioned). Composite types \
+            are dumped via core.rs and excluded on purpose. \
+            Query was:\n{query}"
+    );
+
+    // ---- hardcoded fields are not load-bearing ----
+    //
+    // These columns are kept as constants because they do not appear in
+    // TableColumn::add_to_hasher (see table_column.rs ~L313–L353) and are
+    // not read by TableColumn::get_alter_script. They participate in
+    // PartialEq only — a mismatch produces zero SQL.
+    for hardcoded in [
+        "NULL::int4 as interval_precision",
+        "NULL::text as character_set_catalog",
+        "NULL::text as character_set_schema",
+        "NULL::text as character_set_name",
+        "NULL::text as scope_catalog",
+        "NULL::text as scope_schema",
+        "NULL::text as scope_name",
+        "NULL::int4 as maximum_cardinality",
+        "NULL::text as dtd_identifier",
+        "'NO' as is_self_referencing",
+        "'YES' as is_updatable",
+    ] {
+        assert!(
+            query.contains(hardcoded),
+            "expected hardcoded constant `{hardcoded}` (safe: not in \
+                add_to_hasher or get_alter_script). Query was:\n{query}"
+        );
+    }
+}
+
+#[test]
 fn build_indexes_bulk_query_filters_by_pg_class() {
     let query = Table::build_indexes_bulk_query("('public')");
 
     assert!(
         query.contains("d.classoid = 'pg_class'::regclass"),
         "expected pg_class classoid filter for table index comments"
+    );
+}
+
+#[test]
+fn test_auto_generated_not_null_with_numeric_suffix_skips_constraint_keyword() {
+    // PG appends a numeric suffix to resolve cross-table auto-name collisions.
+    // The result is still semantically anonymous and should not be emitted
+    // with the CONSTRAINT keyword in the column definition.
+    let table = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null1", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = table.get_script();
+    assert!(
+        script.contains("name text not null"),
+        "expected plain NOT NULL for auto-generated suffixed name: {script}"
+    );
+    assert!(
+        !script.contains("constraint users_name_not_null1"),
+        "auto-generated NOT NULL name with suffix should not use CONSTRAINT keyword: {script}"
+    );
+}
+
+#[test]
+fn test_auto_named_not_null_swap_produces_no_diff() {
+    // Reproduces the cross-table auto-name swap scenario:
+    // OLD has "users_name_not_null", NEW has "users_name_not_null1" on the
+    // same column. Both are auto-generated names — diff must be empty.
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null1", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        !script.contains("drop constraint users_name_not_null"),
+        "auto-name suffix swap must not emit a drop: {script}"
+    );
+    assert!(
+        !script.contains("add constraint users_name_not_null"),
+        "auto-name suffix swap must not emit an add: {script}"
+    );
+}
+
+#[test]
+fn test_named_to_auto_named_not_null_still_diffs() {
+    // A user-named NOT NULL ("name_must_exist") replaced with an auto-named
+    // one is a real change — diff should drop+add.
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("name_must_exist", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("drop constraint name_must_exist"),
+        "renaming away from a user-chosen name must still emit a drop: {script}"
     );
 }

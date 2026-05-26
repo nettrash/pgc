@@ -728,3 +728,52 @@ async fn write_to_file_round_trips_via_read_from_file() {
     assert_eq!(restored.routines[0].name, "noop");
     assert_eq!(restored.sequences[0].name, "users_id_seq");
 }
+
+#[test]
+fn require_view_definition_returns_definition_when_present() {
+    let got = Dump::require_view_definition(Some("select 1".to_string()), "public", "v_one", false)
+        .expect("Some should unwrap to Ok");
+    assert_eq!(got, "select 1");
+}
+
+#[test]
+fn require_view_definition_errors_with_view_kind_when_null() {
+    let err = Dump::require_view_definition(None, "public", "v_one", false)
+        .expect_err("None should produce an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("public.v_one"),
+        "message must name the object: {msg}"
+    );
+    assert!(
+        msg.contains(" view "),
+        "message must say \"view\" (not \"materialized view\"): {msg}"
+    );
+    assert!(
+        !msg.contains("materialized view"),
+        "regular-view error must not mention materialized: {msg}"
+    );
+    assert!(
+        msg.contains("SELECT privileges"),
+        "message must hint at the privilege cause: {msg}"
+    );
+}
+
+#[test]
+fn require_view_definition_errors_with_materialized_kind_when_null() {
+    let err = Dump::require_view_definition(None, "reporting", "mv_summary", true)
+        .expect_err("None should produce an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reporting.mv_summary"),
+        "message must name the object: {msg}"
+    );
+    assert!(
+        msg.contains("materialized view"),
+        "materialized error must use the materialized wording: {msg}"
+    );
+    assert!(
+        msg.contains("SELECT privileges"),
+        "message must hint at the privilege cause: {msg}"
+    );
+}
