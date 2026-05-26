@@ -113,6 +113,24 @@
                       that does not end in `_not_null` or
                       `_not_null<digits>`.
 
+                Enhancements:
+                    - Resolved issue #203 (deduplicate view definition
+                      NULL-check in dump core). The NULL-check for the
+                      `view_definition` column was previously repeated
+                      verbatim in the regular-view and materialized-view
+                      arms of `Dump::fetch_views_standalone`. Both arms
+                      now route through a new
+                      `Dump::require_view_definition` private helper
+                      that returns the unwrapped definition or an
+                      `Error::other` naming the affected
+                      `schema.name` and the privilege hint. The helper
+                      takes `Option<String>` (not a `PgRow`) so it is
+                      independently unit-testable; three new tests in
+                      `core_tests.rs` pin the Some-passthrough, the
+                      regular-view error wording, and the
+                      materialized-view error wording so the two
+                      branches cannot drift again.
+
 2026-05-15      v1.0.21
 
                 Bug fixes:

@@ -1474,24 +1474,12 @@ impl Dump {
                 let column_comments = col_comments_map
                     .remove(&(schema.clone(), name.clone()))
                     .unwrap_or_default();
-                let definition: Option<String> = row.get("view_definition");
-                let definition = match definition {
-                    Some(d) => d,
-                    None => {
-                        // A NULL view_definition usually means the current role
-                        // lacks privileges to read the view body (information_schema
-                        // is privilege-filtered). Serializing an empty body would
-                        // silently emit a broken `CREATE VIEW ... AS ;` statement,
-                        // so fail loudly and name the affected object.
-                        return Err(Error::other(format!(
-                            "Failed to read view definition for {}.{}: \
-                             view_definition is NULL. The connecting role likely \
-                             lacks SELECT privileges on this view. Grant the role \
-                             access or run the dump under a more privileged role.",
-                            schema, name
-                        )));
-                    }
-                };
+                let definition = Self::require_view_definition(
+                    row.get("view_definition"),
+                    &schema,
+                    &name,
+                    false,
+                )?;
                 let mut view = View {
                     schema,
                     name,
@@ -1547,24 +1535,12 @@ impl Dump {
                     }
                 });
                 let tablespace: Option<String> = row.get("tablespace_name");
-                let definition: Option<String> = row.get("view_definition");
-                let definition = match definition {
-                    Some(d) => d,
-                    None => {
-                        // A NULL materialized view definition indicates a
-                        // catalog/permissions problem (pg_matviews.definition is
-                        // privilege-filtered). Emitting an empty body would
-                        // produce a broken `CREATE MATERIALIZED VIEW ... AS ;`,
-                        // so fail loudly and name the affected object.
-                        return Err(Error::other(format!(
-                            "Failed to read materialized view definition for {}.{}: \
-                             definition is NULL. The connecting role likely lacks \
-                             SELECT privileges on this materialized view. Grant the \
-                             role access or run the dump under a more privileged role.",
-                            schema, name
-                        )));
-                    }
-                };
+                let definition = Self::require_view_definition(
+                    row.get("view_definition"),
+                    &schema,
+                    &name,
+                    true,
+                )?;
                 let mut view = View {
                     schema,
                     name,
@@ -1597,6 +1573,36 @@ impl Dump {
         }
 
         Ok(views)
+    }
+
+    /// Unwrap a view_definition column value, returning a descriptive error
+    /// when NULL. A NULL definition usually means the current role lacks
+    /// privileges to read the view body (information_schema.views and
+    /// pg_matviews are both privilege-filtered). Emitting an empty body would
+    /// produce a broken `CREATE [MATERIALIZED] VIEW ... AS ;` statement, so
+    /// fail loudly and name the affected object.
+    fn require_view_definition(
+        definition: Option<String>,
+        schema: &str,
+        name: &str,
+        is_materialized: bool,
+    ) -> Result<String, Error> {
+        match definition {
+            Some(d) => Ok(d),
+            None => {
+                let kind = if is_materialized {
+                    "materialized view"
+                } else {
+                    "view"
+                };
+                Err(Error::other(format!(
+                    "Failed to read {kind} definition for {schema}.{name}: \
+                     view_definition is NULL. The connecting role likely \
+                     lacks SELECT privileges on this {kind}. Grant the role \
+                     access or run the dump under a more privileged role."
+                )))
+            }
+        }
     }
 
     fn build_regular_views_query(schema_filter: &str) -> String {
