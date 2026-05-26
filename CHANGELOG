@@ -1,4 +1,4 @@
-2026-05-00      v1.0.22
+2026-05-26      v1.0.22
 
                 Bug fixes:
                     - Rewrote `Table::build_columns_query` to read
