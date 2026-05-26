@@ -1141,7 +1141,8 @@ impl Table {
             // 2. Add column definitions
             // Build a map from column name (lowered) to named NOT NULL constraint.
             // A NOT NULL constraint is "named" if its name differs from PG's
-            // auto-generated default "{table}_{col}_not_null".
+            // auto-generated default "{table}_{col}_not_null" (or that name with
+            // a numeric suffix that PG appends to resolve cross-table collisions).
             let named_nn_constraints: HashMap<String, &TableConstraint> = self
                 .constraints
                 .iter()
@@ -1150,13 +1151,10 @@ impl Table {
                     let def = c.definition.as_deref()?;
                     let def_lower = def.to_lowercase();
                     let col_name = def_lower.strip_prefix("not null ")?.trim().to_string();
-                    let raw_cname = c.name.trim_matches('"');
-                    let raw_col = col_name.trim_matches('"');
-                    let default_name = format!("{}_{}_not_null", self.raw_name, raw_col);
-                    if !raw_cname.eq_ignore_ascii_case(&default_name) {
-                        Some((col_name, c))
-                    } else {
+                    if c.auto_not_null_column(&self.name).is_some() {
                         None
+                    } else {
+                        Some((col_name, c))
                     }
                 })
                 .collect();
@@ -1654,6 +1652,28 @@ impl Table {
             }
         }
 
+        // Match constraints by name, except for NOT NULL constraints with
+        // auto-generated names: those are matched by column because PG's
+        // auto-generated name may differ between databases (collision suffixes).
+        let find_old = |new_c: &TableConstraint| -> Option<&TableConstraint> {
+            if let Some(found) = self.constraints.iter().find(|c| c.name == new_c.name) {
+                return Some(found);
+            }
+            let new_col = new_c.auto_not_null_column(&to_table.name)?;
+            self.constraints
+                .iter()
+                .find(|c| c.auto_not_null_column(&self.name).as_deref() == Some(new_col.as_str()))
+        };
+        let find_new = |old_c: &TableConstraint| -> Option<&TableConstraint> {
+            if let Some(found) = to_table.constraints.iter().find(|c| c.name == old_c.name) {
+                return Some(found);
+            }
+            let old_col = old_c.auto_not_null_column(&self.name)?;
+            to_table.constraints.iter().find(|c| {
+                c.auto_not_null_column(&to_table.name).as_deref() == Some(old_col.as_str())
+            })
+        };
+
         // Collect constraint changes; drop statements run before column drops
         for new_constraint in &to_table.constraints {
             let is_fk = new_constraint.constraint_type.to_lowercase() == "foreign key";
@@ -1663,12 +1683,37 @@ impl Table {
             if is_target_partition && !is_fk && new_constraint.coninhcount > 0 {
                 continue;
             }
-            if let Some(old_constraint) = self
-                .constraints
-                .iter()
-                .find(|c| c.name == new_constraint.name)
-            {
-                if old_constraint != new_constraint {
+            if let Some(old_constraint) = find_old(new_constraint) {
+                // Auto-named NOT NULL on the same column is semantically a no-op
+                // regardless of the numeric suffix PG chose for the name.
+                //
+                // The field set checked here intentionally mirrors
+                // `TableConstraint::PartialEq` *minus* the schema/name/table_name
+                // identifiers (which we have already established describe the
+                // same constraint via `find_old`) and the `definition` string
+                // (whose only NOT NULL payload is the column name, also already
+                // matched).
+                //
+                // `coninhcount` is deliberately NOT included: it is not part of
+                // `TableConstraint::PartialEq` or `add_to_hasher` either, and
+                // inherited NOT NULL constraints on partition children are
+                // filtered out earlier by the
+                // `is_target_partition && coninhcount > 0` guard, so a change
+                // in `coninhcount` cannot reach this branch in the
+                // partitioned-table case. For plain `CREATE TABLE ... INHERITS`
+                // hierarchies a `coninhcount` flip would still be silently
+                // accepted, but that matches the existing behavior for every
+                // other constraint type and is intentionally out of scope here.
+                let both_auto_nn = old_constraint.auto_not_null_column(&self.name).is_some()
+                    && new_constraint
+                        .auto_not_null_column(&to_table.name)
+                        .is_some();
+                let nn_equivalent = both_auto_nn
+                    && old_constraint.is_enforced == new_constraint.is_enforced
+                    && old_constraint.no_inherit == new_constraint.no_inherit
+                    && old_constraint.comment == new_constraint.comment;
+
+                if old_constraint != new_constraint && !nn_equivalent {
                     if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
                         if !is_fk {
                             constraint_post_script.push_str(&alter_script);
@@ -1707,11 +1752,7 @@ impl Table {
             {
                 continue;
             }
-            if !to_table
-                .constraints
-                .iter()
-                .any(|c| c.name == old_constraint.name)
-            {
+            if find_new(old_constraint).is_none() {
                 let drop_cmd = old_constraint.get_drop_script();
                 if use_drop {
                     constraint_pre_script.push_str(&drop_cmd);

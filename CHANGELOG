@@ -1,6 +1,6 @@
 2026-05-00      v1.0.22
 
-                Bug fixes / refactor:
+                Bug fixes:
                     - Rewrote `Table::build_columns_query` to read
                       column metadata directly from `pg_catalog`
                       (`pg_attribute`, `pg_attrdef`, `pg_depend`,
@@ -29,6 +29,29 @@
                       returned as constants and explicitly
                       documented as safe at the top of
                       `build_columns_query`.
+                    - Fixed false positive diffs for auto-named NOT
+                      NULL constraints. PostgreSQL 17+ records every
+                      `NOT NULL` column constraint as a named
+                      `pg_constraint` row using the pattern
+                      `{table}_{col}_not_null`. When two tables in
+                      the same schema collide on the base name
+                      (e.g. `processing_result.status_id` and
+                      `processing_result_status.id` both producing
+                      `processing_result_status_id_not_null`), PG
+                      appends a numeric collision suffix to one of
+                      them. Which side receives the suffix depends
+                      on creation order, so two semantically
+                      identical databases populated by migrations
+                      that ran in different orders ended up with
+                      the suffix attached to different tables, and
+                      the comparer emitted a destructive DROP/ADD
+                      pair on every dump. The fix detects
+                      auto-generated NOT NULL names (handling the
+                      63-byte identifier truncation and the
+                      re-clipping that PG performs when appending
+                      the suffix would otherwise overflow), and
+                      matches such constraints by column instead of
+                      name.
 
                 Behavioural verification:
                     - Unit-test coverage in
@@ -60,7 +83,7 @@
 
                 Caveats:
                     - Composite types (`relkind = 'c'`) are
-                      intentionally excluded from this query;
+                      intentionally excluded from the column query;
                       composite attributes are dumped via a
                       separate path in `core.rs` and would otherwise
                       double-emit.
@@ -72,6 +95,23 @@
                       `attgenerated` character survives as a
                       separate column so virtual vs stored stays
                       differentiable (see PR #185).
+                    - A user-chosen constraint name that happens to
+                      follow the exact
+                      `{table}_{col}_not_null[_digits]` pattern is
+                      now treated as auto-generated: `CREATE TABLE`
+                      will emit a plain `NOT NULL` on the column
+                      rather than `CONSTRAINT <name> NOT NULL`, and
+                      a rename diff against another `..._not_null`
+                      variant on the same column is suppressed. In
+                      practice users either pick distinctive names
+                      (e.g. `..._not_null_v2`, which has a non-digit
+                      tail and is correctly rejected) or do not name
+                      the constraint at all, so this misclassification
+                      should be extremely rare. If you specifically
+                      need to preserve a custom name that matches the
+                      pattern, rename the constraint to something
+                      that does not end in `_not_null` or
+                      `_not_null<digits>`.
 
 2026-05-15      v1.0.21
 
