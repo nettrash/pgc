@@ -1,6 +1,34 @@
 2026-05-00      v1.0.22
 
                 Bug fixes:
+                    - Rewrote `Table::build_columns_query` to read
+                      column metadata directly from `pg_catalog`
+                      (`pg_attribute`, `pg_attrdef`, `pg_depend`,
+                      `pg_sequence`, `pg_collation`, `pg_rewrite`)
+                      instead of from `information_schema.columns`
+                      and `information_schema.view_column_usage`.
+                      Those standard views are privilege-filtered
+                      via `pg_has_role(...) OR
+                      has_column_privilege(...)`, so a dump taken by
+                      a role that was not the table owner and did
+                      not have `SELECT` on every column silently
+                      produced an empty / truncated column list —
+                      strictly worse than a panic, because the
+                      downstream comparer then emitted destructive
+                      `ALTER TABLE ... DROP COLUMN` deltas against a
+                      schema that still had every column in place.
+                      The new query has no privilege filter, so the
+                      dump is faithful regardless of which role
+                      runs `pgc`. Typmod-derived metrics still go
+                      through `information_schema._pg_*` helpers
+                      (plain SQL, not privilege-filtered). Fields
+                      that are not consumed by SQL emission
+                      (`is_updatable`, `character_set_*`, `scope_*`,
+                      `maximum_cardinality`, `interval_precision`,
+                      `is_self_referencing`, `dtd_identifier`) are
+                      returned as constants and explicitly
+                      documented as safe at the top of
+                      `build_columns_query`.
                     - Fixed false positive diffs for auto-named NOT
                       NULL constraints. PostgreSQL 17+ records every
                       `NOT NULL` column constraint as a named
@@ -25,7 +53,48 @@
                       matches such constraints by column instead of
                       name.
 
+                Behavioural verification:
+                    - Unit-test coverage in
+                      `app/src/dump/table_tests.rs` was extended
+                      with `fetch_columns_query_pins_load_bearing_field_semantics`,
+                      which structurally pins the pg_catalog
+                      expressions for every load-bearing field
+                      (identity_*, is_identity, is_generated,
+                      generation_expression, is_nullable,
+                      column_default, formatted_data_type CASE
+                      arms, related_views path, and the outer
+                      relkind filter). The previous test only
+                      asserted the query did not reference
+                      `information_schema.columns`.
+                    - Manual verification path: dump the project's
+                      own `data/test/schema_a.sql` against PG14
+                      through PG18 with the new query, then `diff`
+                      the serialized `Dump.tables[*].columns`
+                      against a dump produced by the v1.0.21
+                      query. Expected delta: zero, except for
+                      `dtd_identifier` (now `None` everywhere — see
+                      hardcoded-fields note above; `dtd_identifier`
+                      does not drive any SQL emission so the
+                      change is invisible at the migration level).
+                      `is_updatable` may also differ on views: the
+                      old query computed it from view privileges,
+                      the new query hardcodes `'YES'`. Same caveat
+                      — `is_updatable` is not consumed downstream.
+
                 Caveats:
+                    - Composite types (`relkind = 'c'`) are
+                      intentionally excluded from the column query;
+                      composite attributes are dumped via a
+                      separate path in `core.rs` and would otherwise
+                      double-emit.
+                    - PG18 virtual generated columns
+                      (`attgenerated = 'v'`) are correctly handled:
+                      the `generation_expression` branch fires on
+                      `attgenerated <> ''`, which covers both
+                      stored (`'s'`) and virtual (`'v'`); the raw
+                      `attgenerated` character survives as a
+                      separate column so virtual vs stored stays
+                      differentiable (see PR #185).
                     - A user-chosen constraint name that happens to
                       follow the exact
                       `{table}_{col}_not_null[_digits]` pattern is

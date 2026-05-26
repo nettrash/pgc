@@ -323,108 +323,212 @@ impl Table {
     }
 
     fn build_columns_query(compression_col: &str, schema_filter: &str) -> String {
+        // Read column metadata directly from pg_catalog instead of
+        // information_schema.columns. The standard view filters rows by
+        // `pg_has_role(... ) OR has_column_privilege(...)`, so a dump taken
+        // by a role without privileges on a table silently produces an empty
+        // column list. pg_catalog views have no such filter, which keeps the
+        // dump faithful regardless of the connecting role's grants.
+        //
+        // For the typmod-derived metrics (character/numeric/datetime
+        // precisions, interval type) we still call the
+        // `information_schema._pg_*` helper functions: they're plain SQL
+        // helpers that the standard view itself uses internally, and unlike
+        // the view they aren't privilege-filtered.
+        //
+        // SAFETY of hardcoded fields. The following columns below are
+        // returned as constants rather than derived from pg_catalog:
+        //
+        //   - `interval_precision`, `character_set_catalog`,
+        //     `character_set_schema`, `character_set_name`,
+        //     `scope_catalog`, `scope_schema`, `scope_name`,
+        //     `maximum_cardinality`, `dtd_identifier`  → all `NULL`
+        //   - `is_self_referencing`                       → `'NO'`
+        //   - `is_updatable`                              → `'YES'`
+        //
+        // None of these appear in `TableColumn::add_to_hasher`
+        // (app/src/dump/table_column.rs ~L313–L353 — the explicit
+        // "skip catalog/charset/related_views and other descriptive-only
+        // fields" comment), and none are read by
+        // `TableColumn::get_alter_script`. They participate in `PartialEq`
+        // for round-trip dump equality only — a mismatch on any of them
+        // produces zero ALTER SQL because no get_alter_script branch
+        // emits a statement for them.
+        //
+        // Information_schema itself derived several of these (character_set_*,
+        // scope_*, maximum_cardinality, dtd_identifier, is_self_referencing)
+        // from the SQL standard's character-set / structured-type machinery
+        // that PostgreSQL does not implement, so they were already constant
+        // on every dump from the old query path; the new path returns the
+        // same constants.
+        //
+        // `is_updatable` was per-row in the old query (info_schema's view
+        // computes it from view privileges), but it isn't read anywhere in
+        // pgc, so hardcoding 'YES' is safe. Keep this list in sync with
+        // `add_to_hasher` if any of these fields ever start driving SQL
+        // emission.
         format!(
-                        "SELECT
-                                c.table_catalog,
-                                quote_ident(c.table_schema) as table_schema,
-                                quote_ident(c.table_name) as table_name,
-                                c.table_schema as raw_table_schema,
-                                c.table_name as raw_table_name,
-                                quote_ident(c.column_name) as column_name,
-                                c.ordinal_position,
-                                c.column_default,
-                                c.is_nullable,
-                                CASE
-                                        WHEN c.data_type IN ('USER-DEFINED', 'ARRAY')
-                                                THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
-                                        ELSE c.data_type
-                                END AS formatted_data_type,
-                                c.character_maximum_length,
-                                c.character_octet_length,
-                                c.numeric_precision,
-                                c.numeric_precision_radix,
-                                c.numeric_scale,
-                                c.datetime_precision,
-                                c.interval_type,
-                                c.interval_precision,
-                                c.character_set_catalog,
-                                c.character_set_schema,
-                                c.character_set_name,
-                                c.collation_catalog,
-                                c.collation_schema,
-                                c.collation_name,
-                                c.domain_catalog,
-                                c.domain_schema,
-                                c.domain_name,
-                                c.udt_catalog,
-                                c.udt_schema,
-                                c.udt_name,
-                                c.scope_catalog,
-                                c.scope_schema,
-                                c.scope_name,
-                                c.maximum_cardinality,
-                                c.dtd_identifier,
-                                c.is_self_referencing,
-                                c.is_identity,
-                                c.identity_generation,
-                                c.identity_start,
-                                c.identity_increment,
-                                c.identity_maximum,
-                                c.identity_minimum,
-                                c.identity_cycle,
-                                c.is_generated,
-                                c.generation_expression,
-                                a.attgenerated::text as attgenerated,
-                                a.attstorage::text as col_storage,
-                                a.attstattarget::int4 as col_stattarget,
-                                c.is_updatable,
-                                pd.description as column_comment{compression_col},
-                                coalesce(
-                                        (select array_agg(acl_item::text) from unnest(a.attacl) as acl_item),
-                                        '{{}}'::text[]
-                                ) as col_acl,
-                                (
-                                        SELECT string_agg(DISTINCT rel, ', ')
-                                        FROM (
-                                            SELECT quote_ident(v.view_schema) || '.' || quote_ident(v.view_name) AS rel
-                                            FROM information_schema.view_column_usage v
-                                            WHERE v.table_schema = c.table_schema
-                                                AND v.table_name  = c.table_name
-                                                AND v.column_name = c.column_name
-                                            UNION ALL
-                                            SELECT quote_ident(mn.nspname) || '.' || quote_ident(mc.relname) AS rel
-                                            FROM pg_attribute  pa
-                                            JOIN pg_class      tc  ON tc.oid           = pa.attrelid
-                                            JOIN pg_namespace  tn  ON tn.oid           = tc.relnamespace
-                                            JOIN pg_depend     dep ON dep.refobjid     = pa.attrelid
-                                                                  AND dep.refobjsubid  = pa.attnum
-                                                                  AND dep.deptype      = 'n'
-                                            JOIN pg_class      mc  ON mc.oid = dep.objid AND mc.relkind = 'm'
-                                            JOIN pg_namespace  mn  ON mn.oid = mc.relnamespace
-                                            WHERE tn.nspname = c.table_schema
-                                              AND tc.relname = c.table_name
-                                              AND pa.attname = c.column_name
-                                              AND pa.attnum  > 0
-                                              AND pa.attisdropped = false
-                                        ) sub
-                                ) AS related_views
-                         FROM information_schema.columns c
-                         JOIN pg_catalog.pg_namespace ns
-                             ON ns.nspname = c.table_schema
-                         JOIN pg_catalog.pg_class cls
-                             ON cls.relnamespace = ns.oid
-                            AND cls.relname = c.table_name
-                         JOIN pg_catalog.pg_attribute a
-                             ON a.attrelid = cls.oid
-                            AND a.attname = c.column_name
-                            AND a.attnum > 0
-                            AND a.attisdropped = false
-                         LEFT JOIN pg_description pd
-                             ON pd.objoid = cls.oid
-                            AND pd.classoid = 'pg_class'::regclass
-                            AND pd.objsubid = a.attnum
-                        WHERE c.table_schema IN {schema_filter}
-                        ORDER BY c.table_schema, c.table_name, c.ordinal_position"
+            "SELECT
+                current_database()::text as table_catalog,
+                quote_ident(nc.nspname) as table_schema,
+                quote_ident(c.relname) as table_name,
+                nc.nspname as raw_table_schema,
+                c.relname as raw_table_name,
+                quote_ident(a.attname) as column_name,
+                a.attnum::int4 as ordinal_position,
+                CASE
+                    WHEN a.attgenerated <> '' OR a.attidentity <> '' THEN NULL
+                    ELSE pg_get_expr(ad.adbin, ad.adrelid)
+                END as column_default,
+                CASE
+                    WHEN a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) THEN 'NO'
+                    ELSE 'YES'
+                END as is_nullable,
+                CASE
+                    WHEN (
+                        (t.typtype = 'd' AND bt.typelem <> 0 AND bt.typlen = -1)
+                        OR (t.typtype <> 'd' AND t.typelem <> 0 AND t.typlen = -1)
+                    )
+                    THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    WHEN (
+                        (t.typtype = 'd' AND nbt.nspname IS NOT NULL AND nbt.nspname <> 'pg_catalog')
+                        OR (t.typtype <> 'd' AND nt.nspname <> 'pg_catalog')
+                    )
+                    THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    WHEN t.typtype = 'd' THEN pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    ELSE pg_catalog.format_type(a.atttypid, NULL)
+                END AS formatted_data_type,
+                information_schema._pg_char_max_length(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as character_maximum_length,
+                information_schema._pg_char_octet_length(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as character_octet_length,
+                information_schema._pg_numeric_precision(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as numeric_precision,
+                information_schema._pg_numeric_precision_radix(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as numeric_precision_radix,
+                information_schema._pg_numeric_scale(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as numeric_scale,
+                information_schema._pg_datetime_precision(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                )::int4 as datetime_precision,
+                information_schema._pg_interval_type(
+                    information_schema._pg_truetypid(a, t),
+                    information_schema._pg_truetypmod(a, t)
+                ) as interval_type,
+                NULL::int4 as interval_precision,
+                NULL::text as character_set_catalog,
+                NULL::text as character_set_schema,
+                NULL::text as character_set_name,
+                CASE
+                    WHEN co.collname IS NOT NULL
+                         AND NOT (nco.nspname = 'pg_catalog' AND co.collname = 'default')
+                    THEN current_database()
+                    ELSE NULL
+                END as collation_catalog,
+                CASE
+                    WHEN co.collname IS NOT NULL
+                         AND NOT (nco.nspname = 'pg_catalog' AND co.collname = 'default')
+                    THEN nco.nspname
+                    ELSE NULL
+                END as collation_schema,
+                CASE
+                    WHEN co.collname IS NOT NULL
+                         AND NOT (nco.nspname = 'pg_catalog' AND co.collname = 'default')
+                    THEN co.collname
+                    ELSE NULL
+                END as collation_name,
+                CASE WHEN t.typtype = 'd' THEN current_database() ELSE NULL END as domain_catalog,
+                CASE WHEN t.typtype = 'd' THEN nt.nspname ELSE NULL END as domain_schema,
+                CASE WHEN t.typtype = 'd' THEN t.typname ELSE NULL END as domain_name,
+                current_database() as udt_catalog,
+                COALESCE(nbt.nspname, nt.nspname) as udt_schema,
+                COALESCE(bt.typname, t.typname) as udt_name,
+                NULL::text as scope_catalog,
+                NULL::text as scope_schema,
+                NULL::text as scope_name,
+                NULL::int4 as maximum_cardinality,
+                NULL::text as dtd_identifier,
+                'NO' as is_self_referencing,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN 'YES' ELSE 'NO' END as is_identity,
+                CASE a.attidentity
+                    WHEN 'a' THEN 'ALWAYS'
+                    WHEN 'd' THEN 'BY DEFAULT'
+                    ELSE NULL
+                END as identity_generation,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqstart::text ELSE NULL END as identity_start,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqincrement::text ELSE NULL END as identity_increment,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqmax::text ELSE NULL END as identity_maximum,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN ps.seqmin::text ELSE NULL END as identity_minimum,
+                CASE
+                    WHEN a.attidentity IN ('a', 'd')
+                    THEN CASE WHEN ps.seqcycle THEN 'YES' ELSE 'NO' END
+                    ELSE 'NO'
+                END as identity_cycle,
+                CASE WHEN a.attgenerated <> '' THEN 'ALWAYS' ELSE 'NEVER' END as is_generated,
+                CASE WHEN a.attgenerated <> '' THEN pg_get_expr(ad.adbin, ad.adrelid) ELSE NULL END as generation_expression,
+                a.attgenerated::text as attgenerated,
+                a.attstorage::text as col_storage,
+                a.attstattarget::int4 as col_stattarget,
+                'YES' as is_updatable,
+                pd.description as column_comment{compression_col},
+                COALESCE(
+                    (SELECT array_agg(acl_item::text) FROM unnest(a.attacl) as acl_item),
+                    '{{}}'::text[]
+                ) as col_acl,
+                (
+                    SELECT string_agg(DISTINCT quote_ident(vn.nspname) || '.' || quote_ident(vc.relname), ', ')
+                    FROM pg_depend dep
+                    JOIN pg_rewrite r
+                        ON r.oid = dep.objid
+                       AND dep.classid = 'pg_rewrite'::regclass
+                    JOIN pg_class vc
+                        ON vc.oid = r.ev_class
+                       AND vc.relkind IN ('v', 'm')
+                       AND vc.oid <> a.attrelid
+                    JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+                    WHERE dep.refclassid = 'pg_class'::regclass
+                      AND dep.refobjid = a.attrelid
+                      AND dep.refobjsubid = a.attnum
+                      AND dep.deptype = 'n'
+                ) AS related_views
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace nc ON nc.oid = c.relnamespace
+            JOIN pg_type t ON t.oid = a.atttypid
+            JOIN pg_namespace nt ON nt.oid = t.typnamespace
+            LEFT JOIN pg_type bt ON t.typtype = 'd' AND bt.oid = t.typbasetype
+            LEFT JOIN pg_namespace nbt ON nbt.oid = bt.typnamespace
+            LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+            LEFT JOIN pg_collation co ON co.oid = a.attcollation
+            LEFT JOIN pg_namespace nco ON nco.oid = co.collnamespace
+            LEFT JOIN pg_depend ident_dep
+                ON ident_dep.refclassid = 'pg_class'::regclass
+               AND ident_dep.refobjid = a.attrelid
+               AND ident_dep.refobjsubid = a.attnum
+               AND ident_dep.classid = 'pg_class'::regclass
+               AND ident_dep.deptype = 'i'
+            LEFT JOIN pg_class seq ON seq.oid = ident_dep.objid AND seq.relkind = 'S'
+            LEFT JOIN pg_sequence ps ON ps.seqrelid = seq.oid
+            LEFT JOIN pg_description pd
+                ON pd.objoid = c.oid
+               AND pd.classoid = 'pg_class'::regclass
+               AND pd.objsubid = a.attnum
+            WHERE nc.nspname IN {schema_filter}
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND c.relkind IN ('r','v','m','f','p')
+            ORDER BY nc.nspname, c.relname, a.attnum"
         )
     }
 
