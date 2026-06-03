@@ -20,6 +20,11 @@ pub struct Config {
     pub grants_mode: GrantsMode,
     // Maximum number of connections in the PostgreSQL connection pool
     pub max_connections: u32,
+    // Whether to emit a migration script that is safe/convenient to run on a
+    // live production database (concurrent index builds, partition-aware index
+    // creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops,
+    // and a split transaction so the concurrent statements run outside it).
+    pub output_for_production: bool,
 }
 
 impl Config {
@@ -55,6 +60,7 @@ impl Config {
         let mut use_comments = true;
         let mut grants_mode = GrantsMode::Ignore;
         let mut max_connections: u32 = 16;
+        let mut output_for_production = false;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -89,6 +95,7 @@ impl Config {
                 && key != "USE_COMMENTS"
                 && key != "GRANTS_MODE"
                 && key != "MAX_CONNECTIONS"
+                && key != "OUTPUT_FOR_PRODUCTION"
             {
                 return Err(format!("Unknown configuration key: {}", parts[0]));
             }
@@ -119,6 +126,17 @@ impl Config {
                 "OUTPUT" => output = raw_value.to_string(),
                 "USE_DROP" => use_drop = value == "TRUE",
                 "USE_SINGLE_TRANSACTION" => use_single_transaction = value == "TRUE",
+                "OUTPUT_FOR_PRODUCTION" => {
+                    output_for_production = match value.as_str() {
+                        "TRUE" => true,
+                        "FALSE" => false,
+                        _ => {
+                            return Err(format!(
+                                "Invalid value for OUTPUT_FOR_PRODUCTION: {raw_value}"
+                            ));
+                        }
+                    };
+                }
                 "USE_COMMENTS" => {
                     use_comments = match value.as_str() {
                         "TRUE" => true,
@@ -208,6 +226,7 @@ impl Config {
             use_comments,
             grants_mode,
             max_connections,
+            output_for_production,
         })
     }
 

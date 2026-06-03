@@ -1,6 +1,8 @@
+use crate::comparer::production::{self, ChildRef, PartitionContext};
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
 use crate::dump::column_dependent::ColumnDependentKind;
+use crate::dump::table::IndexAlterPlan;
 use crate::dump::table_column::TableColumn;
 use crate::dump::table_constraint::TableConstraint;
 use crate::dump::table_index::TableIndex;
@@ -28,9 +30,17 @@ pub struct Comparer {
     use_comments: bool,
     // How to handle grants (privileges) during comparison
     grants_mode: GrantsMode,
+    // Whether to emit a migration script that is safe/convenient to run on a
+    // live production database (concurrent index builds, partition-aware index
+    // creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops).
+    output_for_production: bool,
 
     // The script that will be generated
     script: String,
+    // Statements that must run after the main transaction commits, because
+    // CONCURRENTLY / VALIDATE CONSTRAINT / ATTACH PARTITION cannot run inside a
+    // transaction block. Only populated when `output_for_production` is set.
+    production_post_script: String,
     enum_pre_script: String,
     enum_post_script: String,
     type_post_script: String,
@@ -64,7 +74,9 @@ impl Comparer {
             use_single_transaction,
             use_comments,
             grants_mode,
+            output_for_production: false,
             script: String::new(),
+            production_post_script: String::new(),
             enum_pre_script: String::new(),
             enum_post_script: String::new(),
             type_post_script: String::new(),
@@ -92,8 +104,24 @@ impl Comparer {
         comparer
     }
 
+    /// Enable or disable production-friendly output. When enabled, indexes are
+    /// built concurrently (partition-aware), foreign keys are added `NOT VALID`
+    /// then validated after commit, and indexes are dropped concurrently — all
+    /// post-commit statements are emitted after the main transaction.
+    pub fn set_output_for_production(&mut self, value: bool) -> &mut Self {
+        self.output_for_production = value;
+        self
+    }
+
     // Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
+        if self.output_for_production {
+            self.script.append_block(
+                "/* Output generated for production: indexes are built/dropped concurrently, \
+                 foreign keys are validated, and the statements that cannot run inside a \
+                 transaction are emitted after COMMIT. */",
+            );
+        }
         if self.use_single_transaction {
             self.script.append_block("begin;");
         }
@@ -154,6 +182,19 @@ impl Comparer {
 
         if self.use_single_transaction {
             self.script.push_str("\ncommit;");
+        }
+
+        // Concurrent index builds/drops, FK validations and partition-index
+        // attaches cannot run inside a transaction block, so they are emitted
+        // here, after COMMIT (each runs in its own implicit transaction).
+        if !self.production_post_script.is_empty() {
+            self.script.append_block(
+                "\n/* ---> Production post-commit (run outside a transaction): Start --------------- */",
+            );
+            let post = std::mem::take(&mut self.production_post_script);
+            self.script.push_str(&post);
+            self.script
+                .append_block("/* ---> Production post-commit: End --------------- */");
         }
 
         Ok(())
@@ -295,6 +336,108 @@ impl Comparer {
                     .map(|l| format!("-- {}\n", l))
                     .collect::<String>(),
             );
+        }
+    }
+
+    /// Build the partition topology maps the production output path needs:
+    /// the set of partitioned parent tables, each parent's direct partitions,
+    /// and the set of indexes that live on a partitioned parent (which cannot
+    /// be dropped with `DROP INDEX CONCURRENTLY`). All keys use the dump's
+    /// `quote_ident`-applied `schema.name` form so they match `partition_of`.
+    fn build_partition_context_maps(
+        &self,
+    ) -> (
+        HashSet<String>,
+        HashMap<String, Vec<ChildRef>>,
+        HashSet<String>,
+    ) {
+        let mut partitioned_parents: HashSet<String> = HashSet::new();
+        let mut partitioned_indexes: HashSet<String> = HashSet::new();
+        for table in self.to.tables.iter().chain(self.from.tables.iter()) {
+            if table.partition_key.is_some() {
+                partitioned_parents.insert(format!("{}.{}", table.schema, table.name));
+                for index in &table.indexes {
+                    if !index.is_partition_index {
+                        partitioned_indexes.insert(format!("{}.{}", index.schema, index.name));
+                    }
+                }
+            }
+        }
+        // Children come from the TO side — the schema we are migrating toward.
+        let mut children: HashMap<String, Vec<ChildRef>> = HashMap::new();
+        for table in &self.to.tables {
+            if let Some(parent) = &table.partition_of {
+                children.entry(parent.clone()).or_default().push(ChildRef {
+                    schema: table.schema.clone(),
+                    table: table.name.clone(),
+                });
+            }
+        }
+        (partitioned_parents, children, partitioned_indexes)
+    }
+
+    /// Emit a new table's CREATE (without triggers) plus its indexes, rewriting
+    /// every index for production (concurrent / partition-aware). Free function
+    /// over the two buffers so it can run while `self.to` is borrowed by the
+    /// emission loops.
+    fn emit_new_table_create_prod(
+        script: &mut String,
+        post_commit: &mut String,
+        table: &Table,
+        ctx: &PartitionContext,
+    ) {
+        script.push_str(&table.get_script_without_triggers_no_indexes());
+        for index in table.creatable_indexes() {
+            let split = production::index_create_split(index, ctx);
+            script.push_str(&split.in_txn);
+            post_commit.push_str(&split.post_commit);
+        }
+    }
+
+    /// Emit the index changes of an ALTER for production: drops (concurrent
+    /// unless on a partitioned table), comment-only changes (in-txn), then
+    /// (re)creates (concurrent / partition-aware). Mirrors the ordering of
+    /// `build_alter_script` (drops before creates).
+    fn emit_index_alter_plan_prod(
+        script: &mut String,
+        post_commit: &mut String,
+        plan: &IndexAlterPlan,
+        use_drop: bool,
+        ctx: &PartitionContext,
+    ) {
+        for old_index in &plan.drop {
+            let (stmt, post) = production::index_drop_statement(old_index, ctx);
+            let block = stmt.with_empty_lines();
+            let target = if post {
+                &mut *post_commit
+            } else {
+                &mut *script
+            };
+            if use_drop {
+                target.push_str(&block);
+            } else {
+                target.push_str(&format!("-- {block}"));
+            }
+        }
+        for index in &plan.comment_changes {
+            if let Some(comment) = &index.comment {
+                script.append_block(&format!(
+                    "comment on index {}.{} is '{}';",
+                    index.schema,
+                    index.name,
+                    comment.replace('\'', "''")
+                ));
+            } else {
+                script.append_block(&format!(
+                    "comment on index {}.{} is null;",
+                    index.schema, index.name
+                ));
+            }
+        }
+        for index in &plan.create {
+            let split = production::index_create_split(index, ctx);
+            script.push_str(&split.in_txn);
+            post_commit.push_str(&split.post_commit);
         }
     }
 
@@ -1638,6 +1781,18 @@ impl Comparer {
         // We will drop all tables that exists just in "from" dump (partitions first).
         let ordered_from_drop = Self::ordered_tables_for_drop(&self.from.tables);
 
+        // Partition topology used by the production output path to build/drop
+        // indexes concurrently and partition-aware. Owned maps, so they don't
+        // borrow `self` and the emission loops below can still push to the
+        // script buffers.
+        let (partitioned_parents, partition_children, partitioned_indexes) =
+            self.build_partition_context_maps();
+        let partition_ctx = PartitionContext {
+            partitioned_parents: &partitioned_parents,
+            children: &partition_children,
+            partitioned_indexes: &partitioned_indexes,
+        };
+
         // Build lookup maps for O(1) access
         let to_table_map: HashMap<(&str, &str), usize> = self
             .to
@@ -1881,12 +2036,23 @@ impl Comparer {
 
                 self.script
                     .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
-                self.script
-                    .push_str(table.get_script_without_triggers().as_str());
+                if self.output_for_production {
+                    Self::emit_new_table_create_prod(
+                        &mut self.script,
+                        &mut self.production_post_script,
+                        table,
+                        &partition_ctx,
+                    );
+                } else {
+                    self.script
+                        .push_str(table.get_script_without_triggers().as_str());
+                }
                 self.trigger_post_script
                     .push_str(table.get_trigger_script().as_str());
             }
         }
+        // NOTE: `table` above is `&&Table` (from `ordered_to.iter()`); the
+        // helper takes `&Table` via deref coercion at the call boundary.
 
         // We will find all existing tables in both dumps with different hashes
         for table in ordered_from.iter() {
@@ -1932,8 +2098,17 @@ impl Comparer {
                         // `recreated_tables` to swap in the default ACL.
                         self.recreated_tables
                             .insert(Self::table_key(&table.schema, &table.name));
-                        self.script
-                            .push_str(to_table.get_script_without_triggers().as_str());
+                        if self.output_for_production {
+                            Self::emit_new_table_create_prod(
+                                &mut self.script,
+                                &mut self.production_post_script,
+                                to_table,
+                                &partition_ctx,
+                            );
+                        } else {
+                            self.script
+                                .push_str(to_table.get_script_without_triggers().as_str());
+                        }
                         self.trigger_post_script
                             .push_str(to_table.get_trigger_script().as_str());
                     } else {
@@ -1949,9 +2124,6 @@ impl Comparer {
                         // drift apart.
                         let table_recreated = table.will_be_dropped_and_recreated(to_table);
 
-                        let alter_script =
-                            table.get_alter_script_without_triggers(to_table, self.use_drop);
-
                         if table_recreated {
                             // Mark for grants: same reasoning as the branch
                             // above — the dropped+recreated table inherits
@@ -1965,7 +2137,30 @@ impl Comparer {
                             }
                         }
 
-                        self.script.push_str(alter_script.as_str());
+                        // In production mode (and only when the table is altered
+                        // in place — a wholesale drop+recreate re-emits the full
+                        // CREATE with inline indexes anyway), defer index
+                        // create/drop and re-emit them concurrently / partition-
+                        // aware via the index alter plan.
+                        if self.output_for_production && !table_recreated {
+                            let alter_script = table.get_alter_script_without_triggers_no_indexes(
+                                to_table,
+                                self.use_drop,
+                            );
+                            self.script.push_str(alter_script.as_str());
+                            let plan = table.index_alter_plan(to_table);
+                            Self::emit_index_alter_plan_prod(
+                                &mut self.script,
+                                &mut self.production_post_script,
+                                &plan,
+                                self.use_drop,
+                                &partition_ctx,
+                            );
+                        } else {
+                            let alter_script =
+                                table.get_alter_script_without_triggers(to_table, self.use_drop);
+                            self.script.push_str(alter_script.as_str());
+                        }
 
                         // Issue #188 / Path B: when `get_alter_script`
                         // routes a column through its
@@ -2026,8 +2221,17 @@ impl Comparer {
         for table in deferred_new_children {
             self.script
                 .push_str(format!("/* Table: {}.{}*/\n", table.schema, table.name).as_str());
-            self.script
-                .push_str(table.get_script_without_triggers().as_str());
+            if self.output_for_production {
+                Self::emit_new_table_create_prod(
+                    &mut self.script,
+                    &mut self.production_post_script,
+                    table,
+                    &partition_ctx,
+                );
+            } else {
+                self.script
+                    .push_str(table.get_script_without_triggers().as_str());
+            }
             self.trigger_post_script
                 .push_str(table.get_trigger_script().as_str());
         }
@@ -2635,11 +2839,33 @@ impl Comparer {
                 }
 
                 // Table exists in both. Check for FK changes.
-                self.script
-                    .push_str(&from_table.get_foreign_key_alter_script(table));
+                if self.output_for_production {
+                    // In-place FK modifications stay as-is; brand-new foreign
+                    // keys are added NOT VALID and validated after commit.
+                    let (alters, new_fks) = from_table.foreign_key_alter_split(table);
+                    self.script.push_str(&alters);
+                    for constraint in new_fks {
+                        let split = production::foreign_key_split(constraint);
+                        self.script.push_str(&split.in_txn);
+                        self.production_post_script.push_str(&split.post_commit);
+                    }
+                } else {
+                    self.script
+                        .push_str(&from_table.get_foreign_key_alter_script(table));
+                }
             } else {
                 // New table. Add its FKs.
-                self.script.push_str(&table.get_foreign_key_script());
+                if self.output_for_production {
+                    for constraint in &table.constraints {
+                        if constraint.constraint_type.to_lowercase() == "foreign key" {
+                            let split = production::foreign_key_split(constraint);
+                            self.script.push_str(&split.in_txn);
+                            self.production_post_script.push_str(&split.post_commit);
+                        }
+                    }
+                } else {
+                    self.script.push_str(&table.get_foreign_key_script());
+                }
             }
         }
 
