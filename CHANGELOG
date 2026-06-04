@@ -1,3 +1,41 @@
+2026-06-03      v1.0.23
+
+                Features:
+                    - Production-friendly output for the compare
+                      command, enabled with --output-for-production
+                      (or OUTPUT_FOR_PRODUCTION=true in the config
+                      file). When on, the generated migration is
+                      shaped to minimise locking on a live
+                      database: indexes are built with CREATE INDEX
+                      CONCURRENTLY (the UNIQUE keyword is
+                      preserved); indexes on partitioned parents
+                      use CREATE INDEX ... ON ONLY {parent} inside
+                      the transaction, then CREATE INDEX
+                      CONCURRENTLY on each partition followed by
+                      ALTER INDEX ... ATTACH PARTITION afterwards
+                      (falling back to a single non-concurrent
+                      CREATE INDEX on the parent, with an
+                      explanatory comment, when the layout cannot
+                      be expanded safely); indexes are dropped with
+                      DROP INDEX CONCURRENTLY (kept non-concurrent
+                      for indexes on partitioned tables, where
+                      concurrent drop is illegal); and new foreign
+                      keys are added NOT VALID inside the
+                      transaction and validated with a separate
+                      VALIDATE CONSTRAINT afterwards. Every
+                      statement that cannot run inside a
+                      transaction block (CREATE/DROP INDEX
+                      CONCURRENTLY, VALIDATE CONSTRAINT, ALTER
+                      INDEX ... ATTACH PARTITION) is emitted in a
+                      clearly marked Production post-commit section
+                      after commit;. Defaults to false; when off,
+                      the output is byte-for-byte identical to
+                      previous behaviour.
+                    - Added the OUTPUT_FOR_PRODUCTION key to the
+                      sample data/pgc.conf and documented the new
+                      flag, configuration key, and behaviour in
+                      README.md.
+
 2026-05-26      v1.0.22
 
                 Bug fixes:

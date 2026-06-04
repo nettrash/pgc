@@ -96,6 +96,15 @@ struct Args {
     #[arg(long, default_value = "16", value_parser = clap::value_parser!(u32).range(1..))]
     max_connections: u32,
 
+    /// Emit a migration script that is convenient to run against a live
+    /// production database: indexes are built with CREATE INDEX CONCURRENTLY
+    /// (partition-aware for partitioned tables), foreign keys are added
+    /// NOT VALID then VALIDATEd, and indexes are dropped with DROP INDEX
+    /// CONCURRENTLY. The concurrent statements run after the main transaction
+    /// commits. Default: false (output unchanged).
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
+    output_for_production: bool,
+
     /// Use CASCADE in DROP statements for the clear command. WARNING: CASCADE can drop
     /// dependent objects outside the selected schema(s) (e.g., foreign keys or views in
     /// other schemas that reference the dropped objects). Without this flag, drops rely
@@ -157,6 +166,7 @@ async fn run_main() -> Result<(), Error> {
                     args.use_single_transaction,
                     args.use_comments,
                     args.grants_mode,
+                    args.output_for_production,
                 )
                 .await;
             }
@@ -263,6 +273,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             cfg.use_single_transaction,
             cfg.use_comments,
             cfg.grants_mode,
+            cfg.output_for_production,
         )
         .await;
 
@@ -311,6 +322,7 @@ async fn clear_database(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compare_dumps(
     from: String,
     to: String,
@@ -319,6 +331,7 @@ async fn compare_dumps(
     use_single_transaction: bool,
     use_comments: bool,
     grants_mode: GrantsMode,
+    output_for_production: bool,
 ) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
@@ -334,6 +347,7 @@ async fn compare_dumps(
         use_comments,
         grants_mode,
     );
+    comparer.set_output_for_production(output_for_production);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");

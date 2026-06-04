@@ -71,6 +71,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--grants-mode {ignore|addonly|full}` - controls how grants (privileges) are handled during comparison. `ignore` (default) skips grants entirely; `addonly` adds grants that exist in TO but not in FROM; `full` makes grants identical by adding missing and revoking extra.
 
+`--output-for-production {true|false}` - set to `true` to generate a migration script that is convenient to run against a live production database (default `false` — output is unchanged). See [Production-friendly output](#production-friendly-output).
+
 `--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `16`. Used by all concurrent introspection queries; table metadata is pulled schema-wide in one query per resource kind (columns, indexes, constraints, triggers, policies, partition info, definitions) so connection count mostly matters for the sibling queries (extensions, sequences, routines, views, etc.) running in parallel.
 
 `--use-cascade` - add `CASCADE` to every `DROP` statement in the clear script. **Warning:** `CASCADE` can silently drop dependent objects that live outside the selected schema(s) (e.g., foreign keys or views in other schemas referencing the dropped objects). Use only when you are certain no cross-schema dependencies should survive. Without this flag the generated drops rely on the explicit dependency ordering and will fail cleanly if unresolved dependencies exist.
@@ -94,6 +96,23 @@ pgc --command compare --from {from_dump} --to {to_dump} --output {file} --use-dr
 This command comparing two dumps and produce SQL script for the `FROM` database to be equal to `TO` database after applying it.
 If we add `--use-drop` argument comparer will add drop scripts for all items that non exists in target database, otherwise drop scripts will be ignored.  
 By default, comparer ignore drops.
+
+### Production-friendly output
+
+```bash
+pgc --command compare --from {from_dump} --to {to_dump} --output {file} --use-single-transaction --output-for-production
+```
+
+By default the delta script favours brevity and is meant to be applied to an idle database. With `--output-for-production true` (config key `OUTPUT_FOR_PRODUCTION=true`) the comparer instead emits a script that minimises locking on a live database:
+
+- **Indexes are built concurrently** — `CREATE INDEX` becomes `CREATE INDEX CONCURRENTLY` (the `UNIQUE` keyword is preserved), so building an index does not block writes.
+- **Partitioned tables are handled correctly** — `CONCURRENTLY` is not allowed directly on a partitioned table, so for a partitioned parent the comparer emits `CREATE INDEX ... ON ONLY {parent}` (in the transaction), then `CREATE INDEX CONCURRENTLY` on each partition followed by `ALTER INDEX ... ATTACH PARTITION` (after the transaction). When the partition layout cannot be expanded safely (no known partitions, or multi-level/sub-partitioned children) it falls back to a single non-concurrent `CREATE INDEX` on the parent and explains why in a comment.
+- **Indexes are dropped concurrently** — `DROP INDEX` becomes `DROP INDEX CONCURRENTLY` (kept non-concurrent for indexes on partitioned tables, where concurrent drop is illegal).
+- **Foreign keys are validated separately** — a new foreign key is added `NOT VALID` inside the transaction (a fast, metadata-only operation) and a matching `VALIDATE CONSTRAINT` (the long, scan-heavy step) is emitted afterwards so it does not hold the lock for the whole migration.
+
+Because `CREATE/DROP INDEX CONCURRENTLY`, `VALIDATE CONSTRAINT` and `ALTER INDEX ... ATTACH PARTITION` **cannot run inside a transaction block**, every such statement is moved to a clearly marked `Production post-commit` section emitted **after** the `commit;`. The rest of the migration still runs inside the single transaction when `--use-single-transaction` is set. Each post-commit statement runs in its own implicit transaction, so if one fails you can re-run that section without redoing the committed part.
+
+`--output-for-production` defaults to `false`; when off the output is byte-for-byte identical to previous behaviour.
 
 ### Generate a clear (drop-all) script for a database
 
@@ -153,7 +172,10 @@ USE_SINGLE_TRANSACTION=true
 USE_COMMENTS=false
 GRANTS_MODE=ignore
 MAX_CONNECTIONS=16
+OUTPUT_FOR_PRODUCTION=false
 ```
+
+`OUTPUT_FOR_PRODUCTION` (default `false`) is the configuration-file equivalent of the `--output-for-production` flag described in [Production-friendly output](#production-friendly-output).
 
 ## Choosing `MAX_CONNECTIONS`
 

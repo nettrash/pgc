@@ -30,6 +30,7 @@ fn test_valid_config_parsing() {
         OUTPUT=result.out
         USE_DROP=true
         USE_SINGLE_TRANSACTION=true
+        OUTPUT_FOR_PRODUCTION=true
     "#;
     let file = write_temp_config(config_content, "test_valid_config_parsing.cfg");
     let config = Config::new(file.clone());
@@ -46,6 +47,25 @@ fn test_valid_config_parsing() {
     assert_eq!(config.output, "result.out");
     assert!(config.use_drop);
     assert!(config.use_single_transaction);
+    assert!(config.output_for_production);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn test_output_for_production_defaults_false() {
+    let config_content = "FROM_HOST=localhost\nTO_HOST=remotehost";
+    let file = write_temp_config(config_content, "test_output_for_production_default.cfg");
+    let config = Config::new(file.clone());
+    assert!(!config.output_for_production);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+#[should_panic]
+fn test_invalid_output_for_production_value_panics() {
+    let config_content = "FROM_HOST=localhost\nOUTPUT_FOR_PRODUCTION=maybe";
+    let file = write_temp_config(config_content, "test_invalid_ofp_value.cfg");
+    let _ = Config::new(file.clone());
     let _ = std::fs::remove_file(file);
 }
 
