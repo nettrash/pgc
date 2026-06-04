@@ -388,7 +388,7 @@ impl Comparer {
     ) {
         script.push_str(&table.get_script_without_triggers_no_indexes());
         for index in table.creatable_indexes() {
-            let split = production::index_create_split(index, ctx);
+            let split = production::index_create_split(index, ctx, true);
             script.push_str(&split.in_txn);
             post_commit.push_str(&split.post_commit);
         }
@@ -435,7 +435,7 @@ impl Comparer {
             }
         }
         for index in &plan.create {
-            let split = production::index_create_split(index, ctx);
+            let split = production::index_create_split(index, ctx, false);
             script.push_str(&split.in_txn);
             post_commit.push_str(&split.post_commit);
         }

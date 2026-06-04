@@ -70,12 +70,20 @@ fn insert_concurrently(indexdef: &str) -> String {
 /// Insert `ONLY` after the `ON` of an index definition so the index is created
 /// on the partitioned parent alone (invalid until every partition's index is
 /// attached). Returns `None` if the statement has no ` ON ` token.
+///
+/// `pg_get_indexdef` already emits `ON ONLY` for an index on a partitioned
+/// parent, so the rewrite is idempotent: a definition that is already
+/// `ON ONLY` is returned unchanged rather than producing `ON ONLY ONLY`.
 fn make_on_only(indexdef: &str) -> Option<String> {
     let pos = indexdef.find(" ON ")?;
+    let rest = &indexdef[pos + " ON ".len()..];
+    if rest.starts_with("ONLY ") {
+        return Some(indexdef.to_string());
+    }
     let mut out = String::with_capacity(indexdef.len() + 5);
     out.push_str(&indexdef[..pos]);
     out.push_str(" ON ONLY ");
-    out.push_str(&indexdef[pos + " ON ".len()..]);
+    out.push_str(rest);
     Some(out)
 }
 
@@ -141,12 +149,40 @@ fn child_index_name(parent_index: &TableIndex, child: &ChildRef) -> String {
 }
 
 /// Production rewrite of a single index *creation*.
-pub fn index_create_split(index: &TableIndex, ctx: &PartitionContext) -> ProdSplit {
+///
+/// `parent_is_new` is true when the index's table is being created from scratch
+/// in this same migration (the new-table path). For a brand-new *partitioned*
+/// parent every partition is also new and empty: each is created later via
+/// `CREATE TABLE ... PARTITION OF`, at which point PostgreSQL automatically
+/// creates and attaches the matching partition index. Running the manual
+/// per-partition `CREATE INDEX CONCURRENTLY ... ; ALTER INDEX ... ATTACH
+/// PARTITION` dance on top of that collides with the auto-attached index
+/// (`another index is already attached for partition ...`), so a new
+/// partitioned parent gets a plain in-transaction `CREATE INDEX` — correct and
+/// cheap, since the table holds no rows yet.
+pub fn index_create_split(
+    index: &TableIndex,
+    ctx: &PartitionContext,
+    parent_is_new: bool,
+) -> ProdSplit {
     let mut split = ProdSplit::default();
     let parent_qualified = format!("{}.{}", index.schema, index.table);
+    let is_partitioned_parent = ctx.partitioned_parents.contains(&parent_qualified);
+
+    // New partitioned parent: let PostgreSQL manage the partition indexes when
+    // the (also new, empty) partitions are created. A plain in-txn build avoids
+    // the double-attach conflict.
+    if is_partitioned_parent && parent_is_new {
+        split.in_txn.push_str(&index.indexdef);
+        split.in_txn.append_block(";");
+        if let Some(comment) = &index.comment {
+            split.in_txn.append_block(&comment_on_index(index, comment));
+        }
+        return split;
+    }
 
     // Plain (non-partitioned) table: a straight concurrent build, post-commit.
-    if !ctx.partitioned_parents.contains(&parent_qualified) {
+    if !is_partitioned_parent {
         split
             .post_commit
             .push_str(&insert_concurrently(&index.indexdef));

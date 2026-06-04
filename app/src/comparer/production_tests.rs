@@ -52,7 +52,7 @@ fn plain_index_becomes_concurrent_post_commit() {
         "idx_orders_total",
         "CREATE INDEX idx_orders_total ON public.orders USING btree (total)",
     );
-    let split = index_create_split(&idx, &ctx);
+    let split = index_create_split(&idx, &ctx, false);
     assert!(split.in_txn.is_empty());
     assert!(
         split.post_commit.contains(
@@ -77,7 +77,7 @@ fn unique_index_keyword_preserved() {
         "uq_orders_ref",
         "CREATE UNIQUE INDEX uq_orders_ref ON public.orders USING btree (ref)",
     );
-    let split = index_create_split(&idx, &ctx);
+    let split = index_create_split(&idx, &ctx, false);
     assert!(
         split
             .post_commit
@@ -102,7 +102,7 @@ fn index_comment_follows_concurrent_build() {
         "CREATE INDEX idx_total ON public.orders USING btree (total)",
     );
     idx.comment = Some("by total".to_string());
-    let split = index_create_split(&idx, &ctx);
+    let split = index_create_split(&idx, &ctx, false);
     assert!(split.post_commit.contains("CREATE INDEX CONCURRENTLY"));
     assert!(
         split
@@ -141,7 +141,7 @@ fn partitioned_parent_expands_to_only_plus_attach() {
         "idx_orders_total",
         "CREATE INDEX idx_orders_total ON public.orders USING btree (total)",
     );
-    let split = index_create_split(&idx, &ctx);
+    let split = index_create_split(&idx, &ctx, false);
 
     // Parent index created ON ONLY, in-transaction.
     assert!(
@@ -167,6 +167,98 @@ fn partitioned_parent_expands_to_only_plus_attach() {
 }
 
 #[test]
+fn new_partitioned_parent_emits_plain_in_txn_no_attach() {
+    // When the partitioned parent is itself created in this migration, its
+    // partitions are new and empty: PostgreSQL auto-creates and attaches each
+    // partition index at `PARTITION OF` time. The rewrite must NOT emit the
+    // manual concurrent build + attach (that double-attaches), just a plain
+    // in-transaction CREATE INDEX.
+    let mut parents = HashSet::new();
+    parents.insert("public.orders".to_string());
+    let mut children = HashMap::new();
+    children.insert(
+        "public.orders".to_string(),
+        vec![ChildRef {
+            schema: "public".to_string(),
+            table: "orders_2024".to_string(),
+        }],
+    );
+    let part_idx = HashSet::new();
+    let ctx = PartitionContext {
+        partitioned_parents: &parents,
+        children: &children,
+        partitioned_indexes: &part_idx,
+    };
+    let idx = index(
+        "public",
+        "orders",
+        "idx_orders_total",
+        "CREATE INDEX idx_orders_total ON ONLY public.orders USING btree (total)",
+    );
+    let split = index_create_split(&idx, &ctx, true);
+
+    assert!(
+        split
+            .in_txn
+            .contains("CREATE INDEX idx_orders_total ON ONLY public.orders USING btree (total);"),
+        "in_txn: {}",
+        split.in_txn
+    );
+    assert!(
+        split.post_commit.is_empty(),
+        "new partitioned parent must not emit post-commit attach: {}",
+        split.post_commit
+    );
+    assert!(
+        !split.in_txn.contains("attach partition"),
+        "must not attach partitions manually: {}",
+        split.in_txn
+    );
+}
+
+#[test]
+fn partitioned_parent_indexdef_already_on_only_is_not_doubled() {
+    // `pg_get_indexdef` emits `ON ONLY` for an index on a partitioned parent.
+    // The rewrite must be idempotent and not produce `ON ONLY ONLY`.
+    let mut parents = HashSet::new();
+    parents.insert("data.tagged_items".to_string());
+    let mut children = HashMap::new();
+    children.insert(
+        "data.tagged_items".to_string(),
+        vec![ChildRef {
+            schema: "data".to_string(),
+            table: "tagged_items_p0".to_string(),
+        }],
+    );
+    let part_idx = HashSet::new();
+    let ctx = PartitionContext {
+        partitioned_parents: &parents,
+        children: &children,
+        partitioned_indexes: &part_idx,
+    };
+    let idx = index(
+        "data",
+        "tagged_items",
+        "idx_tagged_items_detail",
+        "CREATE INDEX idx_tagged_items_detail ON ONLY data.tagged_items USING btree (detail)",
+    );
+    let split = index_create_split(&idx, &ctx, false);
+
+    assert!(
+        split.in_txn.contains(
+            "CREATE INDEX idx_tagged_items_detail ON ONLY data.tagged_items USING btree (detail);"
+        ),
+        "in_txn: {}",
+        split.in_txn
+    );
+    assert!(
+        !split.in_txn.contains("ON ONLY ONLY"),
+        "doubled ONLY: {}",
+        split.in_txn
+    );
+}
+
+#[test]
 fn partitioned_parent_without_known_children_falls_back_in_txn() {
     let mut parents = HashSet::new();
     parents.insert("public.orders".to_string());
@@ -183,7 +275,7 @@ fn partitioned_parent_without_known_children_falls_back_in_txn() {
         "idx_orders_total",
         "CREATE INDEX idx_orders_total ON public.orders USING btree (total)",
     );
-    let split = index_create_split(&idx, &ctx);
+    let split = index_create_split(&idx, &ctx, false);
     assert!(split.post_commit.is_empty());
     assert!(split.in_txn.contains("no partitions found"));
     assert!(
