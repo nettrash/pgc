@@ -132,7 +132,7 @@ pub(crate) fn strip_comments_and_collapse(script: &str) -> String {
 /// In both modes every byte is copied verbatim — the scanner does not
 /// interpret the content, only tracks enough structure to know when the
 /// literal ends.
-fn copy_quoted_literal(
+pub(crate) fn copy_quoted_literal(
     src: &[u8],
     result: &mut Vec<u8>,
     i: &mut usize,
@@ -169,7 +169,7 @@ fn copy_quoted_literal(
 /// Checks if a dollar-quote tag starts at position `pos` in `src`.
 /// A tag is `$` followed by zero or more alphanumeric/underscore chars, followed by `$`.
 /// Returns the total length of the tag (including both `$` signs) or None.
-fn dollar_tag_at(src: &[u8], pos: usize) -> Option<usize> {
+pub(crate) fn dollar_tag_at(src: &[u8], pos: usize) -> Option<usize> {
     if pos >= src.len() || src[pos] != b'$' {
         return None;
     }

@@ -175,6 +175,20 @@ pub struct Table {
     pub typed_table_type: Option<String>, // OF type name for typed tables
 }
 
+/// Structured result of [`Table::index_alter_plan`]: which indexes to create,
+/// drop, or merely re-comment when altering a table. Borrows from both the FROM
+/// and TO tables. Consumed by the production output path.
+#[derive(Debug, Default)]
+pub struct IndexAlterPlan<'a> {
+    /// Indexes to (re)create — brand-new, or whose definition changed.
+    pub create: Vec<&'a TableIndex>,
+    /// Old indexes to drop — definition changed (paired with a `create`) or
+    /// removed entirely.
+    pub drop: Vec<&'a TableIndex>,
+    /// Indexes whose comment changed but whose definition did not.
+    pub comment_changes: Vec<&'a TableIndex>,
+}
+
 impl Table {
     /// Creates a new Table with the given name
     #[allow(clippy::too_many_arguments)] // Table metadata naturally includes these fields (from pg_class and related catalogs).
@@ -1100,7 +1114,7 @@ impl Table {
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
-    fn build_script(&self, include_triggers: bool) -> String {
+    fn build_script(&self, include_triggers: bool, defer_indexes: bool) -> String {
         let mut script = String::new();
 
         let unlogged_prefix = if self.is_unlogged { "unlogged " } else { "" };
@@ -1373,10 +1387,16 @@ impl Table {
             }
         }
 
-        // 6. Add indexes (excluding primary key indexes and partition-inherited indexes)
-        for index in &self.indexes {
-            if !index.indexdef.to_lowercase().contains("primary key") && !index.is_partition_index {
-                script.push_str(&index.get_script());
+        // 6. Add indexes (excluding primary key indexes and partition-inherited indexes).
+        // In production output mode the indexes are emitted separately by the
+        // comparer (concurrently / partition-aware), so they are deferred here.
+        if !defer_indexes {
+            for index in &self.indexes {
+                if !index.indexdef.to_lowercase().contains("primary key")
+                    && !index.is_partition_index
+                {
+                    script.push_str(&index.get_script());
+                }
             }
         }
 
@@ -1447,12 +1467,71 @@ impl Table {
 
     /// Get script for the table
     pub fn get_script(&self) -> String {
-        self.build_script(true)
+        self.build_script(true, false)
     }
 
     /// Get script for the table without triggers (for deferred trigger creation)
     pub fn get_script_without_triggers(&self) -> String {
-        self.build_script(false)
+        self.build_script(false, false)
+    }
+
+    /// Get script for the table without triggers and without index creation.
+    /// Used by the production output path, which emits indexes separately so
+    /// they can be built concurrently / partition-aware.
+    pub fn get_script_without_triggers_no_indexes(&self) -> String {
+        self.build_script(false, true)
+    }
+
+    /// Indexes that `build_script` would emit for a brand-new table: excludes
+    /// primary-key-backing indexes (created via the PRIMARY KEY clause) and
+    /// partition-inherited indexes (managed by the partitioned parent). Mirrors
+    /// the filter in `build_script` so the production path stays in sync.
+    pub fn creatable_indexes(&self) -> Vec<&TableIndex> {
+        self.indexes
+            .iter()
+            .filter(|index| {
+                !index.indexdef.to_lowercase().contains("primary key") && !index.is_partition_index
+            })
+            .collect()
+    }
+
+    /// Structured index diff between `self` (FROM) and `to_table` (TO),
+    /// mirroring the index handling in `build_alter_script`. The production
+    /// output path consumes this so each index change can be rewritten
+    /// concurrently / partition-aware instead of emitted inline.
+    pub fn index_alter_plan<'a>(&'a self, to_table: &'a Table) -> IndexAlterPlan<'a> {
+        let mut plan = IndexAlterPlan::default();
+
+        for new_index in &to_table.indexes {
+            if new_index.is_partition_index {
+                continue;
+            }
+            if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
+                if old_index != new_index {
+                    if old_index.indexdef != new_index.indexdef {
+                        // Definition changed: drop the old, build the new.
+                        plan.drop.push(old_index);
+                        plan.create.push(new_index);
+                    } else {
+                        // Comment-only change.
+                        plan.comment_changes.push(new_index);
+                    }
+                }
+            } else {
+                plan.create.push(new_index);
+            }
+        }
+
+        for old_index in &self.indexes {
+            if old_index.is_partition_index {
+                continue;
+            }
+            if !to_table.indexes.iter().any(|i| i.name == old_index.name) {
+                plan.drop.push(old_index);
+            }
+        }
+
+        plan
     }
 
     /// Get trigger creation scripts only
@@ -1521,11 +1600,46 @@ impl Table {
         script
     }
 
+    /// Like [`Table::get_foreign_key_alter_script`] but returns the in-place FK
+    /// modifications as a script and the brand-new foreign keys separately, so
+    /// the production output path can add the new ones `NOT VALID` and validate
+    /// them after the transaction commits. Mirrors the branch structure of
+    /// `get_foreign_key_alter_script` so the two cannot drift apart.
+    pub fn foreign_key_alter_split<'a>(
+        &self,
+        to_table: &'a Table,
+    ) -> (String, Vec<&'a TableConstraint>) {
+        let mut alters = String::new();
+        let mut new_fks: Vec<&TableConstraint> = Vec::new();
+        for new_constraint in &to_table.constraints {
+            if new_constraint.constraint_type.to_lowercase() != "foreign key" {
+                continue;
+            }
+            if let Some(old_constraint) = self
+                .constraints
+                .iter()
+                .find(|c| c.name == new_constraint.name)
+            {
+                if old_constraint != new_constraint {
+                    if let Some(alter_script) = old_constraint.get_alter_script(new_constraint) {
+                        alters.push_str(&alter_script);
+                    } else {
+                        new_fks.push(new_constraint);
+                    }
+                }
+            } else {
+                new_fks.push(new_constraint);
+            }
+        }
+        (alters, new_fks)
+    }
+
     fn build_alter_script(
         &self,
         to_table: &Table,
         use_drop: bool,
         include_triggers: bool,
+        defer_indexes: bool,
     ) -> String {
         // If partition key changes (e.g. from LIST to RANGE, or different column), we must recreate the table.
         // Also if table changes from partitioned to non-partitioned or vice versa.
@@ -1914,14 +2028,18 @@ impl Table {
         script.push_str(&partition_script);
         script.push_str(&constraint_pre_script);
         script.push_str(&column_alter_script);
-        script.push_str(&index_drop_script);
+        if !defer_indexes {
+            script.push_str(&index_drop_script);
+        }
         if include_triggers {
             script.push_str(&trigger_drop_script);
         }
         script.push_str(&policy_drop_script);
         script.push_str(&column_drop_script);
         script.push_str(&constraint_post_script);
-        script.push_str(&index_script);
+        if !defer_indexes {
+            script.push_str(&index_script);
+        }
         if include_triggers {
             script.push_str(&trigger_script);
         }
@@ -2052,12 +2170,24 @@ impl Table {
 
     /// Get script for altering the table (including triggers)
     pub fn get_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
-        self.build_alter_script(to_table, use_drop, true)
+        self.build_alter_script(to_table, use_drop, true, false)
     }
 
     /// Get script for altering the table without triggers (for deferred trigger creation)
     pub fn get_alter_script_without_triggers(&self, to_table: &Table, use_drop: bool) -> String {
-        self.build_alter_script(to_table, use_drop, false)
+        self.build_alter_script(to_table, use_drop, false, false)
+    }
+
+    /// Like [`Table::get_alter_script_without_triggers`] but omits index
+    /// creation/drop statements. Used by the production output path, which
+    /// emits index changes separately (concurrently / partition-aware) via
+    /// [`Table::index_alter_plan`].
+    pub fn get_alter_script_without_triggers_no_indexes(
+        &self,
+        to_table: &Table,
+        use_drop: bool,
+    ) -> String {
+        self.build_alter_script(to_table, use_drop, false, true)
     }
 
     /// True when comparing `self` (FROM) against `to_table` (TO) would
