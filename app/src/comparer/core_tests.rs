@@ -11258,3 +11258,58 @@ async fn output_for_production_disabled_keeps_inline_index() {
         "default mode must not emit a post-commit section:\n{script}"
     );
 }
+
+#[tokio::test]
+async fn production_header_mentions_commit_only_with_single_transaction() {
+    // The production header comment must not claim post-transaction statements
+    // run "after COMMIT" when --use-single-transaction is off (no COMMIT is
+    // emitted in that valid configuration).
+    let build = || {
+        let mut to_dump = Dump::new(DumpConfig::default());
+        to_dump.tables.push(Table::new(
+            "public".to_string(),
+            "orders".to_string(),
+            "public".to_string(),
+            "orders".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
+        (Dump::new(DumpConfig::default()), to_dump)
+    };
+
+    // With single transaction: header says "after COMMIT" and a commit; exists.
+    let (from_txn, to_txn) = build();
+    let mut with_txn = Comparer::new(from_txn, to_txn, false, true, true, GrantsMode::Ignore);
+    with_txn.set_output_for_production(true);
+    with_txn.compare().await.unwrap();
+    let txn_script = with_txn.get_script();
+    assert!(
+        txn_script.contains("are emitted after COMMIT"),
+        "single-transaction header must mention COMMIT:\n{txn_script}"
+    );
+    assert!(txn_script.contains("commit;"), "{txn_script}");
+
+    // Without single transaction: no COMMIT, so the header must not claim one.
+    let (from_no, to_no) = build();
+    let mut no_txn = Comparer::new(from_no, to_no, false, false, true, GrantsMode::Ignore);
+    no_txn.set_output_for_production(true);
+    no_txn.compare().await.unwrap();
+    let no_txn_script = no_txn.get_script();
+    assert!(
+        !no_txn_script.contains("commit;"),
+        "no transaction must be opened without --use-single-transaction:\n{no_txn_script}"
+    );
+    assert!(
+        !no_txn_script.contains("after COMMIT"),
+        "header must not claim 'after COMMIT' without a transaction:\n{no_txn_script}"
+    );
+    assert!(
+        no_txn_script.contains("are emitted in a separate section at the end"),
+        "header must describe the trailing section accurately:\n{no_txn_script}"
+    );
+}

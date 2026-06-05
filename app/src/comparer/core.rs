@@ -116,11 +116,22 @@ impl Comparer {
     // Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
         if self.output_for_production {
-            self.script.append_block(
+            // The statements that cannot run inside a transaction block are
+            // emitted in a trailing section. With --use-single-transaction the
+            // rest of the migration is wrapped in begin/commit, so that section
+            // lands after COMMIT; without it no transaction is opened and the
+            // section is simply the tail of the script (each statement still
+            // runs in its own implicit transaction).
+            let tail = if self.use_single_transaction {
+                "are emitted after COMMIT"
+            } else {
+                "are emitted in a separate section at the end"
+            };
+            self.script.append_block(&format!(
                 "/* Output generated for production: indexes are built/dropped concurrently, \
                  foreign keys are validated, and the statements that cannot run inside a \
-                 transaction are emitted after COMMIT. */",
-            );
+                 transaction {tail}. */"
+            ));
         }
         if self.use_single_transaction {
             self.script.append_block("begin;");
@@ -186,7 +197,9 @@ impl Comparer {
 
         // Concurrent index builds/drops, FK validations and partition-index
         // attaches cannot run inside a transaction block, so they are emitted
-        // here, after COMMIT (each runs in its own implicit transaction).
+        // here in a trailing section — after COMMIT when --use-single-transaction
+        // wrapped the migration, otherwise just at the end. Either way each runs
+        // in its own implicit transaction.
         if !self.production_post_script.is_empty() {
             self.script.append_block(
                 "\n/* ---> Production post-commit (run outside a transaction): Start --------------- */",
