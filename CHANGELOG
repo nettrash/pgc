@@ -36,9 +36,9 @@
                       flag, configuration key, and behaviour in
                       README.md.
                     - Production output is now re-runnable: every
-                      DDL form PostgreSQL supports a guard for is
-                      emitted defensively so a partially-applied
-                      migration can be replayed without failing.
+                      DDL form PostgreSQL supports is emitted defensively
+                      with an idempotency guard where available, so a
+                      partially-applied migration can be replayed without failing.
                       CREATE [UNLOGGED] TABLE, CREATE [UNLOGGED]
                       SEQUENCE, CREATE MATERIALIZED VIEW and CREATE
                       [UNIQUE] INDEX [CONCURRENTLY] gain IF NOT
