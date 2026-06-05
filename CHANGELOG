@@ -28,18 +28,17 @@
                       CONCURRENTLY, VALIDATE CONSTRAINT, ALTER
                       INDEX ... ATTACH PARTITION) is emitted in a
                       clearly marked Production post-commit section
-                      after COMMIT. Defaults to false; when off,
+                      after commit. Defaults to false; when off,
                       the output is byte-for-byte identical to
                       previous behaviour.
                     - Added the OUTPUT_FOR_PRODUCTION key to the
                       sample data/pgc.conf and documented the new
                       flag, configuration key, and behaviour in
                       README.md.
-                    - Production output is now re-runnable: for
-                      every DDL form that PostgreSQL provides an
-                      idempotency guard, the statement is emitted
-                      defensively so a partially-applied migration
-                      can be replayed without failing.
+                    - Production output is now re-runnable: every
+                      DDL form PostgreSQL supports is emitted defensively
+                      with an idempotency guard where available, so a
+                      partially-applied migration can be replayed without failing.
                       CREATE [UNLOGGED] TABLE, CREATE [UNLOGGED]
                       SEQUENCE, CREATE MATERIALIZED VIEW and CREATE
                       [UNIQUE] INDEX [CONCURRENTLY] gain IF NOT
