@@ -28,7 +28,7 @@
                       CONCURRENTLY, VALIDATE CONSTRAINT, ALTER
                       INDEX ... ATTACH PARTITION) is emitted in a
                       clearly marked Production post-commit section
-                      after commit;. Defaults to false; when off,
+                      after commit. Defaults to false; when off,
                       the output is byte-for-byte identical to
                       previous behaviour.
                     - Added the OUTPUT_FOR_PRODUCTION key to the
