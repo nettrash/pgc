@@ -197,6 +197,16 @@ impl Comparer {
                 .append_block("/* ---> Production post-commit: End --------------- */");
         }
 
+        // Production migrations are meant to be re-runnable against a live,
+        // possibly partially-migrated database: inject `if [not] exists` /
+        // `or replace` guards into every DDL form PostgreSQL supports them for.
+        // The pass is literal-/comment-aware so commented-out drops and quoted
+        // text are left untouched. Done last so it also covers the post-commit
+        // (concurrent index) statements appended above.
+        if self.output_for_production {
+            self.script = production::make_idempotent(&self.script);
+        }
+
         Ok(())
     }
 

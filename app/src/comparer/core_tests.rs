@@ -11176,7 +11176,9 @@ async fn output_for_production_defers_concurrent_index_and_validates_fk() {
 
     let commit_pos = script.find("commit;").expect("script must contain commit;");
     let concurrent_pos = script
-        .find("CREATE INDEX CONCURRENTLY idx_orders_total ON public.orders USING btree (total);")
+        .find(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_total ON public.orders USING btree (total);",
+        )
         .expect("concurrent index build must be present");
     let validate_pos = script
         .find("validate constraint fk_orders_customer;")

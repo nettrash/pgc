@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::comparer::scanner::{copy_quoted_literal, dollar_tag_at};
 use crate::dump::table_constraint::TableConstraint;
 use crate::dump::table_index::TableIndex;
 use crate::utils::string_extensions::StringExt;
@@ -326,6 +327,291 @@ pub fn foreign_key_split(constraint: &TableConstraint) -> ProdSplit {
         None => split.in_txn.push_str(&full),
     }
     split
+}
+
+/// Case-insensitive ASCII check that `src[pos..]` begins with `pat`.
+fn matches_ci(src: &[u8], pos: usize, pat: &[u8]) -> bool {
+    pos + pat.len() <= src.len() && src[pos..pos + pat.len()].eq_ignore_ascii_case(pat)
+}
+
+/// A `create …` statement form that gains an `if not exists` guard. `prefix`
+/// is the leading keyword (including its trailing space) the guard is inserted
+/// after; `guard` is the exact text injected (its casing matches the
+/// surrounding keyword family). Longer prefixes must precede their own
+/// sub-prefixes so the most specific form wins.
+struct CreateGuard {
+    prefix: &'static [u8],
+    guard: &'static [u8],
+}
+
+/// `create …` forms that take `if not exists`, most-specific first. `create
+/// view` (regular, non-materialized) is handled separately — PostgreSQL has no
+/// `IF NOT EXISTS` for it, so it is rewritten to `create or replace view`.
+/// `create type` is intentionally absent: PostgreSQL supports no idempotency
+/// guard for it, and a drop-then-create rewrite would cascade dependents.
+const CREATE_GUARDS: &[CreateGuard] = &[
+    CreateGuard {
+        prefix: b"create unlogged table ",
+        guard: b"if not exists ",
+    },
+    CreateGuard {
+        prefix: b"create table ",
+        guard: b"if not exists ",
+    },
+    CreateGuard {
+        prefix: b"create unlogged sequence ",
+        guard: b"if not exists ",
+    },
+    CreateGuard {
+        prefix: b"create sequence ",
+        guard: b"if not exists ",
+    },
+    CreateGuard {
+        prefix: b"create materialized view ",
+        guard: b"if not exists ",
+    },
+    // Index forms use uppercase keywords (`pg_get_indexdef` output, optionally
+    // routed through `CREATE INDEX CONCURRENTLY` for production). The guard is
+    // injected after `concurrently ` when present so the access-method tail is
+    // untouched. Concurrently variants precede their plain counterparts.
+    CreateGuard {
+        prefix: b"create unique index concurrently ",
+        guard: b"IF NOT EXISTS ",
+    },
+    CreateGuard {
+        prefix: b"create index concurrently ",
+        guard: b"IF NOT EXISTS ",
+    },
+    CreateGuard {
+        prefix: b"create unique index ",
+        guard: b"IF NOT EXISTS ",
+    },
+    CreateGuard {
+        prefix: b"create index ",
+        guard: b"IF NOT EXISTS ",
+    },
+];
+
+/// `alter table … <op>` forms whose object reference gains an idempotency
+/// guard. `op` is the operation keyword as generated (lowercase, no leading
+/// space); `guard` is inserted directly after it. `add constraint` is
+/// intentionally absent: PostgreSQL has no `IF NOT EXISTS` for it.
+struct AlterGuard {
+    op: &'static [u8],
+    guard: &'static [u8],
+}
+
+const ALTER_GUARDS: &[AlterGuard] = &[
+    AlterGuard {
+        op: b"add column ",
+        guard: b"if not exists ",
+    },
+    AlterGuard {
+        op: b"drop column ",
+        guard: b"if exists ",
+    },
+    AlterGuard {
+        op: b"drop constraint ",
+        guard: b"if exists ",
+    },
+];
+
+/// Make a production migration script re-runnable by injecting idempotency
+/// guards into the DDL forms PostgreSQL supports them for. Applied once, at the
+/// end of [`Comparer::compare`], only when `output_for_production` is set.
+///
+/// The scan is literal-, comment- and dollar-quote-aware (mirroring
+/// [`crate::comparer::scanner::strip_comments_and_collapse`]) so a keyword that
+/// appears inside a string literal, quoted identifier, or comment is never
+/// mistaken for a statement to rewrite — including the `-- ` line-commented
+/// drops emitted when `use_drop` is off, which must stay untouched.
+///
+/// Guards injected (each a no-op when already present):
+///   * `create [unlogged] table`              → `… if not exists`
+///   * `create [unlogged] sequence`           → `… if not exists`
+///   * `create materialized view`             → `… if not exists`
+///   * `create view`                          → `create or replace view`
+///   * `create [unique] index [concurrently]` → `… if not exists`
+///   * `alter table … add column`             → `… add column if not exists`
+///   * `alter table … drop column`            → `… drop column if exists`
+///   * `alter table … drop constraint`        → `… drop constraint if exists`
+///
+/// `create type` and `alter table … add constraint` are deliberately left
+/// unguarded: PostgreSQL has no `IF NOT EXISTS` for them, and a
+/// drop-then-create rewrite would risk cascading dependent objects.
+pub fn make_idempotent(script: &str) -> String {
+    let src = script.as_bytes();
+    let len = src.len();
+    let mut out: Vec<u8> = Vec::with_capacity(len + 64);
+    let mut i = 0;
+    // True at the very start and immediately after each top-level `;`, through
+    // the leading run of whitespace/comments, until the first code byte.
+    let mut at_stmt_start = true;
+    // Set when an `alter table` statement is open and its operation keyword has
+    // not yet been seen; cleared when the op is found or the statement ends.
+    let mut pending_alter = false;
+
+    while i < len {
+        let b = src[i];
+
+        // Dollar-quoted string ($$…$$ / $tag$…$tag$) — copy verbatim.
+        if b == b'$'
+            && let Some(tag_len) = dollar_tag_at(src, i)
+        {
+            let tag = &src[i..i + tag_len];
+            out.extend_from_slice(tag);
+            i += tag_len;
+            loop {
+                if i >= len {
+                    break;
+                }
+                if src[i] == b'$'
+                    && let Some(close_len) = dollar_tag_at(src, i)
+                    && close_len == tag_len
+                    && &src[i..i + close_len] == tag
+                {
+                    out.extend_from_slice(&src[i..i + close_len]);
+                    i += close_len;
+                    break;
+                }
+                out.push(src[i]);
+                i += 1;
+            }
+            at_stmt_start = false;
+            continue;
+        }
+        // E-string literal E'…' / e'…' — copy verbatim.
+        if (b == b'E' || b == b'e') && i + 1 < len && src[i + 1] == b'\'' {
+            out.push(b);
+            out.push(b'\'');
+            i += 2;
+            copy_quoted_literal(src, &mut out, &mut i, b'\'', true);
+            at_stmt_start = false;
+            continue;
+        }
+        // Single-quoted string — copy verbatim.
+        if b == b'\'' {
+            out.push(b'\'');
+            i += 1;
+            copy_quoted_literal(src, &mut out, &mut i, b'\'', false);
+            at_stmt_start = false;
+            continue;
+        }
+        // Double-quoted identifier — copy verbatim.
+        if b == b'"' {
+            out.push(b'"');
+            i += 1;
+            copy_quoted_literal(src, &mut out, &mut i, b'"', false);
+            at_stmt_start = false;
+            continue;
+        }
+        // Block comment /* … */ (PostgreSQL allows nesting) — copy verbatim.
+        // Trivia: does not end the leading-trivia run before a statement.
+        if i + 1 < len && b == b'/' && src[i + 1] == b'*' {
+            out.push(b'/');
+            out.push(b'*');
+            i += 2;
+            let mut depth: usize = 1;
+            while i + 1 < len && depth > 0 {
+                if src[i] == b'/' && src[i + 1] == b'*' {
+                    depth += 1;
+                    out.push(b'/');
+                    out.push(b'*');
+                    i += 2;
+                } else if src[i] == b'*' && src[i + 1] == b'/' {
+                    depth -= 1;
+                    out.push(b'*');
+                    out.push(b'/');
+                    i += 2;
+                } else {
+                    out.push(src[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Line comment -- … — copy verbatim. Trivia (see block comment).
+        if i + 1 < len && b == b'-' && src[i + 1] == b'-' {
+            while i < len && src[i] != b'\n' {
+                out.push(src[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Open `alter table` statement: look for its operation keyword at a
+        // word boundary (previous output byte is ASCII whitespace). The first
+        // such match is the structural operation — a later occurrence inside a
+        // default expression or check clause sits in a literal/quoted form
+        // already handled above.
+        if pending_alter
+            && out.last().is_some_and(u8::is_ascii_whitespace)
+            && let Some(g) = ALTER_GUARDS.iter().find(|g| matches_ci(src, i, g.op))
+        {
+            out.extend_from_slice(&src[i..i + g.op.len()]);
+            i += g.op.len();
+            if !matches_ci(src, i, g.guard) {
+                out.extend_from_slice(g.guard);
+            }
+            pending_alter = false;
+            continue;
+        }
+
+        // Top-level statement terminator.
+        if b == b';' {
+            out.push(b';');
+            i += 1;
+            at_stmt_start = true;
+            pending_alter = false;
+            continue;
+        }
+
+        // Whitespace inside the leading-trivia run keeps `at_stmt_start` set.
+        if b.is_ascii_whitespace() {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        // First code byte of a statement: classify and inject.
+        if at_stmt_start {
+            at_stmt_start = false;
+            if matches_ci(src, i, b"alter table ") {
+                out.extend_from_slice(&src[i..i + b"alter table ".len()]);
+                i += b"alter table ".len();
+                pending_alter = true;
+                continue;
+            }
+            if matches_ci(src, i, b"create view ") {
+                // No IF NOT EXISTS for regular views — use OR REPLACE instead.
+                out.extend_from_slice(b"create or replace view ");
+                i += b"create view ".len();
+                continue;
+            }
+            if matches_ci(src, i, b"create or replace ") {
+                // Already idempotent (view/function) — leave untouched.
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            if let Some(g) = CREATE_GUARDS.iter().find(|g| matches_ci(src, i, g.prefix)) {
+                out.extend_from_slice(&src[i..i + g.prefix.len()]);
+                i += g.prefix.len();
+                if !matches_ci(src, i, g.guard) {
+                    out.extend_from_slice(g.guard);
+                }
+                continue;
+            }
+        }
+
+        // Ordinary code byte.
+        out.push(b);
+        i += 1;
+    }
+
+    // Safety: `out` is built entirely from slices of `script` (valid UTF-8) and
+    // ASCII guard literals, so it is guaranteed to be valid UTF-8.
+    String::from_utf8(out).expect("output must be valid UTF-8")
 }
 
 #[cfg(test)]

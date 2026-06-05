@@ -35,6 +35,24 @@
                       sample data/pgc.conf and documented the new
                       flag, configuration key, and behaviour in
                       README.md.
+                    - Production output is now re-runnable: every
+                      DDL form PostgreSQL supports a guard for is
+                      emitted defensively so a partially-applied
+                      migration can be replayed without failing.
+                      CREATE [UNLOGGED] TABLE, CREATE [UNLOGGED]
+                      SEQUENCE, CREATE MATERIALIZED VIEW and CREATE
+                      [UNIQUE] INDEX [CONCURRENTLY] gain IF NOT
+                      EXISTS; CREATE VIEW becomes CREATE OR REPLACE
+                      VIEW; ALTER TABLE ... ADD COLUMN gains IF NOT
+                      EXISTS; and ALTER TABLE ... DROP COLUMN /
+                      DROP CONSTRAINT gain IF EXISTS. CREATE TYPE
+                      and ALTER TABLE ... ADD CONSTRAINT are left
+                      as-is (PostgreSQL has no idempotency guard for
+                      them). The rewrite is literal-, comment- and
+                      dollar-quote-aware, so quoted text, commented
+                      drops and function bodies are untouched, and
+                      it only applies when
+                      --output-for-production is on.
 
 2026-05-26      v1.0.22
 

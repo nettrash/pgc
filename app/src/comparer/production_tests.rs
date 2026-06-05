@@ -376,3 +376,224 @@ fn fk_comment_preserved_in_txn() {
             .contains("validate constraint fk_orders_customer;")
     );
 }
+
+// ---- make_idempotent ----
+
+#[test]
+fn create_table_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("create table public.orders (id int);"),
+        "create table if not exists public.orders (id int);"
+    );
+}
+
+#[test]
+fn create_unlogged_table_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("create unlogged table public.t (id int);"),
+        "create unlogged table if not exists public.t (id int);"
+    );
+}
+
+#[test]
+fn create_table_partition_of_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("create table public.p1 partition of public.p for values in (1);"),
+        "create table if not exists public.p1 partition of public.p for values in (1);"
+    );
+}
+
+#[test]
+fn create_table_already_guarded_is_not_doubled() {
+    let s = "create table if not exists public.orders (id int);";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn create_sequence_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("create sequence public.s;"),
+        "create sequence if not exists public.s;"
+    );
+    assert_eq!(
+        make_idempotent("create unlogged sequence public.s;"),
+        "create unlogged sequence if not exists public.s;"
+    );
+}
+
+#[test]
+fn create_materialized_view_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("create materialized view public.mv as\nselect 1;"),
+        "create materialized view if not exists public.mv as\nselect 1;"
+    );
+}
+
+#[test]
+fn create_view_becomes_create_or_replace() {
+    assert_eq!(
+        make_idempotent("create view public.v as\nselect 1;"),
+        "create or replace view public.v as\nselect 1;"
+    );
+}
+
+#[test]
+fn create_or_replace_view_is_left_untouched() {
+    let s = "CREATE OR REPLACE VIEW public.v as\nselect 1;";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn create_index_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("CREATE INDEX idx ON public.t USING btree (a);"),
+        "CREATE INDEX IF NOT EXISTS idx ON public.t USING btree (a);"
+    );
+    assert_eq!(
+        make_idempotent("CREATE UNIQUE INDEX idx ON public.t USING btree (a);"),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx ON public.t USING btree (a);"
+    );
+}
+
+#[test]
+fn create_index_concurrently_gets_if_not_exists_after_concurrently() {
+    assert_eq!(
+        make_idempotent("CREATE INDEX CONCURRENTLY idx ON public.t USING btree (a);"),
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON public.t USING btree (a);"
+    );
+    assert_eq!(
+        make_idempotent("CREATE UNIQUE INDEX CONCURRENTLY idx ON public.t USING btree (a);"),
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx ON public.t USING btree (a);"
+    );
+}
+
+#[test]
+fn create_index_already_guarded_is_not_doubled() {
+    let s = "CREATE INDEX IF NOT EXISTS idx ON public.t USING btree (a);";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn add_column_gets_if_not_exists() {
+    assert_eq!(
+        make_idempotent("alter table public.t add column c int;"),
+        "alter table public.t add column if not exists c int;"
+    );
+}
+
+#[test]
+fn drop_column_gets_if_exists() {
+    assert_eq!(
+        make_idempotent("alter table public.t drop column c;"),
+        "alter table public.t drop column if exists c;"
+    );
+}
+
+#[test]
+fn drop_constraint_gets_if_exists() {
+    assert_eq!(
+        make_idempotent("alter table public.t drop constraint c;"),
+        "alter table public.t drop constraint if exists c;"
+    );
+}
+
+#[test]
+fn add_constraint_is_left_unguarded() {
+    let s = "alter table public.t add constraint c check (x > 0);";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn alter_guards_not_doubled() {
+    let s = "alter table public.t add column if not exists c int;";
+    assert_eq!(make_idempotent(s), s);
+    let d = "alter table public.t drop column if exists c;";
+    assert_eq!(make_idempotent(d), d);
+}
+
+#[test]
+fn create_type_is_left_unguarded() {
+    let s = "create type public.mood as enum ('a', 'b');";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn drop_table_if_exists_is_left_untouched() {
+    let s = "drop table if exists public.t;";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn keyword_inside_string_literal_is_not_rewritten() {
+    // A default literal that contains the text `drop column` must be left
+    // verbatim; only the structural `add column` is guarded.
+    let s = "alter table public.t add column c text default 'x drop column y';";
+    assert_eq!(
+        make_idempotent(s),
+        "alter table public.t add column if not exists c text default 'x drop column y';"
+    );
+}
+
+#[test]
+fn keyword_inside_quoted_identifier_is_not_rewritten() {
+    let s = "alter table public.t drop column \"add column\";";
+    assert_eq!(
+        make_idempotent(s),
+        "alter table public.t drop column if exists \"add column\";"
+    );
+}
+
+#[test]
+fn commented_out_drop_is_left_untouched() {
+    // With `use_drop` off, drops are line-commented and must not be guarded.
+    let s = "-- alter table public.t drop column c;\ncreate table public.u (id int);";
+    assert_eq!(
+        make_idempotent(s),
+        "-- alter table public.t drop column c;\ncreate table if not exists public.u (id int);"
+    );
+}
+
+#[test]
+fn block_comment_before_statement_is_preserved() {
+    let s = "/* Table: public.t */\ncreate table public.t (id int);";
+    assert_eq!(
+        make_idempotent(s),
+        "/* Table: public.t */\ncreate table if not exists public.t (id int);"
+    );
+}
+
+#[test]
+fn dollar_quoted_body_is_left_untouched() {
+    // A function body that mentions DDL keywords must pass through verbatim.
+    let s = "create or replace function f() returns void language plpgsql as $$\nbegin\n  -- create table x\nend;\n$$;";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn multiple_statements_each_guarded_independently() {
+    let s = "create table public.a (id int);\n\nalter table public.a add column b int;\n\nalter table public.a drop constraint old;";
+    assert_eq!(
+        make_idempotent(s),
+        "create table if not exists public.a (id int);\n\nalter table public.a add column if not exists b int;\n\nalter table public.a drop constraint if exists old;"
+    );
+}
+
+#[test]
+fn begin_commit_wrapper_is_untouched() {
+    let s = "begin;\n\ncreate table public.t (id int);\n\ncommit;";
+    assert_eq!(
+        make_idempotent(s),
+        "begin;\n\ncreate table if not exists public.t (id int);\n\ncommit;"
+    );
+}
+
+#[test]
+fn alter_column_set_default_is_not_mistaken_for_op() {
+    let s = "alter table public.t alter column c set default 'add column z';";
+    assert_eq!(make_idempotent(s), s);
+}
+
+#[test]
+fn empty_input_is_empty() {
+    assert_eq!(make_idempotent(""), "");
+}
