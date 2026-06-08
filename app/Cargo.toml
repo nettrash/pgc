@@ -1,6 +1,6 @@
 [package]
 name = "pgc"
-version = "1.0.23"
+version = "1.0.24"
 edition = "2024"
 license = "MIT"
 authors = ["nettrash <nettrash@nettrash.me>"]
