@@ -1,4 +1,4 @@
-                v1.0.24
+2026-06-11      v1.0.24
 
                 Bug fixes:
                     - pg_depend - additional filter by classid and
