@@ -516,42 +516,157 @@ impl Dump {
         Ok(extensions)
     }
 
+    fn build_composite_type_attributes_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                t.oid as type_oid,
+                a.attname,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type
+             from pg_type t
+             join pg_namespace n on t.typnamespace = n.oid
+             join pg_class c on c.oid = t.typrelid
+             join pg_attribute a on a.attrelid = c.oid
+             where
+                n.nspname in {}
+                and t.typtype = 'c'
+                and c.relkind = 'c'
+                and t.typisdefined = true
+                and a.attnum > 0
+                and a.attisdropped = false
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_type'::regclass
+                    and ext_dep.objid = t.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
+             order by t.oid, a.attnum",
+            schema_filter
+        )
+    }
+
+    fn build_range_types_query(
+        schema_filter: &str,
+        multirange_col: &str,
+        multirange_join: &str,
+    ) -> String {
+        format!(
+            "select
+                r.rngtypid as type_oid,
+                pg_catalog.format_type(r.rngsubtype, null) as range_subtype,
+                case when r.rngcollation <> 0 then
+                    (select quote_ident(n.nspname) || '.' || quote_ident(c.collname)
+                     from pg_collation c join pg_namespace n on n.oid = c.collnamespace
+                     where c.oid = r.rngcollation)
+                else null end as range_collation,
+                quote_ident(opc_ns.nspname) || '.' || quote_ident(opc.opcname) as range_opclass,
+                case when r.rngcanonical <> 0 then r.rngcanonical::regproc::text else null end as range_canonical,
+                case when r.rngsubdiff <> 0 then r.rngsubdiff::regproc::text else null end as range_subdiff,
+                {}
+            from pg_range r
+            join pg_type t on t.oid = r.rngtypid
+            join pg_namespace n on n.oid = t.typnamespace
+            join pg_opclass opc on opc.oid = r.rngsubopc
+            join pg_namespace opc_ns on opc_ns.oid = opc.opcnamespace
+            {}
+            where n.nspname in {}
+              and not exists (
+                  select 1 from pg_depend ext_dep
+                  where ext_dep.classid = 'pg_type'::regclass
+                  and ext_dep.objid = t.oid
+                  and ext_dep.objsubid = 0
+                  and ext_dep.deptype = 'e'
+              )",
+            multirange_col, multirange_join, schema_filter
+        )
+    }
+
+    fn build_types_query(schema_filter: &str) -> String {
+        format!(
+            "select
+            quote_ident(n.nspname) as nspname,
+            t.oid as type_oid,
+            quote_ident(t.typname) as typname,
+            t.typnamespace,
+            t.typowner,
+            quote_ident(owner_role.rolname) as typowner_name,
+            t.typlen,
+            t.typbyval,
+            t.typtype,
+            t.typcategory,
+            t.typispreferred,
+            t.typisdefined,
+            t.typdelim,
+            t.typrelid,
+            t.typsubscript::text AS typsubscript,
+            t.typelem,
+            t.typarray,
+            t.typinput::text AS typinput,
+            t.typoutput::text AS typoutput,
+            t.typreceive::text AS typreceive,
+            t.typsend::text AS typsend,
+            t.typmodin::text AS typmodin,
+            t.typmodout::text AS typmodout,
+            t.typanalyze::text AS typanalyze,
+            t.typalign,
+            t.typstorage,
+            t.typnotnull,
+            t.typbasetype,
+            t.typtypmod,
+            t.typndims,
+            t.typcollation,
+            t.typdefault,
+            pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype,
+            case when t.typcollation <> 0 then
+                (select quote_ident(cn.nspname) || '.' || quote_ident(cc.collname)
+                 from pg_collation cc
+                 join pg_namespace cn on cn.oid = cc.collnamespace
+                 where cc.oid = t.typcollation)
+            else null end as domain_collation_name,
+            coalesce(
+                (select array_agg(acl_item::text) from unnest(t.typacl) as acl_item),
+                '{{}}'::text[]
+            ) as typacl,
+            d.description as comment
+        from
+            pg_type t
+            join pg_namespace n on t.typnamespace = n.oid
+            left join pg_class c on c.oid = t.typrelid
+            left join pg_roles owner_role on owner_role.oid = t.typowner
+            left join pg_description d on d.objoid = t.oid
+                and d.classoid = 'pg_type'::regclass
+                and d.objsubid = 0
+        where
+            n.nspname in {}
+            and (
+                t.typtype in ('d', 'e', 'r', 'm')
+                or (t.typtype = 'c' and c.relkind = 'c')
+            )
+            and t.typisdefined = true
+            and not exists (
+                select 1 from pg_depend ext_dep
+                where ext_dep.classid = 'pg_type'::regclass
+                and ext_dep.objid = t.oid
+                and ext_dep.objsubid = 0
+                and ext_dep.deptype = 'e'
+            )",
+            schema_filter
+        )
+    }
+
     async fn fetch_types_standalone(
         pool: &PgPool,
         schema_filter: &str,
         pg_version: i32,
         types: &mut Vec<PgType>,
     ) -> Result<(), Error> {
-        let composite_attributes_rows = sqlx::query(
-            format!(
-                "select
-                    t.oid as type_oid,
-                    a.attname,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type
-                 from pg_type t
-                 join pg_namespace n on t.typnamespace = n.oid
-                 join pg_class c on c.oid = t.typrelid
-                 join pg_attribute a on a.attrelid = c.oid
-                 where
-                    n.nspname in {}
-                    and t.typtype = 'c'
-                    and c.relkind = 'c'
-                    and t.typisdefined = true
-                    and a.attnum > 0
-                    and a.attisdropped = false
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = t.oid
-                        and ext_dep.deptype = 'e'
-                    )
-                 order by t.oid, a.attnum",
-                schema_filter
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch composite type attributes: {e}.")))?;
+        let composite_attributes_rows =
+            sqlx::query(Self::build_composite_type_attributes_query(schema_filter).as_str())
+                .fetch_all(pool)
+                .await
+                .map_err(|e| {
+                    Error::other(format!("Failed to fetch composite type attributes: {e}."))
+                })?;
 
         let mut composite_attributes_map: HashMap<Oid, Vec<CompositeAttribute>> = HashMap::new();
         for row in composite_attributes_rows {
@@ -589,34 +704,7 @@ impl Dump {
         };
 
         let range_metadata_rows = sqlx::query(
-            format!(
-                "select
-                    r.rngtypid as type_oid,
-                    pg_catalog.format_type(r.rngsubtype, null) as range_subtype,
-                    case when r.rngcollation <> 0 then
-                        (select quote_ident(n.nspname) || '.' || quote_ident(c.collname)
-                         from pg_collation c join pg_namespace n on n.oid = c.collnamespace
-                         where c.oid = r.rngcollation)
-                    else null end as range_collation,
-                    quote_ident(opc_ns.nspname) || '.' || quote_ident(opc.opcname) as range_opclass,
-                    case when r.rngcanonical <> 0 then r.rngcanonical::regproc::text else null end as range_canonical,
-                    case when r.rngsubdiff <> 0 then r.rngsubdiff::regproc::text else null end as range_subdiff,
-                    {}
-                from pg_range r
-                join pg_type t on t.oid = r.rngtypid
-                join pg_namespace n on n.oid = t.typnamespace
-                join pg_opclass opc on opc.oid = r.rngsubopc
-                join pg_namespace opc_ns on opc_ns.oid = opc.opcnamespace
-                {}
-                where n.nspname in {}
-                  and not exists (
-                      select 1 from pg_depend ext_dep
-                      where ext_dep.objid = t.oid
-                      and ext_dep.deptype = 'e'
-                  )",
-                multirange_col, multirange_join, schema_filter
-            )
-            .as_str(),
+            Self::build_range_types_query(schema_filter, multirange_col, multirange_join).as_str(),
         )
         .fetch_all(pool)
         .await
@@ -646,80 +734,10 @@ impl Dump {
             );
         }
 
-        let rows = sqlx::query(
-            format!(
-                "select 
-                quote_ident(n.nspname) as nspname,
-                t.oid as type_oid,
-                quote_ident(t.typname) as typname,
-                t.typnamespace,
-                t.typowner,
-                quote_ident(owner_role.rolname) as typowner_name,
-                t.typlen,
-                t.typbyval,
-                t.typtype,
-                t.typcategory,
-                t.typispreferred,
-                t.typisdefined,
-                t.typdelim,
-                t.typrelid,
-                t.typsubscript::text AS typsubscript,
-                t.typelem,
-                t.typarray,
-                t.typinput::text AS typinput,
-                t.typoutput::text AS typoutput,
-                t.typreceive::text AS typreceive,
-                t.typsend::text AS typsend,
-                t.typmodin::text AS typmodin,
-                t.typmodout::text AS typmodout,
-                t.typanalyze::text AS typanalyze,
-                t.typalign,
-                t.typstorage,
-                t.typnotnull,
-                t.typbasetype,
-                t.typtypmod,
-                t.typndims,
-                t.typcollation,
-                t.typdefault,
-                pg_catalog.format_type(t.typbasetype, t.typtypmod) as formatted_basetype,
-                case when t.typcollation <> 0 then
-                    (select quote_ident(cn.nspname) || '.' || quote_ident(cc.collname)
-                     from pg_collation cc
-                     join pg_namespace cn on cn.oid = cc.collnamespace
-                     where cc.oid = t.typcollation)
-                else null end as domain_collation_name,
-                coalesce(
-                    (select array_agg(acl_item::text) from unnest(t.typacl) as acl_item),
-                    '{{}}'::text[]
-                ) as typacl,
-                d.description as comment
-            from 
-                pg_type t 
-                join pg_namespace n on t.typnamespace = n.oid 
-                left join pg_class c on c.oid = t.typrelid
-                left join pg_roles owner_role on owner_role.oid = t.typowner
-                left join pg_description d on d.objoid = t.oid
-                    and d.classoid = 'pg_type'::regclass
-                    and d.objsubid = 0
-            where 
-                n.nspname in {} 
-                and (
-                    t.typtype in ('d', 'e', 'r', 'm')
-                    or (t.typtype = 'c' and c.relkind = 'c')
-                )
-                and t.typisdefined = true
-                and not exists (
-                    select 1 from pg_depend ext_dep
-                    where ext_dep.objid = t.oid
-                    and ext_dep.deptype = 'e'
-                )",
-                schema_filter
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch user-defined types: {e}.")))?;
+        let rows = sqlx::query(Self::build_types_query(schema_filter).as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch user-defined types: {e}.")))?;
 
         if rows.is_empty() {
             println!("No user-defined types found.");
@@ -800,12 +818,8 @@ impl Dump {
         Ok(())
     }
 
-    async fn fetch_domain_constraints_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-        types: &mut [PgType],
-    ) -> Result<(), Error> {
-        let query = format!(
+    fn build_domain_constraints_query(schema_filter: &str) -> String {
+        format!(
             "select
                 c.contypid as domain_oid,
                 c.conname,
@@ -818,14 +832,22 @@ impl Dump {
               and n.nspname in {}
               and not exists (
                   select 1 from pg_depend ext_dep
-                  where ext_dep.objid = c.contypid
+                  where ext_dep.classid = 'pg_type'::regclass
+                  and ext_dep.objid = c.contypid
+                  and ext_dep.objsubid = 0
                   and ext_dep.deptype = 'e'
               )
             order by c.contypid, c.conname",
             schema_filter
-        );
+        )
+    }
 
-        let rows = sqlx::query(query.as_str())
+    async fn fetch_domain_constraints_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+        types: &mut [PgType],
+    ) -> Result<(), Error> {
+        let rows = sqlx::query(Self::build_domain_constraints_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch domain constraints: {e}.")))?;
@@ -860,12 +882,31 @@ impl Dump {
         Ok(())
     }
 
+    fn build_enums_query() -> &'static str {
+        "select
+            e.*
+        from
+            pg_enum e
+        where
+            not exists
+            (
+                select 1
+                from
+                    pg_depend ext_dep
+                where
+                    ext_dep.classid = 'pg_type'::regclass and
+                    ext_dep.objid = e.enumtypid and
+                    ext_dep.objsubid = 0 and
+                    ext_dep.deptype = 'e'
+            )"
+    }
+
     async fn fetch_enums_standalone(
         pool: &PgPool,
         types: &mut [PgType],
         enums: &mut Vec<PgEnum>,
     ) -> Result<(), Error> {
-        let rows = sqlx::query("select e.* from pg_enum e where not exists (select 1 from pg_depend ext_dep where ext_dep.objid = e.enumtypid and ext_dep.deptype = 'e')")
+        let rows = sqlx::query(Self::build_enums_query())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch enums: {e}.")))?;
@@ -1001,7 +1042,9 @@ impl Dump {
                 left join pg_description seq_desc on seq_desc.objoid = seq_class.oid
                     and seq_desc.classoid = 'pg_class'::regclass
                     and seq_desc.objsubid = 0
-                left join pg_depend dep on dep.objid = seq_class.oid
+                left join pg_depend dep on dep.classid = 'pg_class'::regclass
+                    and dep.objid = seq_class.oid
+                    and dep.refclassid = 'pg_class'::regclass
                     and dep.deptype in ('a', 'i')
                 left join pg_class owner_table on owner_table.oid = dep.refobjid
                 left join pg_namespace owner_ns on owner_ns.oid = owner_table.relnamespace
@@ -1011,18 +1054,17 @@ impl Dump {
                 seq.schemaname in {}
                 and not exists (
                     select 1 from pg_depend ext_dep
-                    where ext_dep.objid = seq_class.oid
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = seq_class.oid
+                    and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )",
             schema_filter
         )
     }
 
-    async fn fetch_routines_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<Routine>, Error> {
-        let query = format!(
+    fn build_routines_standalone_query(schema_filter: &str) -> String {
+        format!(
             "select
                 quote_ident(n.nspname) as nspname,
                 r.oid,
@@ -1090,11 +1132,20 @@ impl Dump {
                 and r.prokind in ('f', 'p', 'a', 'w')
                 and not exists (
                     select 1 from pg_depend ext_dep
-                    where ext_dep.objid = r.oid
+                    where ext_dep.classid = 'pg_proc'::regclass
+                    and ext_dep.objid = r.oid
+                    and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 );",
             schema_filter
-        );
+        )
+    }
+
+    async fn fetch_routines_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Routine>, Error> {
+        let query = Self::build_routines_standalone_query(schema_filter);
 
         let rows = sqlx::query(query.as_str())
             .fetch_all(pool)
@@ -1402,7 +1453,9 @@ impl Dump {
                     and t.tablename not like 'pg_%'
                     and not exists (
                         select 1 from pg_depend ext_dep
-                        where ext_dep.objid = c.oid
+                        where ext_dep.classid = 'pg_class'::regclass
+                        and ext_dep.objid = c.oid
+                        and ext_dep.objsubid = 0
                         and ext_dep.deptype = 'e'
                     );",
             schema_filter
@@ -1625,7 +1678,9 @@ impl Dump {
                 and v.table_schema in {}
                 and not exists (
                     select 1 from pg_depend ext_dep
-                    where ext_dep.objid = c.oid
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )
             group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
@@ -1645,7 +1700,9 @@ impl Dump {
                         from pg_depend dep
                         join pg_class dc on dc.oid = dep.refobjid
                         join pg_namespace n on n.oid = dc.relnamespace
-                        where dep.objid = c.oid
+                        where dep.classid = 'pg_class'::regclass
+                          and dep.objid = c.oid
+                          and dep.refclassid = 'pg_class'::regclass
                           and dep.deptype = 'n'
                           and dc.relkind in ('r', 'v', 'm')
                     ) as table_relation,
@@ -1663,7 +1720,9 @@ impl Dump {
                 and mv.schemaname in {}
                 and not exists (
                     select 1 from pg_depend ext_dep
-                    where ext_dep.objid = c.oid
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 );",
             schema_filter
@@ -1691,49 +1750,89 @@ impl Dump {
         )
     }
 
+    fn build_foreign_tables_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as ft_schema,
+                quote_ident(c.relname) as ft_name,
+                quote_ident(s.srvname) as ft_server,
+                quote_ident(r.rolname) as ft_owner,
+                coalesce(
+                    array(
+                        select option_name || ' ' || quote_literal(option_value)
+                        from pg_options_to_table(ft.ftoptions)
+                    ),
+                    array[]::text[]
+                ) as ft_options,
+                d.description as ft_comment,
+                c.relacl::text[] as ft_acl
+            from pg_foreign_table ft
+            join pg_class c on c.oid = ft.ftrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_foreign_server s on s.oid = ft.ftserver
+            left join pg_roles r on r.oid = c.relowner
+            left join pg_description d on d.objoid = c.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = 0
+            where
+                n.nspname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
+            order by n.nspname, c.relname",
+            schema_filter
+        )
+    }
+
+    fn build_foreign_table_columns_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as ft_schema,
+                quote_ident(c.relname) as ft_name,
+                quote_ident(a.attname) as col_name,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as col_type,
+                a.attnotnull as col_notnull,
+                pg_get_expr(ad.adbin, ad.adrelid) as col_default,
+                coalesce(
+                    array(
+                        select option_name || ' ' || quote_literal(option_value)
+                        from pg_options_to_table(a.attfdwoptions)
+                    ),
+                    array[]::text[]
+                ) as col_options
+            from pg_attribute a
+            join pg_class c on c.oid = a.attrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_foreign_table ft on ft.ftrelid = c.oid
+            left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
+            where
+                n.nspname in {}
+                and a.attnum > 0
+                and not a.attisdropped
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
+            order by n.nspname, c.relname, a.attnum",
+            schema_filter
+        )
+    }
+
     async fn fetch_foreign_tables_standalone(
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<Vec<ForeignTable>, Error> {
-        let rows = sqlx::query(
-            format!(
-                "select
-                    quote_ident(n.nspname) as ft_schema,
-                    quote_ident(c.relname) as ft_name,
-                    quote_ident(s.srvname) as ft_server,
-                    quote_ident(r.rolname) as ft_owner,
-                    coalesce(
-                        array(
-                            select option_name || ' ' || quote_literal(option_value)
-                            from pg_options_to_table(ft.ftoptions)
-                        ),
-                        array[]::text[]
-                    ) as ft_options,
-                    d.description as ft_comment,
-                    c.relacl::text[] as ft_acl
-                from pg_foreign_table ft
-                join pg_class c on c.oid = ft.ftrelid
-                join pg_namespace n on n.oid = c.relnamespace
-                join pg_foreign_server s on s.oid = ft.ftserver
-                left join pg_roles r on r.oid = c.relowner
-                left join pg_description d on d.objoid = c.oid
-                    and d.classoid = 'pg_class'::regclass
-                    and d.objsubid = 0
-                where
-                    n.nspname in {}
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = c.oid
-                        and ext_dep.deptype = 'e'
-                    )
-                order by n.nspname, c.relname",
-                schema_filter
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch foreign tables: {e}.")))?;
+        let rows = sqlx::query(Self::build_foreign_tables_query(schema_filter).as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch foreign tables: {e}.")))?;
 
         let mut foreign_tables = Vec::new();
 
@@ -1743,44 +1842,13 @@ impl Dump {
             println!("Foreign tables found:");
 
             // Fetch all foreign table columns at once
-            let col_rows = sqlx::query(
-                format!(
-                    "select
-                        quote_ident(n.nspname) as ft_schema,
-                        quote_ident(c.relname) as ft_name,
-                        quote_ident(a.attname) as col_name,
-                        pg_catalog.format_type(a.atttypid, a.atttypmod) as col_type,
-                        a.attnotnull as col_notnull,
-                        pg_get_expr(ad.adbin, ad.adrelid) as col_default,
-                        coalesce(
-                            array(
-                                select option_name || ' ' || quote_literal(option_value)
-                                from pg_options_to_table(a.attfdwoptions)
-                            ),
-                            array[]::text[]
-                        ) as col_options
-                    from pg_attribute a
-                    join pg_class c on c.oid = a.attrelid
-                    join pg_namespace n on n.oid = c.relnamespace
-                    join pg_foreign_table ft on ft.ftrelid = c.oid
-                    left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
-                    where
-                        n.nspname in {}
-                        and a.attnum > 0
-                        and not a.attisdropped
-                        and not exists (
-                            select 1 from pg_depend ext_dep
-                            where ext_dep.objid = c.oid
-                            and ext_dep.deptype = 'e'
-                        )
-                    order by n.nspname, c.relname, a.attnum",
-                    schema_filter
-                )
-                .as_str(),
-            )
-            .fetch_all(pool)
-            .await
-            .map_err(|e| Error::other(format!("Failed to fetch foreign table columns: {e}.")))?;
+            let col_rows =
+                sqlx::query(Self::build_foreign_table_columns_query(schema_filter).as_str())
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| {
+                        Error::other(format!("Failed to fetch foreign table columns: {e}."))
+                    })?;
 
             // Build column map: (schema, name) -> Vec<ForeignTableColumn>
             let mut col_map: HashMap<(String, String), Vec<ForeignTableColumn>> = HashMap::new();
@@ -1840,45 +1908,48 @@ impl Dump {
         Ok(foreign_tables)
     }
 
+    fn build_statistics_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as stat_schema,
+                quote_ident(s.stxname) as stat_name,
+                quote_ident(r.rolname) as stat_owner,
+                quote_ident(tn.nspname) as table_schema,
+                quote_ident(tc.relname) as table_name,
+                s.stxkind::text[] as stat_kinds,
+                pg_get_statisticsobjdef(s.oid) as stat_def,
+                d.description as stat_comment,
+                s.stxstattarget as stat_target
+            from pg_statistic_ext s
+            join pg_namespace n on n.oid = s.stxnamespace
+            join pg_class tc on tc.oid = s.stxrelid
+            join pg_namespace tn on tn.oid = tc.relnamespace
+            left join pg_roles r on r.oid = s.stxowner
+            left join pg_description d on d.objoid = s.oid
+                and d.classoid = 'pg_statistic_ext'::regclass
+                and d.objsubid = 0
+            where
+                n.nspname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_statistic_ext'::regclass
+                    and ext_dep.objid = s.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
+            order by n.nspname, s.stxname",
+            schema_filter
+        )
+    }
+
     async fn fetch_statistics_standalone(
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<Vec<Statistic>, Error> {
-        let rows = sqlx::query(
-            format!(
-                "select
-                    quote_ident(n.nspname) as stat_schema,
-                    quote_ident(s.stxname) as stat_name,
-                    quote_ident(r.rolname) as stat_owner,
-                    quote_ident(tn.nspname) as table_schema,
-                    quote_ident(tc.relname) as table_name,
-                    s.stxkind::text[] as stat_kinds,
-                    pg_get_statisticsobjdef(s.oid) as stat_def,
-                    d.description as stat_comment,
-                    s.stxstattarget as stat_target
-                from pg_statistic_ext s
-                join pg_namespace n on n.oid = s.stxnamespace
-                join pg_class tc on tc.oid = s.stxrelid
-                join pg_namespace tn on tn.oid = tc.relnamespace
-                left join pg_roles r on r.oid = s.stxowner
-                left join pg_description d on d.objoid = s.oid
-                    and d.classoid = 'pg_statistic_ext'::regclass
-                    and d.objsubid = 0
-                where
-                    n.nspname in {}
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = s.oid
-                        and ext_dep.deptype = 'e'
-                    )
-                order by n.nspname, s.stxname",
-                schema_filter
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch extended statistics: {e}.")))?;
+        let rows = sqlx::query(Self::build_statistics_query(schema_filter).as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch extended statistics: {e}.")))?;
 
         let mut statistics = Vec::new();
 
@@ -1979,11 +2050,8 @@ impl Dump {
     /// requires `refobjsubid > 0` so we only pick up *column-level*
     /// edges (table-level edges have `refobjsubid = 0` and would
     /// duplicate the index/constraint/policy table dependency).
-    async fn fetch_column_dependents_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<ColumnDependent>, Error> {
-        let query = format!(
+    fn build_column_dependents_query(schema_filter: &str) -> String {
+        format!(
             "select
                 quote_ident(refnsp.nspname) as table_schema,
                 quote_ident(refcls.relname) as table_name,
@@ -2010,7 +2078,10 @@ impl Dump {
               and refatt.attisdropped = false
               and not exists (
                   select 1 from pg_catalog.pg_depend ext
-                  where ext.objid = ix_cls.oid and ext.deptype = 'e'
+                  where ext.classid = 'pg_catalog.pg_class'::regclass
+                  and ext.objid = ix_cls.oid
+                  and ext.objsubid = 0
+                  and ext.deptype = 'e'
               )
             union all
             select
@@ -2037,7 +2108,10 @@ impl Dump {
               and refatt.attisdropped = false
               and not exists (
                   select 1 from pg_catalog.pg_depend ext
-                  where ext.objid = con.oid and ext.deptype = 'e'
+                  where ext.classid = 'pg_catalog.pg_constraint'::regclass
+                  and ext.objid = con.oid
+                  and ext.objsubid = 0
+                  and ext.deptype = 'e'
               )
             union all
             select
@@ -2063,9 +2137,14 @@ impl Dump {
               and refnsp.nspname in {schema_filter}
               and refatt.attisdropped = false",
             schema_filter = schema_filter
-        );
+        )
+    }
 
-        let rows = sqlx::query(query.as_str())
+    async fn fetch_column_dependents_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<ColumnDependent>, Error> {
+        let rows = sqlx::query(Self::build_column_dependents_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch column dependents: {e}.")))?;
@@ -2097,40 +2176,43 @@ impl Dump {
         Ok(dependents)
     }
 
+    fn build_rules_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as rule_schema,
+                quote_ident(c.relname) as rule_table,
+                quote_ident(r.rulename) as rule_name,
+                pg_get_ruledef(r.oid, true) as rule_definition,
+                d.description as rule_comment
+            from pg_rewrite r
+            join pg_class c on c.oid = r.ev_class
+            join pg_namespace n on n.oid = c.relnamespace
+            left join pg_description d on d.objoid = r.oid
+                and d.classoid = 'pg_rewrite'::regclass
+                and d.objsubid = 0
+            where
+                n.nspname in {}
+                and r.rulename <> '_RETURN'
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
+            order by n.nspname, c.relname, r.rulename",
+            schema_filter
+        )
+    }
+
     async fn fetch_rules_standalone(
         pool: &PgPool,
         schema_filter: &str,
     ) -> Result<Vec<Rule>, Error> {
-        let rows = sqlx::query(
-            format!(
-                "select
-                    quote_ident(n.nspname) as rule_schema,
-                    quote_ident(c.relname) as rule_table,
-                    quote_ident(r.rulename) as rule_name,
-                    pg_get_ruledef(r.oid, true) as rule_definition,
-                    d.description as rule_comment
-                from pg_rewrite r
-                join pg_class c on c.oid = r.ev_class
-                join pg_namespace n on n.oid = c.relnamespace
-                left join pg_description d on d.objoid = r.oid
-                    and d.classoid = 'pg_rewrite'::regclass
-                    and d.objsubid = 0
-                where
-                    n.nspname in {}
-                    and r.rulename <> '_RETURN'
-                    and not exists (
-                        select 1 from pg_depend ext_dep
-                        where ext_dep.objid = c.oid
-                        and ext_dep.deptype = 'e'
-                    )
-                order by n.nspname, c.relname, r.rulename",
-                schema_filter
-            )
-            .as_str(),
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch rules: {e}.")))?;
+        let rows = sqlx::query(Self::build_rules_query(schema_filter).as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch rules: {e}.")))?;
 
         let mut rules = Vec::new();
 
@@ -2214,6 +2296,51 @@ impl Dump {
         Ok(event_triggers)
     }
 
+    fn build_collations_query(
+        coll_locale_col: &str,
+        icu_locale_col: &str,
+        icu_rules_col: &str,
+        schema_filter: &str,
+    ) -> String {
+        format!(
+            "SELECT
+                quote_ident(n.nspname) as coll_schema,
+                quote_ident(c.collname) as coll_name,
+                COALESCE(quote_ident(r.rolname), '') as coll_owner,
+                c.collprovider::text as coll_provider,
+                {} as coll_locale,
+                c.collcollate as coll_collate,
+                c.collctype as coll_ctype,
+                {} as coll_icu_locale,
+                {} as coll_icu_rules,
+                c.collisdeterministic as coll_deterministic,
+                d.description as coll_comment
+             FROM pg_collation c
+             JOIN pg_namespace n ON n.oid = c.collnamespace
+             LEFT JOIN pg_roles r ON r.oid = c.collowner
+             LEFT JOIN pg_description d ON d.objoid = c.oid
+                 AND d.classoid = 'pg_collation'::regclass AND d.objsubid = 0
+             WHERE n.nspname IN {}
+               AND c.collencoding IN (-1, (SELECT encoding FROM pg_database WHERE datname = current_database()))
+               AND NOT EXISTS
+               (
+                    SELECT 1
+                    FROM
+                        pg_depend ext
+                    WHERE
+                        ext.classid = 'pg_collation'::regclass AND
+                        ext.objid = c.oid AND
+                        ext.objsubid = 0 AND
+                        ext.deptype = 'e'
+                    )
+             ORDER BY n.nspname, c.collname",
+            coll_locale_col,
+            icu_locale_col,
+            icu_rules_col,
+            schema_filter
+        )
+    }
+
     async fn fetch_collations_standalone(
         pool: &PgPool,
         schema_filter: &str,
@@ -2253,32 +2380,11 @@ impl Dump {
             "NULL::text"
         };
 
-        let query = format!(
-            "SELECT
-                quote_ident(n.nspname) as coll_schema,
-                quote_ident(c.collname) as coll_name,
-                COALESCE(quote_ident(r.rolname), '') as coll_owner,
-                c.collprovider::text as coll_provider,
-                {} as coll_locale,
-                c.collcollate as coll_collate,
-                c.collctype as coll_ctype,
-                {} as coll_icu_locale,
-                {} as coll_icu_rules,
-                c.collisdeterministic as coll_deterministic,
-                d.description as coll_comment
-             FROM pg_collation c
-             JOIN pg_namespace n ON n.oid = c.collnamespace
-             LEFT JOIN pg_roles r ON r.oid = c.collowner
-             LEFT JOIN pg_description d ON d.objoid = c.oid
-                 AND d.classoid = 'pg_collation'::regclass AND d.objsubid = 0
-             WHERE n.nspname IN {}
-               AND c.collencoding IN (-1, (SELECT encoding FROM pg_database WHERE datname = current_database()))
-               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
-             ORDER BY n.nspname, c.collname",
+        let query = Self::build_collations_query(
             coll_locale_col,
             icu_locale_col,
             icu_rules_col,
-            schema_filter
+            schema_filter,
         );
 
         let rows = sqlx::query(query.as_str())
@@ -2318,11 +2424,8 @@ impl Dump {
         Ok(collations)
     }
 
-    async fn fetch_ts_configs_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<TextSearchConfig>, Error> {
-        let query = format!(
+    fn build_ts_configs_query(schema_filter: &str) -> String {
+        format!(
             "SELECT
                 quote_ident(n.nspname) as cfg_schema,
                 quote_ident(c.cfgname) as cfg_name,
@@ -2337,23 +2440,24 @@ impl Dump {
              LEFT JOIN pg_description d ON d.objoid = c.oid
                  AND d.classoid = 'pg_ts_config'::regclass AND d.objsubid = 0
              WHERE n.nspname IN {}
-               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
+               AND NOT EXISTS
+               (
+                    SELECT 1
+                    FROM
+                        pg_depend ext
+                    WHERE
+                        ext.classid = 'pg_ts_config'::regclass AND
+                        ext.objid = c.oid AND
+                        ext.objsubid = 0 AND
+                        ext.deptype = 'e'
+                    )
              ORDER BY n.nspname, c.cfgname",
             schema_filter
-        );
+        )
+    }
 
-        let config_rows = sqlx::query(query.as_str())
-            .fetch_all(pool)
-            .await
-            .map_err(|e| Error::other(format!("Failed to fetch text search configs: {e}.")))?;
-
-        if config_rows.is_empty() {
-            println!("No user-defined text search configurations found.");
-            return Ok(Vec::new());
-        }
-
-        // Fetch mappings for each config using pg_ts_config_map
-        let mapping_query = format!(
+    fn build_ts_config_mappings_query(schema_filter: &str) -> String {
+        format!(
             "SELECT
                 c.cfgnamespace as cfg_ns,
                 c.oid as cfg_oid,
@@ -2370,18 +2474,70 @@ impl Dump {
              JOIN pg_ts_dict d ON d.oid = m.mapdict
              JOIN pg_namespace dn ON dn.oid = d.dictnamespace
              WHERE n.nspname IN {}
-               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
+               AND NOT EXISTS
+               (
+                    SELECT 1
+                    FROM
+                        pg_depend ext
+                    WHERE
+                        ext.classid = 'pg_ts_config'::regclass AND
+                        ext.objid = c.oid AND
+                        ext.objsubid = 0 AND
+                        ext.deptype = 'e'
+                )
              GROUP BY c.cfgnamespace, c.oid, c.cfgname, t.alias
              ORDER BY c.oid, t.alias",
             schema_filter
-        );
+        )
+    }
 
-        let mapping_rows = sqlx::query(mapping_query.as_str())
+    fn build_ts_config_oids_query(schema_filter: &str) -> String {
+        format!(
+            "SELECT
+                c.oid as cfg_oid,
+                quote_ident(n.nspname) as cfg_schema,
+                quote_ident(c.cfgname) as cfg_name
+             FROM pg_ts_config c
+             JOIN pg_namespace n ON n.oid = c.cfgnamespace
+             WHERE n.nspname IN {}
+               AND NOT EXISTS
+               (
+                    SELECT 1
+                    FROM
+                        pg_depend ext
+                    WHERE
+                        ext.classid = 'pg_ts_config'::regclass AND
+                        ext.objid = c.oid AND
+                        ext.objsubid = 0 AND
+                        ext.deptype = 'e'
+                    )
+             ORDER BY n.nspname, c.cfgname",
+            schema_filter
+        )
+    }
+
+    async fn fetch_ts_configs_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<TextSearchConfig>, Error> {
+        let config_rows = sqlx::query(Self::build_ts_configs_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
-            .map_err(|e| {
-                Error::other(format!("Failed to fetch text search config mappings: {e}."))
-            })?;
+            .map_err(|e| Error::other(format!("Failed to fetch text search configs: {e}.")))?;
+
+        if config_rows.is_empty() {
+            println!("No user-defined text search configurations found.");
+            return Ok(Vec::new());
+        }
+
+        // Fetch mappings for each config using pg_ts_config_map
+        let mapping_rows =
+            sqlx::query(Self::build_ts_config_mappings_query(schema_filter).as_str())
+                .fetch_all(pool)
+                .await
+                .map_err(|e| {
+                    Error::other(format!("Failed to fetch text search config mappings: {e}."))
+                })?;
 
         // Build a map from cfg_oid to list of "token_type:dict1,dict2" strings
         let mut mapping_map: HashMap<Oid, Vec<String>> = HashMap::new();
@@ -2424,20 +2580,7 @@ impl Dump {
         }
 
         // Re-run a combined query to get configs with their OIDs for mapping association
-        let combined_query = format!(
-            "SELECT
-                c.oid as cfg_oid,
-                quote_ident(n.nspname) as cfg_schema,
-                quote_ident(c.cfgname) as cfg_name
-             FROM pg_ts_config c
-             JOIN pg_namespace n ON n.oid = c.cfgnamespace
-             WHERE n.nspname IN {}
-               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = c.oid AND ext.deptype = 'e')
-             ORDER BY n.nspname, c.cfgname",
-            schema_filter
-        );
-
-        let oid_rows = sqlx::query(combined_query.as_str())
+        let oid_rows = sqlx::query(Self::build_ts_config_oids_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch text search config OIDs: {e}.")))?;
@@ -2460,11 +2603,8 @@ impl Dump {
         Ok(ts_configs)
     }
 
-    async fn fetch_ts_dicts_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<TextSearchDict>, Error> {
-        let query = format!(
+    fn build_ts_dicts_query(schema_filter: &str) -> String {
+        format!(
             "SELECT
                 quote_ident(n.nspname) as dict_schema,
                 quote_ident(d.dictname) as dict_name,
@@ -2480,12 +2620,27 @@ impl Dump {
              LEFT JOIN pg_description desc2 ON desc2.objoid = d.oid
                  AND desc2.classoid = 'pg_ts_dict'::regclass AND desc2.objsubid = 0
              WHERE n.nspname IN {}
-               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = d.oid AND ext.deptype = 'e')
+               AND NOT EXISTS
+               (
+                    SELECT 1
+                    FROM
+                        pg_depend ext
+                    WHERE
+                        ext.classid = 'pg_ts_dict'::regclass AND
+                        ext.objid = d.oid AND
+                        ext.objsubid = 0 AND
+                        ext.deptype = 'e'
+                )
              ORDER BY n.nspname, d.dictname",
             schema_filter
-        );
+        )
+    }
 
-        let rows = sqlx::query(query.as_str())
+    async fn fetch_ts_dicts_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<TextSearchDict>, Error> {
+        let rows = sqlx::query(Self::build_ts_dicts_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch text search dicts: {e}.")))?;
@@ -2525,11 +2680,8 @@ impl Dump {
         Ok(ts_dicts)
     }
 
-    async fn fetch_casts_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<Cast>, Error> {
-        let query = format!(
+    fn build_casts_query(schema_filter: &str) -> String {
+        format!(
             "WITH user_types AS (
                 SELECT t.oid
                 FROM pg_type t
@@ -2551,14 +2703,29 @@ impl Dump {
             LEFT JOIN pg_namespace fn2 ON fn2.oid = p.pronamespace
             LEFT JOIN pg_description d ON d.objoid = c.oid
                 AND d.classoid = 'pg_cast'::regclass AND d.objsubid = 0
-            WHERE NOT EXISTS (SELECT 1 FROM pg_depend pd WHERE pd.objid = c.oid AND pd.deptype IN ('e', 'i'))
+            WHERE NOT EXISTS
+            (
+                SELECT 1
+                FROM
+                    pg_depend pd
+                WHERE
+                    pd.classid = 'pg_cast'::regclass AND
+                    pd.objid = c.oid AND
+                    pd.objsubid = 0 AND
+                    pd.deptype IN ('e', 'i')
+            )
               AND (c.castsource IN (SELECT oid FROM user_types)
                    OR c.casttarget IN (SELECT oid FROM user_types))
             ORDER BY source_type, target_type",
             schema_filter
-        );
+        )
+    }
 
-        let rows = sqlx::query(query.as_str())
+    async fn fetch_casts_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Cast>, Error> {
+        let rows = sqlx::query(Self::build_casts_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch casts: {e}.")))?;
@@ -2590,11 +2757,8 @@ impl Dump {
         Ok(casts)
     }
 
-    async fn fetch_operators_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<Operator>, Error> {
-        let query = format!(
+    fn build_operators_query(schema_filter: &str) -> String {
+        format!(
             "SELECT
                 quote_ident(n.nspname) as op_schema,
                 o.oprname as op_name,
@@ -2630,12 +2794,27 @@ impl Dump {
              LEFT JOIN pg_description d ON d.objoid = o.oid
                  AND d.classoid = 'pg_operator'::regclass AND d.objsubid = 0
              WHERE n.nspname IN {}
-               AND NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = o.oid AND ext.deptype = 'e')
+               AND NOT EXISTS
+               (
+                    SELECT 1
+                    FROM
+                        pg_depend ext
+                    WHERE
+                        ext.classid = 'pg_operator'::regclass AND
+                        ext.objid = o.oid AND
+                        ext.objsubid = 0 AND
+                        ext.deptype = 'e'
+                )
              ORDER BY n.nspname, o.oprname",
             schema_filter
-        );
+        )
+    }
 
-        let rows = sqlx::query(query.as_str())
+    async fn fetch_operators_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Operator>, Error> {
+        let rows = sqlx::query(Self::build_operators_query(schema_filter).as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| Error::other(format!("Failed to fetch operators: {e}.")))?;
@@ -2847,33 +3026,45 @@ impl Dump {
         }
     }
 
-    async fn fetch_fdws_standalone(pool: &PgPool) -> Result<Vec<ForeignDataWrapper>, Error> {
-        let rows = sqlx::query(
-            "SELECT
-                quote_ident(fdw.fdwname) as fdw_name,
-                COALESCE(quote_ident(r.rolname), '') as fdw_owner,
-                CASE WHEN fdw.fdwhandler != 0 THEN
-                    quote_ident(hn.nspname) || '.' || quote_ident(hp.proname)
-                ELSE NULL END as handler_func,
-                CASE WHEN fdw.fdwvalidator != 0 THEN
-                    quote_ident(vn.nspname) || '.' || quote_ident(vp.proname)
-                ELSE NULL END as validator_func,
-                COALESCE(fdw.fdwoptions, '{}'::text[]) as fdw_options,
-                d.description as fdw_comment
-             FROM pg_foreign_data_wrapper fdw
-             LEFT JOIN pg_roles r ON r.oid = fdw.fdwowner
-             LEFT JOIN pg_proc hp ON hp.oid = fdw.fdwhandler
-             LEFT JOIN pg_namespace hn ON hn.oid = hp.pronamespace
-             LEFT JOIN pg_proc vp ON vp.oid = fdw.fdwvalidator
-             LEFT JOIN pg_namespace vn ON vn.oid = vp.pronamespace
-             LEFT JOIN pg_description d ON d.objoid = fdw.oid
-                 AND d.classoid = 'pg_foreign_data_wrapper'::regclass AND d.objsubid = 0
-             WHERE NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = fdw.oid AND ext.deptype = 'e')
-             ORDER BY fdw.fdwname",
+    fn build_fdws_query() -> &'static str {
+        "SELECT
+            quote_ident(fdw.fdwname) as fdw_name,
+            COALESCE(quote_ident(r.rolname), '') as fdw_owner,
+            CASE WHEN fdw.fdwhandler != 0 THEN
+                quote_ident(hn.nspname) || '.' || quote_ident(hp.proname)
+            ELSE NULL END as handler_func,
+            CASE WHEN fdw.fdwvalidator != 0 THEN
+                quote_ident(vn.nspname) || '.' || quote_ident(vp.proname)
+            ELSE NULL END as validator_func,
+            COALESCE(fdw.fdwoptions, '{}'::text[]) as fdw_options,
+            d.description as fdw_comment
+         FROM pg_foreign_data_wrapper fdw
+         LEFT JOIN pg_roles r ON r.oid = fdw.fdwowner
+         LEFT JOIN pg_proc hp ON hp.oid = fdw.fdwhandler
+         LEFT JOIN pg_namespace hn ON hn.oid = hp.pronamespace
+         LEFT JOIN pg_proc vp ON vp.oid = fdw.fdwvalidator
+         LEFT JOIN pg_namespace vn ON vn.oid = vp.pronamespace
+         LEFT JOIN pg_description d ON d.objoid = fdw.oid
+             AND d.classoid = 'pg_foreign_data_wrapper'::regclass AND d.objsubid = 0
+         WHERE NOT EXISTS
+         (
+            SELECT 1
+            FROM
+                pg_depend ext
+            WHERE
+                ext.classid = 'pg_foreign_data_wrapper'::regclass AND
+                ext.objid = fdw.oid AND
+                ext.objsubid = 0 AND
+                ext.deptype = 'e'
         )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch foreign data wrappers: {e}.")))?;
+         ORDER BY fdw.fdwname"
+    }
+
+    async fn fetch_fdws_standalone(pool: &PgPool) -> Result<Vec<ForeignDataWrapper>, Error> {
+        let rows = sqlx::query(Self::build_fdws_query())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch foreign data wrappers: {e}.")))?;
 
         let mut fdws = Vec::new();
         if rows.is_empty() {
@@ -2900,27 +3091,39 @@ impl Dump {
         Ok(fdws)
     }
 
-    async fn fetch_servers_standalone(pool: &PgPool) -> Result<Vec<ForeignServer>, Error> {
-        let rows = sqlx::query(
-            "SELECT
-                quote_ident(s.srvname) as srv_name,
-                COALESCE(quote_ident(r.rolname), '') as srv_owner,
-                quote_ident(fdw.fdwname) as fdw_name,
-                s.srvtype as srv_type,
-                s.srvversion as srv_version,
-                COALESCE(s.srvoptions, '{}'::text[]) as srv_options,
-                d.description as srv_comment
-             FROM pg_foreign_server s
-             JOIN pg_foreign_data_wrapper fdw ON fdw.oid = s.srvfdw
-             LEFT JOIN pg_roles r ON r.oid = s.srvowner
-             LEFT JOIN pg_description d ON d.objoid = s.oid
-                 AND d.classoid = 'pg_foreign_server'::regclass AND d.objsubid = 0
-             WHERE NOT EXISTS (SELECT 1 FROM pg_depend ext WHERE ext.objid = s.oid AND ext.deptype = 'e')
-             ORDER BY s.srvname",
+    fn build_servers_query() -> &'static str {
+        "SELECT
+            quote_ident(s.srvname) as srv_name,
+            COALESCE(quote_ident(r.rolname), '') as srv_owner,
+            quote_ident(fdw.fdwname) as fdw_name,
+            s.srvtype as srv_type,
+            s.srvversion as srv_version,
+            COALESCE(s.srvoptions, '{}'::text[]) as srv_options,
+            d.description as srv_comment
+         FROM pg_foreign_server s
+         JOIN pg_foreign_data_wrapper fdw ON fdw.oid = s.srvfdw
+         LEFT JOIN pg_roles r ON r.oid = s.srvowner
+         LEFT JOIN pg_description d ON d.objoid = s.oid
+             AND d.classoid = 'pg_foreign_server'::regclass AND d.objsubid = 0
+         WHERE NOT EXISTS
+         (
+            SELECT 1
+            FROM
+                pg_depend ext
+            WHERE
+                ext.classid = 'pg_foreign_server'::regclass AND
+                ext.objid = s.oid AND
+                ext.objsubid = 0 AND
+                ext.deptype = 'e'
         )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch foreign servers: {e}.")))?;
+         ORDER BY s.srvname"
+    }
+
+    async fn fetch_servers_standalone(pool: &PgPool) -> Result<Vec<ForeignServer>, Error> {
+        let rows = sqlx::query(Self::build_servers_query())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch foreign servers: {e}.")))?;
 
         let mut servers = Vec::new();
         if rows.is_empty() {

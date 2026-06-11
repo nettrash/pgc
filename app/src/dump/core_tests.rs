@@ -777,3 +777,250 @@ fn require_view_definition_errors_with_materialized_kind_when_null() {
         "message must hint at the privilege cause: {msg}"
     );
 }
+
+fn assert_extension_filter_with_alias(
+    query: &str,
+    alias: &str,
+    expected_classid: &str,
+    deptype_fragment: &str,
+    context: &str,
+) {
+    assert!(
+        query.contains(&format!("{alias}.classid = '{expected_classid}'::regclass")),
+        "{context}: missing classid guard '{alias}.classid = \\'{expected_classid}\\'::regclass'"
+    );
+    assert!(
+        query.contains(&format!("{alias}.objsubid = 0")),
+        "{context}: missing whole-object guard '{alias}.objsubid = 0'"
+    );
+    assert!(
+        query.contains(&format!("{alias}.{deptype_fragment}")),
+        "{context}: missing deptype guard '{alias}.{deptype_fragment}'"
+    );
+}
+
+fn assert_extension_filter(query: &str, expected_classid: &str, context: &str) {
+    assert_extension_filter_with_alias(
+        query,
+        "ext_dep",
+        expected_classid,
+        "deptype = 'e'",
+        context,
+    );
+}
+
+#[test]
+fn build_tables_standalone_query_extension_filter_is_precise() {
+    let query = Dump::build_tables_standalone_query("('public')");
+    assert_extension_filter(&query, "pg_class", "tables");
+}
+
+#[test]
+fn build_sequences_standalone_query_extension_filter_is_precise() {
+    let query = Dump::build_sequences_standalone_query("('public')");
+    assert_extension_filter(&query, "pg_class", "sequences");
+}
+
+#[test]
+fn build_regular_views_query_extension_filter_is_precise() {
+    let query = Dump::build_regular_views_query("('public')");
+    assert_extension_filter(&query, "pg_class", "regular views");
+}
+
+#[test]
+fn build_materialized_views_query_extension_filter_is_precise() {
+    let query = Dump::build_materialized_views_query("('public')");
+    assert_extension_filter(&query, "pg_class", "materialized views");
+}
+
+#[test]
+fn build_routines_standalone_query_extension_filter_is_precise() {
+    let query = Dump::build_routines_standalone_query("('public')");
+    assert_extension_filter(&query, "pg_proc", "routines");
+}
+
+#[test]
+fn build_composite_type_attributes_query_extension_filter_is_precise() {
+    let query = Dump::build_composite_type_attributes_query("('public')");
+    assert_extension_filter(&query, "pg_type", "composite type attributes");
+}
+
+#[test]
+fn build_range_types_query_extension_filter_is_precise() {
+    let query = Dump::build_range_types_query("('public')", "null::text as multirange_name", "");
+    assert_extension_filter(&query, "pg_type", "range types");
+}
+
+#[test]
+fn build_types_query_extension_filter_is_precise() {
+    let query = Dump::build_types_query("('public')");
+    assert_extension_filter(&query, "pg_type", "types");
+}
+
+#[test]
+fn build_foreign_tables_query_extension_filter_is_precise() {
+    let query = Dump::build_foreign_tables_query("('public')");
+    assert_extension_filter(&query, "pg_class", "foreign tables");
+}
+
+#[test]
+fn build_foreign_table_columns_query_extension_filter_is_precise() {
+    let query = Dump::build_foreign_table_columns_query("('public')");
+    assert_extension_filter(&query, "pg_class", "foreign table columns");
+}
+
+#[test]
+fn build_statistics_query_extension_filter_is_precise() {
+    let query = Dump::build_statistics_query("('public')");
+    assert_extension_filter(&query, "pg_statistic_ext", "extended statistics");
+}
+
+#[test]
+fn build_rules_query_extension_filter_is_precise() {
+    let query = Dump::build_rules_query("('public')");
+    assert_extension_filter(&query, "pg_class", "rules");
+}
+
+#[test]
+fn build_domain_constraints_query_extension_filter_is_precise() {
+    let query = Dump::build_domain_constraints_query("('public')");
+    assert_extension_filter(&query, "pg_type", "domain constraints");
+}
+
+#[test]
+fn build_enums_query_extension_filter_is_precise() {
+    let query = Dump::build_enums_query();
+    assert_extension_filter(query, "pg_type", "enums");
+}
+
+#[test]
+fn build_collations_query_extension_filter_is_precise() {
+    let query = Dump::build_collations_query(
+        "c.colllocale",
+        "c.colliculocale",
+        "c.collicurules",
+        "('public')",
+    );
+    assert_extension_filter_with_alias(
+        &query,
+        "ext",
+        "pg_collation",
+        "deptype = 'e'",
+        "collations",
+    );
+}
+
+#[test]
+fn build_ts_configs_query_extension_filter_is_precise() {
+    let query = Dump::build_ts_configs_query("('public')");
+    assert_extension_filter_with_alias(
+        &query,
+        "ext",
+        "pg_ts_config",
+        "deptype = 'e'",
+        "ts_configs",
+    );
+}
+
+#[test]
+fn build_ts_config_mappings_query_extension_filter_is_precise() {
+    let query = Dump::build_ts_config_mappings_query("('public')");
+    assert_extension_filter_with_alias(
+        &query,
+        "ext",
+        "pg_ts_config",
+        "deptype = 'e'",
+        "ts_config_mappings",
+    );
+}
+
+#[test]
+fn build_ts_config_oids_query_extension_filter_is_precise() {
+    let query = Dump::build_ts_config_oids_query("('public')");
+    assert_extension_filter_with_alias(
+        &query,
+        "ext",
+        "pg_ts_config",
+        "deptype = 'e'",
+        "ts_config_oids",
+    );
+}
+
+#[test]
+fn build_ts_dicts_query_extension_filter_is_precise() {
+    let query = Dump::build_ts_dicts_query("('public')");
+    assert_extension_filter_with_alias(&query, "ext", "pg_ts_dict", "deptype = 'e'", "ts_dicts");
+}
+
+#[test]
+fn build_casts_query_extension_filter_is_precise() {
+    let query = Dump::build_casts_query("('public')");
+    assert_extension_filter_with_alias(&query, "pd", "pg_cast", "deptype IN ('e', 'i')", "casts");
+}
+
+#[test]
+fn build_operators_query_extension_filter_is_precise() {
+    let query = Dump::build_operators_query("('public')");
+    assert_extension_filter_with_alias(&query, "ext", "pg_operator", "deptype = 'e'", "operators");
+}
+
+#[test]
+fn build_fdws_query_extension_filter_is_precise() {
+    let query = Dump::build_fdws_query();
+    assert_extension_filter_with_alias(
+        query,
+        "ext",
+        "pg_foreign_data_wrapper",
+        "deptype = 'e'",
+        "fdws",
+    );
+}
+
+#[test]
+fn build_servers_query_extension_filter_is_precise() {
+    let query = Dump::build_servers_query();
+    assert_extension_filter_with_alias(
+        query,
+        "ext",
+        "pg_foreign_server",
+        "deptype = 'e'",
+        "foreign servers",
+    );
+}
+
+#[test]
+fn build_column_dependents_query_index_extension_filter_is_precise() {
+    let query = Dump::build_column_dependents_query("('public')");
+    assert_extension_filter_with_alias(
+        &query,
+        "ext",
+        "pg_catalog.pg_class",
+        "deptype = 'e'",
+        "column dependents (index branch)",
+    );
+}
+
+#[test]
+fn build_column_dependents_query_constraint_extension_filter_is_precise() {
+    let query = Dump::build_column_dependents_query("('public')");
+    assert_extension_filter_with_alias(
+        &query,
+        "ext",
+        "pg_catalog.pg_constraint",
+        "deptype = 'e'",
+        "column dependents (constraint branch)",
+    );
+}
+
+#[test]
+fn build_sequences_standalone_query_owner_dep_join_is_precise() {
+    let query = Dump::build_sequences_standalone_query("('public')");
+    assert!(
+        query.contains("dep.classid = 'pg_class'::regclass"),
+        "sequences: owner-dep join must filter dep.classid to 'pg_class'"
+    );
+    assert!(
+        query.contains("dep.refclassid = 'pg_class'::regclass"),
+        "sequences: owner-dep join must filter dep.refclassid to 'pg_class'"
+    );
+}

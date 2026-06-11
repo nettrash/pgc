@@ -1,3 +1,16 @@
+                v1.0.24
+
+                Bug fixes:
+                    - pg_depend - additional filter by classid and
+                      objsubid to prevent objects from being excluded.
+                      Every not exists(...) guard that filters
+                      extension-owned objects was missing the classid
+                      (catalog OID) and objsubid = 0 (whole-object)
+                      conditions, so a stale pg_depend row in a
+                      different catalog whose objid happened to collide
+                      with a user-created object's OID caused that
+                      object to be omitted from the dump.
+
 2026-06-03      v1.0.23
 
                 Features:
