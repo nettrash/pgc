@@ -183,6 +183,12 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `product_inventory` — added `manufacturer`, `is_featured` columns; 'Low Stock' threshold changed from 10 → 5
 - **Removed**: `user_order_summary` (orders table removed)
 - **Added**: `user_review_summary`, `product_review_stats`, `v_user_stats`
+- **Modified**: `vw_from_function` — body gains a `WHERE` clause. The view selects
+  only from `fn_only_view_source()` and never touches a table, so it has no rows in
+  `information_schema.view_table_usage`; dumping views through a join against that
+  table silently omitted the view and made the change undetectable (issue #219).
+  `vw_on_function_view` selects from it, so the pair also covers dependency
+  ordering between two views with an empty `table_relation`.
 
 #### Materialized Views
 - **Modified**: `active_users_mat` — added `status` column

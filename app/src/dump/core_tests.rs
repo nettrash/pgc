@@ -651,6 +651,48 @@ fn build_regular_views_query_filters_by_pg_class() {
     );
 }
 
+// A view whose body only calls functions has no rows in view_table_usage, so an
+// inner join against it dropped the view from the dump entirely (issue #219).
+#[test]
+fn build_regular_views_query_does_not_join_view_table_usage() {
+    let query = Dump::build_regular_views_query("('public')");
+    assert!(
+        !query.contains("view_table_usage"),
+        "regular view query must not join view_table_usage: it excludes views that \
+         reference only functions, and hides views whose tables the dump role does not own"
+    );
+}
+
+#[test]
+fn view_queries_resolve_table_relation_through_pg_rewrite() {
+    // The dependency on a referenced relation is recorded against the view's
+    // _RETURN rewrite rule, not against the view's pg_class row, so a walk that
+    // reads pg_depend for the relation oid directly always yields no relations.
+    for (label, query) in [
+        (
+            "regular views",
+            Dump::build_regular_views_query("('public')"),
+        ),
+        (
+            "materialized views",
+            Dump::build_materialized_views_query("('public')"),
+        ),
+    ] {
+        assert!(
+            query.contains("dep.classid = 'pg_rewrite'::regclass")
+                && query.contains("r.ev_class = c.oid")
+                && query.contains("and dep.objid = r.oid"),
+            "expected {label} to resolve table_relation via the view's rewrite rule"
+        );
+        assert!(
+            !query.contains("and dep.objid = c.oid"),
+            "expected {label} not to anchor table_relation on the view's pg_class row: \
+             a view's relation dependencies hang off its rewrite rule, so that walk \
+             always returns no relations"
+        );
+    }
+}
+
 #[test]
 fn build_materialized_views_query_filters_by_pg_class() {
     let query = Dump::build_materialized_views_query("('public')");

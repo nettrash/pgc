@@ -1654,6 +1654,26 @@ impl Dump {
         }
     }
 
+    /// Relations referenced by the view whose `pg_class` row is aliased `c`.
+    ///
+    /// A view's dependencies are recorded against its `_RETURN` rewrite rule rather
+    /// than the view relation, so the walk goes through `pg_rewrite`. Views that only
+    /// call functions reference no relations and correctly yield an empty array.
+    fn view_table_relation_subquery() -> &'static str {
+        "array(
+                        select distinct dn.nspname || '.' || dc.relname
+                        from pg_rewrite r
+                        join pg_depend dep on dep.classid = 'pg_rewrite'::regclass and dep.objid = r.oid
+                        join pg_class dc on dc.oid = dep.refobjid
+                        join pg_namespace dn on dn.oid = dc.relnamespace
+                        where r.ev_class = c.oid
+                          and dep.refclassid = 'pg_class'::regclass
+                          and dep.deptype = 'n'
+                          and dc.oid <> c.oid
+                          and dc.relkind in ('r', 'v', 'm', 'f', 'p')
+                    )"
+    }
+
     fn build_regular_views_query(schema_filter: &str) -> String {
         format!(
             "select
@@ -1661,13 +1681,12 @@ impl Dump {
                     quote_ident(v.table_name) as table_name,
                     v.view_definition,
                     quote_ident(pv.viewowner) as view_owner,
-                    array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
+                    {} as table_relation,
                     d.description as view_comment,
                     (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
                     coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker,
                     v.check_option
             from information_schema.views v
-            join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
             left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
             left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
             left join pg_description d on d.objoid = c.oid
@@ -1682,8 +1701,8 @@ impl Dump {
                     and ext_dep.objid = c.oid
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
-                )
-            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
+                );",
+            Self::view_table_relation_subquery(),
             schema_filter
         )
     }
@@ -1695,17 +1714,7 @@ impl Dump {
                     mv.matviewname as table_name,
                     mv.definition as view_definition,
                     mv.matviewowner as view_owner,
-                    array(
-                        select distinct n.nspname || '.' || dc.relname
-                        from pg_depend dep
-                        join pg_class dc on dc.oid = dep.refobjid
-                        join pg_namespace n on n.oid = dc.relnamespace
-                        where dep.classid = 'pg_class'::regclass
-                          and dep.objid = c.oid
-                          and dep.refclassid = 'pg_class'::regclass
-                          and dep.deptype = 'n'
-                          and dc.relkind in ('r', 'v', 'm')
-                    ) as table_relation,
+                    {} as table_relation,
                     d.description as view_comment,
                     c.relacl::text[] as view_acl,
                     c.reloptions as storage_options,
@@ -1725,6 +1734,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 );",
+            Self::view_table_relation_subquery(),
             schema_filter
         )
     }

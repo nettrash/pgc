@@ -1622,3 +1622,24 @@ CREATE TABLE test_schema.nn_coll_a_b (
     id serial PRIMARY KEY,
     c integer NOT NULL
 );
+
+-- =============================================================================
+-- Regression: views that reference only functions (issue #219)
+-- =============================================================================
+-- A view whose body calls only a function has no rows in
+-- information_schema.view_table_usage, so it used to be dropped from the dump
+-- entirely and any change to it was invisible to `compare`.
+--
+-- FROM: view body selects straight from the function.
+-- TO:   body gains a WHERE clause, so the round-trip must emit a replacement.
+CREATE FUNCTION test_schema.fn_only_view_source()
+RETURNS TABLE(id integer, val text)
+LANGUAGE sql AS $$ SELECT 1, 'hello' $$;
+
+CREATE VIEW test_schema.vw_from_function AS
+SELECT id, val FROM test_schema.fn_only_view_source();
+
+-- Same shape, but the view is referenced by another view: the dependent view
+-- must still be ordered correctly even though neither touches a table.
+CREATE VIEW test_schema.vw_on_function_view AS
+SELECT id FROM test_schema.vw_from_function;
