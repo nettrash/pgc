@@ -3278,7 +3278,7 @@ impl Dump {
         use_comments: bool,
         use_cascade: bool,
     ) -> String {
-        use crate::utils::string_extensions::{StringExt, normalized_relation_key};
+        use crate::utils::string_extensions::{StringExt, unquote_ident};
 
         let cascade_suffix = if use_cascade { " cascade" } else { "" };
         let mut script = String::new();
@@ -3310,12 +3310,15 @@ impl Dump {
                 .collect();
 
             // table_relation stores raw catalog names, while a regular view's schema
-            // and name come from quote_ident, so `s."MyView"` and `s.MyView` denote
-            // the same view. Match on a normalized key or every view whose name needs
-            // quoting loses its dependency edges and gets dropped out of order.
-            let lookup_keys: Vec<String> = view_keys
+            // and name come from quote_ident, so the same view reads as `s."MyView"`
+            // here and `s.MyView` there. Undo the quoting per part — schema and name
+            // are separate fields, so no guessing where a dotted name splits — and the
+            // two sides meet on the raw catalog name. Anything less exact would fuse
+            // `s."A"` with `s.a`, which PostgreSQL keeps as different views.
+            let lookup_keys: Vec<String> = self
+                .views
                 .iter()
-                .map(|k| normalized_relation_key(k))
+                .map(|v| format!("{}.{}", unquote_ident(&v.schema), unquote_ident(&v.name)))
                 .collect();
 
             // Map qualified name → index (only views, not tables).
@@ -3333,7 +3336,7 @@ impl Dump {
 
             for (i, view) in self.views.iter().enumerate() {
                 for rel in &view.table_relation {
-                    if let Some(&j) = key_to_idx.get(normalized_relation_key(rel).as_str())
+                    if let Some(&j) = key_to_idx.get(rel.trim())
                         && j != i
                     {
                         edges[i].push(j);

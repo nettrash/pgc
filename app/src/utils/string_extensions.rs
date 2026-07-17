@@ -6,20 +6,33 @@ pub trait StringExt {
     fn append_block(&mut self, other: &str);
 }
 
-/// Normalize a `schema.name` relation reference for equality comparison by
-/// dropping SQL identifier quoting and case.
+/// Reverses `quote_ident` for one identifier, yielding the raw catalog name:
+/// strips the surrounding double quotes and unescapes any doubled quote inside.
+/// Input that carries no surrounding quotes is returned unchanged.
 ///
-/// A view's `table_relation` holds raw catalog names (`s.MyView`) while the keys it
-/// is matched against are built from `quote_ident` output (`s."MyView"`), so both
-/// sides have to be normalized or every identifier that needs quoting loses its
-/// dependency edge.
-pub fn normalized_relation_key(reference: &str) -> String {
-    reference
-        .trim()
-        .chars()
-        .filter(|c| !matches!(c, '"' | '\'' | '`'))
-        .collect::<String>()
-        .to_lowercase()
+/// This exists because a dump stores a regular view's schema and name as
+/// `quote_ident` renders them (`"MyView"`) but a `table_relation` entry as the raw
+/// catalog name (`MyView`), so the two only compare equal once the quoting is undone.
+///
+/// Scope, so callers do not mistake this for more than it is:
+///
+/// - It takes exactly **one** identifier, as `quote_ident` would render it — not a
+///   qualified `schema.name`, not arbitrary SQL. Unquote each part, then join.
+/// - Case is preserved, and so is every character inside the quotes. PostgreSQL
+///   identifiers are case-sensitive and may legally contain `"`, `'` or backticks,
+///   so `"A"` and `a` are different relations and must not collapse to one key.
+/// - The one input it cannot round-trip is a raw, never-quoted name that itself
+///   begins and ends with a double quote; such a name is indistinguishable from a
+///   quoted rendering of its own interior.
+pub fn unquote_ident(part: &str) -> String {
+    let trimmed = part.trim();
+    match trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => trimmed.to_string(),
+    }
 }
 
 /// Normalize CRLF line endings to LF, returning the original string

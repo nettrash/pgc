@@ -256,6 +256,31 @@ fn clear_script_orders_quoted_view_names_by_dependency() {
     );
 }
 
+// "A" and a are different views. A key that folded case would map both to the same
+// entry, so the edge from "DepOnA" would land on whichever view was stored last and
+// "A" could be dropped while its dependent still stands.
+#[test]
+fn clear_script_keeps_case_distinct_view_names_apart() {
+    let mut dump = empty_dump();
+    dump.schemas.push(make_schema("t"));
+    dump.views.push(make_view("t", "\"A\""));
+    dump.views.push(make_view("t", "a"));
+    dump.views
+        .push(make_view_with_deps("t", "\"DepOnA\"", vec!["t.A"]));
+
+    let script = dump.generate_clear_script(false, false, false);
+    let dependent = script
+        .find("drop view if exists t.\"DepOnA\"")
+        .expect("dependent view must be dropped");
+    let quoted_a = script
+        .find("drop view if exists t.\"A\"")
+        .expect("t.\"A\" must be dropped");
+    assert!(
+        dependent < quoted_a,
+        "expected t.\"DepOnA\" to be dropped before t.\"A\"; got:\n{script}"
+    );
+}
+
 #[test]
 fn test_clear_script_single_transaction() {
     let mut dump = empty_dump();

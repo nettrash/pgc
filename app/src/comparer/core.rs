@@ -479,7 +479,12 @@ impl Comparer {
     }
 
     fn normalized_view_reference(reference: &str) -> String {
-        crate::utils::string_extensions::normalized_relation_key(reference)
+        reference
+            .trim()
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '`'))
+            .collect::<String>()
+            .to_lowercase()
     }
 
     fn normalized_view_key(schema: &str, name: &str) -> String {
