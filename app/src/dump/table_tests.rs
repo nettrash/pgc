@@ -994,6 +994,106 @@ fn test_sub_partition_script() {
     );
 }
 
+// A partition recreated without its reloptions comes back with none at all, so the
+// migration only reaches the target schema on a second pass (issue #216).
+#[test]
+fn test_partition_child_emits_storage_parameters() {
+    let mut table = Table::new(
+        "data".to_string(),
+        "test_2025".to_string(),
+        "data".to_string(),
+        "test_2025".to_string(),
+        "owner".to_string(),
+        None,
+        vec![create_dummy_column("id", "bigint")],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.partition_of = Some("data.test".to_string());
+    table.partition_bound = Some("FOR VALUES FROM (2025) TO (2026)".to_string());
+    table.storage_parameters = Some(vec![
+        "autovacuum_analyze_scale_factor=0.02".to_string(),
+        "autovacuum_vacuum_scale_factor=0.05".to_string(),
+    ]);
+
+    let script = table.get_script();
+    assert!(
+        script.contains(
+            "with (autovacuum_analyze_scale_factor=0.02, autovacuum_vacuum_scale_factor=0.05)"
+        ),
+        "partition must carry its reloptions: {script}"
+    );
+    // CREATE TABLE ... PARTITION OF takes WITH (...) after the bound, so the clause has
+    // to sit inside the statement rather than trail the terminating semicolon.
+    assert!(
+        script.contains("FOR VALUES FROM (2025) TO (2026)\nwith ("),
+        "with (...) must follow the partition bound inside the statement: {script}"
+    );
+}
+
+// PostgreSQL's grammar fixes the order: PARTITION BY, then WITH (...), then TABLESPACE.
+#[test]
+fn test_partition_child_orders_storage_parameters_before_tablespace() {
+    let mut table = Table::new(
+        "data".to_string(),
+        "test_2025".to_string(),
+        "data".to_string(),
+        "test_2025".to_string(),
+        "owner".to_string(),
+        None,
+        vec![create_dummy_column("id", "bigint")],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.partition_of = Some("data.test".to_string());
+    table.partition_bound = Some("DEFAULT".to_string());
+    table.partition_key = Some("LIST (id)".to_string());
+    table.storage_parameters = Some(vec!["fillfactor=70".to_string()]);
+    table.space = Some("fast_disk".to_string());
+
+    let script = table.get_script();
+    let key = script
+        .find("partition by LIST (id)")
+        .expect("partition key");
+    let with = script
+        .find("with (fillfactor=70)")
+        .expect("storage parameters");
+    let space = script.find("tablespace \"fast_disk\"").expect("tablespace");
+    assert!(
+        key < with && with < space,
+        "expected partition by -> with (...) -> tablespace; got:\n{script}"
+    );
+}
+
+#[test]
+fn test_partition_child_without_storage_parameters_omits_with() {
+    let mut table = Table::new(
+        "data".to_string(),
+        "test_default".to_string(),
+        "data".to_string(),
+        "test_default".to_string(),
+        "owner".to_string(),
+        None,
+        vec![create_dummy_column("id", "bigint")],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.partition_of = Some("data.test".to_string());
+    table.partition_bound = Some("DEFAULT".to_string());
+    table.storage_parameters = Some(Vec::new());
+
+    assert!(
+        !table.get_script().contains("with ("),
+        "an empty reloptions list must not emit an empty with ()"
+    );
+}
+
 #[test]
 fn test_partition_child_with_tablespace() {
     let mut table = Table::new(

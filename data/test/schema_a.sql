@@ -1698,3 +1698,29 @@ SELECT id, val FROM test_schema.mv_nodata_base;
 CREATE VIEW test_schema.vw_check_opt AS
 SELECT id, val FROM test_schema.mv_nodata_base WHERE amount > 0
 WITH LOCAL CHECK OPTION;
+
+-- =============================================================================
+-- Regression: reloptions on partitions of a table recreated as partitioned (#216)
+-- =============================================================================
+-- Turning a regular table into a partitioned one has to go through DROP + CREATE,
+-- and each partition is then created with CREATE TABLE ... PARTITION OF. That
+-- statement takes WITH (...) like any other CREATE TABLE; emitting it without the
+-- clause leaves every partition with no reloptions, so the migration only reaches
+-- the target schema on a second pass.
+--
+-- FROM: plain regular table, no reloptions.
+-- TO:   partitioned, with reloptions on both partitions (and on the parent).
+CREATE TABLE test_schema.reloptions_to_partitioned (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+-- The inverse direction, which already worked: partitioned -> regular, where the
+-- reloptions ride along in the plain CREATE TABLE's WITH (...) clause.
+CREATE TABLE test_schema.reloptions_to_regular (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE test_schema.reloptions_to_regular_default
+    PARTITION OF test_schema.reloptions_to_regular DEFAULT;
