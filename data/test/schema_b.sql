@@ -1965,3 +1965,40 @@ WITH NO DATA;
 CREATE VIEW test_schema.vw_check_opt AS
 SELECT id, val FROM test_schema.mv_nodata_base WHERE amount > 0
 WITH CASCADED CHECK OPTION;
+
+-- =============================================================================
+-- Regression: reloptions on partitions of a table recreated as partitioned (#216)
+-- =============================================================================
+-- See schema_a.sql for the full description. Here the table is partitioned and every
+-- partition carries reloptions that the generated CREATE TABLE ... PARTITION OF must
+-- keep.
+CREATE TABLE test_schema.reloptions_to_partitioned (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE test_schema.reloptions_to_partitioned_2025
+    PARTITION OF test_schema.reloptions_to_partitioned
+    FOR VALUES FROM ('2024-12-31 23:00:00+00') TO ('2025-12-31 23:00:00+00');
+ALTER TABLE test_schema.reloptions_to_partitioned_2025 SET (
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_scale_factor = 0.05
+);
+
+-- A DEFAULT partition with a different reloption set, so the fixture also covers a
+-- bound that is not FOR VALUES.
+CREATE TABLE test_schema.reloptions_to_partitioned_default
+    PARTITION OF test_schema.reloptions_to_partitioned DEFAULT;
+ALTER TABLE test_schema.reloptions_to_partitioned_default SET (
+    fillfactor = 70
+);
+
+-- Inverse direction: partitioned -> regular, reloptions via the CREATE TABLE WITH.
+CREATE TABLE test_schema.reloptions_to_regular (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+);
+ALTER TABLE test_schema.reloptions_to_regular SET (
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_scale_factor = 0.05
+);

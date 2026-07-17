@@ -1133,6 +1133,16 @@ impl Table {
                 script.push_str(&format!("\npartition by {}", partition_key));
             }
 
+            // Storage parameters. CREATE TABLE ... PARTITION OF takes WITH (...) just
+            // like a plain CREATE TABLE, and the clause has to be here: a partition
+            // recreated without it comes back with no reloptions at all, so the
+            // migration only reaches the target schema on a second pass.
+            if let Some(params) = &self.storage_parameters
+                && !params.is_empty()
+            {
+                script.push_str(&format!("\nwith ({})", params.join(", ")));
+            }
+
             if let Some(space) = &self.space {
                 script.push_str(&format!("\ntablespace {}", quote_ident(space)));
             }

@@ -1,6 +1,23 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #216 (reloptions missing from
+                      partitions when a table is recreated as
+                      partitioned). Turning a regular table into a
+                      partitioned one goes through DROP + CREATE, and
+                      the partitions are then built with CREATE TABLE
+                      ... PARTITION OF. That statement was emitted
+                      without a WITH (...) clause, so every partition
+                      came back with no storage parameters at all and
+                      the migration only reached the target schema on
+                      a second pass — the first diff applied, and
+                      comparing again still asked for the reloptions.
+                      PARTITION OF accepts WITH (...) like any other
+                      CREATE TABLE, and the clause is now emitted
+                      there, between PARTITION BY and TABLESPACE as
+                      the grammar requires. The opposite direction,
+                      partitioned to regular, already carried its
+                      reloptions through the plain CREATE TABLE.
                     - Resolved issue #220 (CREATE MATERIALIZED VIEW in
                       generated diff is missing WITH NO DATA clause). A
                       materialized view created WITH NO DATA is left
