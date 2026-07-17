@@ -18,6 +18,28 @@ pub struct TableIndex {
     pub comment: Option<String>,
 }
 
+/// Drop the `ONLY` from an index definition's `ON ONLY <table>` target.
+///
+/// `pg_get_indexdef` renders a partitioned parent's index with `ON ONLY`, which
+/// creates only the metadata index on the parent and leaves it `indisvalid = false`
+/// until every partition's index is built and attached. The default (non-production)
+/// output has no attach step, so it must emit a plain `CREATE INDEX ... ON <table>`:
+/// PostgreSQL then builds and attaches the partition indexes itself and the parent
+/// index is valid immediately. A definition without `ON ONLY` (every non-partitioned
+/// index) is returned unchanged. The production path builds its own `ON ONLY` form
+/// with the concurrent per-partition attach sequence (see `comparer::production`) and
+/// does not go through here.
+fn strip_on_only(indexdef: &str) -> String {
+    let Some(pos) = indexdef.find(" ON ") else {
+        return indexdef.to_string();
+    };
+    let after = &indexdef[pos + " ON ".len()..];
+    match after.strip_prefix("ONLY ") {
+        Some(rest) => format!("{} ON {}", &indexdef[..pos], rest),
+        None => indexdef.to_string(),
+    }
+}
+
 impl TableIndex {
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
@@ -34,7 +56,7 @@ impl TableIndex {
     /// Returns a string representation of the index
     pub fn get_script(&self) -> String {
         let mut script = String::new();
-        script.push_str(&self.indexdef);
+        script.push_str(&strip_on_only(&self.indexdef));
         script.append_block(";");
         if let Some(comment) = &self.comment {
             script.append_block(&format!(

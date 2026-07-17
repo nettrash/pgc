@@ -172,6 +172,28 @@ jobs:
         psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=0 \
           -f /tmp/output.sql
 
+    - name: Assert all indexes are valid
+      env:
+        PGPASSWORD: postgres
+      run: |
+        # An index on a partitioned parent emitted as `CREATE INDEX ... ON ONLY`
+        # without the per-partition attach sequence stays indisvalid=false
+        # (issue #223). The round-2 diff cannot catch it — the invalid index
+        # still exists, so the compare is empty — so assert directly that no
+        # index the migration produced was left invalid.
+        invalid=$(psql -h 127.0.0.1 -U postgres -d a -tAc \
+          "select string_agg(format('%I.%I', n.nspname, c.relname), ', ')
+           from pg_index x
+           join pg_class c on c.oid = x.indexrelid
+           join pg_namespace n on n.oid = c.relnamespace
+           where not x.indisvalid
+             and n.nspname not in ('pg_catalog', 'information_schema');")
+        if [ -n "${invalid}" ]; then
+          echo "ERROR: invalid indexes after applying the migration on PG ${{ matrix.pg_version }}: ${invalid}"
+          exit 1
+        fi
+        echo "OK: all indexes valid on PG ${{ matrix.pg_version }}"
+
     - name: Run pgc compare (round 2) — must be empty
       run: |
         ./app/target/release/pgc --config /tmp/pgc.conf

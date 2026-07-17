@@ -98,6 +98,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `idx_audit_logs_table_op_changed_at` — unique index gains `record_id` column
 - **Removed**: all indexes on removed tables (`orders`, `order_items`)
 - **Unchanged**: existing indexes on `users`, `products`, `audit_logs`, `logs`
+- **Index on a partitioned parent** (Issue #223): `idx_partidx_value` is added to the existing partitioned parent `partidx` (two partitions, identical in both schemas). `pg_get_indexdef` renders such an index with `ON ONLY`, which builds only the invalid metadata index on the parent. The default (non-production) output must emit a plain `CREATE INDEX ... ON` so PostgreSQL builds and attaches every partition's index and the parent is valid immediately. The round-2 diff cannot catch this on its own — an invalid-but-present index still round-trips empty — so the integration job additionally asserts that no index is left `indisvalid = false` after applying the migration
 
 ### 7. Foreign Keys
 - **Added**: FKs on `reviews` (to products, users), FK on `user_preferences` (to users)
