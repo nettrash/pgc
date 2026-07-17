@@ -55,7 +55,7 @@ fn test_get_script_returns_create_statement() {
     let view = create_view("select id from public.users");
     assert_eq!(
         view.get_script(),
-        "create view analytics.active_users as\nselect id from public.users\n\n"
+        "create view analytics.active_users as\nselect id from public.users;\n\n"
     );
 }
 
@@ -64,7 +64,67 @@ fn test_get_script_returns_create_materialized_statement() {
     let view = create_materialized_view("select id from public.users");
     assert_eq!(
         view.get_script(),
-        "create materialized view analytics.active_users as\nselect id from public.users\n\n"
+        "create materialized view analytics.active_users as\nselect id from public.users;\n\n"
+    );
+}
+
+// A materialized view created WITH NO DATA is unpopulated; recreating it without the
+// clause would run the query and fill it (issue #220).
+#[test]
+fn test_get_script_materialized_unpopulated_emits_with_no_data() {
+    let mut view = create_materialized_view("select id from public.users");
+    view.is_populated = false;
+    assert_eq!(
+        view.get_script(),
+        "create materialized view analytics.active_users as\nselect id from public.users\nwith no data;\n\n"
+    );
+}
+
+// PostgreSQL hands back definitions with a terminating semicolon; the clause has to
+// land inside the statement rather than after it.
+#[test]
+fn test_get_script_with_no_data_precedes_definition_semicolon() {
+    let mut view = create_materialized_view("select id from public.users;");
+    view.is_populated = false;
+    let script = view.get_script();
+    assert_eq!(
+        script,
+        "create materialized view analytics.active_users as\nselect id from public.users\nwith no data;\n\n"
+    );
+    assert!(
+        !script.contains("users;\nwith no data"),
+        "with no data must not follow the statement-terminating semicolon: {script}"
+    );
+}
+
+#[test]
+fn test_get_script_populated_materialized_omits_with_no_data() {
+    let view = create_materialized_view("select id from public.users;");
+    assert!(!view.get_script().contains("with no data"));
+}
+
+// The same trap as WITH NO DATA: a check option appended after the terminating
+// semicolon parses as a separate statement and is a syntax error.
+#[test]
+fn test_get_script_check_option_precedes_definition_semicolon() {
+    let mut view = create_view("select id from public.users where active;");
+    view.check_option = Some("cascaded".to_string());
+    assert_eq!(
+        view.get_script(),
+        "create view analytics.active_users as\nselect id from public.users where active\nwith cascaded check option;\n\n"
+    );
+}
+
+#[test]
+fn test_get_alter_script_check_option_precedes_definition_semicolon() {
+    let current = create_view("select id from public.users;");
+    let mut target = create_view("select id, active from public.users;");
+    target.check_option = Some("local".to_string());
+    target.hash();
+    let script = current.get_alter_script(&target, true);
+    assert!(
+        script.contains("select id, active from public.users\nwith local check option;"),
+        "check option must sit inside the statement: {script}"
     );
 }
 
@@ -76,7 +136,7 @@ fn test_get_script_includes_owner_when_present() {
 
     assert_eq!(
         view.get_script(),
-        "create view analytics.active_users as\nselect id from public.users\n\nalter view analytics.active_users owner to pgc_owner;\n\n"
+        "create view analytics.active_users as\nselect id from public.users;\n\nalter view analytics.active_users owner to pgc_owner;\n\n"
     );
 }
 
@@ -88,7 +148,7 @@ fn test_get_script_includes_owner_for_materialized_view() {
 
     assert_eq!(
         view.get_script(),
-        "create materialized view analytics.active_users as\nselect id from public.users\n\nalter materialized view analytics.active_users owner to pgc_owner;\n\n"
+        "create materialized view analytics.active_users as\nselect id from public.users;\n\nalter materialized view analytics.active_users owner to pgc_owner;\n\n"
     );
 }
 
@@ -145,7 +205,7 @@ fn test_get_alter_script_respects_create_or_replace_definition() {
 
     assert_eq!(
         current.get_alter_script(&replacement, true),
-        "CREATE OR REPLACE VIEW analytics.active_users AS\ncreate or replace view analytics.active_users as select 2\n\n"
+        "CREATE OR REPLACE VIEW analytics.active_users AS\ncreate or replace view analytics.active_users as select 2;\n\n"
     );
 }
 
@@ -156,7 +216,7 @@ fn test_get_alter_script_generates_replace_statement() {
 
     assert_eq!(
         current.get_alter_script(&target, true),
-        "CREATE OR REPLACE VIEW analytics.active_users AS\nselect id, active from public.users where active\n\n"
+        "CREATE OR REPLACE VIEW analytics.active_users AS\nselect id, active from public.users where active;\n\n"
     );
 }
 
@@ -167,7 +227,7 @@ fn test_get_alter_script_materialized_drops_and_recreates() {
 
     assert_eq!(
         current.get_alter_script(&target, true),
-        "drop materialized view if exists analytics.active_users;\n\ncreate materialized view analytics.active_users as\nselect id from public.users\n\n"
+        "drop materialized view if exists analytics.active_users;\n\ncreate materialized view analytics.active_users as\nselect id from public.users;\n\n"
     );
 }
 

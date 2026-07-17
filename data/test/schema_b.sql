@@ -1940,3 +1940,28 @@ SELECT id, name FROM test_schema.vw_rule_base;
 CREATE RULE vw_with_rule_ins AS ON INSERT TO test_schema.vw_with_rule
     DO INSTEAD INSERT INTO test_schema.vw_rule_audit(id, note)
     VALUES (NEW.id, NEW.name);
+
+-- =============================================================================
+-- Regression: materialized view created WITH NO DATA (issue #220)
+-- =============================================================================
+-- See schema_a.sql for the full description. Here mv_no_data exists and is
+-- unpopulated; the generated diff must create it WITH NO DATA rather than run the
+-- query and fill it.
+CREATE TABLE test_schema.mv_nodata_base (
+    id integer PRIMARY KEY,
+    val text,
+    amount numeric
+);
+
+CREATE MATERIALIZED VIEW test_schema.mv_with_data AS
+SELECT id, val FROM test_schema.mv_nodata_base;
+
+-- TO-only, and deliberately never refreshed.
+CREATE MATERIALIZED VIEW test_schema.mv_no_data AS
+SELECT id, val, amount FROM test_schema.mv_nodata_base WHERE amount > 0
+WITH NO DATA;
+
+-- check option changed from LOCAL (FROM) to CASCADED (TO).
+CREATE VIEW test_schema.vw_check_opt AS
+SELECT id, val FROM test_schema.mv_nodata_base WHERE amount > 0
+WITH CASCADED CHECK OPTION;

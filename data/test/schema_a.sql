@@ -1670,3 +1670,31 @@ SELECT id, name FROM test_schema.vw_rule_base;
 CREATE RULE vw_with_rule_ins AS ON INSERT TO test_schema.vw_with_rule
     DO INSTEAD INSERT INTO test_schema.vw_rule_audit(id, note)
     VALUES (NEW.id, NEW.name);
+
+-- =============================================================================
+-- Regression: materialized view created WITH NO DATA (issue #220)
+-- =============================================================================
+-- WITH NO DATA is not part of the stored definition — it survives only as
+-- pg_class.relispopulated — so a diff that recreates the view from its definition
+-- alone silently populates it. The base table is identical in both schemas to keep
+-- the case about the view itself.
+--
+-- FROM: base table only, no materialized view.
+-- TO:   mv_no_data added WITH NO DATA; the diff must carry the clause through.
+CREATE TABLE test_schema.mv_nodata_base (
+    id integer PRIMARY KEY,
+    val text,
+    amount numeric
+);
+
+-- A populated materialized view over the same table, unchanged in both schemas:
+-- it must never acquire a WITH NO DATA clause.
+CREATE MATERIALIZED VIEW test_schema.mv_with_data AS
+SELECT id, val FROM test_schema.mv_nodata_base;
+
+-- WITH CHECK OPTION is emitted as a trailing clause like WITH NO DATA, so it hits
+-- the same trap of landing after the definition's terminating semicolon. The option
+-- changes local -> cascaded in TO, which exercises the CREATE OR REPLACE path.
+CREATE VIEW test_schema.vw_check_opt AS
+SELECT id, val FROM test_schema.mv_nodata_base WHERE amount > 0
+WITH LOCAL CHECK OPTION;

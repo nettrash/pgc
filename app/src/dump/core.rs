@@ -1543,6 +1543,8 @@ impl Dump {
                         .unwrap_or_default(),
                     comment: row.get("view_comment"),
                     is_materialized: false,
+                    // Only materialized views can be unpopulated.
+                    is_populated: true,
                     hash: None,
                     acl: row
                         .get::<Option<Vec<String>>, _>("view_acl")
@@ -1604,6 +1606,7 @@ impl Dump {
                         .unwrap_or_default(),
                     comment: row.get("view_comment"),
                     is_materialized: true,
+                    is_populated: row.get::<Option<bool>, _>("is_populated").unwrap_or(true),
                     hash: None,
                     acl: row
                         .get::<Option<Vec<String>>, _>("view_acl")
@@ -1724,6 +1727,7 @@ impl Dump {
                     d.description as view_comment,
                     c.relacl::text[] as view_acl,
                     c.reloptions as storage_options,
+                    mv.ispopulated as is_populated,
                     (select spcname from pg_tablespace where oid = c.reltablespace) as tablespace_name
             from pg_matviews mv
             join pg_class c on c.relname = mv.matviewname
