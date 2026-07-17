@@ -1748,3 +1748,21 @@ BEGIN
     RAISE NOTICE 'id=%', p_id;
 END;
 $$;
+
+-- =============================================================================
+-- Regression: inline NOT NULL must not become a named ADD/DROP CONSTRAINT (#218)
+-- =============================================================================
+-- PostgreSQL 18 records a column's inline NOT NULL in pg_constraint under the
+-- auto-generated name {table}_{column}_not_null (contype='n'); PG14–17 keep it only
+-- in pg_attribute.attnotnull. When a NOT NULL column is dropped, or a nullable column
+-- gains NOT NULL, the diff must use only the column-level `set/drop not null` (or the
+-- inline `not null` of a dropped column), never `ADD/DROP CONSTRAINT` for the invented
+-- name: the DROP errors on PG14–17 ("constraint does not exist") and the ADD is
+-- PG18-only syntax that also leaves a constraint the source never declared, looping.
+--
+-- FROM: nn_col has inline NOT NULL (dropped in TO); null_col is nullable (NOT NULL in TO).
+CREATE TABLE test_schema.notnull_recreate (
+    id       integer,
+    nn_col   varchar(10) NOT NULL,
+    null_col varchar(10)
+);

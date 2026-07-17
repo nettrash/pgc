@@ -1,6 +1,26 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #218 (spurious DROP CONSTRAINT
+                      and ADD CONSTRAINT for inline NOT NULL). A
+                      column's inline NOT NULL is surfaced by
+                      PostgreSQL 18 in pg_constraint under the
+                      auto-generated name {table}_{column}_not_null,
+                      while PostgreSQL 14–17 keep it only in
+                      pg_attribute.attnotnull. When a dump taken from
+                      PG18 drove a diff, the constraint pass emitted
+                      DROP CONSTRAINT for a dropped NOT NULL column and
+                      ADD CONSTRAINT for a column that gained NOT NULL,
+                      on top of the correct column-level SET/DROP NOT
+                      NULL. The DROP fails on PG14–17 (the named
+                      constraint does not exist there); the ADD is
+                      PG18-only syntax and leaves a named constraint
+                      the source never declared, so the next compare
+                      keeps trying to drop it. Auto-named NOT NULL
+                      constraints are now left entirely to the
+                      column-level NOT NULL handling and are never
+                      emitted as ADD or DROP CONSTRAINT. Explicitly
+                      named NOT NULL constraints are unaffected.
                     - Resolved issue #217 (SET configuration values
                       wrapped in single quotes, causing an infinite
                       diff loop). CREATE OR REPLACE FUNCTION/PROCEDURE

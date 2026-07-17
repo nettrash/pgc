@@ -90,6 +90,9 @@ These schemas are designed to test comparison capabilities for the following Pos
 #### Modified Tables (constraint diff only)
 - **check_literal_case_test**: `chk_priority_label` modified (added `'P5-Informational'`); `chk_category_values` unchanged (tests mixed-case string literal case preservation)
 
+#### Inline NOT NULL is not a named constraint (Issue #218)
+- **notnull_recreate**: FROM has `nn_col` with inline NOT NULL and a nullable `null_col`; TO drops `nn_col` and makes `null_col` NOT NULL. On PG18 a column's inline NOT NULL is surfaced in `pg_constraint` as the auto-generated `{table}_{col}_not_null` (contype='n'); on PG14–17 it lives only in `pg_attribute.attnotnull`. The diff must be exactly `alter column null_col set not null` and `drop column nn_col` — never `ADD`/`DROP CONSTRAINT` for the invented name. `DROP CONSTRAINT ..._not_null` errors on PG14–17 ("constraint does not exist"), and `ADD CONSTRAINT ... NOT NULL` is PG18-only syntax that leaves a named constraint the source never declared, so the second diff would keep re-emitting it. This case only bites when the dump is taken from PG18, so the round-trip must close on the PG18 leg of the matrix specifically
+
 ### 6. Indexes
 - **Added**: `idx_users_preferred_contact`, `idx_users_timezone`, `idx_products_manufacturer`, `idx_products_is_featured`, `idx_products_barcode`, `idx_reviews_*` (5 indexes), `idx_audit_logs_session_id`, `idx_audit_logs_request_id`, `idx_tagged_items_detail`, `idx_user_preferences_prefs`
 - **Modified**: `idx_audit_logs_table_op_changed_at` — unique index gains `record_id` column

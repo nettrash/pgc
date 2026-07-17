@@ -2020,3 +2020,13 @@ BEGIN
     RAISE NOTICE 'id=%', p_id;
 END;
 $$;
+
+-- =============================================================================
+-- Regression: inline NOT NULL must not become a named ADD/DROP CONSTRAINT (#218)
+-- =============================================================================
+-- See schema_a.sql. Here nn_col is gone and null_col is NOT NULL; the diff must be
+-- just `drop column nn_col` and `alter column null_col set not null`.
+CREATE TABLE test_schema.notnull_recreate (
+    id       integer,
+    null_col varchar(10) NOT NULL
+);
