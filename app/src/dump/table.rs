@@ -1867,9 +1867,21 @@ impl Table {
                         }
                     }
                 }
-            } else if !is_fk {
+            } else if !is_fk
+                && new_constraint
+                    .auto_not_null_column(&to_table.name)
+                    .is_none()
+            {
                 constraint_post_script.push_str(&new_constraint.get_script());
             }
+            // An auto-named NOT NULL constraint present only on the TO side is not a
+            // real object to ADD. PG18 surfaces a column's NOT NULL in pg_constraint as
+            // `{table}_{col}_not_null`, but the column itself is already made NOT NULL —
+            // by the column diff's `alter column ... set not null`, or by the inline
+            // `not null` when the whole column is newly added. Emitting `ADD CONSTRAINT
+            // ... NOT NULL` on top is redundant, uses PG18-only syntax that fails on
+            // PG14–17, and leaves a named constraint the source never declared, which
+            // the next compare would try to drop again.
         }
 
         for old_constraint in &self.constraints {
@@ -1883,7 +1895,15 @@ impl Table {
             {
                 continue;
             }
-            if find_new(old_constraint).is_none() {
+            // An auto-named NOT NULL constraint present only on the FROM side is not a
+            // real object to DROP. On PG14–17 no such named constraint exists (it lives
+            // only as `pg_attribute.attnotnull`), so `DROP CONSTRAINT {table}_{col}_not_null`
+            // errors with "constraint does not exist"; on PG18 it exists but dropping it
+            // is redundant — either the column is being dropped (which removes its NOT
+            // NULL) or the column diff already emits `alter column ... drop not null`.
+            if find_new(old_constraint).is_none()
+                && old_constraint.auto_not_null_column(&self.name).is_none()
+            {
                 let drop_cmd = old_constraint.get_drop_script();
                 if use_drop {
                     constraint_pre_script.push_str(&drop_cmd);

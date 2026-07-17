@@ -3048,3 +3048,145 @@ fn test_named_to_auto_named_not_null_still_diffs() {
         "renaming away from a user-chosen name must still emit a drop: {script}"
     );
 }
+
+// Issue #218: a column becoming NOT NULL must not also emit ADD CONSTRAINT for the
+// auto-named NOT NULL that PG18 surfaces in pg_constraint. The column diff already
+// emits `set not null`; the ADD CONSTRAINT is redundant, PG18-only syntax, and leaves
+// a named constraint the source never declared.
+#[test]
+fn test_column_gains_not_null_omits_add_constraint() {
+    let mut nullable_name = name_column();
+    nullable_name.is_nullable = true;
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), nullable_name],
+        vec![primary_key_constraint()],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("alter column name set not null"),
+        "the column diff must set NOT NULL: {script}"
+    );
+    assert!(
+        !script.contains("add constraint users_name_not_null"),
+        "an auto-named NOT NULL must not be emitted as ADD CONSTRAINT: {script}"
+    );
+}
+
+// Issue #218: a column losing NOT NULL must not emit DROP CONSTRAINT for the auto-named
+// NOT NULL. On PG14–17 that named constraint does not exist and the drop errors; on
+// PG18 the column diff's `drop not null` already removes it.
+#[test]
+fn test_column_loses_not_null_omits_drop_constraint() {
+    let mut nullable_name = name_column();
+    nullable_name.is_nullable = true;
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), nullable_name],
+        vec![primary_key_constraint()],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("alter column name drop not null"),
+        "the column diff must drop NOT NULL: {script}"
+    );
+    assert!(
+        !script.contains("drop constraint users_name_not_null"),
+        "an auto-named NOT NULL must not be emitted as DROP CONSTRAINT: {script}"
+    );
+}
+
+// A column dropped entirely must not emit DROP CONSTRAINT for its auto-named NOT NULL:
+// dropping the column removes the constraint, and the explicit drop errors on PG14–17.
+#[test]
+fn test_dropped_not_null_column_omits_drop_constraint() {
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer")],
+        vec![primary_key_constraint()],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("drop column name"),
+        "the column must be dropped: {script}"
+    );
+    assert!(
+        !script.contains("drop constraint users_name_not_null"),
+        "dropping the column must not also drop its auto-named NOT NULL: {script}"
+    );
+}
