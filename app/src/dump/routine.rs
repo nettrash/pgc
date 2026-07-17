@@ -3,6 +3,26 @@ use sqlx::postgres::types::Oid;
 
 use crate::utils::string_extensions::StringExt;
 
+/// GUC parameters flagged `GUC_LIST_QUOTE` in PostgreSQL. Their `proconfig` value is
+/// stored as an already-quoted comma-separated list rather than a plain scalar, so a
+/// `SET` clause must emit it verbatim instead of wrapping it in a string literal.
+const LIST_QUOTE_GUCS: [&str; 6] = [
+    "search_path",
+    "temp_tablespaces",
+    "session_preload_libraries",
+    "shared_preload_libraries",
+    "local_preload_libraries",
+    "unix_socket_directories",
+];
+
+/// Whether `name` is a GUC whose `proconfig` value is a quote-preserving list.
+/// GUC names are case-insensitive, matching PostgreSQL's own lookup.
+fn is_list_quote_guc(name: &str) -> bool {
+    LIST_QUOTE_GUCS
+        .iter()
+        .any(|guc| guc.eq_ignore_ascii_case(name))
+}
+
 /// Information about a PostgreSQL aggregate function from pg_aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateInfo {
@@ -410,14 +430,18 @@ impl Routine {
             if let Some(pos) = entry.find('=') {
                 let name = entry[..pos].trim();
                 let value = entry[pos + 1..].trim();
-                // For list-valued GUCs (e.g. search_path), proconfig stores values
-                // with double-quote delimiters (e.g. "public, pg_temp"). These must
-                // NOT be wrapped in single quotes because that would turn them into
-                // a string literal, changing the semantics (the comma becomes part of
-                // a single identifier instead of separating list elements).
-                // Use the value verbatim when it contains double quotes; otherwise
-                // wrap in single quotes as a safe string literal.
-                if value.contains('"') {
+                // A GUC_LIST_QUOTE parameter (search_path, temp_tablespaces, …) stores
+                // its value in proconfig already as a canonical comma-separated list
+                // with each element quoted exactly as needed. It must be emitted
+                // verbatim, the way pg_get_functiondef does: wrapping the whole list in
+                // a single-quoted literal turns `t, pg_temp` into one schema literally
+                // named "t, pg_temp", which re-stores differently from the source and
+                // makes every subsequent compare re-emit the routine forever.
+                //
+                // Any other GUC holds a plain scalar value, so it is quoted as a string
+                // literal — which is also correct when that value happens to contain a
+                // double quote, unlike a bare `contains('"')` test would be.
+                if is_list_quote_guc(name) {
                     parts.push(format!(" SET {name} = {value}"));
                 } else {
                     parts.push(format!(" SET {name} = '{}'", value.replace('\'', "''")));

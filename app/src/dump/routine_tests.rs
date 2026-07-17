@@ -640,9 +640,10 @@ fn get_config_clause_empty_when_no_config() {
 
 #[test]
 fn get_config_clause_single_param() {
+    // search_path is a GUC_LIST_QUOTE parameter, so its value is emitted verbatim.
     let mut routine = build_function_routine();
     routine.config = vec!["search_path=public".to_string()];
-    assert_eq!(routine.get_config_clause(), " SET search_path = 'public'");
+    assert_eq!(routine.get_config_clause(), " SET search_path = public");
 }
 
 #[test]
@@ -659,12 +660,15 @@ fn get_config_clause_multiple_params() {
 }
 
 #[test]
-fn get_config_clause_value_with_single_quote() {
+fn get_config_clause_scalar_value_single_quote_is_escaped() {
+    // A scalar (non-list) GUC is quoted as a literal, and single quotes inside the
+    // value are doubled. search_path could not exercise this: it is list-quoted and
+    // an apostrophe there lives inside a double-quoted element, not a literal.
     let mut routine = build_function_routine();
-    routine.config = vec!["search_path=it's_schema".to_string()];
+    routine.config = vec!["application_name=it's".to_string()];
     assert_eq!(
         routine.get_config_clause(),
-        " SET search_path = 'it''s_schema'"
+        " SET application_name = 'it''s'"
     );
 }
 
@@ -676,7 +680,7 @@ fn get_config_clause_skips_malformed_entry() {
         "search_path=public".to_string(),
     ];
     // The malformed entry (no '=') is skipped; only the valid one is emitted.
-    assert_eq!(routine.get_config_clause(), " SET search_path = 'public'");
+    assert_eq!(routine.get_config_clause(), " SET search_path = public");
 }
 
 #[test]
@@ -692,9 +696,62 @@ fn get_config_clause_value_with_equals_sign() {
 
 #[test]
 fn get_config_clause_empty_value() {
+    // An empty value on a scalar GUC still emits an empty string literal.
     let mut routine = build_function_routine();
-    routine.config = vec!["search_path=".to_string()];
-    assert_eq!(routine.get_config_clause(), " SET search_path = ''");
+    routine.config = vec!["application_name=".to_string()];
+    assert_eq!(routine.get_config_clause(), " SET application_name = ''");
+}
+
+// Issue #217: a search_path list whose elements need no quoting (`t, pg_temp`) was
+// wrapped in a single-quoted literal, so PostgreSQL re-stored it as one schema named
+// "t, pg_temp" and every subsequent compare re-emitted the routine. GUC_LIST_QUOTE
+// values must be emitted verbatim, exactly as pg_get_functiondef does.
+#[test]
+fn get_config_clause_list_guc_comma_list_is_verbatim() {
+    let mut routine = build_function_routine();
+    routine.config = vec!["search_path=t, pg_temp".to_string()];
+    assert_eq!(routine.get_config_clause(), " SET search_path = t, pg_temp");
+}
+
+#[test]
+fn get_config_clause_list_guc_quoted_element_is_verbatim() {
+    let mut routine = build_function_routine();
+    routine.config = vec!["search_path=\"My Schema\", public".to_string()];
+    assert_eq!(
+        routine.get_config_clause(),
+        " SET search_path = \"My Schema\", public"
+    );
+}
+
+#[test]
+fn get_config_clause_temp_tablespaces_is_list_guc() {
+    let mut routine = build_function_routine();
+    routine.config = vec!["temp_tablespaces=ts1, ts2".to_string()];
+    assert_eq!(
+        routine.get_config_clause(),
+        " SET temp_tablespaces = ts1, ts2"
+    );
+}
+
+#[test]
+fn get_config_clause_guc_name_match_is_case_insensitive() {
+    // GUC names are case-insensitive, so Search_Path is still the list-quote parameter.
+    let mut routine = build_function_routine();
+    routine.config = vec!["Search_Path=t, pg_temp".to_string()];
+    assert_eq!(routine.get_config_clause(), " SET Search_Path = t, pg_temp");
+}
+
+// A scalar GUC whose value happens to contain a double quote must still be quoted as
+// a literal; the pre-fix heuristic keyed on the '"' character and emitted it verbatim,
+// producing invalid SQL.
+#[test]
+fn get_config_clause_scalar_value_with_double_quote_is_quoted() {
+    let mut routine = build_function_routine();
+    routine.config = vec!["application_name=a\"b".to_string()];
+    assert_eq!(
+        routine.get_config_clause(),
+        " SET application_name = 'a\"b'"
+    );
 }
 
 #[test]
@@ -779,7 +836,7 @@ fn get_script_function_with_multiple_config() {
 
     let script = routine.get_script();
     assert!(
-        script.contains("SET search_path = 'public, pg_temp' SET statement_timeout = '30s'"),
+        script.contains("SET search_path = public, pg_temp SET statement_timeout = '30s'"),
         "all SET clauses must appear in order, got:\n{}",
         script
     );
@@ -798,7 +855,7 @@ fn get_script_procedure_with_config() {
     let script = routine.get_script();
     assert!(
         script.contains(
-            "SECURITY DEFINER SET search_path = 'public, pg_temp' SET lock_timeout = '5s' as $$"
+            "SECURITY DEFINER SET search_path = public, pg_temp SET lock_timeout = '5s' as $$"
         ),
         "procedure SET clauses must appear after SECURITY DEFINER and before AS, got:\n{}",
         script
@@ -816,7 +873,7 @@ fn get_script_procedure_config_only_no_security_definer() {
 
     let script = routine.get_script();
     assert!(
-        script.contains("language sql SET search_path = 'public' as $$"),
+        script.contains("language sql SET search_path = public as $$"),
         "config must appear even without SECURITY DEFINER, got:\n{}",
         script
     );

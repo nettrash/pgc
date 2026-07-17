@@ -5909,7 +5909,7 @@ async fn compare_routines_procedure_with_config_params() {
     let script = comparer.get_script();
 
     assert!(
-        script.contains("SET search_path = 'public, pg_temp'"),
+        script.contains("SET search_path = public, pg_temp"),
         "script must contain SET search_path, got:\n{}",
         script
     );
@@ -6013,7 +6013,7 @@ async fn compare_routines_config_change_triggers_update() {
         script
     );
     assert!(
-        script.contains("SET search_path = 'public'"),
+        script.contains("SET search_path = public"),
         "script must contain SET search_path, got:\n{}",
         script
     );

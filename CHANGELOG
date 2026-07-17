@@ -1,6 +1,23 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #217 (SET configuration values
+                      wrapped in single quotes, causing an infinite
+                      diff loop). CREATE OR REPLACE FUNCTION/PROCEDURE
+                      quoted every SET value as a string literal,
+                      including list-valued GUCs such as search_path
+                      and temp_tablespaces. Their proconfig value is a
+                      bare comma-separated list, so wrapping it turned
+                      `t, pg_temp` into a single schema literally named
+                      "t, pg_temp"; the applied routine then re-stored
+                      differently from the source and every subsequent
+                      compare re-emitted the routine forever. Values of
+                      GUC_LIST_QUOTE parameters are now emitted
+                      verbatim, the way pg_get_functiondef does, while
+                      scalar GUCs stay quoted as literals — which also
+                      fixes the mirror case of a scalar value that
+                      happens to contain a double quote, previously
+                      emitted unquoted and invalid.
                     - Resolved issue #216 (reloptions missing from
                       partitions when a table is recreated as
                       partitioned). Turning a regular table into a
