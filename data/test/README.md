@@ -183,6 +183,19 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `product_inventory` — added `manufacturer`, `is_featured` columns; 'Low Stock' threshold changed from 10 → 5
 - **Removed**: `user_order_summary` (orders table removed)
 - **Added**: `user_review_summary`, `product_review_stats`, `v_user_stats`
+- **Modified**: `vw_from_function` — body gains a `WHERE` clause. The view selects
+  only from `fn_only_view_source()` and never touches a table, so it has no rows in
+  `information_schema.view_table_usage`; dumping views through a join against that
+  table silently omitted the view and made the change undetectable (issue #219).
+  `vw_from_function` itself reads no relation, so its `table_relation` is empty —
+  the case the old join could not represent at all. `vw_on_function_view` selects
+  from it and so carries `test_schema.vw_from_function`, covering the view→view
+  dependency edge that has to survive on top of a view with no table of its own.
+- **Unchanged**: `vw_with_rule` — a view carrying a `DO INSTEAD` rule that writes to
+  `vw_rule_audit`, a table its definition never reads. `table_relation` must list only
+  `vw_rule_base`: the dependency walk follows the view's `_RETURN` rule alone, and
+  counting the targets of user-defined rules would invent drop-ordering edges. Its base
+  table is identical in both schemas on purpose — see the note in `schema_a.sql`.
 
 #### Materialized Views
 - **Modified**: `active_users_mat` — added `status` column
