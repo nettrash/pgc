@@ -1643,3 +1643,30 @@ SELECT id, val FROM test_schema.fn_only_view_source();
 -- must still be ordered correctly even though neither touches a table.
 CREATE VIEW test_schema.vw_on_function_view AS
 SELECT id FROM test_schema.vw_from_function;
+
+-- A DO INSTEAD rule on the view writes to a table the view definition never
+-- reads, so table_relation must stay limited to what the definition selects
+-- from (vw_rule_base): rules are dumped separately, and crediting their targets
+-- to the view would invent dependency edges for drop ordering.
+--
+-- vw_rule_base is deliberately identical in both schemas. A view whose source
+-- table changes is dropped and recreated, and the recreate does not restore
+-- rules on the view, so anchoring this fixture on a changing table would make
+-- the round-trip re-emit the rule forever for reasons unrelated to the view
+-- dependency walk this case exists to cover.
+CREATE TABLE test_schema.vw_rule_base (
+    id integer PRIMARY KEY,
+    name text
+);
+
+CREATE TABLE test_schema.vw_rule_audit (
+    id integer,
+    note text
+);
+
+CREATE VIEW test_schema.vw_with_rule AS
+SELECT id, name FROM test_schema.vw_rule_base;
+
+CREATE RULE vw_with_rule_ins AS ON INSERT TO test_schema.vw_with_rule
+    DO INSTEAD INSERT INTO test_schema.vw_rule_audit(id, note)
+    VALUES (NEW.id, NEW.name);

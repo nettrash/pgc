@@ -690,6 +690,12 @@ fn view_queries_resolve_table_relation_through_pg_rewrite() {
              a view's relation dependencies hang off its rewrite rule, so that walk \
              always returns no relations"
         );
+        // Without this the walk also follows user-defined DO INSTEAD rules on the
+        // view and credits their target tables to the view's definition.
+        assert!(
+            query.contains("and r.rulename = '_RETURN'"),
+            "expected {label} to follow only the _RETURN rule that holds the view definition"
+        );
     }
 }
 

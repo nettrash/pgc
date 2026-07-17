@@ -189,6 +189,11 @@ These schemas are designed to test comparison capabilities for the following Pos
   table silently omitted the view and made the change undetectable (issue #219).
   `vw_on_function_view` selects from it, so the pair also covers dependency
   ordering between two views with an empty `table_relation`.
+- **Unchanged**: `vw_with_rule` — a view carrying a `DO INSTEAD` rule that writes to
+  `vw_rule_audit`, a table its definition never reads. `table_relation` must list only
+  `vw_rule_base`: the dependency walk follows the view's `_RETURN` rule alone, and
+  counting the targets of user-defined rules would invent drop-ordering edges. Its base
+  table is identical in both schemas on purpose — see the note in `schema_a.sql`.
 
 #### Materialized Views
 - **Modified**: `active_users_mat` — added `status` column

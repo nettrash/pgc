@@ -1659,6 +1659,11 @@ impl Dump {
     /// A view's dependencies are recorded against its `_RETURN` rewrite rule rather
     /// than the view relation, so the walk goes through `pg_rewrite`. Views that only
     /// call functions reference no relations and correctly yield an empty array.
+    ///
+    /// Only `_RETURN` is followed: it holds the view definition. A view can carry
+    /// user-defined `DO INSTEAD` rules whose bodies touch unrelated tables, and those
+    /// are dumped separately as rules, so counting their targets here would attribute
+    /// relations to the view that its definition never reads.
     fn view_table_relation_subquery() -> &'static str {
         "array(
                         select distinct dn.nspname || '.' || dc.relname
@@ -1667,6 +1672,7 @@ impl Dump {
                         join pg_class dc on dc.oid = dep.refobjid
                         join pg_namespace dn on dn.oid = dc.relnamespace
                         where r.ev_class = c.oid
+                          and r.rulename = '_RETURN'
                           and dep.refclassid = 'pg_class'::regclass
                           and dep.deptype = 'n'
                           and dc.oid <> c.oid

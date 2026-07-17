@@ -10,8 +10,9 @@
                       function call was dropped from the dump and
                       compare could not see any change to it. That
                       view is now dumped, and the relations it
-                      references are resolved from pg_rewrite /
-                      pg_depend instead. view_table_usage is also
+                      references are resolved from the view's _RETURN
+                      rewrite rule via pg_rewrite / pg_depend instead.
+                      view_table_usage is also
                       privilege-filtered to tables owned by a
                       currently enabled role, so the same join
                       dropped any view whose underlying table
