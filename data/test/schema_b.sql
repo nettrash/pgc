@@ -1970,7 +1970,8 @@ WITH CASCADED CHECK OPTION;
 -- Regression: reloptions on partitions of a table recreated as partitioned (#216)
 -- =============================================================================
 -- See schema_a.sql for the full description. Here the table is partitioned and every
--- partition carries reloptions the generated CREATE TABLE ... PARTITION OF must keep.
+-- partition carries reloptions that the generated CREATE TABLE ... PARTITION OF must
+-- keep.
 CREATE TABLE test_schema.reloptions_to_partitioned (
     id INTEGER,
     created_at TIMESTAMPTZ NOT NULL

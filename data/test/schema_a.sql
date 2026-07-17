@@ -1709,7 +1709,10 @@ WITH LOCAL CHECK OPTION;
 -- the target schema on a second pass.
 --
 -- FROM: plain regular table, no reloptions.
--- TO:   partitioned, with reloptions on both partitions (and on the parent).
+-- TO:   partitioned, with reloptions on both partitions. The partitioned parent
+--       carries none of its own: PostgreSQL rejects storage parameters on a
+--       partitioned table ("cannot specify storage parameters for a partitioned
+--       table"), so the reloptions live only on the leaf partitions.
 CREATE TABLE test_schema.reloptions_to_partitioned (
     id INTEGER,
     created_at TIMESTAMPTZ NOT NULL
