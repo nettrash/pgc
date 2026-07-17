@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,17 +28,18 @@ pub struct TableIndex {
 /// output has no attach step, so it must emit a plain `CREATE INDEX ... ON <table>`:
 /// PostgreSQL then builds and attaches the partition indexes itself and the parent
 /// index is valid immediately. A definition without `ON ONLY` (every non-partitioned
-/// index) is returned unchanged. The production path builds its own `ON ONLY` form
-/// with the concurrent per-partition attach sequence (see `comparer::production`) and
-/// does not go through here.
-fn strip_on_only(indexdef: &str) -> String {
+/// index — the common case) is borrowed unchanged, so only the rare partitioned-parent
+/// rewrite allocates. The production path builds its own `ON ONLY` form with the
+/// concurrent per-partition attach sequence (see `comparer::production`) and does not
+/// go through here.
+fn strip_on_only(indexdef: &str) -> Cow<'_, str> {
     let Some(pos) = indexdef.find(" ON ") else {
-        return indexdef.to_string();
+        return Cow::Borrowed(indexdef);
     };
     let after = &indexdef[pos + " ON ".len()..];
     match after.strip_prefix("ONLY ") {
-        Some(rest) => format!("{} ON {}", &indexdef[..pos], rest),
-        None => indexdef.to_string(),
+        Some(rest) => Cow::Owned(format!("{} ON {}", &indexdef[..pos], rest)),
+        None => Cow::Borrowed(indexdef),
     }
 }
 
