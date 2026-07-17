@@ -16,11 +16,18 @@
                       constraint does not exist there); the ADD is
                       PG18-only syntax and leaves a named constraint
                       the source never declared, so the next compare
-                      keeps trying to drop it. Auto-named NOT NULL
-                      constraints are now left entirely to the
-                      column-level NOT NULL handling and are never
-                      emitted as ADD or DROP CONSTRAINT. Explicitly
-                      named NOT NULL constraints are unaffected.
+                      keeps trying to drop it. NOT NULL constraints
+                      whose name matches PostgreSQL's auto-generated
+                      {table}_{column}_not_null pattern (optionally
+                      with a numeric collision suffix) are now left
+                      entirely to the column-level NOT NULL handling
+                      and are never emitted as ADD or DROP CONSTRAINT.
+                      A NOT NULL constraint whose name differs from
+                      that pattern is treated as an explicit constraint
+                      and is unaffected; a user-chosen name that
+                      happens to match the pattern is indistinguishable
+                      from an auto-generated one and is handled the
+                      same way (the column still ends up NOT NULL).
                     - Resolved issue #217 (SET configuration values
                       wrapped in single quotes, causing an infinite
                       diff loop). CREATE OR REPLACE FUNCTION/PROCEDURE
