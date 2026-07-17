@@ -233,6 +233,74 @@ fn test_get_script_partial_index() {
     assert_eq!(script, expected);
 }
 
+// Issue #223: pg_get_indexdef renders a partitioned parent's index with `ON ONLY`,
+// which creates only the invalid metadata index. The default (non-production) output
+// must emit a plain `CREATE INDEX ... ON` so PostgreSQL builds and attaches every
+// partition's index and the parent index is valid immediately.
+#[test]
+fn test_get_script_strips_on_only_for_partitioned_parent() {
+    let index = TableIndex {
+        schema: "t".to_string(),
+        table: "events".to_string(),
+        name: "ix_events_event_type".to_string(),
+        catalog: None,
+        indexdef: "CREATE INDEX ix_events_event_type ON ONLY t.events USING btree (event_type)"
+            .to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+    assert_eq!(
+        index.get_script(),
+        "CREATE INDEX ix_events_event_type ON t.events USING btree (event_type);\n\n"
+    );
+}
+
+#[test]
+fn test_get_script_strips_on_only_for_unique_partitioned_parent() {
+    let index = TableIndex {
+        schema: "t".to_string(),
+        table: "events".to_string(),
+        name: "uq_events_id".to_string(),
+        catalog: None,
+        indexdef: "CREATE UNIQUE INDEX uq_events_id ON ONLY t.events USING btree (id)".to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+    assert_eq!(
+        index.get_script(),
+        "CREATE UNIQUE INDEX uq_events_id ON t.events USING btree (id);\n\n"
+    );
+}
+
+// A non-partitioned index never carries `ON ONLY`, so it must pass through untouched —
+// including any later `only` that is part of a column name or predicate.
+#[test]
+fn test_get_script_leaves_plain_index_unchanged() {
+    let index = create_simple_index();
+    assert_eq!(
+        index.get_script(),
+        "CREATE INDEX idx_orders_date ON app.orders USING btree (created_at);\n\n"
+    );
+}
+
+#[test]
+fn test_get_script_does_not_strip_only_outside_on_target() {
+    // `only_flag` appears after the ON target; it must survive verbatim.
+    let index = TableIndex {
+        schema: "public".to_string(),
+        table: "t".to_string(),
+        name: "ix".to_string(),
+        catalog: None,
+        indexdef: "CREATE INDEX ix ON public.t USING btree (only_flag)".to_string(),
+        is_partition_index: false,
+        comment: None,
+    };
+    assert_eq!(
+        index.get_script(),
+        "CREATE INDEX ix ON public.t USING btree (only_flag);\n\n"
+    );
+}
+
 #[test]
 fn test_get_script_case_conversion() {
     let index = TableIndex {

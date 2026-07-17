@@ -1,6 +1,25 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #223 (CREATE INDEX on a
+                      partitioned table used ON ONLY without attaching
+                      the partition indexes, leaving the index
+                      invalid). pg_get_indexdef renders a partitioned
+                      parent's index with ON ONLY, which creates only
+                      the metadata index on the parent and leaves it
+                      indisvalid=false until every partition's index is
+                      built and attached. The default output emitted
+                      that ON ONLY form verbatim with no attach step,
+                      so the resulting index was permanently invalid
+                      and no partition indexes were created. The
+                      non-production output now emits a plain CREATE
+                      INDEX ... ON, so PostgreSQL builds and attaches
+                      the partition indexes itself and the parent index
+                      is valid immediately. Production output
+                      (OUTPUT_FOR_PRODUCTION=true) is unchanged: it
+                      still emits ON ONLY followed by the per-partition
+                      CREATE INDEX CONCURRENTLY and ATTACH PARTITION
+                      sequence.
                     - Resolved issue #218 (spurious DROP CONSTRAINT
                       and ADD CONSTRAINT for inline NOT NULL). A
                       column's inline NOT NULL is surfaced by

@@ -1766,3 +1766,27 @@ CREATE TABLE test_schema.notnull_recreate (
     nn_col   varchar(10) NOT NULL,
     null_col varchar(10)
 );
+
+-- =============================================================================
+-- Regression: index on a partitioned parent must be created valid (#223)
+-- =============================================================================
+-- pg_get_indexdef renders a partitioned parent's index with `ON ONLY`, which builds
+-- only the metadata index on the parent and leaves it indisvalid=false until each
+-- partition's index is attached. The default (non-production) output has no attach
+-- step, so it must emit a plain `CREATE INDEX ... ON` — PostgreSQL then builds and
+-- attaches the partition indexes itself. The parent table is identical in both
+-- schemas; only the index is added in TO. (The round-2 diff cannot catch this on its
+-- own — an invalid index still round-trips empty — so the integration job also
+-- asserts indisvalid after applying the migration.)
+--
+-- FROM: partitioned table with two partitions, no index on partidx_value.
+CREATE TABLE test_schema.partidx (
+    id      integer,
+    value   text,
+    bucket  date
+) PARTITION BY RANGE (bucket);
+
+CREATE TABLE test_schema.partidx_2024 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.partidx_2025 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');

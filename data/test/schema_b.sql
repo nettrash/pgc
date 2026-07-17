@@ -2030,3 +2030,21 @@ CREATE TABLE test_schema.notnull_recreate (
     id       integer,
     null_col varchar(10) NOT NULL
 );
+
+-- =============================================================================
+-- Regression: index on a partitioned parent must be created valid (#223)
+-- =============================================================================
+-- See schema_a.sql. Here the partitioned parent gains an index; the generated
+-- CREATE INDEX must be a plain `ON` (not `ON ONLY`) so the applied index is valid.
+CREATE TABLE test_schema.partidx (
+    id      integer,
+    value   text,
+    bucket  date
+) PARTITION BY RANGE (bucket);
+
+CREATE TABLE test_schema.partidx_2024 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.partidx_2025 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX idx_partidx_value ON test_schema.partidx (value);
