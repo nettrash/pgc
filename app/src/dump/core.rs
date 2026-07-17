@@ -3278,7 +3278,7 @@ impl Dump {
         use_comments: bool,
         use_cascade: bool,
     ) -> String {
-        use crate::utils::string_extensions::StringExt;
+        use crate::utils::string_extensions::{StringExt, normalized_relation_key};
 
         let cascade_suffix = if use_cascade { " cascade" } else { "" };
         let mut script = String::new();
@@ -3309,8 +3309,17 @@ impl Dump {
                 .map(|v| format!("{}.{}", v.schema, v.name))
                 .collect();
 
+            // table_relation stores raw catalog names, while a regular view's schema
+            // and name come from quote_ident, so `s."MyView"` and `s.MyView` denote
+            // the same view. Match on a normalized key or every view whose name needs
+            // quoting loses its dependency edges and gets dropped out of order.
+            let lookup_keys: Vec<String> = view_keys
+                .iter()
+                .map(|k| normalized_relation_key(k))
+                .collect();
+
             // Map qualified name → index (only views, not tables).
-            let key_to_idx: HashMap<&str, usize> = view_keys
+            let key_to_idx: HashMap<&str, usize> = lookup_keys
                 .iter()
                 .enumerate()
                 .map(|(i, k)| (k.as_str(), i))
@@ -3324,7 +3333,7 @@ impl Dump {
 
             for (i, view) in self.views.iter().enumerate() {
                 for rel in &view.table_relation {
-                    if let Some(&j) = key_to_idx.get(rel.as_str())
+                    if let Some(&j) = key_to_idx.get(normalized_relation_key(rel).as_str())
                         && j != i
                     {
                         edges[i].push(j);

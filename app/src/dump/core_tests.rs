@@ -228,6 +228,34 @@ fn test_clear_script_empty_dump() {
     assert!(!script.contains("drop"));
 }
 
+// A view's schema/name come from quote_ident, so a name needing quotes is stored
+// as `"MyBase"`, while table_relation holds the raw catalog name `MyBase`. The drop
+// order must still see the edge, or clear emits `drop view "MyBase"` before the
+// view that depends on it and PostgreSQL rejects the script.
+#[test]
+fn clear_script_orders_quoted_view_names_by_dependency() {
+    let mut dump = empty_dump();
+    dump.schemas.push(make_schema("t"));
+    dump.views.push(make_view("t", "\"MyBase\""));
+    dump.views.push(make_view_with_deps(
+        "t",
+        "\"MyDependent\"",
+        vec!["t.MyBase"],
+    ));
+
+    let script = dump.generate_clear_script(false, false, false);
+    let dependent = script
+        .find("drop view if exists t.\"MyDependent\"")
+        .expect("dependent view must be dropped");
+    let base = script
+        .find("drop view if exists t.\"MyBase\"")
+        .expect("base view must be dropped");
+    assert!(
+        dependent < base,
+        "expected t.\"MyDependent\" to be dropped before t.\"MyBase\"; got:\n{script}"
+    );
+}
+
 #[test]
 fn test_clear_script_single_transaction() {
     let mut dump = empty_dump();

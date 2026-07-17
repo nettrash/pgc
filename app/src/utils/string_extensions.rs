@@ -6,6 +6,22 @@ pub trait StringExt {
     fn append_block(&mut self, other: &str);
 }
 
+/// Normalize a `schema.name` relation reference for equality comparison by
+/// dropping SQL identifier quoting and case.
+///
+/// A view's `table_relation` holds raw catalog names (`s.MyView`) while the keys it
+/// is matched against are built from `quote_ident` output (`s."MyView"`), so both
+/// sides have to be normalized or every identifier that needs quoting loses its
+/// dependency edge.
+pub fn normalized_relation_key(reference: &str) -> String {
+    reference
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '`'))
+        .collect::<String>()
+        .to_lowercase()
+}
+
 /// Normalize CRLF line endings to LF, returning the original string
 /// unchanged (no allocation) when it contains no `\r\n`.
 pub fn normalize_line_endings(s: String) -> String {
