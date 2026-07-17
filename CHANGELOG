@@ -1,6 +1,35 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #220 (CREATE MATERIALIZED VIEW in
+                      generated diff is missing WITH NO DATA clause). A
+                      materialized view created WITH NO DATA is left
+                      unpopulated, but that is recorded only in
+                      pg_class.relispopulated — the stored definition
+                      is just the SELECT — so a diff rebuilt from the
+                      definition dropped the clause and applying it ran
+                      the query and filled the view the clause exists
+                      to keep empty. The dump now reads ispopulated
+                      and the generated CREATE MATERIALIZED VIEW
+                      carries WITH NO DATA again. Whether a view holds
+                      data is state rather than schema (REFRESH ...
+                      WITH NO DATA flips it either way), so it stays
+                      out of the view hash: refreshing a materialized
+                      view still does not make compare want to drop and
+                      recreate it. Dumps written by earlier versions
+                      read back as populated.
+                    - Trailing view clauses are no longer emitted after
+                      the statement they belong to. PostgreSQL renders
+                      a view definition with its terminating semicolon,
+                      and both WITH NO DATA and WITH CHECK OPTION were
+                      appended after it, so the clause parsed as a
+                      separate statement. WITH CHECK OPTION therefore
+                      failed with a syntax error and the view was
+                      created without the option — silently, since the
+                      CREATE itself succeeded. Clauses are now written
+                      inside the statement, and the statement is
+                      terminated once, whether or not the definition
+                      arrived with a semicolon of its own.
                     - Resolved issue #219 (views that reference only
                       functions are silently excluded from dump).
                       Regular views were read with an inner join

@@ -22,6 +22,12 @@ pub struct View {
     /// Whether this is a materialized view
     #[serde(default)]
     pub is_materialized: bool,
+    /// Whether a materialized view holds data. `false` means it was created (or last
+    /// refreshed) `WITH NO DATA` and is not scannable until refreshed. Meaningless for
+    /// regular views. Dumps written before this field existed default to populated,
+    /// which is how every materialized view they could describe was created.
+    #[serde(default = "View::default_is_populated")]
+    pub is_populated: bool,
     /// Hash of the view
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -61,6 +67,7 @@ impl View {
             owner: String::new(),
             comment: None,
             is_materialized: false,
+            is_populated: Self::default_is_populated(),
             hash: None,
             acl: Vec::new(),
             security_invoker: false,
@@ -71,6 +78,10 @@ impl View {
         };
         view.hash();
         view
+    }
+
+    fn default_is_populated() -> bool {
+        true
     }
 
     /// Returns the SQL keyword for this view type ("view" or "materialized view")
@@ -123,13 +134,16 @@ impl View {
             ""
         };
 
+        // PostgreSQL renders a view definition with its terminating semicolon, but
+        // every trailing clause below belongs *inside* the statement. Drop the
+        // semicolon here and put it back once the clauses are attached, otherwise
+        // they land after the statement has already ended and fail to parse.
+        let definition = self.definition.trim_end();
+        let body = definition.strip_suffix(';').unwrap_or(definition);
+
         let mut create_stmt = format!(
             "create {} {}.{}{} as\n{}",
-            keyword,
-            self.schema,
-            self.name,
-            with_clause,
-            self.definition.trim_end()
+            keyword, self.schema, self.name, with_clause, body
         );
 
         // WITH CHECK OPTION (regular views only)
@@ -141,6 +155,15 @@ impl View {
                 _ => create_stmt.push_str("\nwith cascaded check option"),
             }
         }
+
+        // An unpopulated materialized view has to be created empty: without the
+        // clause the definition runs and fills it, which is what WITH NO DATA exists
+        // to avoid.
+        if self.is_materialized && !self.is_populated {
+            create_stmt.push_str("\nwith no data");
+        }
+
+        create_stmt.push(';');
 
         let mut script = create_stmt.with_empty_lines();
 
@@ -288,12 +311,13 @@ impl View {
             } else {
                 ""
             };
+            // As in get_script: the check option belongs inside the statement, so the
+            // definition's terminating semicolon comes off and goes back on at the end.
+            let desired = target.definition.trim_end();
+            let body = desired.strip_suffix(';').unwrap_or(desired);
             let mut create_stmt = format!(
                 "CREATE OR REPLACE VIEW {}.{}{} AS\n{}",
-                target.schema,
-                target.name,
-                with_clause,
-                target.definition.trim_end()
+                target.schema, target.name, with_clause, body
             );
             if let Some(ref co) = target.check_option {
                 match co.to_lowercase().as_str() {
@@ -301,6 +325,7 @@ impl View {
                     _ => create_stmt.push_str("\nwith cascaded check option"),
                 }
             }
+            create_stmt.push(';');
             script = create_stmt.with_empty_lines();
         }
 

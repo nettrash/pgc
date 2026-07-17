@@ -196,12 +196,24 @@ These schemas are designed to test comparison capabilities for the following Pos
   `vw_rule_base`: the dependency walk follows the view's `_RETURN` rule alone, and
   counting the targets of user-defined rules would invent drop-ordering edges. Its base
   table is identical in both schemas on purpose — see the note in `schema_a.sql`.
+- **Modified**: `vw_check_opt` — `WITH CHECK OPTION` goes from `LOCAL` to `CASCADED`,
+  driving the `CREATE OR REPLACE` path. Like `WITH NO DATA` (issue #220) this is a
+  trailing clause, so it has to be written inside the statement; emitted after the
+  definition's semicolon it parses as a separate statement and is a syntax error.
 
 #### Materialized Views
 - **Modified**: `active_users_mat` — added `status` column
 - **Removed**: `from_only_mat` (FROM-only)
 - **Added**: `product_stock_mat` (TO-only)
 - **Unchanged**: `user_count_mat`
+- **Added**: `mv_no_data` (TO-only) — created `WITH NO DATA` and never refreshed. The
+  clause is not part of the stored definition; it survives only as
+  `pg_class.relispopulated`, so a diff built from the definition alone recreates the
+  view populated and applying it runs the query the clause exists to defer (issue #220).
+  The generated `CREATE MATERIALIZED VIEW` must carry `WITH NO DATA`, and it must sit
+  before the statement's terminating semicolon rather than after it.
+- **Unchanged**: `mv_with_data` — a populated materialized view over the same base
+  table, which must never acquire a `WITH NO DATA` clause.
 
 ### 14. Row-Level Security Policies
 - **Modified**: `users_rls_select` — changed to `RESTRICTIVE`, role changed to `tenant_reader`, added `AND two_factor_enabled = TRUE` condition
