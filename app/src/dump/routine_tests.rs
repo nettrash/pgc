@@ -702,6 +702,16 @@ fn get_config_clause_empty_value() {
     assert_eq!(routine.get_config_clause(), " SET application_name = ''");
 }
 
+// An empty value on a list-quote GUC must not be emitted verbatim: `SET search_path =`
+// with nothing after it is a syntax error. It falls back to an empty string literal,
+// which is valid (a real empty search_path is stored as `""`, never as a bare empty).
+#[test]
+fn get_config_clause_empty_value_list_guc() {
+    let mut routine = build_function_routine();
+    routine.config = vec!["search_path=".to_string()];
+    assert_eq!(routine.get_config_clause(), " SET search_path = ''");
+}
+
 // Issue #217: a search_path list whose elements need no quoting (`t, pg_temp`) was
 // wrapped in a single-quoted literal, so PostgreSQL re-stored it as one schema named
 // "t, pg_temp" and every subsequent compare re-emitted the routine. GUC_LIST_QUOTE

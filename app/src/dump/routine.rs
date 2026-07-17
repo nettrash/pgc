@@ -441,7 +441,13 @@ impl Routine {
                 // Any other GUC holds a plain scalar value, so it is quoted as a string
                 // literal — which is also correct when that value happens to contain a
                 // double quote, unlike a bare `contains('"')` test would be.
-                if is_list_quote_guc(name) {
+                if value.is_empty() {
+                    // Emitting a list GUC's value verbatim breaks down for an empty
+                    // value: `SET search_path = ` (nothing) is a syntax error. An empty
+                    // string literal is valid for both list and scalar GUCs, and a real
+                    // empty search_path is anyway stored as `""`, not as a bare empty.
+                    parts.push(format!(" SET {name} = ''"));
+                } else if is_list_quote_guc(name) {
                     parts.push(format!(" SET {name} = {value}"));
                 } else {
                     parts.push(format!(" SET {name} = '{}'", value.replace('\'', "''")));
