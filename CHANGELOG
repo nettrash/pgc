@@ -1,3 +1,38 @@
+2026-07-17      v1.0.25
+
+                Bug fixes:
+                    - Resolved issue #219 (views that reference only
+                      functions are silently excluded from dump).
+                      Regular views were read with an inner join
+                      against information_schema.view_table_usage,
+                      which holds no rows for a view whose body never
+                      reads a table, so a view built solely on a
+                      function call was dropped from the dump and
+                      compare could not see any change to it. That
+                      view is now dumped, and the relations it
+                      references are resolved from pg_rewrite /
+                      pg_depend instead. view_table_usage is also
+                      privilege-filtered to tables owned by a
+                      currently enabled role, so the same join
+                      dropped any view whose underlying table
+                      belonged to another role; that case is fixed
+                      as well, which brings the view path in line
+                      with the privilege-independent dump contract
+                      the other introspection queries already honour.
+                    - table_relation for materialized views is no
+                      longer always empty. It was read from pg_depend
+                      rows anchored on the materialized view's
+                      pg_class OID, but a view's dependencies on the
+                      relations it reads are recorded against its
+                      _RETURN rewrite rule, so the lookup never
+                      matched anything. Materialized views therefore
+                      carried no dependency information at all:
+                      compare could not tell that a materialized view
+                      had to be dropped before an altered table it
+                      reads, and clear emitted materialized-view
+                      drops without ordering them against the tables
+                      they depend on.
+
 2026-06-11      v1.0.24
 
                 Bug fixes:
