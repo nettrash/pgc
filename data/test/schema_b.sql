@@ -2002,3 +2002,21 @@ ALTER TABLE test_schema.reloptions_to_regular SET (
     autovacuum_analyze_scale_factor = 0.02,
     autovacuum_vacuum_scale_factor = 0.05
 );
+
+-- =============================================================================
+-- Regression: SET config values must round-trip (issue #217)
+-- =============================================================================
+-- See schema_a.sql. Here the procedure carries an unquoted list-valued search_path
+-- alongside a scalar and a numeric SET; the generated CREATE OR REPLACE must emit the
+-- list verbatim so the applied routine's proconfig matches this source exactly.
+CREATE OR REPLACE PROCEDURE test_schema.set_config_roundtrip(p_id integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = test_schema, pg_temp
+SET lock_timeout = '5s'
+SET statement_timeout = 30000
+AS $$
+BEGIN
+    RAISE NOTICE 'id=%', p_id;
+END;
+$$;

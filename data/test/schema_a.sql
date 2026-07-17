@@ -1727,3 +1727,24 @@ CREATE TABLE test_schema.reloptions_to_regular (
 
 CREATE TABLE test_schema.reloptions_to_regular_default
     PARTITION OF test_schema.reloptions_to_regular DEFAULT;
+
+-- =============================================================================
+-- Regression: SET config values must round-trip (issue #217)
+-- =============================================================================
+-- A GUC_LIST_QUOTE parameter (search_path, temp_tablespaces) stores its value in
+-- proconfig as a plain comma-separated list. Emitting it as a single-quoted literal
+-- turns `test_schema, pg_temp` into one schema literally named "test_schema, pg_temp",
+-- which re-stores differently from the source, so every compare re-emits the routine
+-- forever. The existing get_session_user_safe / secure_lookup fixtures use a QUOTED
+-- single element ('public, pg_temp'), which round-trips either way and so never
+-- exercised this — the unquoted multi-element list below is what does.
+--
+-- FROM: procedure with no SET config.
+-- TO:   gains SECURITY DEFINER and three SET clauses, one of them an unquoted list.
+CREATE OR REPLACE PROCEDURE test_schema.set_config_roundtrip(p_id integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE NOTICE 'id=%', p_id;
+END;
+$$;
