@@ -415,27 +415,41 @@ impl Dump {
         Ok(())
     }
 
+    /// The schema-resolution query: expands the `--scheme` SIMILAR TO pattern into
+    /// the concrete schema list every other dump query filters by.
+    ///
+    /// All `pg_`-prefixed schemas are excluded, not just `pg_catalog`: a broad
+    /// pattern such as `%` would otherwise pick up `pg_toast` and — whenever any
+    /// session holds temporary objects at dump time — the per-session
+    /// `pg_temp_N` / `pg_toast_temp_N` schemas, and the generated
+    /// `create schema pg_temp_N` fails with `unacceptable schema name` (issue
+    /// #229). PostgreSQL reserves the `pg_` prefix for system schemas ("The
+    /// prefix \"pg_\" is reserved"), so no user schema can ever match the filter
+    /// and nothing dumpable is lost.
+    fn build_schemas_query() -> &'static str {
+        "select
+                quote_ident(n.nspname) as schema_name,
+                n.nspname as raw_schema_name,
+                quote_ident(r.rolname) as schema_owner,
+                d.description as schema_comment,
+                has_schema_privilege(n.nspname, 'USAGE') as has_usage,
+                n.nspacl::text[] as schema_acl
+         from pg_namespace n
+         left join pg_roles r on r.oid = n.nspowner
+         left join pg_description d on d.objoid = n.oid
+             and d.classoid = 'pg_namespace'::regclass
+             and d.objsubid = 0
+         where n.nspname similar to $1
+           and n.nspname not like 'pg\\_%'
+           and n.nspname <> 'information_schema'"
+    }
+
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let rows = sqlx::query(
-            "select
-                    quote_ident(n.nspname) as schema_name,
-                    n.nspname as raw_schema_name,
-                    quote_ident(r.rolname) as schema_owner,
-                    d.description as schema_comment,
-                    has_schema_privilege(n.nspname, 'USAGE') as has_usage,
-                    n.nspacl::text[] as schema_acl
-             from pg_namespace n
-             left join pg_roles r on r.oid = n.nspowner
-             left join pg_description d on d.objoid = n.oid
-                 and d.classoid = 'pg_namespace'::regclass
-                 and d.objsubid = 0
-             where n.nspname similar to $1
-               and n.nspname not in ('pg_catalog', 'information_schema')",
-        )
-        .bind(&self.configuration.scheme)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch schemas: {e}.")))?;
+        let rows = sqlx::query(Self::build_schemas_query())
+            .bind(&self.configuration.scheme)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch schemas: {e}.")))?;
 
         if rows.is_empty() {
             println!("No schemas found.");

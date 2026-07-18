@@ -937,6 +937,23 @@ fn build_view_columns_query_extension_filter_is_precise() {
     assert_extension_filter(&query, "pg_class", "view columns");
 }
 
+// A broad --scheme pattern such as `%` must never resolve to system schemas: the
+// per-session pg_temp_N / pg_toast_temp_N schemas cannot be recreated ("unacceptable
+// schema name", issue #229) and pg_toast/pg_catalog are not dumpable either.
+// PostgreSQL reserves the whole pg_ prefix, so filtering it excludes no user schema.
+#[test]
+fn build_schemas_query_excludes_all_pg_prefixed_schemas() {
+    let query = Dump::build_schemas_query();
+    assert!(
+        query.contains("n.nspname not like 'pg\\_%'"),
+        "schema resolution must exclude every pg_-prefixed schema"
+    );
+    assert!(
+        query.contains("n.nspname <> 'information_schema'"),
+        "information_schema must stay excluded"
+    );
+}
+
 // Collations are schema-scoped: two different collations may share a bare name, and
 // PostgreSQL rejects OR REPLACE across them ("cannot change collation of view column
 // ... from \"mycoll\" to \"mycoll\"", verified live). The capture must therefore

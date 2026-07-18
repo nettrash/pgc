@@ -1,6 +1,21 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #229 (temporary session schemas
+                      included when dumping with --scheme %). A broad
+                      scheme pattern picked up pg_toast and, whenever
+                      any session held temporary objects at dump time,
+                      the per-session pg_temp_N / pg_toast_temp_N
+                      schemas together with their temporary tables.
+                      The generated create schema pg_temp_N then
+                      failed with "unacceptable schema name: the
+                      prefix pg_ is reserved for system schemas". The
+                      schema-resolution query now excludes every
+                      pg_-prefixed schema, which propagates to all
+                      dump, compare and clear paths since they filter
+                      by the resolved schema list. PostgreSQL reserves
+                      the pg_ prefix, so no user schema can match the
+                      filter and nothing dumpable is lost.
                     - Resolved issue #227 (CREATE OR REPLACE VIEW
                       generated when the column order changes, causing
                       migration failure). PostgreSQL accepts CREATE OR
