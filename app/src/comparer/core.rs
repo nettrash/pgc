@@ -2204,6 +2204,9 @@ impl Comparer {
                         if !table_recreated {
                             let mut col_dep_emitted: HashSet<String> = HashSet::new();
                             let mut col_dep_recreate = String::new();
+                            let mut col_dep_post_commit = String::new();
+                            let col_dep_prod_ctx =
+                                self.output_for_production.then_some(&partition_ctx);
                             for to_col in &to_table.columns {
                                 if let Some(from_col) =
                                     table.columns.iter().find(|c| c.name == to_col.name)
@@ -2214,7 +2217,11 @@ impl Comparer {
                                         &to_col.table,
                                         &to_col.name,
                                         &mut col_dep_emitted,
-                                        &mut col_dep_recreate,
+                                        &mut RecreateBuffers {
+                                            out: &mut col_dep_recreate,
+                                            post_commit: &mut col_dep_post_commit,
+                                        },
+                                        col_dep_prod_ctx,
                                     );
                                 }
                             }
@@ -2227,6 +2234,7 @@ impl Comparer {
                                     "/* ---> Recreate dependents dropped by virtual-column rewrite: End ------ */",
                                 );
                             }
+                            self.production_post_script.push_str(&col_dep_post_commit);
                         }
 
                         self.trigger_post_script.push_str(
@@ -2939,8 +2947,26 @@ impl Comparer {
                 .map(|tv| from_view.is_materialized != tv.is_materialized)
                 .unwrap_or(false);
 
-            let should_drop =
-                is_dependent || is_from_only || is_changed_mat_view || is_kind_transition;
+            // A changed regular view whose column list is not an exact prefix of the
+            // target's (column inserted, reordered, renamed, retyped, or dropped)
+            // cannot be updated with CREATE OR REPLACE VIEW — PostgreSQL rejects it
+            // with "cannot change name of view column" (issue #227). Route it through
+            // drop+recreate; when either dump predates column capture the check
+            // returns compatible and the historical OR REPLACE path is kept.
+            let is_incompatible_regular_change = !from_view.is_materialized
+                && to_view
+                    .map(|tv| {
+                        !tv.is_materialized
+                            && Self::hashes_differ(&from_view.hash, &tv.hash)
+                            && !from_view.or_replace_compatible(tv)
+                    })
+                    .unwrap_or(false);
+
+            let should_drop = is_dependent
+                || is_from_only
+                || is_changed_mat_view
+                || is_kind_transition
+                || is_incompatible_regular_change;
 
             if should_drop {
                 // The drop is emitted as active SQL only when use_drop is true.
@@ -2949,6 +2975,71 @@ impl Comparer {
                 // out so the user can review them manually.
                 let drop_is_active = self.use_drop;
                 candidates.push((idx, normalized_view, drop_is_active));
+            }
+        }
+
+        // Prelowered definition and lowered (schema, name) for every FROM view,
+        // computed once and shared by the dependency-expansion fixpoint below and the
+        // drop-ordering pass after it. Indexed by FROM-view position, so it stays
+        // valid while the candidate set grows. Skipped entirely when nothing drops.
+        let prelowered_defs: Vec<(String, String)> = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.from
+                .views
+                .iter()
+                .map(|v| Self::prelower_pair(&v.definition))
+                .collect()
+        };
+        let names_lc: Vec<(String, String)> = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.from
+                .views
+                .iter()
+                .map(|v| (v.schema.to_lowercase(), v.name.to_lowercase()))
+                .collect()
+        };
+
+        // A view that reads another view being dropped must itself be dropped first
+        // and recreated after: DROP VIEW runs without CASCADE, so it fails while any
+        // dependent view still exists (issue #227). Expand the candidate set to a
+        // fixpoint so whole dependency chains ride along; every addition is recreated
+        // from the TO dump afterwards because dropped_views membership marks it for
+        // action in compare_routines_and_views.
+        let mut candidate_keys: HashSet<String> =
+            candidates.iter().map(|(_, key, _)| key.clone()).collect();
+        while !candidates.is_empty() {
+            let mut added = false;
+            for (idx, from_view) in self.from.views.iter().enumerate() {
+                let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
+                if candidate_keys.contains(&normalized_view) {
+                    continue;
+                }
+                // FROM-only views are already candidates via is_from_only, so only
+                // views that still exist in TO can be reached here.
+                let (def_lower, def_unquoted) = &prelowered_defs[idx];
+                let references_candidate = from_view
+                    .table_relation
+                    .iter()
+                    .any(|rel| candidate_keys.contains(&Self::normalized_view_reference(rel)))
+                    || candidates.iter().any(|(cidx, _, _)| {
+                        let (schema_lc, name_lc) = &names_lc[*cidx];
+                        Self::text_references_qualified_name_pre(
+                            def_lower,
+                            def_unquoted,
+                            schema_lc,
+                            name_lc,
+                        )
+                    });
+                if references_candidate {
+                    candidate_keys.insert(normalized_view.clone());
+                    candidates.push((idx, normalized_view, self.use_drop));
+                    added = true;
+                }
+            }
+            if !added {
+                break;
             }
         }
 
@@ -2962,21 +3053,6 @@ impl Comparer {
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); candidates.len()];
 
-            // Precompute per-view: prelowered definition + lowered
-            // (schema, name) of the other-view key. Avoids re-lowering the
-            // full view definition on every inner-loop iteration.
-            let candidate_defs: Vec<(String, String)> = candidates
-                .iter()
-                .map(|(idx, _, _)| Self::prelower_pair(&self.from.views[*idx].definition))
-                .collect();
-            let candidate_names_lc: Vec<(String, String)> = candidates
-                .iter()
-                .map(|(idx, _, _)| {
-                    let v = &self.from.views[*idx];
-                    (v.schema.to_lowercase(), v.name.to_lowercase())
-                })
-                .collect();
-
             for (i, (view_idx, _, _)) in candidates.iter().enumerate() {
                 let view = &self.from.views[*view_idx];
                 // Check table_relation
@@ -2989,8 +3065,9 @@ impl Comparer {
                     }
                 }
                 // Check definition text for references to other dropping views
-                let (def_lower, def_unquoted) = &candidate_defs[i];
-                for (j, (schema_lc, name_lc)) in candidate_names_lc.iter().enumerate() {
+                let (def_lower, def_unquoted) = &prelowered_defs[*view_idx];
+                for (j, (cand_idx, _, _)) in candidates.iter().enumerate() {
+                    let (schema_lc, name_lc) = &names_lc[*cand_idx];
                     if i != j
                         && Self::text_references_qualified_name_pre(
                             def_lower,
@@ -4360,6 +4437,24 @@ impl Comparer {
 
         let mut emitted_keys: HashSet<String> = HashSet::new();
         let mut recreate: String = String::new();
+        // Post-commit statements produced by the production-mode index split
+        // (per-partition CONCURRENTLY builds and ATTACH PARTITION); flushed into
+        // production_post_script at the end. Empty in default mode.
+        let mut recreate_post_commit: String = String::new();
+        let partition_maps = if self.output_for_production {
+            Some(self.build_partition_context_maps())
+        } else {
+            None
+        };
+        let prod_ctx = partition_maps
+            .as_ref()
+            .map(
+                |(parents, children, partitioned_indexes)| PartitionContext {
+                    partitioned_parents: parents,
+                    children,
+                    partitioned_indexes,
+                },
+            );
 
         for from_table in &self.from.tables {
             // If the table is gone in TO it is being dropped — there is
@@ -4482,10 +4577,12 @@ impl Comparer {
                 if !emitted_keys.insert(key) {
                     continue;
                 }
-                Self::emit_dependent_recreate(
+                Self::emit_index_dependent_recreate(
                     &mut recreate,
+                    &mut recreate_post_commit,
                     self.use_drop,
-                    &index_recreate_block(to_index),
+                    to_index,
+                    prod_ctx.as_ref(),
                 );
             }
 
@@ -4564,7 +4661,11 @@ impl Comparer {
                                 &to_column.table,
                                 &to_column.name,
                                 &mut emitted_keys,
-                                &mut recreate,
+                                &mut RecreateBuffers {
+                                    out: &mut recreate,
+                                    post_commit: &mut recreate_post_commit,
+                                },
+                                prod_ctx.as_ref(),
                             );
                         }
                     } else if default_referenced && let Some(default) = &to_column.column_default {
@@ -4697,6 +4798,7 @@ impl Comparer {
             self.script
                 .append_block("/* ---> Recreate dependents dropped by CASCADE: End ------ */");
         }
+        self.production_post_script.push_str(&recreate_post_commit);
     }
 
     /// True when `definition` textually references any `(schema, name)` in
@@ -4914,6 +5016,35 @@ impl Comparer {
         }
     }
 
+    /// Emit the recreate block for a CASCADE-dropped index.
+    ///
+    /// In production mode (`prod_ctx` is `Some`) the index goes through the same
+    /// partition-aware concurrent split as every other index creation: `ON ONLY`
+    /// in-transaction plus per-partition `CONCURRENTLY`/`ATTACH PARTITION`
+    /// post-commit for a partitioned parent, and a concurrent post-commit build for
+    /// a plain table. A plain in-transaction `CREATE INDEX` here would take a long
+    /// write lock — and before issue #223 the verbatim `ON ONLY` rendering left the
+    /// recreated parent index permanently invalid instead. The default mode keeps
+    /// the plain `CREATE INDEX IF NOT EXISTS` block, and so does commented review
+    /// output (`use_drop = false`), where post-commit fragments would be
+    /// meaningless.
+    fn emit_index_dependent_recreate(
+        out: &mut String,
+        post_commit: &mut String,
+        use_drop: bool,
+        index: &TableIndex,
+        prod_ctx: Option<&PartitionContext>,
+    ) {
+        match prod_ctx {
+            Some(ctx) if use_drop => {
+                let split = production::index_create_split(index, ctx, false);
+                out.push_str(&split.in_txn);
+                post_commit.push_str(&split.post_commit);
+            }
+            _ => Self::emit_dependent_recreate(out, use_drop, &index_recreate_block(index)),
+        }
+    }
+
     /// Re-emit every TO-side dependent of `(table_schema, table_name,
     /// column_name)` that PostgreSQL would have CASCADE-dropped when the
     /// column was dropped. Uses the `column_dependents` graph harvested
@@ -4938,8 +5069,12 @@ impl Comparer {
         table_name: &str,
         column_name: &str,
         emitted_keys: &mut HashSet<String>,
-        out: &mut String,
+        buffers: &mut RecreateBuffers<'_>,
+        prod_ctx: Option<&PartitionContext>,
     ) {
+        let RecreateBuffers { out, post_commit } = buffers;
+        let out: &mut String = out;
+        let post_commit: &mut String = post_commit;
         let want_schema = table_schema.to_lowercase().replace('"', "");
         let want_table = table_name.to_lowercase().replace('"', "");
         let want_column = column_name.to_lowercase().replace('"', "");
@@ -4995,10 +5130,12 @@ impl Comparer {
                     if !emitted_keys.insert(key) {
                         continue;
                     }
-                    Self::emit_dependent_recreate(
+                    Self::emit_index_dependent_recreate(
                         out,
+                        post_commit,
                         self.use_drop,
-                        &index_recreate_block(to_index),
+                        to_index,
+                        prod_ctx,
                     );
                 }
                 ColumnDependentKind::Constraint => {
@@ -5631,6 +5768,14 @@ fn constraint_recreate_block(constraint: &TableConstraint) -> String {
 /// drop in that case would silently invalidate a perfectly good index.
 /// `IF NOT EXISTS` makes the recreate a no-op when the index survived
 /// CASCADE and a real create when it did not.
+/// Output buffers for dependent-recreation emission: the in-transaction recreate
+/// block and the production post-commit statements (per-partition concurrent index
+/// builds and ATTACH PARTITION) that belong with it.
+struct RecreateBuffers<'a> {
+    out: &'a mut String,
+    post_commit: &'a mut String,
+}
+
 fn index_recreate_block(index: &TableIndex) -> String {
     inject_if_not_exists_into_create_index(&index.get_script())
 }

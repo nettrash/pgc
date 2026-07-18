@@ -5909,7 +5909,7 @@ async fn compare_routines_procedure_with_config_params() {
     let script = comparer.get_script();
 
     assert!(
-        script.contains("SET search_path = 'public, pg_temp'"),
+        script.contains("SET search_path = public, pg_temp"),
         "script must contain SET search_path, got:\n{}",
         script
     );
@@ -6013,7 +6013,7 @@ async fn compare_routines_config_change_triggers_update() {
         script
     );
     assert!(
-        script.contains("SET search_path = 'public'"),
+        script.contains("SET search_path = public"),
         "script must contain SET search_path, got:\n{}",
         script
     );
@@ -11311,5 +11311,158 @@ async fn production_header_mentions_commit_only_with_single_transaction() {
     assert!(
         no_txn_script.contains("are emitted in a separate section at the end"),
         "header must describe the trailing section accurately:\n{no_txn_script}"
+    );
+}
+
+// ------ OR-REPLACE incompatible column changes (issue #227) ------
+
+fn view_227(name: &str, definition: &str, cols: &[(&str, &str)]) -> View {
+    let mut v = View::new(
+        name.to_string(),
+        definition.to_string(),
+        "public".to_string(),
+        vec![],
+    );
+    v.columns = cols
+        .iter()
+        .map(|(n, t)| crate::dump::view::ViewColumn {
+            name: n.to_string(),
+            data_type: t.to_string(),
+            collation: None,
+        })
+        .collect();
+    v.hash();
+    v
+}
+
+#[tokio::test]
+async fn incompatible_view_column_change_drops_and_recreates() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.views.push(view_227(
+        "item_v",
+        "select id, profile_id from public.item",
+        &[("id", "integer"), ("profile_id", "integer")],
+    ));
+    to_dump.views.push(view_227(
+        "item_v",
+        "select id, kind, profile_id from public.item",
+        &[
+            ("id", "integer"),
+            ("kind", "text"),
+            ("profile_id", "integer"),
+        ],
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.drop_views().await.unwrap();
+    let script = comparer.get_script();
+    let has_active_drop = script
+        .lines()
+        .any(|l| !l.starts_with("--") && l.contains("drop view if exists public.item_v"));
+    assert!(
+        has_active_drop,
+        "incompatible column change must emit an active DROP VIEW:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn compatible_view_column_append_keeps_or_replace_without_drop() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.views.push(view_227(
+        "item_v",
+        "select id from public.item",
+        &[("id", "integer")],
+    ));
+    to_dump.views.push(view_227(
+        "item_v",
+        "select id, kind from public.item",
+        &[("id", "integer"), ("kind", "text")],
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.drop_views().await.unwrap();
+    let script = comparer.get_script();
+    assert!(
+        !script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view")),
+        "appending a column at the end must not drop the view:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn changed_views_without_column_data_keep_or_replace() {
+    // Dumps written by an older pgc carry no column data; the historical
+    // CREATE OR REPLACE behavior must be preserved for them.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.views.push(view_227(
+        "item_v",
+        "select id, profile_id from public.item",
+        &[],
+    ));
+    to_dump.views.push(view_227(
+        "item_v",
+        "select id, kind, profile_id from public.item",
+        &[],
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.drop_views().await.unwrap();
+    let script = comparer.get_script();
+    assert!(
+        !script
+            .lines()
+            .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view")),
+        "without column data the view must not be dropped:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn dependent_view_is_dropped_before_incompatible_base_view() {
+    // v2 reads item_v and is unchanged; item_v changes incompatibly. DROP VIEW runs
+    // without CASCADE, so v2 must be pulled into the drop set and dropped first.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    from_dump.views.push(view_227(
+        "item_v",
+        "select id, profile_id from public.item",
+        &[("id", "integer"), ("profile_id", "integer")],
+    ));
+    let mut from_dep = view_227("v2", "select id from public.item_v", &[("id", "integer")]);
+    from_dep.table_relation = vec!["public.item_v".to_string()];
+    from_dep.hash();
+    from_dump.views.push(from_dep);
+
+    to_dump.views.push(view_227(
+        "item_v",
+        "select id, kind, profile_id from public.item",
+        &[
+            ("id", "integer"),
+            ("kind", "text"),
+            ("profile_id", "integer"),
+        ],
+    ));
+    let mut to_dep = view_227("v2", "select id from public.item_v", &[("id", "integer")]);
+    to_dep.table_relation = vec!["public.item_v".to_string()];
+    to_dep.hash();
+    to_dump.views.push(to_dep);
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.drop_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let drop_dep = script
+        .find("drop view if exists public.v2;")
+        .expect("dependent view must be dropped too");
+    let drop_base = script
+        .find("drop view if exists public.item_v;")
+        .expect("base view must be dropped");
+    assert!(
+        drop_dep < drop_base,
+        "dependent must drop before the view it reads:\n{script}"
     );
 }

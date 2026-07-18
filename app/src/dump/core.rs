@@ -415,27 +415,41 @@ impl Dump {
         Ok(())
     }
 
+    /// The schema-resolution query: expands the `--scheme` SIMILAR TO pattern into
+    /// the concrete schema list every other dump query filters by.
+    ///
+    /// All `pg_`-prefixed schemas are excluded, not just `pg_catalog`: a broad
+    /// pattern such as `%` would otherwise pick up `pg_toast` and — whenever any
+    /// session holds temporary objects at dump time — the per-session
+    /// `pg_temp_N` / `pg_toast_temp_N` schemas, and the generated
+    /// `create schema pg_temp_N` fails with `unacceptable schema name` (issue
+    /// #229). PostgreSQL reserves the `pg_` prefix for system schemas ("The
+    /// prefix \"pg_\" is reserved"), so no user schema can ever match the filter
+    /// and nothing dumpable is lost.
+    fn build_schemas_query() -> &'static str {
+        "select
+                quote_ident(n.nspname) as schema_name,
+                n.nspname as raw_schema_name,
+                quote_ident(r.rolname) as schema_owner,
+                d.description as schema_comment,
+                has_schema_privilege(n.nspname, 'USAGE') as has_usage,
+                n.nspacl::text[] as schema_acl
+         from pg_namespace n
+         left join pg_roles r on r.oid = n.nspowner
+         left join pg_description d on d.objoid = n.oid
+             and d.classoid = 'pg_namespace'::regclass
+             and d.objsubid = 0
+         where n.nspname similar to $1
+           and n.nspname not like 'pg\\_%'
+           and n.nspname <> 'information_schema'"
+    }
+
     async fn get_schemas(&mut self, pool: &PgPool) -> Result<(), Error> {
-        let rows = sqlx::query(
-            "select
-                    quote_ident(n.nspname) as schema_name,
-                    n.nspname as raw_schema_name,
-                    quote_ident(r.rolname) as schema_owner,
-                    d.description as schema_comment,
-                    has_schema_privilege(n.nspname, 'USAGE') as has_usage,
-                    n.nspacl::text[] as schema_acl
-             from pg_namespace n
-             left join pg_roles r on r.oid = n.nspowner
-             left join pg_description d on d.objoid = n.oid
-                 and d.classoid = 'pg_namespace'::regclass
-                 and d.objsubid = 0
-             where n.nspname similar to $1
-               and n.nspname not in ('pg_catalog', 'information_schema')",
-        )
-        .bind(&self.configuration.scheme)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::other(format!("Failed to fetch schemas: {e}.")))?;
+        let rows = sqlx::query(Self::build_schemas_query())
+            .bind(&self.configuration.scheme)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch schemas: {e}.")))?;
 
         if rows.is_empty() {
             println!("No schemas found.");
@@ -1090,7 +1104,7 @@ impl Dump {
                 r.proacl::text[] as routine_acl,
                 r.proconfig::text[] as proconfig,
                 agg.aggtransfn::regproc::text as agg_sfunc,
-                format_type(agg.aggtranstype, null) as agg_stype,
+                pg_catalog.format_type(agg.aggtranstype, null) as agg_stype,
                 agg.aggtransspace as agg_sspace,
                 case when agg.aggfinalfn != 0 then agg.aggfinalfn::regproc::text end as agg_finalfunc,
                 agg.aggfinalextra as agg_finalfunc_extra,
@@ -1101,7 +1115,7 @@ impl Dump {
                 agg.agginitval as agg_initcond,
                 case when agg.aggmtransfn != 0 then agg.aggmtransfn::regproc::text end as agg_msfunc,
                 case when agg.aggminvtransfn != 0 then agg.aggminvtransfn::regproc::text end as agg_minvfunc,
-                case when agg.aggmtransfn != 0 then format_type(agg.aggmtranstype, null) end as agg_mstype,
+                case when agg.aggmtransfn != 0 then pg_catalog.format_type(agg.aggmtranstype, null) end as agg_mstype,
                 agg.aggmtransspace as agg_msspace,
                 case when agg.aggmfinalfn != 0 then agg.aggmfinalfn::regproc::text end as agg_mfinalfunc,
                 agg.aggmfinalextra as agg_mfinalfunc_extra,
@@ -1114,7 +1128,7 @@ impl Dump {
                 r.prorows,
                 case when r.prosupport != 0 then r.prosupport::regproc::text else null end as prosupport,
                 (
-                    select array_agg(format_type(t.oid, null) order by ordinality)
+                    select array_agg(pg_catalog.format_type(t.oid, null) order by ordinality)
                     from unnest(r.protrftypes) with ordinality as u(typid, ordinality)
                     join pg_type t on t.oid = u.typid
                 ) as protrftypes
@@ -1507,6 +1521,29 @@ impl Dump {
                 .push((col, comment));
         }
 
+        // Output columns per regular view, ordinal order (fetched sequentially so
+        // the pool budget of this branch is unchanged). Rows arrive ordered by
+        // attnum, so pushing preserves position.
+        let view_columns_query = Self::build_view_columns_query(schema_filter);
+        let view_column_rows = sqlx::query(view_columns_query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch view columns: {e}.")))?;
+        let mut view_columns_map: HashMap<(String, String), Vec<crate::dump::view::ViewColumn>> =
+            HashMap::new();
+        for row in &view_column_rows {
+            let schema: String = row.get("schema_name");
+            let view_name: String = row.get("view_name");
+            view_columns_map
+                .entry((schema, view_name))
+                .or_default()
+                .push(crate::dump::view::ViewColumn {
+                    name: row.get("column_name"),
+                    data_type: row.get("data_type"),
+                    collation: row.get("collation"),
+                });
+        }
+
         let mut views = Vec::new();
 
         if regular_rows.is_empty() {
@@ -1527,6 +1564,9 @@ impl Dump {
                 let column_comments = col_comments_map
                     .remove(&(schema.clone(), name.clone()))
                     .unwrap_or_default();
+                let columns = view_columns_map
+                    .remove(&(schema.clone(), name.clone()))
+                    .unwrap_or_default();
                 let definition = Self::require_view_definition(
                     row.get("view_definition"),
                     &schema,
@@ -1543,6 +1583,8 @@ impl Dump {
                         .unwrap_or_default(),
                     comment: row.get("view_comment"),
                     is_materialized: false,
+                    // Only materialized views can be unpopulated.
+                    is_populated: true,
                     hash: None,
                     acl: row
                         .get::<Option<Vec<String>>, _>("view_acl")
@@ -1552,6 +1594,7 @@ impl Dump {
                     column_comments,
                     storage_parameters: None,
                     tablespace: None,
+                    columns,
                 };
                 view.hash();
                 println!(
@@ -1604,6 +1647,7 @@ impl Dump {
                         .unwrap_or_default(),
                     comment: row.get("view_comment"),
                     is_materialized: true,
+                    is_populated: row.get::<Option<bool>, _>("is_populated").unwrap_or(true),
                     hash: None,
                     acl: row
                         .get::<Option<Vec<String>>, _>("view_acl")
@@ -1613,6 +1657,9 @@ impl Dump {
                     column_comments,
                     storage_parameters,
                     tablespace,
+                    // Materialized views never use CREATE OR REPLACE, so the
+                    // OR-REPLACE compatibility column list is not collected for them.
+                    columns: Vec::new(),
                 };
                 view.hash();
                 println!(
@@ -1654,6 +1701,32 @@ impl Dump {
         }
     }
 
+    /// Relations referenced by the view whose `pg_class` row is aliased `c`.
+    ///
+    /// A view's dependencies are recorded against its `_RETURN` rewrite rule rather
+    /// than the view relation, so the walk goes through `pg_rewrite`. Views that only
+    /// call functions reference no relations and correctly yield an empty array.
+    ///
+    /// Only `_RETURN` is followed: it holds the view definition. A view can carry
+    /// user-defined `DO INSTEAD` rules whose bodies touch unrelated tables, and those
+    /// are dumped separately as rules, so counting their targets here would attribute
+    /// relations to the view that its definition never reads.
+    fn view_table_relation_subquery() -> &'static str {
+        "array(
+                        select distinct dn.nspname || '.' || dc.relname
+                        from pg_rewrite r
+                        join pg_depend dep on dep.classid = 'pg_rewrite'::regclass and dep.objid = r.oid
+                        join pg_class dc on dc.oid = dep.refobjid
+                        join pg_namespace dn on dn.oid = dc.relnamespace
+                        where r.ev_class = c.oid
+                          and r.rulename = '_RETURN'
+                          and dep.refclassid = 'pg_class'::regclass
+                          and dep.deptype = 'n'
+                          and dc.oid <> c.oid
+                          and dc.relkind in ('r', 'v', 'm', 'f', 'p')
+                    )"
+    }
+
     fn build_regular_views_query(schema_filter: &str) -> String {
         format!(
             "select
@@ -1661,13 +1734,12 @@ impl Dump {
                     quote_ident(v.table_name) as table_name,
                     v.view_definition,
                     quote_ident(pv.viewowner) as view_owner,
-                    array_agg(distinct vtu.table_schema || '.' || vtu.table_name) as table_relation,
+                    {} as table_relation,
                     d.description as view_comment,
                     (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
                     coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker,
                     v.check_option
             from information_schema.views v
-            join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
             left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
             left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
             left join pg_description d on d.objoid = c.oid
@@ -1682,8 +1754,8 @@ impl Dump {
                     and ext_dep.objid = c.oid
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
-                )
-            group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
+                );",
+            Self::view_table_relation_subquery(),
             schema_filter
         )
     }
@@ -1695,20 +1767,11 @@ impl Dump {
                     mv.matviewname as table_name,
                     mv.definition as view_definition,
                     mv.matviewowner as view_owner,
-                    array(
-                        select distinct n.nspname || '.' || dc.relname
-                        from pg_depend dep
-                        join pg_class dc on dc.oid = dep.refobjid
-                        join pg_namespace n on n.oid = dc.relnamespace
-                        where dep.classid = 'pg_class'::regclass
-                          and dep.objid = c.oid
-                          and dep.refclassid = 'pg_class'::regclass
-                          and dep.deptype = 'n'
-                          and dc.relkind in ('r', 'v', 'm')
-                    ) as table_relation,
+                    {} as table_relation,
                     d.description as view_comment,
                     c.relacl::text[] as view_acl,
                     c.reloptions as storage_options,
+                    mv.ispopulated as is_populated,
                     (select spcname from pg_tablespace where oid = c.reltablespace) as tablespace_name
             from pg_matviews mv
             join pg_class c on c.relname = mv.matviewname
@@ -1725,6 +1788,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 );",
+            Self::view_table_relation_subquery(),
             schema_filter
         )
     }
@@ -1745,6 +1809,43 @@ impl Dump {
             where c.relkind in ('v', 'm')
                 and n.nspname not in ('pg_catalog', 'information_schema')
                 and n.nspname in {}
+            order by n.nspname, c.relname, a.attnum;",
+            schema_filter
+        )
+    }
+
+    /// Output columns of every regular view, in ordinal order. Captured so the
+    /// comparer can tell whether a changed view can be updated with
+    /// `CREATE OR REPLACE VIEW` (old columns an exact prefix of new: same name,
+    /// type and collation per position) or must be dropped and recreated
+    /// (issue #227). Materialized views are excluded — they never use OR REPLACE.
+    fn build_view_columns_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as schema_name,
+                quote_ident(c.relname) as view_name,
+                a.attname as column_name,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                (select case
+                            when nco.nspname = 'pg_catalog' then co.collname
+                            else nco.nspname || '.' || co.collname
+                        end
+                 from pg_catalog.pg_collation co
+                 join pg_catalog.pg_namespace nco on nco.oid = co.collnamespace
+                 where co.oid = a.attcollation) as collation
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+            where c.relkind = 'v'
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
             order by n.nspname, c.relname, a.attnum;",
             schema_filter
         )
@@ -3262,7 +3363,7 @@ impl Dump {
         use_comments: bool,
         use_cascade: bool,
     ) -> String {
-        use crate::utils::string_extensions::StringExt;
+        use crate::utils::string_extensions::{StringExt, unquote_ident};
 
         let cascade_suffix = if use_cascade { " cascade" } else { "" };
         let mut script = String::new();
@@ -3293,8 +3394,20 @@ impl Dump {
                 .map(|v| format!("{}.{}", v.schema, v.name))
                 .collect();
 
+            // table_relation stores raw catalog names, while a regular view's schema
+            // and name come from quote_ident, so the same view reads as `s."MyView"`
+            // here and `s.MyView` there. Undo the quoting per part — schema and name
+            // are separate fields, so no guessing where a dotted name splits — and the
+            // two sides meet on the raw catalog name. Anything less exact would fuse
+            // `s."A"` with `s.a`, which PostgreSQL keeps as different views.
+            let lookup_keys: Vec<String> = self
+                .views
+                .iter()
+                .map(|v| format!("{}.{}", unquote_ident(&v.schema), unquote_ident(&v.name)))
+                .collect();
+
             // Map qualified name → index (only views, not tables).
-            let key_to_idx: HashMap<&str, usize> = view_keys
+            let key_to_idx: HashMap<&str, usize> = lookup_keys
                 .iter()
                 .enumerate()
                 .map(|(i, k)| (k.as_str(), i))
@@ -3308,7 +3421,7 @@ impl Dump {
 
             for (i, view) in self.views.iter().enumerate() {
                 for rel in &view.table_relation {
-                    if let Some(&j) = key_to_idx.get(rel.as_str())
+                    if let Some(&j) = key_to_idx.get(rel.trim())
                         && j != i
                     {
                         edges[i].push(j);

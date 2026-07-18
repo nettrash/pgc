@@ -1,3 +1,214 @@
+2026-07-17      v1.0.25
+
+                Bug fixes:
+                    - Resolved issue #229 (temporary session schemas
+                      included when dumping with --scheme %). A broad
+                      scheme pattern picked up pg_toast and, whenever
+                      any session held temporary objects at dump time,
+                      the per-session pg_temp_N / pg_toast_temp_N
+                      schemas together with their temporary tables.
+                      The generated create schema pg_temp_N then
+                      failed with "unacceptable schema name: the
+                      prefix pg_ is reserved for system schemas". The
+                      schema-resolution query now excludes every
+                      pg_-prefixed schema, which propagates to all
+                      dump, compare and clear paths since they filter
+                      by the resolved schema list. PostgreSQL reserves
+                      the pg_ prefix, so no user schema can match the
+                      filter and nothing dumpable is lost.
+                    - Resolved issue #227 (CREATE OR REPLACE VIEW
+                      generated when the column order changes, causing
+                      migration failure). PostgreSQL accepts CREATE OR
+                      REPLACE VIEW only when every existing column
+                      keeps its name, type and collation at the same
+                      position and new columns are appended at the
+                      end; inserting a column in the middle,
+                      reordering, renaming, retyping or dropping one
+                      fails with "cannot change name of view column".
+                      The dump now captures each regular view's output
+                      columns (name, type including typmod, and
+                      collation), and a changed view whose old column
+                      list is not an exact prefix of the new one is
+                      dropped and recreated instead of replaced.
+                      Because that DROP VIEW runs without CASCADE,
+                      views reading a dropped view are pulled into the
+                      drop set transitively, dropped first in
+                      dependency order and recreated afterwards — this
+                      also covers dependents of changed materialized
+                      views, whose drops could previously fail the
+                      same way. Compatible changes (appending columns
+                      at the end, or body-only changes) still use
+                      CREATE OR REPLACE VIEW, and dumps written by
+                      older pgc versions carry no column data, so they
+                      keep the historical behavior.
+                    - Resolved issue #226 (non-idempotent PostgreSQL
+                      expression normalization caused an infinite diff
+                      loop). PostgreSQL deparses `col IN ('FOO','BAR')`
+                      as an array-level cast
+                      `(ARRAY[...])::text[]` on first render, then as
+                      an element-level cast `ARRAY[(...)::text, ...]`
+                      once that form is re-parsed. Both are equivalent
+                      but differ textually, and pgc compares the
+                      deparsed definition text, so it kept re-emitting
+                      DROP+CREATE for any materialized view, partial
+                      index, generated column, or check constraint
+                      whose expression carried an IN-list. Definitions
+                      are now canonicalized before hashing and
+                      comparison: the array-level cast is rewritten
+                      into PostgreSQL's element-level fixed point (and
+                      the paren-free CHECK-constraint form keeps
+                      collapsing as before), so equivalent renderings
+                      compare equal and the second diff is empty. The
+                      canonicalizer is literal- and quoted-identifier
+                      aware, so string contents and case-sensitive
+                      identifiers are never altered.
+                    - Resolved issue #223 (CREATE INDEX on a
+                      partitioned table used ON ONLY without attaching
+                      the partition indexes, leaving the index
+                      invalid). pg_get_indexdef renders a partitioned
+                      parent's index with ON ONLY, which creates only
+                      the metadata index on the parent and leaves it
+                      indisvalid=false until every partition's index is
+                      built and attached. The default output emitted
+                      that ON ONLY form verbatim with no attach step,
+                      so the resulting index was permanently invalid
+                      and no partition indexes were created. The
+                      non-production output now emits a plain CREATE
+                      INDEX ... ON, so PostgreSQL builds and attaches
+                      the partition indexes itself and the parent index
+                      is valid immediately. Production output
+                      (OUTPUT_FOR_PRODUCTION=true) keeps emitting ON
+                      ONLY followed by the per-partition CREATE INDEX
+                      CONCURRENTLY and ATTACH PARTITION sequence, and
+                      indexes recreated after a DROP FUNCTION ...
+                      CASCADE now go through that same partition-aware
+                      concurrent sequence too — previously that path
+                      re-emitted the raw definition, leaving the
+                      recreated parent index permanently invalid in
+                      every mode.
+                    - Resolved issue #218 (spurious DROP CONSTRAINT
+                      and ADD CONSTRAINT for inline NOT NULL). A
+                      column's inline NOT NULL is surfaced by
+                      PostgreSQL 18 in pg_constraint under the
+                      auto-generated name {table}_{column}_not_null,
+                      while PostgreSQL 14–17 keep it only in
+                      pg_attribute.attnotnull. When a dump taken from
+                      PG18 drove a diff, the constraint pass emitted
+                      DROP CONSTRAINT for a dropped NOT NULL column and
+                      ADD CONSTRAINT for a column that gained NOT NULL,
+                      on top of the correct column-level SET/DROP NOT
+                      NULL. The DROP fails on PG14–17 (the named
+                      constraint does not exist there); the ADD is
+                      PG18-only syntax and leaves a named constraint
+                      the source never declared, so the next compare
+                      keeps trying to drop it. NOT NULL constraints
+                      whose name matches PostgreSQL's auto-generated
+                      {table}_{column}_not_null pattern (optionally
+                      with a numeric collision suffix) are now left
+                      entirely to the column-level NOT NULL handling
+                      and are never emitted as ADD or DROP CONSTRAINT.
+                      A NOT NULL constraint whose name differs from
+                      that pattern is treated as an explicit constraint
+                      and is unaffected; a user-chosen name that
+                      happens to match the pattern is indistinguishable
+                      from an auto-generated one and is handled the
+                      same way (the column still ends up NOT NULL).
+                    - Resolved issue #217 (SET configuration values
+                      wrapped in single quotes, causing an infinite
+                      diff loop). CREATE OR REPLACE FUNCTION/PROCEDURE
+                      quoted every SET value as a string literal,
+                      including list-valued GUCs such as search_path
+                      and temp_tablespaces. Their proconfig value is a
+                      bare comma-separated list, so wrapping it turned
+                      `t, pg_temp` into a single schema literally named
+                      "t, pg_temp"; the applied routine then re-stored
+                      differently from the source and every subsequent
+                      compare re-emitted the routine forever. Values of
+                      GUC_LIST_QUOTE parameters are now emitted
+                      verbatim, the way pg_get_functiondef does, while
+                      scalar GUCs stay quoted as literals — which also
+                      fixes the mirror case of a scalar value that
+                      happens to contain a double quote, previously
+                      emitted unquoted and invalid.
+                    - Resolved issue #216 (reloptions missing from
+                      partitions when a table is recreated as
+                      partitioned). Turning a regular table into a
+                      partitioned one goes through DROP + CREATE, and
+                      the partitions are then built with CREATE TABLE
+                      ... PARTITION OF. That statement was emitted
+                      without a WITH (...) clause, so every partition
+                      came back with no storage parameters at all and
+                      the migration only reached the target schema on
+                      a second pass — the first diff applied, and
+                      comparing again still asked for the reloptions.
+                      PARTITION OF accepts WITH (...) like any other
+                      CREATE TABLE, and the clause is now emitted
+                      there, between PARTITION BY and TABLESPACE as
+                      the grammar requires. The opposite direction,
+                      partitioned to regular, already carried its
+                      reloptions through the plain CREATE TABLE.
+                    - Resolved issue #220 (CREATE MATERIALIZED VIEW in
+                      generated diff is missing WITH NO DATA clause). A
+                      materialized view created WITH NO DATA is left
+                      unpopulated, but that is recorded only in
+                      pg_class.relispopulated — the stored definition
+                      is just the SELECT — so a diff rebuilt from the
+                      definition dropped the clause and applying it ran
+                      the query and filled the view the clause exists
+                      to keep empty. The dump now reads ispopulated
+                      and the generated CREATE MATERIALIZED VIEW
+                      carries WITH NO DATA again. Whether a view holds
+                      data is state rather than schema (REFRESH ...
+                      WITH NO DATA flips it either way), so it stays
+                      out of the view hash: refreshing a materialized
+                      view still does not make compare want to drop and
+                      recreate it. Dumps written by earlier versions
+                      read back as populated.
+                    - Trailing view clauses are no longer emitted after
+                      the statement they belong to. PostgreSQL renders
+                      a view definition with its terminating semicolon,
+                      and both WITH NO DATA and WITH CHECK OPTION were
+                      appended after it, so the clause parsed as a
+                      separate statement. WITH CHECK OPTION therefore
+                      failed with a syntax error and the view was
+                      created without the option — silently, since the
+                      CREATE itself succeeded. Clauses are now written
+                      inside the statement, and the statement is
+                      terminated once, whether or not the definition
+                      arrived with a semicolon of its own.
+                    - Resolved issue #219 (views that reference only
+                      functions are silently excluded from dump).
+                      Regular views were read with an inner join
+                      against information_schema.view_table_usage,
+                      which holds no rows for a view whose body never
+                      reads a table, so a view built solely on a
+                      function call was dropped from the dump and
+                      compare could not see any change to it. That
+                      view is now dumped, and the relations it
+                      references are resolved from the view's _RETURN
+                      rewrite rule via pg_rewrite / pg_depend instead.
+                      view_table_usage is also
+                      privilege-filtered to tables owned by a
+                      currently enabled role, so the same join
+                      dropped any view whose underlying table
+                      belonged to another role; that case is fixed
+                      as well, which brings the view path in line
+                      with the privilege-independent dump contract
+                      the other introspection queries already honour.
+                    - table_relation for materialized views is no
+                      longer always empty. It was read from pg_depend
+                      rows anchored on the materialized view's
+                      pg_class OID, but a view's dependencies on the
+                      relations it reads are recorded against its
+                      _RETURN rewrite rule, so the lookup never
+                      matched anything. Materialized views therefore
+                      carried no dependency information at all:
+                      compare could not tell that a materialized view
+                      had to be dropped before an altered table it
+                      reads, and clear emitted materialized-view
+                      drops without ordering them against the tables
+                      they depend on.
+
 2026-06-11      v1.0.24
 
                 Bug fixes:

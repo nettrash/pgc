@@ -994,6 +994,106 @@ fn test_sub_partition_script() {
     );
 }
 
+// A partition recreated without its reloptions comes back with none at all, so the
+// migration only reaches the target schema on a second pass (issue #216).
+#[test]
+fn test_partition_child_emits_storage_parameters() {
+    let mut table = Table::new(
+        "data".to_string(),
+        "test_2025".to_string(),
+        "data".to_string(),
+        "test_2025".to_string(),
+        "owner".to_string(),
+        None,
+        vec![create_dummy_column("id", "bigint")],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.partition_of = Some("data.test".to_string());
+    table.partition_bound = Some("FOR VALUES FROM (2025) TO (2026)".to_string());
+    table.storage_parameters = Some(vec![
+        "autovacuum_analyze_scale_factor=0.02".to_string(),
+        "autovacuum_vacuum_scale_factor=0.05".to_string(),
+    ]);
+
+    let script = table.get_script();
+    assert!(
+        script.contains(
+            "with (autovacuum_analyze_scale_factor=0.02, autovacuum_vacuum_scale_factor=0.05)"
+        ),
+        "partition must carry its reloptions: {script}"
+    );
+    // CREATE TABLE ... PARTITION OF takes WITH (...) after the bound, so the clause has
+    // to sit inside the statement rather than trail the terminating semicolon.
+    assert!(
+        script.contains("FOR VALUES FROM (2025) TO (2026)\nwith ("),
+        "with (...) must follow the partition bound inside the statement: {script}"
+    );
+}
+
+// PostgreSQL's grammar fixes the order: PARTITION BY, then WITH (...), then TABLESPACE.
+#[test]
+fn test_partition_child_orders_storage_parameters_before_tablespace() {
+    let mut table = Table::new(
+        "data".to_string(),
+        "test_2025".to_string(),
+        "data".to_string(),
+        "test_2025".to_string(),
+        "owner".to_string(),
+        None,
+        vec![create_dummy_column("id", "bigint")],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.partition_of = Some("data.test".to_string());
+    table.partition_bound = Some("DEFAULT".to_string());
+    table.partition_key = Some("LIST (id)".to_string());
+    table.storage_parameters = Some(vec!["fillfactor=70".to_string()]);
+    table.space = Some("fast_disk".to_string());
+
+    let script = table.get_script();
+    let key = script
+        .find("partition by LIST (id)")
+        .expect("partition key");
+    let with = script
+        .find("with (fillfactor=70)")
+        .expect("storage parameters");
+    let space = script.find("tablespace \"fast_disk\"").expect("tablespace");
+    assert!(
+        key < with && with < space,
+        "expected partition by -> with (...) -> tablespace; got:\n{script}"
+    );
+}
+
+#[test]
+fn test_partition_child_without_storage_parameters_omits_with() {
+    let mut table = Table::new(
+        "data".to_string(),
+        "test_default".to_string(),
+        "data".to_string(),
+        "test_default".to_string(),
+        "owner".to_string(),
+        None,
+        vec![create_dummy_column("id", "bigint")],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.partition_of = Some("data.test".to_string());
+    table.partition_bound = Some("DEFAULT".to_string());
+    table.storage_parameters = Some(Vec::new());
+
+    assert!(
+        !table.get_script().contains("with ("),
+        "an empty reloptions list must not emit an empty with ()"
+    );
+}
+
 #[test]
 fn test_partition_child_with_tablespace() {
     let mut table = Table::new(
@@ -2946,5 +3046,147 @@ fn test_named_to_auto_named_not_null_still_diffs() {
     assert!(
         script.contains("drop constraint name_must_exist"),
         "renaming away from a user-chosen name must still emit a drop: {script}"
+    );
+}
+
+// Issue #218: a column becoming NOT NULL must not also emit ADD CONSTRAINT for the
+// auto-named NOT NULL that PG18 surfaces in pg_constraint. The column diff already
+// emits `set not null`; the ADD CONSTRAINT is redundant, PG18-only syntax, and leaves
+// a named constraint the source never declared.
+#[test]
+fn test_column_gains_not_null_omits_add_constraint() {
+    let mut nullable_name = name_column();
+    nullable_name.is_nullable = true;
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), nullable_name],
+        vec![primary_key_constraint()],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("alter column name set not null"),
+        "the column diff must set NOT NULL: {script}"
+    );
+    assert!(
+        !script.contains("add constraint users_name_not_null"),
+        "an auto-named NOT NULL must not be emitted as ADD CONSTRAINT: {script}"
+    );
+}
+
+// Issue #218: a column losing NOT NULL must not emit DROP CONSTRAINT for the auto-named
+// NOT NULL. On PG14–17 that named constraint does not exist and the drop errors; on
+// PG18 the column diff's `drop not null` already removes it.
+#[test]
+fn test_column_loses_not_null_omits_drop_constraint() {
+    let mut nullable_name = name_column();
+    nullable_name.is_nullable = true;
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), nullable_name],
+        vec![primary_key_constraint()],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("alter column name drop not null"),
+        "the column diff must drop NOT NULL: {script}"
+    );
+    assert!(
+        !script.contains("drop constraint users_name_not_null"),
+        "an auto-named NOT NULL must not be emitted as DROP CONSTRAINT: {script}"
+    );
+}
+
+// A column dropped entirely must not emit DROP CONSTRAINT for its auto-named NOT NULL:
+// dropping the column removes the constraint, and the explicit drop errors on PG14–17.
+#[test]
+fn test_dropped_not_null_column_omits_drop_constraint() {
+    let from = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer"), name_column()],
+        vec![
+            primary_key_constraint(),
+            not_null_constraint("users_name_not_null", "name"),
+        ],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+    let to = Table::new(
+        "public".to_string(),
+        "users".to_string(),
+        "public".to_string(),
+        "users".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![identity_column("id", 1, "integer")],
+        vec![primary_key_constraint()],
+        vec![primary_key_index()],
+        vec![],
+        None,
+    );
+
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("drop column name"),
+        "the column must be dropped: {script}"
+    );
+    assert!(
+        !script.contains("drop constraint users_name_not_null"),
+        "dropping the column must not also drop its auto-named NOT NULL: {script}"
     );
 }

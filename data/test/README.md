@@ -90,11 +90,16 @@ These schemas are designed to test comparison capabilities for the following Pos
 #### Modified Tables (constraint diff only)
 - **check_literal_case_test**: `chk_priority_label` modified (added `'P5-Informational'`); `chk_category_values` unchanged (tests mixed-case string literal case preservation)
 
+#### Inline NOT NULL is not a named constraint (Issue #218)
+- **notnull_recreate**: FROM has `nn_col` with inline NOT NULL and a nullable `null_col`; TO drops `nn_col` and makes `null_col` NOT NULL. On PG18 a column's inline NOT NULL is surfaced in `pg_constraint` as the auto-generated `{table}_{col}_not_null` (contype='n'); on PG14–17 it lives only in `pg_attribute.attnotnull`. The diff must be exactly `alter column null_col set not null` and `drop column nn_col` — never `ADD`/`DROP CONSTRAINT` for the invented name. `DROP CONSTRAINT ..._not_null` errors on PG14–17 ("constraint does not exist"), and `ADD CONSTRAINT ... NOT NULL` is PG18-only syntax that leaves a named constraint the source never declared, so the second diff would keep re-emitting it. This case only bites when the dump is taken from PG18, so the round-trip must close on the PG18 leg of the matrix specifically
+
 ### 6. Indexes
 - **Added**: `idx_users_preferred_contact`, `idx_users_timezone`, `idx_products_manufacturer`, `idx_products_is_featured`, `idx_products_barcode`, `idx_reviews_*` (5 indexes), `idx_audit_logs_session_id`, `idx_audit_logs_request_id`, `idx_tagged_items_detail`, `idx_user_preferences_prefs`
 - **Modified**: `idx_audit_logs_table_op_changed_at` — unique index gains `record_id` column
 - **Removed**: all indexes on removed tables (`orders`, `order_items`)
 - **Unchanged**: existing indexes on `users`, `products`, `audit_logs`, `logs`
+- **Partial index with a non-idempotent predicate** (Issue #226): `ix_innorm_trust` (TO-only) has a `WHERE action_type IN ('FOO','BAR')` predicate. PostgreSQL deparses the `IN`-list into an array-level cast on first render and an element-level cast once re-parsed; comparing the raw `indexdef` re-emits `DROP`+`CREATE` every run. The predicate is canonicalized before comparison so the second diff is empty. Paired with the `innorm_mv` matview (§13) which exercises the same non-idempotency in a view definition
+- **Index on a partitioned parent** (Issue #223): `idx_partidx_value` is added to the existing partitioned parent `partidx` (two partitions, identical in both schemas). `pg_get_indexdef` renders such an index with `ON ONLY`, which builds only the invalid metadata index on the parent. The default (non-production) output must emit a plain `CREATE INDEX ... ON` so PostgreSQL builds and attaches every partition's index and the parent is valid immediately. The round-2 diff cannot catch this on its own — an invalid-but-present index still round-trips empty — so the integration job additionally asserts that no index is left `indisvalid = false` after applying the migration
 
 ### 7. Foreign Keys
 - **Added**: FKs on `reviews` (to products, users), FK on `user_preferences` (to users)
@@ -107,6 +112,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `chk_priority_label` — added `'P5-Informational'` value in Schema B
 - **Removed**: `chk_products_weight_positive` (column removed), `chk_orders_dates`, `chk_orders_delivery_dates` (table removed)
 - **Unchanged**: `chk_users_email_format`, `chk_category_values` (mixed-case string literals preserved), inline checks on `products`, `audit_logs`
+- **Typmod IN-list** (Issue #226): `chk_innorm_typmod` (TO-only) — `code IN ('A'::varchar(10), 'B'::varchar(10))`. The explicit typmod survives both pretty `pg_get_constraintdef` renderings and flips between the array-level (`ARRAY[...]::text[]`) and element-level (`ARRAY['A'::character varying(10)::text, ...]`) cast forms exactly like the bare-varchar IN-list, so the canonicalizer must converge the typmod'd renderings too or the constraint re-emits `DROP`+`ADD` on every run. Companion to the `innorm_mv`/`ix_innorm_trust` cases (§6, §13)
 
 ### 9. Functions
 
@@ -122,6 +128,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **get_active_usernames_sql()**: return type adds `preferred_contact` column
 - **product_price_with_tax_sql()**: new parameter `p_currency varchar DEFAULT 'USD'`
 - **cascade_compute(integer)**: return type `INTEGER` → `BIGINT` — return type change requires `DROP FUNCTION ... CASCADE` (PostgreSQL has no `ALTER FUNCTION` for return types). The argument list (`integer`) is unchanged, so the function's signature in PostgreSQL terms is identical between FROM and TO; the cascade still fires. Exercises Phase 7 of `compare_routines_and_views`, which must re-emit every dependent (CHECK / functional index / generated column / DEFAULT / RLS policy) silently dropped by CASCADE; see _CASCADE-Drop Dependent Recreation (Issue #179)_ in section 46.
+- **cascade_part_fn(text)**: same return-type-change cascade, but the dependent is a functional index on the **partitioned parent** `cascade_part`. Phase 7's recreate must leave that index valid (guarded by the integration job's `indisvalid` assertion): default mode emits a plain `CREATE INDEX` that builds and attaches every partition, and production mode routes the recreate through the same `ON ONLY` + per-partition `CONCURRENTLY`/`ATTACH PARTITION` split as any other index creation — a plain blocking build (or, before issue #223, a permanently invalid `ON ONLY` parent) is not acceptable there.
 
 #### Removed Functions
 - **calculate_order_total()**: depends on removed `orders` table
@@ -183,12 +190,48 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `product_inventory` — added `manufacturer`, `is_featured` columns; 'Low Stock' threshold changed from 10 → 5
 - **Removed**: `user_order_summary` (orders table removed)
 - **Added**: `user_review_summary`, `product_review_stats`, `v_user_stats`
+- **Incompatible column change** (Issue #227): `v227_base` gains `kind` inserted *before* `profile_id`. `CREATE OR REPLACE VIEW` only allows appending columns at the end (inserting/reordering/renaming/retyping fails with "cannot change name of view column"), so the diff must emit `DROP VIEW` + `CREATE` instead. The textually unchanged dependent `v227_dep` reads `v227_base`, and `DROP VIEW` runs without `CASCADE`, so the dependent must be pulled into the drop set, dropped first, and recreated after. Compatibility is decided from per-view column data (name, type incl. typmod, collation) captured at dump time; dumps from older pgc versions carry no column data and keep the historical `OR REPLACE` behavior
+- **Modified**: `vw_from_function` — body gains a `WHERE` clause. The view selects
+  only from `fn_only_view_source()` and never touches a table, so it has no rows in
+  `information_schema.view_table_usage`; dumping views through a join against that
+  table silently omitted the view and made the change undetectable (issue #219).
+  `vw_from_function` itself reads no relation, so its `table_relation` is empty —
+  the case the old join could not represent at all. `vw_on_function_view` selects
+  from it and so carries `test_schema.vw_from_function`, covering the view→view
+  dependency edge that has to survive on top of a view with no table of its own.
+- **Unchanged**: `vw_with_rule` — a view carrying a `DO INSTEAD` rule that writes to
+  `vw_rule_audit`, a table its definition never reads. `table_relation` must list only
+  `vw_rule_base`: the dependency walk follows the view's `_RETURN` rule alone, and
+  counting the targets of user-defined rules would invent drop-ordering edges. Its base
+  table is identical in both schemas on purpose — see the note in `schema_a.sql`.
+- **Modified**: `vw_check_opt` — `WITH CHECK OPTION` goes from `LOCAL` to `CASCADED`,
+  driving the `CREATE OR REPLACE` path. Like `WITH NO DATA` (issue #220) this is a
+  trailing clause, so it has to be written inside the statement; emitted after the
+  definition's semicolon it parses as a separate statement and is a syntax error.
 
 #### Materialized Views
 - **Modified**: `active_users_mat` — added `status` column
 - **Removed**: `from_only_mat` (FROM-only)
 - **Added**: `product_stock_mat` (TO-only)
 - **Unchanged**: `user_count_mat`
+- **Added**: `mv_no_data` (TO-only) — created `WITH NO DATA` and never refreshed. The
+  clause is not part of the stored definition; it survives only as
+  `pg_class.relispopulated`, so a diff built from the definition alone recreates the
+  view populated and applying it runs the query the clause exists to defer (issue #220).
+  The generated `CREATE MATERIALIZED VIEW` must carry `WITH NO DATA`, and it must sit
+  before the statement's terminating semicolon rather than after it.
+- **Unchanged**: `mv_with_data` — a populated materialized view over the same base
+  table, which must never acquire a `WITH NO DATA` clause.
+- **Added**: `innorm_mv` (TO-only) — a materialized view whose `WHERE` uses
+  `label IN ('FOO','BAR')` (issue #226). PostgreSQL deparses an `IN`-list as an
+  array-level cast `(ARRAY[...])::text[]` on first render, then as an element-level
+  cast `ARRAY[(...)::text, ...]` once that form is re-parsed. The two are equivalent
+  but differ textually, so comparing the raw definition re-emits `DROP`+`CREATE` every
+  run. Definitions are canonicalized (array-level cast rewritten to the element-level
+  fixed point) before hashing/comparison, so the second diff is empty. The base table
+  `innorm` is identical in both schemas; the matview exists only in TO so the diff
+  creates it and applying it re-parses the expression. The companion partial index
+  `ix_innorm_trust` (§6) exercises the same non-idempotency in an index predicate.
 
 ### 14. Row-Level Security Policies
 - **Modified**: `users_rls_select` — changed to `RESTRICTIVE`, role changed to `tenant_reader`, added `AND two_factor_enabled = TRUE` condition
@@ -407,6 +450,7 @@ Requires `wal_level = logical`. Comment out these statements if the test server 
 - **Default partition**: `partition_test_default`
 - **DDL inheritance**: `customers` parent modified (add/drop columns, alter NOT NULL/DEFAULT, add/modify constraints); partitions `customers_2024`/`customers_2025` must NOT receive inherited DDL (ADD COLUMN, DROP COLUMN, SET NOT NULL, SET DEFAULT, constraint add/drop)
 - **Non-partition-key column type change** (Issue #118): `expenses` parent partitioned by `expense_date`; column `amount` changed from `NUMERIC(10,2)` → `NUMERIC(15,4)`. Only `ALTER COLUMN` on the parent must be generated; partition `expenses_2024_01` must NOT be dropped/recreated
+- **Reloptions on recreated partitions** (Issue #216): `reloptions_to_partitioned` goes regular → partitioned, which forces DROP + CREATE. Its partitions are then built with `CREATE TABLE ... PARTITION OF`, which takes `WITH (...)` like any other `CREATE TABLE`; emitting it without the clause leaves every partition with no reloptions and the second diff is non-empty. `reloptions_to_partitioned_2025` (autovacuum settings, `FOR VALUES` bound) and `reloptions_to_partitioned_default` (`fillfactor`, `DEFAULT` bound) cover both bound forms with different option sets. `reloptions_to_regular` covers the inverse direction (partitioned → regular), which already carried its reloptions through the plain `CREATE TABLE` `WITH (...)`
 
 #### Identity/Serial Columns
 - Tests `SERIAL`, `BIGSERIAL`, `GENERATED ALWAYS AS IDENTITY`, `GENERATED BY DEFAULT AS IDENTITY`
@@ -436,6 +480,7 @@ Requires `wal_level = logical`. Comment out these statements if the test server 
 - **Unchanged**: `get_session_user_safe()` has `SET search_path = 'public, pg_temp'` in both schemas — no diff expected
 - **Modified config**: `secure_lookup(key text)` has `SET search_path = 'public'` in FROM; TO changes to `SET search_path = 'public, pg_temp'` and adds `SET lock_timeout = '5s'` — `CREATE OR REPLACE` with new SET clauses expected
 - **New with config**: `apply_secure_settings(IN pvalue text)` exists only in TO with `SET search_path = 'public, pg_temp'` and `SET lock_timeout = '5s'` — `CREATE OR REPLACE` with SET clauses expected
+- **Unquoted list round-trip** (Issue #217): `set_config_roundtrip(p_id integer)` has no config in FROM; TO adds `SECURITY DEFINER`, an **unquoted** list-valued `SET search_path = test_schema, pg_temp`, a scalar `SET lock_timeout = '5s'`, and a numeric `SET statement_timeout = 30000`. `search_path` is a `GUC_LIST_QUOTE` parameter, so its `proconfig` value is a bare comma-separated list; emitting it as a single-quoted literal (`'test_schema, pg_temp'`) makes PostgreSQL re-store it as one schema named `test_schema, pg_temp`, and the second diff keeps re-emitting the routine. The list must be emitted verbatim, the scalars as literals. The pre-existing `'public, pg_temp'` fixtures above could not catch this: a single-quoted value stores as one element and round-trips regardless
 - PostgreSQL stores these in `pg_proc.proconfig` as an array (e.g. `{search_path=public\, pg_temp,lock_timeout=5s}`)
 
 #### CASCADE-Drop Dependent Recreation (Issue #179)

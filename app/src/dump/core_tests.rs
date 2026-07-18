@@ -228,6 +228,59 @@ fn test_clear_script_empty_dump() {
     assert!(!script.contains("drop"));
 }
 
+// A view's schema/name come from quote_ident, so a name needing quotes is stored
+// as `"MyBase"`, while table_relation holds the raw catalog name `MyBase`. The drop
+// order must still see the edge, or clear emits `drop view "MyBase"` before the
+// view that depends on it and PostgreSQL rejects the script.
+#[test]
+fn clear_script_orders_quoted_view_names_by_dependency() {
+    let mut dump = empty_dump();
+    dump.schemas.push(make_schema("t"));
+    dump.views.push(make_view("t", "\"MyBase\""));
+    dump.views.push(make_view_with_deps(
+        "t",
+        "\"MyDependent\"",
+        vec!["t.MyBase"],
+    ));
+
+    let script = dump.generate_clear_script(false, false, false);
+    let dependent = script
+        .find("drop view if exists t.\"MyDependent\"")
+        .expect("dependent view must be dropped");
+    let base = script
+        .find("drop view if exists t.\"MyBase\"")
+        .expect("base view must be dropped");
+    assert!(
+        dependent < base,
+        "expected t.\"MyDependent\" to be dropped before t.\"MyBase\"; got:\n{script}"
+    );
+}
+
+// "A" and a are different views. A key that folded case would map both to the same
+// entry, so the edge from "DepOnA" would land on whichever view was stored last and
+// "A" could be dropped while its dependent still stands.
+#[test]
+fn clear_script_keeps_case_distinct_view_names_apart() {
+    let mut dump = empty_dump();
+    dump.schemas.push(make_schema("t"));
+    dump.views.push(make_view("t", "\"A\""));
+    dump.views.push(make_view("t", "a"));
+    dump.views
+        .push(make_view_with_deps("t", "\"DepOnA\"", vec!["t.A"]));
+
+    let script = dump.generate_clear_script(false, false, false);
+    let dependent = script
+        .find("drop view if exists t.\"DepOnA\"")
+        .expect("dependent view must be dropped");
+    let quoted_a = script
+        .find("drop view if exists t.\"A\"")
+        .expect("t.\"A\" must be dropped");
+    assert!(
+        dependent < quoted_a,
+        "expected t.\"DepOnA\" to be dropped before t.\"A\"; got:\n{script}"
+    );
+}
+
 #[test]
 fn test_clear_script_single_transaction() {
     let mut dump = empty_dump();
@@ -651,6 +704,54 @@ fn build_regular_views_query_filters_by_pg_class() {
     );
 }
 
+// A view whose body only calls functions has no rows in view_table_usage, so an
+// inner join against it dropped the view from the dump entirely (issue #219).
+#[test]
+fn build_regular_views_query_does_not_join_view_table_usage() {
+    let query = Dump::build_regular_views_query("('public')");
+    assert!(
+        !query.contains("view_table_usage"),
+        "regular view query must not join view_table_usage: it excludes views that \
+         reference only functions, and hides views whose tables the dump role does not own"
+    );
+}
+
+#[test]
+fn view_queries_resolve_table_relation_through_pg_rewrite() {
+    // The dependency on a referenced relation is recorded against the view's
+    // _RETURN rewrite rule, not against the view's pg_class row, so a walk that
+    // reads pg_depend for the relation oid directly always yields no relations.
+    for (label, query) in [
+        (
+            "regular views",
+            Dump::build_regular_views_query("('public')"),
+        ),
+        (
+            "materialized views",
+            Dump::build_materialized_views_query("('public')"),
+        ),
+    ] {
+        assert!(
+            query.contains("dep.classid = 'pg_rewrite'::regclass")
+                && query.contains("r.ev_class = c.oid")
+                && query.contains("and dep.objid = r.oid"),
+            "expected {label} to resolve table_relation via the view's rewrite rule"
+        );
+        assert!(
+            !query.contains("and dep.objid = c.oid"),
+            "expected {label} not to anchor table_relation on the view's pg_class row: \
+             a view's relation dependencies hang off its rewrite rule, so that walk \
+             always returns no relations"
+        );
+        // Without this the walk also follows user-defined DO INSTEAD rules on the
+        // view and credits their target tables to the view's definition.
+        assert!(
+            query.contains("and r.rulename = '_RETURN'"),
+            "expected {label} to follow only the _RETURN rule that holds the view definition"
+        );
+    }
+}
+
 #[test]
 fn build_materialized_views_query_filters_by_pg_class() {
     let query = Dump::build_materialized_views_query("('public')");
@@ -825,6 +926,50 @@ fn build_sequences_standalone_query_extension_filter_is_precise() {
 fn build_regular_views_query_extension_filter_is_precise() {
     let query = Dump::build_regular_views_query("('public')");
     assert_extension_filter(&query, "pg_class", "regular views");
+}
+
+// Extension-owned views are excluded from the view list, so fetching their columns
+// would be pure waste (large extensions such as PostGIS ship many views); the columns
+// query must carry the same extension filter as the view list queries.
+#[test]
+fn build_view_columns_query_extension_filter_is_precise() {
+    let query = Dump::build_view_columns_query("('public')");
+    assert_extension_filter(&query, "pg_class", "view columns");
+}
+
+// A broad --scheme pattern such as `%` must never resolve to system schemas: the
+// per-session pg_temp_N / pg_toast_temp_N schemas cannot be recreated ("unacceptable
+// schema name", issue #229) and pg_toast/pg_catalog are not dumpable either.
+// PostgreSQL reserves the whole pg_ prefix, so filtering it excludes no user schema.
+#[test]
+fn build_schemas_query_excludes_all_pg_prefixed_schemas() {
+    let query = Dump::build_schemas_query();
+    assert!(
+        query.contains("n.nspname not like 'pg\\_%'"),
+        "schema resolution must exclude every pg_-prefixed schema"
+    );
+    assert!(
+        query.contains("n.nspname <> 'information_schema'"),
+        "information_schema must stay excluded"
+    );
+}
+
+// Collations are schema-scoped: two different collations may share a bare name, and
+// PostgreSQL rejects OR REPLACE across them ("cannot change collation of view column
+// ... from \"mycoll\" to \"mycoll\"", verified live). The capture must therefore
+// schema-qualify non-pg_catalog collations or or_replace_compatible could call two
+// different collations equal and emit an OR REPLACE the server refuses.
+#[test]
+fn build_view_columns_query_qualifies_non_catalog_collations() {
+    let query = Dump::build_view_columns_query("('public')");
+    assert!(
+        query.contains("nco.nspname || '.' || co.collname"),
+        "non-pg_catalog collations must be captured schema-qualified"
+    );
+    assert!(
+        query.contains("when nco.nspname = 'pg_catalog' then co.collname"),
+        "pg_catalog collations must stay bare for dump stability"
+    );
 }
 
 #[test]

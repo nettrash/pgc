@@ -1622,3 +1622,251 @@ CREATE TABLE test_schema.nn_coll_a_b (
     id serial PRIMARY KEY,
     c integer NOT NULL
 );
+
+-- =============================================================================
+-- Regression: views that reference only functions (issue #219)
+-- =============================================================================
+-- A view whose body calls only a function has no rows in
+-- information_schema.view_table_usage, so it used to be dropped from the dump
+-- entirely and any change to it was invisible to `compare`.
+--
+-- FROM: view body selects straight from the function.
+-- TO:   body gains a WHERE clause, so the round-trip must emit a replacement.
+CREATE FUNCTION test_schema.fn_only_view_source()
+RETURNS TABLE(id integer, val text)
+LANGUAGE sql AS $$ SELECT 1, 'hello' $$;
+
+CREATE VIEW test_schema.vw_from_function AS
+SELECT id, val FROM test_schema.fn_only_view_source();
+
+-- Same shape, but the view is referenced by another view: the dependent view
+-- must still be ordered correctly even though neither touches a table.
+CREATE VIEW test_schema.vw_on_function_view AS
+SELECT id FROM test_schema.vw_from_function;
+
+-- A DO INSTEAD rule on the view writes to a table the view definition never
+-- reads, so table_relation must stay limited to what the definition selects
+-- from (vw_rule_base): rules are dumped separately, and crediting their targets
+-- to the view would invent dependency edges for drop ordering.
+--
+-- vw_rule_base is deliberately identical in both schemas. A view whose source
+-- table changes is dropped and recreated, and the recreate does not restore
+-- rules on the view, so anchoring this fixture on a changing table would make
+-- the round-trip re-emit the rule forever for reasons unrelated to the view
+-- dependency walk this case exists to cover.
+CREATE TABLE test_schema.vw_rule_base (
+    id integer PRIMARY KEY,
+    name text
+);
+
+CREATE TABLE test_schema.vw_rule_audit (
+    id integer,
+    note text
+);
+
+CREATE VIEW test_schema.vw_with_rule AS
+SELECT id, name FROM test_schema.vw_rule_base;
+
+CREATE RULE vw_with_rule_ins AS ON INSERT TO test_schema.vw_with_rule
+    DO INSTEAD INSERT INTO test_schema.vw_rule_audit(id, note)
+    VALUES (NEW.id, NEW.name);
+
+-- =============================================================================
+-- Regression: materialized view created WITH NO DATA (issue #220)
+-- =============================================================================
+-- WITH NO DATA is not part of the stored definition — it survives only as
+-- pg_class.relispopulated — so a diff that recreates the view from its definition
+-- alone silently populates it. The base table is identical in both schemas to keep
+-- the case about the view itself.
+--
+-- FROM: base table only, no materialized view.
+-- TO:   mv_no_data added WITH NO DATA; the diff must carry the clause through.
+CREATE TABLE test_schema.mv_nodata_base (
+    id integer PRIMARY KEY,
+    val text,
+    amount numeric
+);
+
+-- A populated materialized view over the same table, unchanged in both schemas:
+-- it must never acquire a WITH NO DATA clause.
+CREATE MATERIALIZED VIEW test_schema.mv_with_data AS
+SELECT id, val FROM test_schema.mv_nodata_base;
+
+-- WITH CHECK OPTION is emitted as a trailing clause like WITH NO DATA, so it hits
+-- the same trap of landing after the definition's terminating semicolon. The option
+-- changes local -> cascaded in TO, which exercises the CREATE OR REPLACE path.
+CREATE VIEW test_schema.vw_check_opt AS
+SELECT id, val FROM test_schema.mv_nodata_base WHERE amount > 0
+WITH LOCAL CHECK OPTION;
+
+-- =============================================================================
+-- Regression: reloptions on partitions of a table recreated as partitioned (#216)
+-- =============================================================================
+-- Turning a regular table into a partitioned one has to go through DROP + CREATE,
+-- and each partition is then created with CREATE TABLE ... PARTITION OF. That
+-- statement takes WITH (...) like any other CREATE TABLE; emitting it without the
+-- clause leaves every partition with no reloptions, so the migration only reaches
+-- the target schema on a second pass.
+--
+-- FROM: plain regular table, no reloptions.
+-- TO:   partitioned, with reloptions on both partitions. The partitioned parent
+--       carries none of its own: PostgreSQL rejects storage parameters on a
+--       partitioned table ("cannot specify storage parameters for a partitioned
+--       table"), so the reloptions live only on the leaf partitions.
+CREATE TABLE test_schema.reloptions_to_partitioned (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+-- The inverse direction, which already worked: partitioned -> regular, where the
+-- reloptions ride along in the plain CREATE TABLE's WITH (...) clause.
+CREATE TABLE test_schema.reloptions_to_regular (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE test_schema.reloptions_to_regular_default
+    PARTITION OF test_schema.reloptions_to_regular DEFAULT;
+
+-- =============================================================================
+-- Regression: SET config values must round-trip (issue #217)
+-- =============================================================================
+-- A GUC_LIST_QUOTE parameter (search_path, temp_tablespaces) stores its value in
+-- proconfig as a plain comma-separated list. Emitting it as a single-quoted literal
+-- turns `test_schema, pg_temp` into one schema literally named "test_schema, pg_temp",
+-- which re-stores differently from the source, so every compare re-emits the routine
+-- forever. The existing get_session_user_safe / secure_lookup fixtures use a QUOTED
+-- single element ('public, pg_temp'), which round-trips either way and so never
+-- exercised this — the unquoted multi-element list below is what does.
+--
+-- FROM: procedure with no SET config.
+-- TO:   gains SECURITY DEFINER and three SET clauses, one of them an unquoted list.
+CREATE OR REPLACE PROCEDURE test_schema.set_config_roundtrip(p_id integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE NOTICE 'id=%', p_id;
+END;
+$$;
+
+-- =============================================================================
+-- Regression: inline NOT NULL must not become a named ADD/DROP CONSTRAINT (#218)
+-- =============================================================================
+-- PostgreSQL 18 records a column's inline NOT NULL in pg_constraint under the
+-- auto-generated name {table}_{column}_not_null (contype='n'); PG14–17 keep it only
+-- in pg_attribute.attnotnull. When a NOT NULL column is dropped, or a nullable column
+-- gains NOT NULL, the diff must use only the column-level `set/drop not null` (or the
+-- inline `not null` of a dropped column), never `ADD/DROP CONSTRAINT` for the invented
+-- name: the DROP errors on PG14–17 ("constraint does not exist") and the ADD is
+-- PG18-only syntax that also leaves a constraint the source never declared, looping.
+--
+-- FROM: nn_col has inline NOT NULL (dropped in TO); null_col is nullable (NOT NULL in TO).
+CREATE TABLE test_schema.notnull_recreate (
+    id       integer,
+    nn_col   varchar(10) NOT NULL,
+    null_col varchar(10)
+);
+
+-- =============================================================================
+-- Regression: index on a partitioned parent must be created valid (#223)
+-- =============================================================================
+-- pg_get_indexdef renders a partitioned parent's index with `ON ONLY`, which builds
+-- only the metadata index on the parent and leaves it indisvalid=false until each
+-- partition's index is attached. The default (non-production) output has no attach
+-- step, so it must emit a plain `CREATE INDEX ... ON` — PostgreSQL then builds and
+-- attaches the partition indexes itself. The parent table is identical in both
+-- schemas; only the index is added in TO. (The round-2 diff cannot catch this on its
+-- own — an invalid index still round-trips empty — so the integration job also
+-- asserts indisvalid after applying the migration.)
+--
+-- FROM: partitioned table with two partitions, no index on partidx_value.
+CREATE TABLE test_schema.partidx (
+    id      integer,
+    value   text,
+    bucket  date
+) PARTITION BY RANGE (bucket);
+
+CREATE TABLE test_schema.partidx_2024 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.partidx_2025 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- =============================================================================
+-- Regression: non-idempotent IN-list deparsing must not loop (issue #226)
+-- =============================================================================
+-- PostgreSQL deparses `col IN ('FOO','BAR')` as an array-level cast
+-- `(ARRAY[...])::text[]` on first render, then as an element-level cast
+-- `ARRAY[(...)::text, ...]` when that form is re-parsed. Both are equivalent but
+-- differ textually, so a matview/partial-index/generated-column expression carrying
+-- an IN-list re-emits DROP+CREATE on every run unless the definitions are
+-- canonicalized before comparison.
+--
+-- The base table is present in both schemas; the matview and partial index that
+-- carry the IN-list exist only in TO, so the diff creates them, applying re-parses
+-- the expression into the element-level form, and the second diff must still be
+-- empty.
+CREATE TABLE test_schema.innorm (
+    id          integer PRIMARY KEY,
+    label       character varying(50),
+    action_type character varying(50),
+    device      jsonb
+);
+
+-- Companion to the innorm case (#226): a CHECK IN-list whose literals carry an
+-- explicit varchar typmod. The typmod spelling survives both pretty
+-- pg_get_constraintdef renderings and flips between the array-level and
+-- element-level cast forms exactly like the bare-varchar IN-list, so the
+-- canonicalizer must converge it too or this constraint re-emits DROP+ADD forever.
+-- FROM: table only; TO adds the constraint, so the migration creates it and the
+-- re-parsed rendering must still compare equal.
+CREATE TABLE test_schema.innorm_typmod (
+    id   integer PRIMARY KEY,
+    code character varying(10)
+);
+
+-- =============================================================================
+-- Regression: incompatible view column change needs DROP+CREATE (issue #227)
+-- =============================================================================
+-- CREATE OR REPLACE VIEW only allows appending columns at the end; inserting a
+-- column in the middle (as TO does with `kind`) is rejected with "cannot change
+-- name of view column". The diff must drop and recreate the view instead — and
+-- because DROP VIEW runs without CASCADE, the unchanged dependent view
+-- v227_dep must be dropped first and recreated after. The base table is
+-- identical in both schemas so only the view definitions drive the diff.
+CREATE TABLE test_schema.v227_item (
+    id         integer PRIMARY KEY,
+    status     text,
+    kind       text,
+    profile_id integer
+);
+
+CREATE VIEW test_schema.v227_base AS
+SELECT id, status, profile_id FROM test_schema.v227_item;
+
+CREATE VIEW test_schema.v227_dep AS
+SELECT id, status FROM test_schema.v227_base;
+
+-- =============================================================================
+-- CASCADE recreation of an index on a partitioned parent (PR #234 review)
+-- =============================================================================
+-- cascade_part_fn's return type changes in TO, so its drop CASCADEs through the
+-- functional index on the partitioned parent; Phase 7 must recreate that index
+-- valid. In production mode the recreate must use the ON ONLY + per-partition
+-- CONCURRENTLY/ATTACH sequence rather than a blocking plain CREATE INDEX; in
+-- default mode a plain CREATE INDEX builds and attaches everything itself. The
+-- integration job's indisvalid assertion guards the result.
+CREATE FUNCTION test_schema.cascade_part_fn(text)
+RETURNS integer IMMUTABLE LANGUAGE sql AS $$ SELECT length($1) $$;
+
+CREATE TABLE test_schema.cascade_part (
+    id integer,
+    s  text,
+    d  date NOT NULL
+) PARTITION BY RANGE (d);
+
+CREATE TABLE test_schema.cascade_part_2024 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.cascade_part_2025 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX ix_cascade_part_fn ON test_schema.cascade_part (test_schema.cascade_part_fn(s));

@@ -1897,3 +1897,228 @@ CREATE TABLE test_schema.nn_coll_a (
     id serial PRIMARY KEY,
     b_c integer NOT NULL
 );
+
+-- =============================================================================
+-- Regression: views that reference only functions (issue #219)
+-- =============================================================================
+-- See schema_a.sql for the full description. Here the view body carries the
+-- extra WHERE clause, which is the change `compare` must detect and emit.
+CREATE FUNCTION test_schema.fn_only_view_source()
+RETURNS TABLE(id integer, val text)
+LANGUAGE sql AS $$ SELECT 1, 'hello' $$;
+
+CREATE VIEW test_schema.vw_from_function AS
+SELECT id, val FROM test_schema.fn_only_view_source()
+WHERE id > 0;
+
+CREATE VIEW test_schema.vw_on_function_view AS
+SELECT id FROM test_schema.vw_from_function;
+
+-- A DO INSTEAD rule on the view writes to a table the view definition never
+-- reads, so table_relation must stay limited to what the definition selects
+-- from (vw_rule_base): rules are dumped separately, and crediting their targets
+-- to the view would invent dependency edges for drop ordering.
+--
+-- vw_rule_base is deliberately identical in both schemas. A view whose source
+-- table changes is dropped and recreated, and the recreate does not restore
+-- rules on the view, so anchoring this fixture on a changing table would make
+-- the round-trip re-emit the rule forever for reasons unrelated to the view
+-- dependency walk this case exists to cover.
+CREATE TABLE test_schema.vw_rule_base (
+    id integer PRIMARY KEY,
+    name text
+);
+
+CREATE TABLE test_schema.vw_rule_audit (
+    id integer,
+    note text
+);
+
+CREATE VIEW test_schema.vw_with_rule AS
+SELECT id, name FROM test_schema.vw_rule_base;
+
+CREATE RULE vw_with_rule_ins AS ON INSERT TO test_schema.vw_with_rule
+    DO INSTEAD INSERT INTO test_schema.vw_rule_audit(id, note)
+    VALUES (NEW.id, NEW.name);
+
+-- =============================================================================
+-- Regression: materialized view created WITH NO DATA (issue #220)
+-- =============================================================================
+-- See schema_a.sql for the full description. Here mv_no_data exists and is
+-- unpopulated; the generated diff must create it WITH NO DATA rather than run the
+-- query and fill it.
+CREATE TABLE test_schema.mv_nodata_base (
+    id integer PRIMARY KEY,
+    val text,
+    amount numeric
+);
+
+CREATE MATERIALIZED VIEW test_schema.mv_with_data AS
+SELECT id, val FROM test_schema.mv_nodata_base;
+
+-- TO-only, and deliberately never refreshed.
+CREATE MATERIALIZED VIEW test_schema.mv_no_data AS
+SELECT id, val, amount FROM test_schema.mv_nodata_base WHERE amount > 0
+WITH NO DATA;
+
+-- check option changed from LOCAL (FROM) to CASCADED (TO).
+CREATE VIEW test_schema.vw_check_opt AS
+SELECT id, val FROM test_schema.mv_nodata_base WHERE amount > 0
+WITH CASCADED CHECK OPTION;
+
+-- =============================================================================
+-- Regression: reloptions on partitions of a table recreated as partitioned (#216)
+-- =============================================================================
+-- See schema_a.sql for the full description. Here the table is partitioned and every
+-- partition carries reloptions that the generated CREATE TABLE ... PARTITION OF must
+-- keep.
+CREATE TABLE test_schema.reloptions_to_partitioned (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE test_schema.reloptions_to_partitioned_2025
+    PARTITION OF test_schema.reloptions_to_partitioned
+    FOR VALUES FROM ('2024-12-31 23:00:00+00') TO ('2025-12-31 23:00:00+00');
+ALTER TABLE test_schema.reloptions_to_partitioned_2025 SET (
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_scale_factor = 0.05
+);
+
+-- A DEFAULT partition with a different reloption set, so the fixture also covers a
+-- bound that is not FOR VALUES.
+CREATE TABLE test_schema.reloptions_to_partitioned_default
+    PARTITION OF test_schema.reloptions_to_partitioned DEFAULT;
+ALTER TABLE test_schema.reloptions_to_partitioned_default SET (
+    fillfactor = 70
+);
+
+-- Inverse direction: partitioned -> regular, reloptions via the CREATE TABLE WITH.
+CREATE TABLE test_schema.reloptions_to_regular (
+    id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL
+);
+ALTER TABLE test_schema.reloptions_to_regular SET (
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_scale_factor = 0.05
+);
+
+-- =============================================================================
+-- Regression: SET config values must round-trip (issue #217)
+-- =============================================================================
+-- See schema_a.sql. Here the procedure carries an unquoted list-valued search_path
+-- alongside a scalar and a numeric SET; the generated CREATE OR REPLACE must emit the
+-- list verbatim so the applied routine's proconfig matches this source exactly.
+CREATE OR REPLACE PROCEDURE test_schema.set_config_roundtrip(p_id integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = test_schema, pg_temp
+SET lock_timeout = '5s'
+SET statement_timeout = 30000
+AS $$
+BEGIN
+    RAISE NOTICE 'id=%', p_id;
+END;
+$$;
+
+-- =============================================================================
+-- Regression: inline NOT NULL must not become a named ADD/DROP CONSTRAINT (#218)
+-- =============================================================================
+-- See schema_a.sql. Here nn_col is gone and null_col is NOT NULL; the diff must be
+-- just `drop column nn_col` and `alter column null_col set not null`.
+CREATE TABLE test_schema.notnull_recreate (
+    id       integer,
+    null_col varchar(10) NOT NULL
+);
+
+-- =============================================================================
+-- Regression: index on a partitioned parent must be created valid (#223)
+-- =============================================================================
+-- See schema_a.sql. Here the partitioned parent gains an index; the generated
+-- CREATE INDEX must be a plain `ON` (not `ON ONLY`) so the applied index is valid.
+CREATE TABLE test_schema.partidx (
+    id      integer,
+    value   text,
+    bucket  date
+) PARTITION BY RANGE (bucket);
+
+CREATE TABLE test_schema.partidx_2024 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.partidx_2025 PARTITION OF test_schema.partidx
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX idx_partidx_value ON test_schema.partidx (value);
+
+-- =============================================================================
+-- Regression: non-idempotent IN-list deparsing must not loop (issue #226)
+-- =============================================================================
+-- See schema_a.sql. The matview and partial index below carry an IN-list whose
+-- deparsed form is not idempotent; the second diff must be empty despite the base
+-- table being identical in both schemas.
+CREATE TABLE test_schema.innorm (
+    id          integer PRIMARY KEY,
+    label       character varying(50),
+    action_type character varying(50),
+    device      jsonb
+);
+
+CREATE MATERIALIZED VIEW test_schema.innorm_mv AS
+SELECT id, label
+FROM test_schema.innorm
+WHERE label IN ('FOO', 'BAR')
+WITH NO DATA;
+
+CREATE INDEX ix_innorm_trust
+    ON test_schema.innorm USING btree (id, ((device ->> 'id'::text)))
+    WHERE action_type IN ('FOO', 'BAR');
+
+-- Companion to the innorm case (#226): explicit varchar-typmod IN-list. See
+-- schema_a.sql for the full description.
+CREATE TABLE test_schema.innorm_typmod (
+    id   integer PRIMARY KEY,
+    code character varying(10)
+);
+
+ALTER TABLE test_schema.innorm_typmod
+    ADD CONSTRAINT chk_innorm_typmod
+    CHECK (code IN ('A'::varchar(10), 'B'::varchar(10)));
+
+-- =============================================================================
+-- Regression: incompatible view column change needs DROP+CREATE (issue #227)
+-- =============================================================================
+-- See schema_a.sql. `kind` is inserted before profile_id, which CREATE OR
+-- REPLACE VIEW cannot express; v227_dep is textually unchanged but must ride
+-- along through drop+recreate.
+CREATE TABLE test_schema.v227_item (
+    id         integer PRIMARY KEY,
+    status     text,
+    kind       text,
+    profile_id integer
+);
+
+CREATE VIEW test_schema.v227_base AS
+SELECT id, status, kind, profile_id FROM test_schema.v227_item;
+
+CREATE VIEW test_schema.v227_dep AS
+SELECT id, status FROM test_schema.v227_base;
+
+-- =============================================================================
+-- CASCADE recreation of an index on a partitioned parent (PR #234 review)
+-- =============================================================================
+-- See schema_a.sql: the return type changed integer -> bigint, forcing
+-- DROP FUNCTION ... CASCADE which takes ix_cascade_part_fn with it.
+CREATE FUNCTION test_schema.cascade_part_fn(text)
+RETURNS bigint IMMUTABLE LANGUAGE sql AS $$ SELECT length($1)::bigint $$;
+
+CREATE TABLE test_schema.cascade_part (
+    id integer,
+    s  text,
+    d  date NOT NULL
+) PARTITION BY RANGE (d);
+
+CREATE TABLE test_schema.cascade_part_2024 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.cascade_part_2025 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX ix_cascade_part_fn ON test_schema.cascade_part (test_schema.cascade_part_fn(s));
