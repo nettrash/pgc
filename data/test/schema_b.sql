@@ -2048,3 +2048,37 @@ CREATE TABLE test_schema.partidx_2025 PARTITION OF test_schema.partidx
     FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 
 CREATE INDEX idx_partidx_value ON test_schema.partidx (value);
+
+-- =============================================================================
+-- Regression: non-idempotent IN-list deparsing must not loop (issue #226)
+-- =============================================================================
+-- See schema_a.sql. The matview and partial index below carry an IN-list whose
+-- deparsed form is not idempotent; the second diff must be empty despite the base
+-- table being identical in both schemas.
+CREATE TABLE test_schema.innorm (
+    id          integer PRIMARY KEY,
+    label       character varying(50),
+    action_type character varying(50),
+    device      jsonb
+);
+
+CREATE MATERIALIZED VIEW test_schema.innorm_mv AS
+SELECT id, label
+FROM test_schema.innorm
+WHERE label IN ('FOO', 'BAR')
+WITH NO DATA;
+
+CREATE INDEX ix_innorm_trust
+    ON test_schema.innorm USING btree (id, ((device ->> 'id'::text)))
+    WHERE action_type IN ('FOO', 'BAR');
+
+-- Companion to the innorm case (#226): explicit varchar-typmod IN-list. See
+-- schema_a.sql for the full description.
+CREATE TABLE test_schema.innorm_typmod (
+    id   integer PRIMARY KEY,
+    code character varying(10)
+);
+
+ALTER TABLE test_schema.innorm_typmod
+    ADD CONSTRAINT chk_innorm_typmod
+    CHECK (code IN ('A'::varchar(10), 'B'::varchar(10)));

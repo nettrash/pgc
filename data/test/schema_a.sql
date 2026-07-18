@@ -1790,3 +1790,36 @@ CREATE TABLE test_schema.partidx_2024 PARTITION OF test_schema.partidx
     FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 CREATE TABLE test_schema.partidx_2025 PARTITION OF test_schema.partidx
     FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- =============================================================================
+-- Regression: non-idempotent IN-list deparsing must not loop (issue #226)
+-- =============================================================================
+-- PostgreSQL deparses `col IN ('FOO','BAR')` as an array-level cast
+-- `(ARRAY[...])::text[]` on first render, then as an element-level cast
+-- `ARRAY[(...)::text, ...]` when that form is re-parsed. Both are equivalent but
+-- differ textually, so a matview/partial-index/generated-column expression carrying
+-- an IN-list re-emits DROP+CREATE on every run unless the definitions are
+-- canonicalized before comparison.
+--
+-- The base table is present in both schemas; the matview and partial index that
+-- carry the IN-list exist only in TO, so the diff creates them, applying re-parses
+-- the expression into the element-level form, and the second diff must still be
+-- empty.
+CREATE TABLE test_schema.innorm (
+    id          integer PRIMARY KEY,
+    label       character varying(50),
+    action_type character varying(50),
+    device      jsonb
+);
+
+-- Companion to the innorm case (#226): a CHECK IN-list whose literals carry an
+-- explicit varchar typmod. The typmod spelling survives both pretty
+-- pg_get_constraintdef renderings and flips between the array-level and
+-- element-level cast forms exactly like the bare-varchar IN-list, so the
+-- canonicalizer must converge it too or this constraint re-emits DROP+ADD forever.
+-- FROM: table only; TO adds the constraint, so the migration creates it and the
+-- re-parsed rendering must still compare equal.
+CREATE TABLE test_schema.innorm_typmod (
+    id   integer PRIMARY KEY,
+    code character varying(10)
+);

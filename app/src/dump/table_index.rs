@@ -43,13 +43,27 @@ fn strip_on_only(indexdef: &str) -> Cow<'_, str> {
     }
 }
 
+/// Whether two `CREATE INDEX` definitions describe the same index, ignoring the
+/// non-idempotent ways PostgreSQL deparses an `IN`-list partial-index predicate
+/// (issue #226). Falls back to a canonicalized comparison of the full statement.
+pub(crate) fn indexdefs_equivalent(a: &str, b: &str) -> bool {
+    a == b
+        || crate::utils::sql_normalize::canonicalize_definition(a)
+            == crate::utils::sql_normalize::canonicalize_definition(b)
+}
+
 impl TableIndex {
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.schema.as_bytes());
         hasher.update(self.table.as_bytes());
         hasher.update(self.name.as_bytes());
-        hasher.update(self.indexdef.as_bytes());
+        // Canonicalize the definition (a partial-index predicate may carry a
+        // non-idempotent IN-list expression) so the index does not look changed on
+        // every run (issue #226).
+        hasher.update(
+            crate::utils::sql_normalize::canonicalize_definition(&self.indexdef).as_bytes(),
+        );
         if let Some(comment) = &self.comment {
             hasher.update((comment.len() as u32).to_be_bytes());
             hasher.update(comment.as_bytes());
@@ -79,7 +93,7 @@ impl PartialEq for TableIndex {
             && self.table == other.table
             && self.name == other.name
             && self.catalog == other.catalog
-            && self.indexdef == other.indexdef
+            && indexdefs_equivalent(&self.indexdef, &other.indexdef)
             && self.comment == other.comment
     }
 }

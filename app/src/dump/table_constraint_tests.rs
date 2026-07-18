@@ -990,12 +990,14 @@ fn test_lowercase_outside_literals_adjacent_literals() {
 
 #[test]
 fn test_normalize_definition_array_level_cast() {
-    // Form A from pg_get_constraintdef (created via IN (...))
+    // Form A from pg_get_constraintdef (created via IN (...)). The canonical target
+    // is the element-level fixed point, which keeps the `::text` markers so a
+    // `text[]` array can never collapse to the same key as a plain varchar array.
     let def_a = "CHECK (priority::text = ANY (ARRAY['P1-Critical'::character varying, 'P2-High'::character varying]::text[]))";
     let norm = TableConstraint::normalize_definition(def_a);
     assert_eq!(
         norm,
-        "check (priority::text = any (array['P1-Critical'::character varying, 'P2-High'::character varying]))"
+        "check (priority::text = any (array[('P1-Critical'::character varying)::text, ('P2-High'::character varying)::text]))"
     );
 }
 
@@ -1006,7 +1008,7 @@ fn test_normalize_definition_element_level_cast() {
     let norm = TableConstraint::normalize_definition(def_b);
     assert_eq!(
         norm,
-        "check (priority::text = any (array['P1-Critical'::character varying, 'P2-High'::character varying]))"
+        "check (priority::text = any (array[('P1-Critical'::character varying)::text, ('P2-High'::character varying)::text]))"
     );
 }
 
@@ -1180,13 +1182,16 @@ fn test_normalize_definition_preserves_varying_text_cast_inside_literal() {
 
 #[test]
 fn test_normalize_definition_mixed_literal_and_outside_casts() {
-    // Cast outside the literal is normalized; identical text inside is preserved.
+    // Lowercasing applies outside literals; identical text inside is preserved. The
+    // `::character varying::text` collapse only fires inside an `array[...]` literal
+    // (issue #226 review): a standalone double cast is a genuine cast to text and must
+    // be kept, otherwise dropping it would change the type and hide a real diff.
     let def =
         "CHECK (x::character varying::text = ']::text[]' AND y::character varying::text = 'ok')";
     let norm = TableConstraint::normalize_definition(def);
     assert_eq!(
         norm,
-        "check (x::character varying = ']::text[]' and y::character varying = 'ok')"
+        "check (x::character varying::text = ']::text[]' and y::character varying::text = 'ok')"
     );
 }
 

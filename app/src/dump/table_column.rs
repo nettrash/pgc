@@ -3,6 +3,20 @@ use sha2::{Digest, Sha256};
 
 use crate::utils::string_extensions::StringExt;
 
+/// Whether two optional generated-column expressions are equivalent, ignoring the
+/// non-idempotent ways PostgreSQL deparses an `IN`-list expression (issue #226).
+fn generation_expressions_equivalent(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            x == y
+                || crate::utils::sql_normalize::canonicalize_definition(x)
+                    == crate::utils::sql_normalize::canonicalize_definition(y)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 // This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableColumn {
@@ -334,7 +348,9 @@ impl TableColumn {
             hasher.update(generation.as_bytes());
         }
         if let Some(expr) = &self.generation_expression {
-            hasher.update(expr.as_bytes());
+            // Canonicalize so a non-idempotent IN-list deparse in the generation
+            // expression does not make the column look changed every run (issue #226).
+            hasher.update(crate::utils::sql_normalize::canonicalize_definition(expr).as_bytes());
         }
         hasher.update(self.effective_generation_type().as_bytes());
         if let Some(comment) = &self.comment {
@@ -897,8 +913,10 @@ impl PartialEq for TableColumn {
             && self.identity_cycle == other.identity_cycle
             && self_generated == other_generated
             && (self_generated != "ALWAYS"
-                || (self.generation_expression == other.generation_expression
-                    && self.effective_generation_type() == other.effective_generation_type()))
+                || (generation_expressions_equivalent(
+                    &self.generation_expression,
+                    &other.generation_expression,
+                ) && self.effective_generation_type() == other.effective_generation_type()))
             && self.is_updatable == other.is_updatable
             && self.comment == other.comment
             && self.storage == other.storage

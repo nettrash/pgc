@@ -98,6 +98,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `idx_audit_logs_table_op_changed_at` — unique index gains `record_id` column
 - **Removed**: all indexes on removed tables (`orders`, `order_items`)
 - **Unchanged**: existing indexes on `users`, `products`, `audit_logs`, `logs`
+- **Partial index with a non-idempotent predicate** (Issue #226): `ix_innorm_trust` (TO-only) has a `WHERE action_type IN ('FOO','BAR')` predicate. PostgreSQL deparses the `IN`-list into an array-level cast on first render and an element-level cast once re-parsed; comparing the raw `indexdef` re-emits `DROP`+`CREATE` every run. The predicate is canonicalized before comparison so the second diff is empty. Paired with the `innorm_mv` matview (§13) which exercises the same non-idempotency in a view definition
 - **Index on a partitioned parent** (Issue #223): `idx_partidx_value` is added to the existing partitioned parent `partidx` (two partitions, identical in both schemas). `pg_get_indexdef` renders such an index with `ON ONLY`, which builds only the invalid metadata index on the parent. The default (non-production) output must emit a plain `CREATE INDEX ... ON` so PostgreSQL builds and attaches every partition's index and the parent is valid immediately. The round-2 diff cannot catch this on its own — an invalid-but-present index still round-trips empty — so the integration job additionally asserts that no index is left `indisvalid = false` after applying the migration
 
 ### 7. Foreign Keys
@@ -111,6 +112,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `chk_priority_label` — added `'P5-Informational'` value in Schema B
 - **Removed**: `chk_products_weight_positive` (column removed), `chk_orders_dates`, `chk_orders_delivery_dates` (table removed)
 - **Unchanged**: `chk_users_email_format`, `chk_category_values` (mixed-case string literals preserved), inline checks on `products`, `audit_logs`
+- **Typmod IN-list** (Issue #226): `chk_innorm_typmod` (TO-only) — `code IN ('A'::varchar(10), 'B'::varchar(10))`. The explicit typmod survives both pretty `pg_get_constraintdef` renderings and flips between the array-level (`ARRAY[...]::text[]`) and element-level (`ARRAY['A'::character varying(10)::text, ...]`) cast forms exactly like the bare-varchar IN-list, so the canonicalizer must converge the typmod'd renderings too or the constraint re-emits `DROP`+`ADD` on every run. Companion to the `innorm_mv`/`ix_innorm_trust` cases (§6, §13)
 
 ### 9. Functions
 
@@ -218,6 +220,16 @@ These schemas are designed to test comparison capabilities for the following Pos
   before the statement's terminating semicolon rather than after it.
 - **Unchanged**: `mv_with_data` — a populated materialized view over the same base
   table, which must never acquire a `WITH NO DATA` clause.
+- **Added**: `innorm_mv` (TO-only) — a materialized view whose `WHERE` uses
+  `label IN ('FOO','BAR')` (issue #226). PostgreSQL deparses an `IN`-list as an
+  array-level cast `(ARRAY[...])::text[]` on first render, then as an element-level
+  cast `ARRAY[(...)::text, ...]` once that form is re-parsed. The two are equivalent
+  but differ textually, so comparing the raw definition re-emits `DROP`+`CREATE` every
+  run. Definitions are canonicalized (array-level cast rewritten to the element-level
+  fixed point) before hashing/comparison, so the second diff is empty. The base table
+  `innorm` is identical in both schemas; the matview exists only in TO so the diff
+  creates it and applying it re-parses the expression. The companion partial index
+  `ix_innorm_trust` (§6) exercises the same non-idempotency in an index predicate.
 
 ### 14. Row-Level Security Policies
 - **Modified**: `users_rls_select` — changed to `RESTRICTIVE`, role changed to `tenant_reader`, added `AND two_factor_enabled = TRUE` condition

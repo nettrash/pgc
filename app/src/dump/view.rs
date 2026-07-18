@@ -112,7 +112,9 @@ impl View {
                 "{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}",
                 self.schema,
                 self.name,
-                self.definition,
+                // Canonicalize so PostgreSQL's non-idempotent IN-list deparsing does
+                // not make a materialized view look changed on every run (issue #226).
+                crate::utils::sql_normalize::canonicalize_definition(&self.definition),
                 self.owner,
                 self.comment.clone().unwrap_or_default(),
                 self.is_materialized,
@@ -248,10 +250,12 @@ impl View {
             );
         }
 
-        let current_definition = self.definition.trim();
-        let desired_definition = target.definition.trim();
-
-        let has_definition_change = current_definition != desired_definition;
+        // Compare canonicalized forms so a non-idempotent IN-list deparse (issue #226)
+        // is not seen as a definition change, while still emitting the raw definition.
+        // `canonicalize_definition` trims, so this matches what `hash()` feeds the hash.
+        let has_definition_change =
+            crate::utils::sql_normalize::canonicalize_definition(&self.definition)
+                != crate::utils::sql_normalize::canonicalize_definition(&target.definition);
         let has_kind_change = self.is_materialized != target.is_materialized;
         let has_security_invoker_change = self.security_invoker != target.security_invoker;
         let has_check_option_change = self.check_option != target.check_option;

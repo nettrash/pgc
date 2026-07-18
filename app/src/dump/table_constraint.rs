@@ -149,65 +149,21 @@ impl TableConstraint {
     ///
     /// Which form is returned depends on how the constraint was originally
     /// created (e.g. via `IN(...)` in DDL versus applying a migration that
-    /// reuses Form A verbatim).  Normalize by lowercasing outside literals
+    /// reuses Form A verbatim).  Normalize by lowercasing outside quoted text
     /// and collapsing the redundant `::text` casts so both forms compare equal.
     ///
-    /// Both the lowercasing and the cast replacements are applied only to
-    /// text **outside** single-quoted string literals, so literal contents
-    /// like `']::text[]'` are never altered.
+    /// The lowercasing and cast replacements are applied only **outside** both
+    /// single-quoted string literals and double-quoted identifiers (see
+    /// [`crate::utils::sql_normalize::canonicalize_definition`]), so a literal like
+    /// `']::text[]'` and a case-sensitive identifier like `"MyCol"` are never
+    /// altered.
     fn normalize_definition(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars();
-        // Accumulates non-literal text so we can apply replacements on it
-        // in one go before flushing.
-        let mut buf = String::new();
-
-        while let Some(c) = chars.next() {
-            if c == '\'' {
-                // Flush the non-literal buffer (lowercased + cast-normalized).
-                Self::flush_outside_buf(&mut buf, &mut out);
-
-                // Inside a single-quoted literal — copy verbatim.
-                out.push('\'');
-                loop {
-                    match chars.next() {
-                        Some('\'') => {
-                            out.push('\'');
-                            if chars.as_str().starts_with('\'') {
-                                out.push('\'');
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                        Some(ch) => out.push(ch),
-                        None => break,
-                    }
-                }
-            } else {
-                // Outside a literal — collect into buf for batch processing.
-                for lc in c.to_lowercase() {
-                    buf.push(lc);
-                }
-            }
-        }
-
-        // Flush any remaining non-literal text.
-        Self::flush_outside_buf(&mut buf, &mut out);
-        out
-    }
-
-    /// Applies cast-normalization replacements to `buf` (which contains only
-    /// non-literal text), appends the result to `out`, and clears `buf`.
-    fn flush_outside_buf(buf: &mut String, out: &mut String) {
-        if buf.is_empty() {
-            return;
-        }
-        let normalized = buf
-            .replace("::character varying::text", "::character varying")
-            .replace("]::text[]", "]");
-        out.push_str(&normalized);
-        buf.clear();
+        // Shared with view / index / generated-column comparison. Besides the
+        // paren-free `IN`-list cast collapse this handles here, the shared helper
+        // also rewrites the parenthesized array-level cast into PostgreSQL's
+        // element-level fixed point (issue #226); a constraint definition that
+        // never contains that form is unaffected.
+        crate::utils::sql_normalize::canonicalize_definition(s)
     }
 
     /// Lowercases a SQL expression while preserving the original case of text
