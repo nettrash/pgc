@@ -47,6 +47,17 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether `chars[at..]` starts with the ASCII `prefix`, compared
+/// case-insensitively, without allocating. The array-literal matchers run this at
+/// every scan position, so it must stay allocation-free.
+fn starts_with_ascii_ci(chars: &[char], at: usize, prefix: &str) -> bool {
+    at + prefix.len() <= chars.len()
+        && chars[at..at + prefix.len()]
+            .iter()
+            .zip(prefix.chars())
+            .all(|(c, p)| c.eq_ignore_ascii_case(&p))
+}
+
 /// If a quoted region begins at `chars[at]`, return its length (both delimiters
 /// included); otherwise `None`. Recognizes every form PostgreSQL can render a string
 /// literal or identifier as, so their content is always skipped verbatim:
@@ -273,11 +284,7 @@ fn distribute_array_casts(input: &str) -> String {
 fn try_rewrite_array_cast(chars: &[char], at: usize) -> Option<(String, usize)> {
     // Case-insensitive match of the literal prefix `(array[`.
     const PREFIX: &str = "(array[";
-    if at + PREFIX.len() > chars.len() {
-        return None;
-    }
-    let head: String = chars[at..at + PREFIX.len()].iter().collect();
-    if !head.eq_ignore_ascii_case(PREFIX) {
+    if !starts_with_ascii_ci(chars, at, PREFIX) {
         return None;
     }
     let bracket_open = at + PREFIX.len() - 1; // index of '['
@@ -398,11 +405,10 @@ fn collapse_array_literal_casts(s: &str) -> String {
 /// not exactly one of the two renderings (mixed elements, other element types, any
 /// other trailing cast) is returned as `None` and left untouched.
 fn try_collapse_array_literal(chars: &[char], at: usize) -> Option<(String, usize)> {
+    // Input is already lowercased outside quotes, so the case-insensitive compare is
+    // equivalent to an exact match here — and allocation-free.
     const PREFIX: &str = "array[";
-    if at + PREFIX.len() > chars.len() {
-        return None;
-    }
-    if chars[at..at + PREFIX.len()].iter().collect::<String>() != PREFIX {
+    if !starts_with_ascii_ci(chars, at, PREFIX) {
         return None;
     }
     // `array` must stand alone, not be the tail of another identifier (e.g. `x_array[`).
