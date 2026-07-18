@@ -24,13 +24,16 @@
 
 /// Canonicalize a catalog expression/definition for comparison and hashing.
 ///
-/// Distributes the parenthesized array-level `IN`-list cast into the element-level
-/// fixed-point form, lowercases everything outside string literals and quoted
-/// identifiers, then collapses the paren-free `IN`-list redundancy that CHECK
-/// constraints render — but only inside an `array[...]` literal whose elements are
-/// `::character varying`, so a real array cast (`::integer[]`, `::bigint[]`, an array
-/// subscript's `::text[]`) is preserved. Content inside `'...'` literals and `"..."`
-/// identifiers is preserved verbatim, including case.
+/// Every rendering PostgreSQL uses for a varchar `IN`-list array — parenthesized or
+/// paren-free, array-level or element-level cast — is rewritten to the one
+/// element-level fixed point `array[('v'::character varying)::text, …]`, and
+/// everything outside string literals and quoted identifiers is lowercased. Both
+/// rewrites preserve semantics exactly (cast distribution is what PostgreSQL performs
+/// on re-parse; the rest is parenthesization), so no type information is ever dropped:
+/// a real array cast (`::integer[]`, `::bigint[]`, an array subscript's `::text[]`)
+/// and a plain `character varying[]` literal keep their own distinct canonical keys.
+/// Content inside `'...'` literals and `"..."` identifiers is preserved verbatim,
+/// including case.
 ///
 /// Leading and trailing whitespace is stripped, so a definition is canonicalized to
 /// the same string whether or not a catalog rendering left surrounding whitespace —
@@ -291,9 +294,9 @@ fn try_rewrite_array_cast(chars: &[char], at: usize) -> Option<(String, usize)> 
 }
 
 /// Lowercase everything outside single-quoted literals and double-quoted
-/// identifiers, then collapse the redundant paren-free `IN`-list casts that only ever
-/// occur inside an `array[...]` literal. Quoted regions (both kinds) are copied
-/// verbatim so literal values and case-sensitive identifiers survive.
+/// identifiers, then rewrite the paren-free `IN`-list array renderings to the
+/// element-level fixed point. Quoted regions (both kinds) are copied verbatim so
+/// literal values and case-sensitive identifiers survive.
 fn lowercase_and_collapse(s: &str) -> String {
     collapse_array_literal_casts(&lowercase_outside_quotes(s))
 }
@@ -318,15 +321,13 @@ fn lowercase_outside_quotes(s: &str) -> String {
     out
 }
 
-/// Collapse the redundant casts PostgreSQL leaves on the paren-free `IN`-list
-/// rendering — but only where they occur, inside an `array[...]` literal. For a match
-/// `array[<content>]::T[]`, the array-level cast `::T[]` is dropped and each element's
-/// `::character varying::text` collapses to `::character varying`, so the array-level
-/// and element-level renderings converge. A `::text[]` cast on anything else (an array
-/// subscript or slice such as `col[1:2]::text[]`) and a standalone `x::character
-/// varying::text` double cast are outside any `array[...]` literal and are left intact
-/// — collapsing them would drop a real cast and hide a diff. Input must already be
-/// lowercased outside quotes.
+/// Rewrite the paren-free `IN`-list renderings of a `text[]` array literal into the
+/// element-level fixed point, so they compare equal to each other and to the
+/// parenthesized family handled by [`distribute_array_casts`]. Everything that is not
+/// exactly one of those two renderings — a plain varchar array, any other element
+/// type, any other trailing cast, an array subscript's `::text[]`, a standalone
+/// `x::character varying::text` double cast — is left byte-for-byte intact. Input
+/// must already be lowercased outside quotes.
 fn collapse_array_literal_casts(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -348,8 +349,27 @@ fn collapse_array_literal_casts(s: &str) -> String {
     out
 }
 
-/// If `chars[at..]` starts an `array[...]` literal (optionally cast with `::T[]`),
-/// return its collapsed rendering and the index just past the consumed region.
+/// If `chars[at..]` starts an `array[...]` literal in one of the two paren-free
+/// renderings PostgreSQL uses for a varchar `IN`-list, return the element-level
+/// fixed-point rendering and the index just past the consumed region.
+///
+/// The two redundant renderings of the same `text[]` array are
+///
+/// * array-level cast:   `array['v'::character varying, …]::text[]`
+/// * element-level cast: `array['v'::character varying::text, …]`
+///
+/// Both become `array[('v'::character varying)::text, …]` — the same fixed point the
+/// parenthesized `(array[…])::text[]` family reaches via [`distribute_array_casts`] —
+/// so every rendering of one `IN`-list compares equal, even across a dump taken on a
+/// server that renders one family and a dump that renders the other. Each rewrite
+/// preserves semantics exactly: distributing an array-level cast over the elements is
+/// what PostgreSQL itself does on re-parse, and turning `X::character varying::text`
+/// into `(X::character varying)::text` only parenthesizes a left-associative cast
+/// chain. Because the `::text` marker is kept rather than stripped, a plain
+/// `character varying[]` literal canonicalizes to a *different* key than any of the
+/// `text[]` renderings — the two types can never be conflated. Any literal that is
+/// not exactly one of the two renderings (mixed elements, other element types, any
+/// other trailing cast) is returned as `None` and left untouched.
 fn try_collapse_array_literal(chars: &[char], at: usize) -> Option<(String, usize)> {
     const PREFIX: &str = "array[";
     if at + PREFIX.len() > chars.len() {
@@ -365,21 +385,73 @@ fn try_collapse_array_literal(chars: &[char], at: usize) -> Option<(String, usiz
     let bracket_open = at + PREFIX.len() - 1; // index of '['
     let bracket_close = matching_bracket(chars, bracket_open)?;
     let content = &chars[bracket_open + 1..bracket_close];
+    let elements = split_top_level_commas(content);
+    if elements.is_empty() {
+        return None;
+    }
 
-    // Only the array-level cast that PostgreSQL's varchar `IN`-list deparsing leaves
-    // redundant is dropped: `::text[]` on an array whose elements are already
-    // `::character varying`. Any other array cast (`::integer[]`, `::bigint[]`, or even
-    // `::text[]` on non-varchar elements) is a real type conversion and is preserved —
-    // dropping it would make distinct expressions compare equal and hide a diff.
-    let end = match trailing_array_cast(chars, bracket_close + 1) {
-        Some((base_type, after)) if base_type == "text" && all_elements_are_varchar(content) => {
-            after
+    // Array-level rendering: a trailing `::text[]` over all-varchar elements.
+    if let Some((base_type, after)) = trailing_array_cast(chars, bracket_close + 1) {
+        if base_type == "text" && elements.iter().all(|e| ends_with_varchar_cast(e)) {
+            return Some((element_level_fixed_point(&elements), after));
         }
-        Some(_) => return None, // real array cast — leave the literal untouched
-        None => bracket_close + 1,
-    };
+        return None; // real array cast — leave the literal untouched
+    }
 
-    Some((format!("array[{}]", collapse_element_casts(content)), end))
+    // Element-level rendering: every element carries the paren-free chained cast.
+    if elements
+        .iter()
+        .all(|e| e.strip_suffix("::text").is_some_and(ends_with_varchar_cast))
+    {
+        return Some((element_level_fixed_point(&elements), bracket_close + 1));
+    }
+    None
+}
+
+/// Whether an array element ends with a varchar cast — `::character varying`,
+/// optionally carrying a typmod, e.g. `::character varying(10)`. The typmod spelling
+/// survives PostgreSQL's re-parse (an explicit `'A'::varchar(10)` inside an `IN` list
+/// deparses as `'A'::character varying(10)` in both the array-level and element-level
+/// renderings), so it participates in the same #226 flip as the bare form and must be
+/// gated in for the renderings to converge. Input is already lowercased outside quotes.
+fn ends_with_varchar_cast(element: &str) -> bool {
+    strip_trailing_typmod(element).ends_with("::character varying")
+}
+
+/// Strip a trailing `(digits[, digits…])` typmod from a cast spelling, returning the
+/// prefix; input without one is returned unchanged.
+fn strip_trailing_typmod(e: &str) -> &str {
+    if !e.ends_with(')') {
+        return e;
+    }
+    let Some(open) = e.rfind('(') else {
+        return e;
+    };
+    let inner = &e[open + 1..e.len() - 1];
+    if !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ',' || c == ' ')
+    {
+        &e[..open]
+    } else {
+        e
+    }
+}
+
+/// Rebuild an array literal at the element-level fixed point: each element becomes
+/// `(<element>)::text`, with the element-level rendering's own trailing `::text`
+/// removed first so both paren-free renderings produce byte-identical output. Nested
+/// array literals inside an element are canonicalized recursively.
+fn element_level_fixed_point(elements: &[String]) -> String {
+    let rebuilt: Vec<String> = elements
+        .iter()
+        .map(|e| {
+            let base = e.strip_suffix("::text").unwrap_or(e);
+            format!("({})::text", collapse_array_literal_casts(base))
+        })
+        .collect();
+    format!("array[{}]", rebuilt.join(", "))
 }
 
 /// A trailing array-level cast `::TYPE[]` starting at `chars[pos]`: the base type name
@@ -400,39 +472,6 @@ fn trailing_array_cast(chars: &[char], pos: usize) -> Option<(String, usize)> {
     }
     let base_type: String = chars[type_start..j].iter().collect();
     Some((base_type.trim().to_string(), j + 2))
-}
-
-/// Whether every top-level element of an array literal's content is a
-/// `… :: character varying` cast — the exact element form PostgreSQL emits for a
-/// varchar `IN`-list, and the only case where dropping a `::text[]` array cast is a
-/// safe no-op. Input is already lowercased outside quotes.
-fn all_elements_are_varchar(content: &[char]) -> bool {
-    let elements = split_top_level_commas(content);
-    !elements.is_empty()
-        && elements
-            .iter()
-            .all(|e| e.trim_end().ends_with("::character varying"))
-}
-
-/// Collapse `::character varying::text` to `::character varying` in array-literal
-/// content, outside quoted regions so literal values are never rewritten.
-fn collapse_element_casts(content: &[char]) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut buf = String::new();
-    let mut i = 0;
-    while i < content.len() {
-        if let Some(len) = quoted_prefix_len(content, i) {
-            out.push_str(&buf.replace("::character varying::text", "::character varying"));
-            buf.clear();
-            out.extend(&content[i..i + len]);
-            i += len;
-            continue;
-        }
-        buf.push(content[i]);
-        i += 1;
-    }
-    out.push_str(&buf.replace("::character varying::text", "::character varying"));
-    out
 }
 
 #[cfg(test)]

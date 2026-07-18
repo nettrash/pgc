@@ -112,6 +112,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `chk_priority_label` — added `'P5-Informational'` value in Schema B
 - **Removed**: `chk_products_weight_positive` (column removed), `chk_orders_dates`, `chk_orders_delivery_dates` (table removed)
 - **Unchanged**: `chk_users_email_format`, `chk_category_values` (mixed-case string literals preserved), inline checks on `products`, `audit_logs`
+- **Typmod IN-list** (Issue #226): `chk_innorm_typmod` (TO-only) — `code IN ('A'::varchar(10), 'B'::varchar(10))`. The explicit typmod survives both pretty `pg_get_constraintdef` renderings and flips between the array-level (`ARRAY[...]::text[]`) and element-level (`ARRAY['A'::character varying(10)::text, ...]`) cast forms exactly like the bare-varchar IN-list, so the canonicalizer must converge the typmod'd renderings too or the constraint re-emits `DROP`+`ADD` on every run. Companion to the `innorm_mv`/`ix_innorm_trust` cases (§6, §13)
 
 ### 9. Functions
 

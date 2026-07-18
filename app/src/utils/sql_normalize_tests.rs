@@ -41,16 +41,33 @@ fn partial_index_predicate_forms_are_equal() {
     );
 }
 
-// The paren-free CHECK-constraint rendering (already handled by the prior
-// normalize_definition) must keep collapsing to the same simplified form.
+// The paren-free CHECK-constraint renderings must converge — on the element-level
+// fixed point, which keeps the `::text` markers so type information is never lost.
 #[test]
 fn check_constraint_paren_free_forms_are_equal() {
     let array_level = "CHECK (priority::text = ANY (ARRAY['P1'::character varying, 'P2'::character varying]::text[]))";
     let element_level = "CHECK (priority::text = ANY (ARRAY['P1'::character varying::text, 'P2'::character varying::text]))";
-    let expected =
-        "check (priority::text = any (array['P1'::character varying, 'P2'::character varying]))";
+    let expected = "check (priority::text = any (array[('P1'::character varying)::text, ('P2'::character varying)::text]))";
     assert_eq!(canonicalize_definition(array_level), expected);
     assert_eq!(canonicalize_definition(element_level), expected);
+}
+
+// All four renderings of the same varchar IN-list — parenthesized or paren-free,
+// array-level or element-level cast — converge on one canonical key, so even a
+// FROM dump and a TO dump rendered by different server behaviors compare equal.
+#[test]
+fn all_four_in_list_renderings_converge() {
+    let forms = [
+        "(ARRAY['v'::character varying, 'w'::character varying])::text[]",
+        "ARRAY[('v'::character varying)::text, ('w'::character varying)::text]",
+        "ARRAY['v'::character varying, 'w'::character varying]::text[]",
+        "ARRAY['v'::character varying::text, 'w'::character varying::text]",
+    ];
+    let keys: Vec<String> = forms.iter().map(|f| canonicalize_definition(f)).collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] == w[1]),
+        "all renderings must share one canonical key: {keys:?}"
+    );
 }
 
 #[test]
@@ -159,7 +176,7 @@ fn array_literal_string_content_with_cast_text_is_preserved() {
     let def = "ARRAY['a::character varying::text'::character varying]::text[]";
     assert_eq!(
         canonicalize_definition(def),
-        "array['a::character varying::text'::character varying]"
+        "array[('a::character varying::text'::character varying)::text]"
     );
 }
 
@@ -257,14 +274,90 @@ fn text_cast_on_non_varchar_array_is_preserved() {
     );
 }
 
-// The redundant form (varchar elements + `::text[]`) still collapses — the fix must
-// not disable the #226 canonicalization it exists for.
+// The redundant form (varchar elements + `::text[]`) still canonicalizes — to the
+// element-level fixed point — so the #226 loop stays fixed.
 #[test]
 fn redundant_varchar_text_array_cast_still_collapses() {
     assert_eq!(
         canonicalize_definition(
             "array['FOO'::character varying, 'BAR'::character varying]::text[]"
         ),
-        "array['FOO'::character varying, 'BAR'::character varying]"
+        "array[('FOO'::character varying)::text, ('BAR'::character varying)::text]"
     );
+}
+
+// The reviewer's conflation cases: a `text[]` rendering (in either paren-free form)
+// must never share a canonical key with the plain `character varying[]` literal —
+// they are different types, and fusing them would hide a real change.
+#[test]
+fn text_array_renderings_stay_distinct_from_plain_varchar_array() {
+    let plain_varchar = canonicalize_definition("array['a'::character varying]");
+    let element_cast = canonicalize_definition("array['a'::character varying::text]");
+    let array_cast = canonicalize_definition("array['a'::character varying]::text[]");
+    assert_ne!(element_cast, plain_varchar);
+    assert_ne!(array_cast, plain_varchar);
+    // ...while the two text[] renderings agree with each other.
+    assert_eq!(element_cast, array_cast);
+}
+
+// An array literal with varchar::text element casts on only SOME elements is not an
+// IN-list rendering; it must be left byte-for-byte untouched.
+#[test]
+fn mixed_element_casts_are_left_untouched() {
+    let def = "array['a'::character varying::text, 'b'::character varying]";
+    assert_eq!(
+        canonicalize_definition(def),
+        "array['a'::character varying::text, 'b'::character varying]"
+    );
+}
+
+// A user-written `IN ('A'::varchar(10), …)` keeps its typmod through both pretty
+// pg_get_constraintdef renderings and flips between them just like the bare form
+// (verified live on PostgreSQL 16), so the typmod'd renderings must converge too or
+// the constraint loops with DROP+ADD forever. Exact strings from the live server.
+#[test]
+fn typmod_varchar_in_list_renderings_converge() {
+    let round1 = "CHECK (code::text = ANY (ARRAY['A'::character varying(10), 'B'::character varying(10)]::text[]))";
+    let round2 = "CHECK (code::text = ANY (ARRAY['A'::character varying(10)::text, 'B'::character varying(10)::text]))";
+    assert_eq!(
+        canonicalize_definition(round1),
+        canonicalize_definition(round2)
+    );
+    assert_eq!(
+        canonicalize_definition(round1),
+        "check (code::text = any (array[('A'::character varying(10))::text, ('B'::character varying(10))::text]))"
+    );
+}
+
+// The typmod'd fixed point stays distinct from the bare-varchar fixed point: the two
+// spellings render consistently on both sides of a compare, so folding them is
+// unnecessary and keeping them apart is the safe direction.
+#[test]
+fn typmod_and_bare_varchar_fixed_points_stay_distinct() {
+    assert_ne!(
+        canonicalize_definition("array['A'::character varying(10)]::text[]"),
+        canonicalize_definition("array['A'::character varying]::text[]")
+    );
+}
+
+// A domain-typed element spelling (e.g. `::order_status`) is intentionally NOT gated
+// in: PostgreSQL types IN-list literals as plain varchar even for a domain-over-varchar
+// column (verified live), so this spelling never participates in the #226 flip; an
+// expression carrying it renders identically on both sides and passes through
+// untouched.
+#[test]
+fn domain_typed_elements_are_left_untouched() {
+    let def = "array['new'::order_status, 'done'::order_status]::text[]";
+    assert_eq!(canonicalize_definition(def), def);
+}
+
+// The typmod recognizer must not mistake other parenthesized tails for a typmod.
+#[test]
+fn non_typmod_parenthesized_tails_are_not_varchar_casts() {
+    // function call tail — not a varchar cast
+    let def = "array[f(1), f(2)]::text[]";
+    assert_eq!(canonicalize_definition(def), def);
+    // typmod-looking tail on a non-varchar cast
+    let def2 = "array['x'::numeric(10, 2)]::text[]";
+    assert_eq!(canonicalize_definition(def2), def2);
 }

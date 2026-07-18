@@ -2071,3 +2071,14 @@ WITH NO DATA;
 CREATE INDEX ix_innorm_trust
     ON test_schema.innorm USING btree (id, ((device ->> 'id'::text)))
     WHERE action_type IN ('FOO', 'BAR');
+
+-- Companion to the innorm case (#226): explicit varchar-typmod IN-list. See
+-- schema_a.sql for the full description.
+CREATE TABLE test_schema.innorm_typmod (
+    id   integer PRIMARY KEY,
+    code character varying(10)
+);
+
+ALTER TABLE test_schema.innorm_typmod
+    ADD CONSTRAINT chk_innorm_typmod
+    CHECK (code IN ('A'::varchar(10), 'B'::varchar(10)));

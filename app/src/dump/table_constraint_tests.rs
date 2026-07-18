@@ -990,12 +990,14 @@ fn test_lowercase_outside_literals_adjacent_literals() {
 
 #[test]
 fn test_normalize_definition_array_level_cast() {
-    // Form A from pg_get_constraintdef (created via IN (...))
+    // Form A from pg_get_constraintdef (created via IN (...)). The canonical target
+    // is the element-level fixed point, which keeps the `::text` markers so a
+    // `text[]` array can never collapse to the same key as a plain varchar array.
     let def_a = "CHECK (priority::text = ANY (ARRAY['P1-Critical'::character varying, 'P2-High'::character varying]::text[]))";
     let norm = TableConstraint::normalize_definition(def_a);
     assert_eq!(
         norm,
-        "check (priority::text = any (array['P1-Critical'::character varying, 'P2-High'::character varying]))"
+        "check (priority::text = any (array[('P1-Critical'::character varying)::text, ('P2-High'::character varying)::text]))"
     );
 }
 
@@ -1006,7 +1008,7 @@ fn test_normalize_definition_element_level_cast() {
     let norm = TableConstraint::normalize_definition(def_b);
     assert_eq!(
         norm,
-        "check (priority::text = any (array['P1-Critical'::character varying, 'P2-High'::character varying]))"
+        "check (priority::text = any (array[('P1-Critical'::character varying)::text, ('P2-High'::character varying)::text]))"
     );
 }
 

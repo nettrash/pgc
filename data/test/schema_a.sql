@@ -1811,3 +1811,15 @@ CREATE TABLE test_schema.innorm (
     action_type character varying(50),
     device      jsonb
 );
+
+-- Companion to the innorm case (#226): a CHECK IN-list whose literals carry an
+-- explicit varchar typmod. The typmod spelling survives both pretty
+-- pg_get_constraintdef renderings and flips between the array-level and
+-- element-level cast forms exactly like the bare-varchar IN-list, so the
+-- canonicalizer must converge it too or this constraint re-emits DROP+ADD forever.
+-- FROM: table only; TO adds the constraint, so the migration creates it and the
+-- re-parsed rendering must still compare equal.
+CREATE TABLE test_schema.innorm_typmod (
+    id   integer PRIMARY KEY,
+    code character varying(10)
+);
