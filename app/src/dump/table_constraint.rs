@@ -149,12 +149,14 @@ impl TableConstraint {
     ///
     /// Which form is returned depends on how the constraint was originally
     /// created (e.g. via `IN(...)` in DDL versus applying a migration that
-    /// reuses Form A verbatim).  Normalize by lowercasing outside literals
+    /// reuses Form A verbatim).  Normalize by lowercasing outside quoted text
     /// and collapsing the redundant `::text` casts so both forms compare equal.
     ///
-    /// Both the lowercasing and the cast replacements are applied only to
-    /// text **outside** single-quoted string literals, so literal contents
-    /// like `']::text[]'` are never altered.
+    /// The lowercasing and cast replacements are applied only **outside** both
+    /// single-quoted string literals and double-quoted identifiers (see
+    /// [`crate::utils::sql_normalize::canonicalize_definition`]), so a literal like
+    /// `']::text[]'` and a case-sensitive identifier like `"MyCol"` are never
+    /// altered.
     fn normalize_definition(s: &str) -> String {
         // Shared with view / index / generated-column comparison. Besides the
         // paren-free `IN`-list cast collapse this handles here, the shared helper
