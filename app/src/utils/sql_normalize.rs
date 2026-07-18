@@ -31,8 +31,13 @@
 /// `::character varying`, so a real array cast (`::integer[]`, `::bigint[]`, an array
 /// subscript's `::text[]`) is preserved. Content inside `'...'` literals and `"..."`
 /// identifiers is preserved verbatim, including case.
+///
+/// Leading and trailing whitespace is stripped, so a definition is canonicalized to
+/// the same string whether or not a catalog rendering left surrounding whitespace —
+/// every caller (view hash and alter comparison, index, constraint, generated column)
+/// therefore agrees regardless of trimming at the call site.
 pub fn canonicalize_definition(s: &str) -> String {
-    lowercase_and_collapse(&distribute_array_casts(s))
+    lowercase_and_collapse(&distribute_array_casts(s.trim()))
 }
 
 fn is_ident_char(c: char) -> bool {

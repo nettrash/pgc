@@ -100,6 +100,22 @@ fn empty_input_is_empty() {
     assert_eq!(canonicalize_definition(""), "");
 }
 
+// Leading/trailing whitespace must not affect the canonical form, so a caller that
+// trims (View::get_alter_script) and one that does not (View::hash) agree, and a
+// catalog rendering that leaves surrounding whitespace never causes spurious churn.
+#[test]
+fn surrounding_whitespace_is_ignored() {
+    assert_eq!(
+        canonicalize_definition(" SELECT a FROM t "),
+        canonicalize_definition("SELECT a FROM t")
+    );
+    assert_eq!(
+        canonicalize_definition("select x\n\n"),
+        canonicalize_definition("select x")
+    );
+    assert_eq!(canonicalize_definition("   "), "");
+}
+
 // The cast collapse only applies inside an `array[...]` literal. An array subscript or
 // slice cast such as `col[1:2]::text[]` must keep its `::text[]`: dropping it changes
 // the type and would make two non-equivalent definitions compare equal (missed diff).
