@@ -351,6 +351,42 @@ fn domain_typed_elements_are_left_untouched() {
     assert_eq!(canonicalize_definition(def), def);
 }
 
+// PostgreSQL's deparser never escapes a quote as `\'` — quotes are always doubled —
+// and under standard_conforming_strings = on a string ending in a backslash renders
+// as `'x\'`, where the quote after the backslash IS the terminator (verified live on
+// PostgreSQL 16). The scanner must close the literal there; treating `\'` as an
+// escape would swallow everything after the string. These strings are exact
+// deparser output.
+#[test]
+fn standard_string_ending_in_backslash_terminates_at_quote() {
+    // literal preserved, expression around it still lowercased
+    assert_eq!(
+        canonicalize_definition("WHERE (s = 'x\\'::text)"),
+        "where (s = 'x\\'::text)"
+    );
+    // the scan must NOT continue past the closing quote: the keyword after the
+    // literal is outside it and gets lowercased
+    assert_eq!(
+        canonicalize_definition("'x\\' AND UPPER_KEyword"),
+        "'x\\' and upper_keyword"
+    );
+}
+
+// Deparser output for a string containing both an embedded quote and a backslash:
+// scs=on renders `'a''\b'` (quote doubled, backslash bare); scs=off renders
+// `'a''\\b'` (backslash doubled). Both must be preserved verbatim.
+#[test]
+fn deparser_quote_and_backslash_renderings_are_preserved() {
+    assert_eq!(
+        canonicalize_definition("WHERE (s = 'a''\\b'::text)"),
+        "where (s = 'a''\\b'::text)"
+    );
+    assert_eq!(
+        canonicalize_definition("WHERE (s = 'a''\\\\b'::text)"),
+        "where (s = 'a''\\\\b'::text)"
+    );
+}
+
 // The typmod recognizer must not mistake other parenthesized tails for a typmod.
 #[test]
 fn non_typmod_parenthesized_tails_are_not_varchar_casts() {

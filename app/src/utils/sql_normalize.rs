@@ -56,9 +56,14 @@ fn is_ident_char(c: char) -> bool {
 /// * E-strings `E'...'` / `e'...'`, with backslash escapes (`\'` does not close),
 /// * dollar-quoted strings `$tag$...$tag$` (and `$$...$$`).
 ///
-/// PostgreSQL's expression deparser emits only the standard single-quoted form, but
-/// handling the others keeps the canonicalizer correct if one ever reaches it (e.g.
-/// under `standard_conforming_strings = off`) rather than mis-scanning literal content.
+/// PostgreSQL's expression deparser emits only the standard single-quoted form,
+/// under **both** settings of `standard_conforming_strings`: quotes are always
+/// escaped by doubling (never `\'`), and backslashes are emitted bare when the
+/// setting is `on` or doubled to `\\` when it is `off` (ruleutils'
+/// `simple_quote_literal`, verified live on PostgreSQL 16 in both modes). E-strings
+/// and dollar-quotes therefore never appear in catalog deparse output; handling them
+/// keeps the canonicalizer from mis-scanning literal content if hand-written SQL
+/// ever reaches it.
 fn quoted_prefix_len(chars: &[char], at: usize) -> Option<usize> {
     let c = chars[at];
     // E-string: E'…' / e'…', only when the E stands alone (not the tail of an
@@ -79,8 +84,18 @@ fn quoted_prefix_len(chars: &[char], at: usize) -> Option<usize> {
 }
 
 /// Length of a standard `'...'` / `"..."` region starting at `chars[start]` (the
-/// opening delimiter), including both delimiters and honoring the doubled-delimiter
-/// escape.
+/// opening delimiter), including both delimiters. The only escape is the doubled
+/// delimiter (`''` / `""`); a backslash is an ordinary character, so `\'` ends the
+/// literal at the quote.
+///
+/// That is exactly the contract of PostgreSQL's deparser output: it never renders a
+/// quote as `\'`, and under `standard_conforming_strings = on` a string ending in a
+/// backslash legitimately renders as `'x\'` — the quote after the backslash IS the
+/// terminator (under `= off` the deparser doubles the backslash instead). Treating
+/// `\'` as an escape here would mis-scan that trailing-backslash rendering and
+/// swallow everything after it into the literal, so a backslash escape must never
+/// be added to this function. Backslash escapes exist only in the E-string scanner
+/// ([`escaped_literal_body_len`]), whose `E'...'` form the deparser never emits.
 fn standard_quoted_len(chars: &[char], start: usize) -> usize {
     let quote = chars[start];
     let mut i = start + 1;
@@ -215,11 +230,22 @@ fn split_top_level_commas(chars: &[char]) -> Vec<String> {
     parts
 }
 
-/// Rewrite every `(ARRAY[e1, …, en])::T[]` (array-level cast) into
+/// Rewrite `(ARRAY[e1, …, en])::T[]` (array-level cast) into
 /// `ARRAY[(e1)::baseT, …, (en)::baseT]` (element-level cast), where `baseT` is `T`
 /// with the trailing `[]` removed. This is PostgreSQL's re-parsed fixed point, so a
 /// definition already in that form is left unchanged and the two renderings collapse
 /// to the same text. Quoted literals and identifiers are never inspected or altered.
+///
+/// The matcher is deliberately exact, mirroring what the deparser emits for this
+/// pattern: `)` immediately followed by `::` (the deparser never puts whitespace
+/// around a cast), and `T` an unqualified, unquoted, typmod-free type name
+/// (ASCII alphanumerics, `_` and spaces — e.g. `text`, `character varying`)
+/// immediately followed by `[]`. In the `IN`-list deparse this exists for, `T` is
+/// always `text`. Wider spellings — schema-qualified `::s.dom[]`, quoted `::"T"[]`,
+/// typmod `::character varying(10)[]` — do not match and the expression passes
+/// through untouched, which fails safe: an unmatched rendering can at worst cause
+/// churn for a form that has never been observed to flip, while an unsound rewrite
+/// could fuse genuinely different expressions.
 fn distribute_array_casts(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -243,6 +269,7 @@ fn distribute_array_casts(input: &str) -> String {
 
 /// If `chars[at..]` begins with `(ARRAY[ ... ])::TYPE[]`, return the distributed
 /// replacement and the index just past the consumed region. `None` otherwise.
+/// See [`distribute_array_casts`] for the exact matcher contract this implements.
 fn try_rewrite_array_cast(chars: &[char], at: usize) -> Option<(String, usize)> {
     // Case-insensitive match of the literal prefix `(array[`.
     const PREFIX: &str = "(array[";
