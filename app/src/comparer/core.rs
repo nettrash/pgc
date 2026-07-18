@@ -2970,6 +2970,29 @@ impl Comparer {
             }
         }
 
+        // Prelowered definition and lowered (schema, name) for every FROM view,
+        // computed once and shared by the dependency-expansion fixpoint below and the
+        // drop-ordering pass after it. Indexed by FROM-view position, so it stays
+        // valid while the candidate set grows. Skipped entirely when nothing drops.
+        let prelowered_defs: Vec<(String, String)> = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.from
+                .views
+                .iter()
+                .map(|v| Self::prelower_pair(&v.definition))
+                .collect()
+        };
+        let names_lc: Vec<(String, String)> = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.from
+                .views
+                .iter()
+                .map(|v| (v.schema.to_lowercase(), v.name.to_lowercase()))
+                .collect()
+        };
+
         // A view that reads another view being dropped must itself be dropped first
         // and recreated after: DROP VIEW runs without CASCADE, so it fails while any
         // dependent view still exists (issue #227). Expand the candidate set to a
@@ -2978,7 +3001,7 @@ impl Comparer {
         // action in compare_routines_and_views.
         let mut candidate_keys: HashSet<String> =
             candidates.iter().map(|(_, key, _)| key.clone()).collect();
-        loop {
+        while !candidates.is_empty() {
             let mut added = false;
             for (idx, from_view) in self.from.views.iter().enumerate() {
                 let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
@@ -2987,22 +3010,20 @@ impl Comparer {
                 }
                 // FROM-only views are already candidates via is_from_only, so only
                 // views that still exist in TO can be reached here.
+                let (def_lower, def_unquoted) = &prelowered_defs[idx];
                 let references_candidate = from_view
                     .table_relation
                     .iter()
                     .any(|rel| candidate_keys.contains(&Self::normalized_view_reference(rel)))
-                    || {
-                        let (def_lower, def_unquoted) = Self::prelower_pair(&from_view.definition);
-                        candidates.iter().any(|(cidx, _, _)| {
-                            let cv = &self.from.views[*cidx];
-                            Self::text_references_qualified_name_pre(
-                                &def_lower,
-                                &def_unquoted,
-                                &cv.schema.to_lowercase(),
-                                &cv.name.to_lowercase(),
-                            )
-                        })
-                    };
+                    || candidates.iter().any(|(cidx, _, _)| {
+                        let (schema_lc, name_lc) = &names_lc[*cidx];
+                        Self::text_references_qualified_name_pre(
+                            def_lower,
+                            def_unquoted,
+                            schema_lc,
+                            name_lc,
+                        )
+                    });
                 if references_candidate {
                     candidate_keys.insert(normalized_view.clone());
                     candidates.push((idx, normalized_view, self.use_drop));
@@ -3024,21 +3045,6 @@ impl Comparer {
 
             let mut depends_on: Vec<HashSet<usize>> = vec![HashSet::new(); candidates.len()];
 
-            // Precompute per-view: prelowered definition + lowered
-            // (schema, name) of the other-view key. Avoids re-lowering the
-            // full view definition on every inner-loop iteration.
-            let candidate_defs: Vec<(String, String)> = candidates
-                .iter()
-                .map(|(idx, _, _)| Self::prelower_pair(&self.from.views[*idx].definition))
-                .collect();
-            let candidate_names_lc: Vec<(String, String)> = candidates
-                .iter()
-                .map(|(idx, _, _)| {
-                    let v = &self.from.views[*idx];
-                    (v.schema.to_lowercase(), v.name.to_lowercase())
-                })
-                .collect();
-
             for (i, (view_idx, _, _)) in candidates.iter().enumerate() {
                 let view = &self.from.views[*view_idx];
                 // Check table_relation
@@ -3051,8 +3057,9 @@ impl Comparer {
                     }
                 }
                 // Check definition text for references to other dropping views
-                let (def_lower, def_unquoted) = &candidate_defs[i];
-                for (j, (schema_lc, name_lc)) in candidate_names_lc.iter().enumerate() {
+                let (def_lower, def_unquoted) = &prelowered_defs[*view_idx];
+                for (j, (cand_idx, _, _)) in candidates.iter().enumerate() {
+                    let (schema_lc, name_lc) = &names_lc[*cand_idx];
                     if i != j
                         && Self::text_references_qualified_name_pre(
                             def_lower,

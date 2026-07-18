@@ -5,8 +5,17 @@ use crate::utils::string_extensions::StringExt;
 /// One output column of a regular view, as PostgreSQL records it in
 /// `pg_attribute`. Captured at dump time solely to decide whether a changed view
 /// can be updated with `CREATE OR REPLACE VIEW` or must be dropped and recreated
-/// (issue #227); deliberately excluded from `View::hash`, since the column list is
-/// derived from the definition that is already hashed.
+/// (issue #227).
+///
+/// Deliberately excluded from `View::hash`: dumps written before this field
+/// existed carry no column data, so hashing it would make every regular view
+/// compare as changed against an older dump, and `format_type` renderings could
+/// in principle drift across server versions and churn the hash. Exclusion is
+/// safe for change *detection* because the deparsed definition — which is hashed
+/// — always reflects the current column names and expressions (verified live:
+/// `ALTER VIEW ... RENAME COLUMN` re-renders the select list with an `AS` alias
+/// for the new name). The column list therefore only decides *how* an
+/// already-detected change is emitted, never *whether* a change exists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewColumn {
     /// Column name (`pg_attribute.attname`)

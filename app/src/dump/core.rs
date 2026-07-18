@@ -1819,6 +1819,13 @@ impl Dump {
             where c.relkind = 'v'
                 and n.nspname not in ('pg_catalog', 'information_schema')
                 and n.nspname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
             order by n.nspname, c.relname, a.attnum;",
             schema_filter
         )

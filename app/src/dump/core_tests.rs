@@ -928,6 +928,15 @@ fn build_regular_views_query_extension_filter_is_precise() {
     assert_extension_filter(&query, "pg_class", "regular views");
 }
 
+// Extension-owned views are excluded from the view list, so fetching their columns
+// would be pure waste (large extensions such as PostGIS ship many views); the columns
+// query must carry the same extension filter as the view list queries.
+#[test]
+fn build_view_columns_query_extension_filter_is_precise() {
+    let query = Dump::build_view_columns_query("('public')");
+    assert_extension_filter(&query, "pg_class", "view columns");
+}
+
 #[test]
 fn build_materialized_views_query_extension_filter_is_precise() {
     let query = Dump::build_materialized_views_query("('public')");
