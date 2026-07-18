@@ -1518,7 +1518,10 @@ impl Table {
             }
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
-                    if old_index.indexdef != new_index.indexdef {
+                    if !crate::dump::table_index::indexdefs_equivalent(
+                        &old_index.indexdef,
+                        &new_index.indexdef,
+                    ) {
                         // Definition changed: drop the old, build the new.
                         plan.drop.push(old_index);
                         plan.create.push(new_index);
@@ -1944,7 +1947,10 @@ impl Table {
             if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
                 if old_index != new_index {
                     // Check if only the comment changed (no need to drop+recreate)
-                    let def_changed = old_index.indexdef != new_index.indexdef;
+                    let def_changed = !crate::dump::table_index::indexdefs_equivalent(
+                        &old_index.indexdef,
+                        &new_index.indexdef,
+                    );
                     if def_changed {
                         let drop_cmd = format!(
                             "drop index if exists {}.{};",
