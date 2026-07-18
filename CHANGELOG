@@ -1,6 +1,31 @@
 2026-07-17      v1.0.25
 
                 Bug fixes:
+                    - Resolved issue #227 (CREATE OR REPLACE VIEW
+                      generated when the column order changes, causing
+                      migration failure). PostgreSQL accepts CREATE OR
+                      REPLACE VIEW only when every existing column
+                      keeps its name, type and collation at the same
+                      position and new columns are appended at the
+                      end; inserting a column in the middle,
+                      reordering, renaming, retyping or dropping one
+                      fails with "cannot change name of view column".
+                      The dump now captures each regular view's output
+                      columns (name, type including typmod, and
+                      collation), and a changed view whose old column
+                      list is not an exact prefix of the new one is
+                      dropped and recreated instead of replaced.
+                      Because that DROP VIEW runs without CASCADE,
+                      views reading a dropped view are pulled into the
+                      drop set transitively, dropped first in
+                      dependency order and recreated afterwards — this
+                      also covers dependents of changed materialized
+                      views, whose drops could previously fail the
+                      same way. Compatible changes (appending columns
+                      at the end, or body-only changes) still use
+                      CREATE OR REPLACE VIEW, and dumps written by
+                      older pgc versions carry no column data, so they
+                      keep the historical behavior.
                     - Resolved issue #226 (non-idempotent PostgreSQL
                       expression normalization caused an infinite diff
                       loop). PostgreSQL deparses `col IN ('FOO','BAR')`

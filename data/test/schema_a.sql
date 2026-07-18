@@ -1823,3 +1823,25 @@ CREATE TABLE test_schema.innorm_typmod (
     id   integer PRIMARY KEY,
     code character varying(10)
 );
+
+-- =============================================================================
+-- Regression: incompatible view column change needs DROP+CREATE (issue #227)
+-- =============================================================================
+-- CREATE OR REPLACE VIEW only allows appending columns at the end; inserting a
+-- column in the middle (as TO does with `kind`) is rejected with "cannot change
+-- name of view column". The diff must drop and recreate the view instead — and
+-- because DROP VIEW runs without CASCADE, the unchanged dependent view
+-- v227_dep must be dropped first and recreated after. The base table is
+-- identical in both schemas so only the view definitions drive the diff.
+CREATE TABLE test_schema.v227_item (
+    id         integer PRIMARY KEY,
+    status     text,
+    kind       text,
+    profile_id integer
+);
+
+CREATE VIEW test_schema.v227_base AS
+SELECT id, status, profile_id FROM test_schema.v227_item;
+
+CREATE VIEW test_schema.v227_dep AS
+SELECT id, status FROM test_schema.v227_base;

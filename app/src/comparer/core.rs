@@ -2939,8 +2939,26 @@ impl Comparer {
                 .map(|tv| from_view.is_materialized != tv.is_materialized)
                 .unwrap_or(false);
 
-            let should_drop =
-                is_dependent || is_from_only || is_changed_mat_view || is_kind_transition;
+            // A changed regular view whose column list is not an exact prefix of the
+            // target's (column inserted, reordered, renamed, retyped, or dropped)
+            // cannot be updated with CREATE OR REPLACE VIEW — PostgreSQL rejects it
+            // with "cannot change name of view column" (issue #227). Route it through
+            // drop+recreate; when either dump predates column capture the check
+            // returns compatible and the historical OR REPLACE path is kept.
+            let is_incompatible_regular_change = !from_view.is_materialized
+                && to_view
+                    .map(|tv| {
+                        !tv.is_materialized
+                            && Self::hashes_differ(&from_view.hash, &tv.hash)
+                            && !from_view.or_replace_compatible(tv)
+                    })
+                    .unwrap_or(false);
+
+            let should_drop = is_dependent
+                || is_from_only
+                || is_changed_mat_view
+                || is_kind_transition
+                || is_incompatible_regular_change;
 
             if should_drop {
                 // The drop is emitted as active SQL only when use_drop is true.
@@ -2949,6 +2967,50 @@ impl Comparer {
                 // out so the user can review them manually.
                 let drop_is_active = self.use_drop;
                 candidates.push((idx, normalized_view, drop_is_active));
+            }
+        }
+
+        // A view that reads another view being dropped must itself be dropped first
+        // and recreated after: DROP VIEW runs without CASCADE, so it fails while any
+        // dependent view still exists (issue #227). Expand the candidate set to a
+        // fixpoint so whole dependency chains ride along; every addition is recreated
+        // from the TO dump afterwards because dropped_views membership marks it for
+        // action in compare_routines_and_views.
+        let mut candidate_keys: HashSet<String> =
+            candidates.iter().map(|(_, key, _)| key.clone()).collect();
+        loop {
+            let mut added = false;
+            for (idx, from_view) in self.from.views.iter().enumerate() {
+                let normalized_view = Self::normalized_view_key(&from_view.schema, &from_view.name);
+                if candidate_keys.contains(&normalized_view) {
+                    continue;
+                }
+                // FROM-only views are already candidates via is_from_only, so only
+                // views that still exist in TO can be reached here.
+                let references_candidate = from_view
+                    .table_relation
+                    .iter()
+                    .any(|rel| candidate_keys.contains(&Self::normalized_view_reference(rel)))
+                    || {
+                        let (def_lower, def_unquoted) = Self::prelower_pair(&from_view.definition);
+                        candidates.iter().any(|(cidx, _, _)| {
+                            let cv = &self.from.views[*cidx];
+                            Self::text_references_qualified_name_pre(
+                                &def_lower,
+                                &def_unquoted,
+                                &cv.schema.to_lowercase(),
+                                &cv.name.to_lowercase(),
+                            )
+                        })
+                    };
+                if references_candidate {
+                    candidate_keys.insert(normalized_view.clone());
+                    candidates.push((idx, normalized_view, self.use_drop));
+                    added = true;
+                }
+            }
+            if !added {
+                break;
             }
         }
 

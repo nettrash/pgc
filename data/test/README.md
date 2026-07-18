@@ -189,6 +189,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Modified**: `product_inventory` — added `manufacturer`, `is_featured` columns; 'Low Stock' threshold changed from 10 → 5
 - **Removed**: `user_order_summary` (orders table removed)
 - **Added**: `user_review_summary`, `product_review_stats`, `v_user_stats`
+- **Incompatible column change** (Issue #227): `v227_base` gains `kind` inserted *before* `profile_id`. `CREATE OR REPLACE VIEW` only allows appending columns at the end (inserting/reordering/renaming/retyping fails with "cannot change name of view column"), so the diff must emit `DROP VIEW` + `CREATE` instead. The textually unchanged dependent `v227_dep` reads `v227_base`, and `DROP VIEW` runs without `CASCADE`, so the dependent must be pulled into the drop set, dropped first, and recreated after. Compatibility is decided from per-view column data (name, type incl. typmod, collation) captured at dump time; dumps from older pgc versions carry no column data and keep the historical `OR REPLACE` behavior
 - **Modified**: `vw_from_function` — body gains a `WHERE` clause. The view selects
   only from `fn_only_view_source()` and never touches a table, so it has no rows in
   `information_schema.view_table_usage`; dumping views through a join against that
