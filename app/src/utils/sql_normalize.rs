@@ -33,23 +33,114 @@ pub fn canonicalize_definition(s: &str) -> String {
     lowercase_and_collapse(&distribute_array_casts(s))
 }
 
-/// Length of the quoted region starting at `chars[start]` (a `'` or `"`), including
-/// both delimiters and honoring the doubled-quote escape. `chars[start]` must be the
-/// opening quote. Returns the number of chars the region spans.
-fn quoted_run_len(chars: &[char], start: usize) -> usize {
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// If a quoted region begins at `chars[at]`, return its length (both delimiters
+/// included); otherwise `None`. Recognizes every form PostgreSQL can render a string
+/// literal or identifier as, so their content is always skipped verbatim:
+///
+/// * standard `'...'` literals and `"..."` identifiers, with the doubled-delimiter
+///   (`''` / `""`) escape,
+/// * E-strings `E'...'` / `e'...'`, with backslash escapes (`\'` does not close),
+/// * dollar-quoted strings `$tag$...$tag$` (and `$$...$$`).
+///
+/// PostgreSQL's expression deparser emits only the standard single-quoted form, but
+/// handling the others keeps the canonicalizer correct if one ever reaches it (e.g.
+/// under `standard_conforming_strings = off`) rather than mis-scanning literal content.
+fn quoted_prefix_len(chars: &[char], at: usize) -> Option<usize> {
+    let c = chars[at];
+    // E-string: E'…' / e'…', only when the E stands alone (not the tail of an
+    // identifier like `some_value'…'`, which is an identifier followed by a literal).
+    if (c == 'E' || c == 'e')
+        && chars.get(at + 1) == Some(&'\'')
+        && (at == 0 || !is_ident_char(chars[at - 1]))
+    {
+        return Some(2 + escaped_literal_body_len(chars, at + 2));
+    }
+    if c == '\'' || c == '"' {
+        return Some(standard_quoted_len(chars, at));
+    }
+    if c == '$' {
+        return dollar_quoted_len(chars, at);
+    }
+    None
+}
+
+/// Length of a standard `'...'` / `"..."` region starting at `chars[start]` (the
+/// opening delimiter), including both delimiters and honoring the doubled-delimiter
+/// escape.
+fn standard_quoted_len(chars: &[char], start: usize) -> usize {
     let quote = chars[start];
     let mut i = start + 1;
     while i < chars.len() {
         if chars[i] == quote {
-            if i + 1 < chars.len() && chars[i + 1] == quote {
-                i += 2; // doubled-quote escape stays inside the run
+            if chars.get(i + 1) == Some(&quote) {
+                i += 2; // doubled-delimiter escape stays inside the run
                 continue;
             }
-            return i - start + 1; // closing quote
+            return i - start + 1; // closing delimiter
         }
         i += 1;
     }
     chars.len() - start // unterminated: consume the rest
+}
+
+/// Length of an E-string body starting at `body` (just past the opening `'`),
+/// including the closing `'`. A backslash escapes the next char, and `''` is a
+/// doubled-quote escape.
+fn escaped_literal_body_len(chars: &[char], body: usize) -> usize {
+    let mut i = body;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2, // escaped char — never terminates the literal
+            '\'' => {
+                if chars.get(i + 1) == Some(&'\'') {
+                    i += 2; // doubled-quote escape
+                    continue;
+                }
+                return i - body + 1; // closing quote
+            }
+            _ => i += 1,
+        }
+    }
+    chars.len() - body
+}
+
+/// If a dollar-quote `$tag$...$tag$` begins at `chars[at]` (a `$`), return its total
+/// length. `None` when `chars[at]` does not open a dollar-quote or the closing tag is
+/// absent (so a stray `$` — e.g. in `col$1` — is treated as an ordinary character).
+fn dollar_quoted_len(chars: &[char], at: usize) -> Option<usize> {
+    let tag_len = dollar_tag_len(chars, at)?;
+    let tag = &chars[at..at + tag_len];
+    let mut i = at + tag_len;
+    while i + tag_len <= chars.len() {
+        if chars[i] == '$'
+            && dollar_tag_len(chars, i) == Some(tag_len)
+            && &chars[i..i + tag_len] == tag
+        {
+            return Some(i + tag_len - at);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Length of a dollar-quote tag `$[alnum_|_]*$` starting at `chars[pos]`, or `None`.
+fn dollar_tag_len(chars: &[char], pos: usize) -> Option<usize> {
+    if chars.get(pos) != Some(&'$') {
+        return None;
+    }
+    let mut j = pos + 1;
+    while j < chars.len() && is_ident_char(chars[j]) {
+        j += 1;
+    }
+    if chars.get(j) == Some(&'$') {
+        Some(j - pos + 1)
+    } else {
+        None
+    }
 }
 
 /// Index of the `]` matching the `[` at `chars[open]`, respecting nested brackets
@@ -58,11 +149,11 @@ fn matching_bracket(chars: &[char], open: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = open;
     while i < chars.len() {
+        if let Some(len) = quoted_prefix_len(chars, i) {
+            i += len;
+            continue;
+        }
         match chars[i] {
-            '\'' | '"' => {
-                i += quoted_run_len(chars, i);
-                continue;
-            }
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
@@ -85,14 +176,13 @@ fn split_top_level_commas(chars: &[char]) -> Vec<String> {
     let mut depth = 0i32;
     let mut i = 0;
     while i < chars.len() {
+        if let Some(len) = quoted_prefix_len(chars, i) {
+            current.extend(&chars[i..i + len]);
+            i += len;
+            continue;
+        }
         let c = chars[i];
         match c {
-            '\'' | '"' => {
-                let len = quoted_run_len(chars, i);
-                current.extend(&chars[i..i + len]);
-                i += len;
-                continue;
-            }
             '(' | '[' => {
                 depth += 1;
                 current.push(c);
@@ -125,8 +215,7 @@ fn distribute_array_casts(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '\'' || chars[i] == '"' {
-            let len = quoted_run_len(&chars, i);
+        if let Some(len) = quoted_prefix_len(&chars, i) {
             out.extend(&chars[i..i + len]);
             i += len;
             continue;
@@ -209,14 +298,12 @@ fn lowercase_outside_quotes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' || c == '"' {
-            let len = quoted_run_len(&chars, i);
+        if let Some(len) = quoted_prefix_len(&chars, i) {
             out.extend(&chars[i..i + len]);
             i += len;
             continue;
         }
-        for lc in c.to_lowercase() {
+        for lc in chars[i].to_lowercase() {
             out.push(lc);
         }
         i += 1;
@@ -238,8 +325,7 @@ fn collapse_array_literal_casts(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '\'' || chars[i] == '"' {
-            let len = quoted_run_len(&chars, i);
+        if let Some(len) = quoted_prefix_len(&chars, i) {
             out.extend(&chars[i..i + len]);
             i += len;
             continue;
@@ -298,10 +384,9 @@ fn collapse_element_casts(content: &[char]) -> String {
     let mut buf = String::new();
     let mut i = 0;
     while i < content.len() {
-        if content[i] == '\'' || content[i] == '"' {
+        if let Some(len) = quoted_prefix_len(content, i) {
             out.push_str(&buf.replace("::character varying::text", "::character varying"));
             buf.clear();
-            let len = quoted_run_len(content, i);
             out.extend(&content[i..i + len]);
             i += len;
             continue;

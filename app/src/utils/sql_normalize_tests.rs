@@ -146,3 +146,64 @@ fn array_literal_string_content_with_cast_text_is_preserved() {
         "array['a::character varying::text'::character varying]"
     );
 }
+
+// PostgreSQL's deparser emits only standard single-quoted literals, but if an E-string
+// ever reaches the canonicalizer its body — including a backslash-escaped quote and
+// upper-case content — must be preserved verbatim, not mis-scanned.
+#[test]
+fn e_string_body_is_preserved() {
+    let def = "WHERE x = E'A\\'B' AND y > 0";
+    let out = canonicalize_definition(def);
+    assert!(
+        out.contains("E'A\\'B'"),
+        "E-string body must survive verbatim: {out}"
+    );
+    // text outside the E-string is still lowercased
+    assert!(out.starts_with("where x = "));
+    assert!(out.contains("and y > 0"));
+}
+
+#[test]
+fn e_string_escaped_quote_does_not_end_literal() {
+    // The `\'` is escaped, so the whole `E'...'` is one literal and the trailing
+    // uppercase stays inside it (would be lowercased if the scan ended early).
+    let def = "E'A\\'BAR'";
+    assert_eq!(canonicalize_definition(def), "E'A\\'BAR'");
+}
+
+// A lowercase-e E-string with `''` doubling.
+#[test]
+fn lowercase_e_string_with_doubled_quote_is_preserved() {
+    assert_eq!(canonicalize_definition("e'O''BRIEN'"), "e'O''BRIEN'");
+}
+
+// `some_e'x'` is an identifier ending in `e` followed by a literal, not an E-string;
+// the identifier is still lowercased and the literal preserved.
+#[test]
+fn trailing_e_is_not_an_e_string_prefix() {
+    assert_eq!(canonicalize_definition("SOMEE'X'"), "somee'X'");
+}
+
+// Dollar-quoted strings must be preserved verbatim, including their upper-case content.
+#[test]
+fn dollar_quoted_string_is_preserved() {
+    assert_eq!(
+        canonicalize_definition("x = $$RAW '\\ Content$$"),
+        "x = $$RAW '\\ Content$$"
+    );
+}
+
+#[test]
+fn tagged_dollar_quoted_string_is_preserved() {
+    assert_eq!(
+        canonicalize_definition("$tag$Body ']::text[]' Here$tag$"),
+        "$tag$Body ']::text[]' Here$tag$"
+    );
+}
+
+// A stray `$` that is not a dollar-quote (no closing tag) must be treated as an
+// ordinary character, not swallow the rest of the string.
+#[test]
+fn stray_dollar_is_not_a_dollar_quote() {
+    assert_eq!(canonicalize_definition("COL$1 > 0"), "col$1 > 0");
+}
