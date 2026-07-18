@@ -1180,13 +1180,16 @@ fn test_normalize_definition_preserves_varying_text_cast_inside_literal() {
 
 #[test]
 fn test_normalize_definition_mixed_literal_and_outside_casts() {
-    // Cast outside the literal is normalized; identical text inside is preserved.
+    // Lowercasing applies outside literals; identical text inside is preserved. The
+    // `::character varying::text` collapse only fires inside an `array[...]` literal
+    // (issue #226 review): a standalone double cast is a genuine cast to text and must
+    // be kept, otherwise dropping it would change the type and hide a real diff.
     let def =
         "CHECK (x::character varying::text = ']::text[]' AND y::character varying::text = 'ok')";
     let norm = TableConstraint::normalize_definition(def);
     assert_eq!(
         norm,
-        "check (x::character varying = ']::text[]' and y::character varying = 'ok')"
+        "check (x::character varying::text = ']::text[]' and y::character varying::text = 'ok')"
     );
 }
 

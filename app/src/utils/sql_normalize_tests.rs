@@ -99,3 +99,50 @@ fn integer_array_cast_is_distributed() {
 fn empty_input_is_empty() {
     assert_eq!(canonicalize_definition(""), "");
 }
+
+// The cast collapse only applies inside an `array[...]` literal. An array subscript or
+// slice cast such as `col[1:2]::text[]` must keep its `::text[]`: dropping it changes
+// the type and would make two non-equivalent definitions compare equal (missed diff).
+#[test]
+fn array_subscript_slice_cast_is_preserved() {
+    assert_eq!(
+        canonicalize_definition("col[1:2]::text[]"),
+        "col[1:2]::text[]"
+    );
+    assert_eq!(canonicalize_definition("col[1]::text[]"), "col[1]::text[]");
+    assert_eq!(
+        canonicalize_definition("(arr[1])[1:2]::text[]"),
+        "(arr[1])[1:2]::text[]"
+    );
+}
+
+// A standalone `x::character varying::text` double cast (varchar then text) is not
+// inside an array literal and must be preserved rather than collapsed to varchar.
+#[test]
+fn standalone_double_cast_is_preserved() {
+    assert_eq!(
+        canonicalize_definition("x::character varying::text"),
+        "x::character varying::text"
+    );
+}
+
+// A subscript cast that is genuinely different from an uncast subscript must still
+// produce a diff — the collapse must not fuse them.
+#[test]
+fn subscript_cast_and_uncast_differ() {
+    assert_ne!(
+        canonicalize_definition("GENERATED ALWAYS AS (arr[1:2]::text[]) STORED"),
+        canonicalize_definition("GENERATED ALWAYS AS (arr[1:2]) STORED")
+    );
+}
+
+// An array literal that contains a genuine `::character varying::text` inside a string
+// value must not have that literal content rewritten.
+#[test]
+fn array_literal_string_content_with_cast_text_is_preserved() {
+    let def = "ARRAY['a::character varying::text'::character varying]::text[]";
+    assert_eq!(
+        canonicalize_definition(def),
+        "array['a::character varying::text'::character varying]"
+    );
+}

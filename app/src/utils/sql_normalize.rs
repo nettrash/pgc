@@ -195,43 +195,122 @@ fn try_rewrite_array_cast(chars: &[char], at: usize) -> Option<(String, usize)> 
 }
 
 /// Lowercase everything outside single-quoted literals and double-quoted
-/// identifiers, then collapse the redundant paren-free `IN`-list casts. Quoted
-/// regions (both kinds) are copied verbatim so literal values and case-sensitive
-/// identifiers survive.
+/// identifiers, then collapse the redundant paren-free `IN`-list casts that only ever
+/// occur inside an `array[...]` literal. Quoted regions (both kinds) are copied
+/// verbatim so literal values and case-sensitive identifiers survive.
 fn lowercase_and_collapse(s: &str) -> String {
+    collapse_array_literal_casts(&lowercase_outside_quotes(s))
+}
+
+/// Lowercase every character outside single-quoted literals and double-quoted
+/// identifiers, copying quoted regions (both kinds) verbatim.
+fn lowercase_outside_quotes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut buf = String::new();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' || c == '"' {
-            flush_collapsed(&mut buf, &mut out);
             let len = quoted_run_len(&chars, i);
             out.extend(&chars[i..i + len]);
             i += len;
             continue;
         }
         for lc in c.to_lowercase() {
-            buf.push(lc);
+            out.push(lc);
         }
         i += 1;
     }
-    flush_collapsed(&mut buf, &mut out);
     out
 }
 
-/// Collapse redundant casts in `buf` (guaranteed to hold no quoted content), append
-/// to `out`, and clear `buf`.
-fn flush_collapsed(buf: &mut String, out: &mut String) {
-    if buf.is_empty() {
-        return;
+/// Collapse the redundant casts PostgreSQL leaves on the paren-free `IN`-list
+/// rendering — but only where they occur, inside an `array[...]` literal. For a match
+/// `array[<content>]::T[]`, the array-level cast `::T[]` is dropped and each element's
+/// `::character varying::text` collapses to `::character varying`, so the array-level
+/// and element-level renderings converge. A `::text[]` cast on anything else (an array
+/// subscript or slice such as `col[1:2]::text[]`) and a standalone `x::character
+/// varying::text` double cast are outside any `array[...]` literal and are left intact
+/// — collapsing them would drop a real cast and hide a diff. Input must already be
+/// lowercased outside quotes.
+fn collapse_array_literal_casts(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\'' || chars[i] == '"' {
+            let len = quoted_run_len(&chars, i);
+            out.extend(&chars[i..i + len]);
+            i += len;
+            continue;
+        }
+        if let Some((replacement, end)) = try_collapse_array_literal(&chars, i) {
+            out.push_str(&replacement);
+            i = end;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
     }
-    let collapsed = buf
-        .replace("::character varying::text", "::character varying")
-        .replace("]::text[]", "]");
-    out.push_str(&collapsed);
-    buf.clear();
+    out
+}
+
+/// If `chars[at..]` starts an `array[...]` literal (optionally cast with `::T[]`),
+/// return its collapsed rendering and the index just past the consumed region.
+fn try_collapse_array_literal(chars: &[char], at: usize) -> Option<(String, usize)> {
+    const PREFIX: &str = "array[";
+    if at + PREFIX.len() > chars.len() {
+        return None;
+    }
+    if chars[at..at + PREFIX.len()].iter().collect::<String>() != PREFIX {
+        return None;
+    }
+    // `array` must stand alone, not be the tail of another identifier (e.g. `x_array[`).
+    if at > 0 && (chars[at - 1].is_ascii_alphanumeric() || chars[at - 1] == '_') {
+        return None;
+    }
+    let bracket_open = at + PREFIX.len() - 1; // index of '['
+    let bracket_close = matching_bracket(chars, bracket_open)?;
+    let content = &chars[bracket_open + 1..bracket_close];
+
+    // Drop a trailing array-level cast `::TYPE[]` if present.
+    let mut end = bracket_close + 1;
+    if end + 1 < chars.len() && chars[end] == ':' && chars[end + 1] == ':' {
+        let mut j = end + 2;
+        let type_start = j;
+        while j < chars.len()
+            && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == ' ')
+        {
+            j += 1;
+        }
+        if j > type_start && j + 1 < chars.len() && chars[j] == '[' && chars[j + 1] == ']' {
+            end = j + 2;
+        }
+    }
+
+    Some((format!("array[{}]", collapse_element_casts(content)), end))
+}
+
+/// Collapse `::character varying::text` to `::character varying` in array-literal
+/// content, outside quoted regions so literal values are never rewritten.
+fn collapse_element_casts(content: &[char]) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < content.len() {
+        if content[i] == '\'' || content[i] == '"' {
+            out.push_str(&buf.replace("::character varying::text", "::character varying"));
+            buf.clear();
+            let len = quoted_run_len(content, i);
+            out.extend(&content[i..i + len]);
+            i += len;
+            continue;
+        }
+        buf.push(content[i]);
+        i += 1;
+    }
+    out.push_str(&buf.replace("::character varying::text", "::character varying"));
+    out
 }
 
 #[cfg(test)]
