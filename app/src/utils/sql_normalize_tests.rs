@@ -207,3 +207,48 @@ fn tagged_dollar_quoted_string_is_preserved() {
 fn stray_dollar_is_not_a_dollar_quote() {
     assert_eq!(canonicalize_definition("COL$1 > 0"), "col$1 > 0");
 }
+
+// Only the redundant `::text[]` cast on a varchar array literal is dropped. A real
+// array-type cast must be preserved, or distinct expressions would compare equal
+// (missed diff). `integer[]` and `bigint[]` must not collapse to the same key.
+#[test]
+fn non_text_array_cast_is_preserved() {
+    assert_eq!(
+        canonicalize_definition("array[1]::integer[]"),
+        "array[1]::integer[]"
+    );
+    assert_eq!(
+        canonicalize_definition("array[1]::bigint[]"),
+        "array[1]::bigint[]"
+    );
+    assert_ne!(
+        canonicalize_definition("array[1]::integer[]"),
+        canonicalize_definition("array[1]::bigint[]")
+    );
+}
+
+// A `::text[]` cast on a non-varchar array literal is a real conversion, not the
+// redundant IN-list form, so it is preserved and stays distinct from the uncast array.
+#[test]
+fn text_cast_on_non_varchar_array_is_preserved() {
+    assert_eq!(
+        canonicalize_definition("array[1]::text[]"),
+        "array[1]::text[]"
+    );
+    assert_ne!(
+        canonicalize_definition("array[1]::text[]"),
+        canonicalize_definition("array[1]")
+    );
+}
+
+// The redundant form (varchar elements + `::text[]`) still collapses — the fix must
+// not disable the #226 canonicalization it exists for.
+#[test]
+fn redundant_varchar_text_array_cast_still_collapses() {
+    assert_eq!(
+        canonicalize_definition(
+            "array['FOO'::character varying, 'BAR'::character varying]::text[]"
+        ),
+        "array['FOO'::character varying, 'BAR'::character varying]"
+    );
+}

@@ -24,11 +24,13 @@
 
 /// Canonicalize a catalog expression/definition for comparison and hashing.
 ///
-/// Distributes the array-level `IN`-list cast into the element-level fixed-point
-/// form, then lowercases everything outside string literals and quoted identifiers
-/// and collapses the redundant `::character varying::text` / `]::text[]` casts that
-/// the paren-free (CHECK-constraint) rendering leaves behind. Content inside
-/// `'...'` literals and `"..."` identifiers is preserved verbatim, including case.
+/// Distributes the parenthesized array-level `IN`-list cast into the element-level
+/// fixed-point form, lowercases everything outside string literals and quoted
+/// identifiers, then collapses the paren-free `IN`-list redundancy that CHECK
+/// constraints render — but only inside an `array[...]` literal whose elements are
+/// `::character varying`, so a real array cast (`::integer[]`, `::bigint[]`, an array
+/// subscript's `::text[]`) is preserved. Content inside `'...'` literals and `"..."`
+/// identifiers is preserved verbatim, including case.
 pub fn canonicalize_definition(s: &str) -> String {
     lowercase_and_collapse(&distribute_array_casts(s))
 }
@@ -359,22 +361,52 @@ fn try_collapse_array_literal(chars: &[char], at: usize) -> Option<(String, usiz
     let bracket_close = matching_bracket(chars, bracket_open)?;
     let content = &chars[bracket_open + 1..bracket_close];
 
-    // Drop a trailing array-level cast `::TYPE[]` if present.
-    let mut end = bracket_close + 1;
-    if end + 1 < chars.len() && chars[end] == ':' && chars[end + 1] == ':' {
-        let mut j = end + 2;
-        let type_start = j;
-        while j < chars.len()
-            && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == ' ')
-        {
-            j += 1;
+    // Only the array-level cast that PostgreSQL's varchar `IN`-list deparsing leaves
+    // redundant is dropped: `::text[]` on an array whose elements are already
+    // `::character varying`. Any other array cast (`::integer[]`, `::bigint[]`, or even
+    // `::text[]` on non-varchar elements) is a real type conversion and is preserved —
+    // dropping it would make distinct expressions compare equal and hide a diff.
+    let end = match trailing_array_cast(chars, bracket_close + 1) {
+        Some((base_type, after)) if base_type == "text" && all_elements_are_varchar(content) => {
+            after
         }
-        if j > type_start && j + 1 < chars.len() && chars[j] == '[' && chars[j + 1] == ']' {
-            end = j + 2;
-        }
-    }
+        Some(_) => return None, // real array cast — leave the literal untouched
+        None => bracket_close + 1,
+    };
 
     Some((format!("array[{}]", collapse_element_casts(content)), end))
+}
+
+/// A trailing array-level cast `::TYPE[]` starting at `chars[pos]`: the base type name
+/// (`TYPE`) and the index just past the closing `[]`. `None` when there is no such cast.
+fn trailing_array_cast(chars: &[char], pos: usize) -> Option<(String, usize)> {
+    if chars.get(pos) != Some(&':') || chars.get(pos + 1) != Some(&':') {
+        return None;
+    }
+    let type_start = pos + 2;
+    let mut j = type_start;
+    while j < chars.len()
+        && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == ' ')
+    {
+        j += 1;
+    }
+    if j == type_start || chars.get(j) != Some(&'[') || chars.get(j + 1) != Some(&']') {
+        return None;
+    }
+    let base_type: String = chars[type_start..j].iter().collect();
+    Some((base_type.trim().to_string(), j + 2))
+}
+
+/// Whether every top-level element of an array literal's content is a
+/// `… :: character varying` cast — the exact element form PostgreSQL emits for a
+/// varchar `IN`-list, and the only case where dropping a `::text[]` array cast is a
+/// safe no-op. Input is already lowercased outside quotes.
+fn all_elements_are_varchar(content: &[char]) -> bool {
+    let elements = split_top_level_commas(content);
+    !elements.is_empty()
+        && elements
+            .iter()
+            .all(|e| e.trim_end().ends_with("::character varying"))
 }
 
 /// Collapse `::character varying::text` to `::character varying` in array-literal
