@@ -1090,7 +1090,7 @@ impl Dump {
                 r.proacl::text[] as routine_acl,
                 r.proconfig::text[] as proconfig,
                 agg.aggtransfn::regproc::text as agg_sfunc,
-                format_type(agg.aggtranstype, null) as agg_stype,
+                pg_catalog.format_type(agg.aggtranstype, null) as agg_stype,
                 agg.aggtransspace as agg_sspace,
                 case when agg.aggfinalfn != 0 then agg.aggfinalfn::regproc::text end as agg_finalfunc,
                 agg.aggfinalextra as agg_finalfunc_extra,
@@ -1101,7 +1101,7 @@ impl Dump {
                 agg.agginitval as agg_initcond,
                 case when agg.aggmtransfn != 0 then agg.aggmtransfn::regproc::text end as agg_msfunc,
                 case when agg.aggminvtransfn != 0 then agg.aggminvtransfn::regproc::text end as agg_minvfunc,
-                case when agg.aggmtransfn != 0 then format_type(agg.aggmtranstype, null) end as agg_mstype,
+                case when agg.aggmtransfn != 0 then pg_catalog.format_type(agg.aggmtranstype, null) end as agg_mstype,
                 agg.aggmtransspace as agg_msspace,
                 case when agg.aggmfinalfn != 0 then agg.aggmfinalfn::regproc::text end as agg_mfinalfunc,
                 agg.aggmfinalextra as agg_mfinalfunc_extra,
@@ -1114,7 +1114,7 @@ impl Dump {
                 r.prorows,
                 case when r.prosupport != 0 then r.prosupport::regproc::text else null end as prosupport,
                 (
-                    select array_agg(format_type(t.oid, null) order by ordinality)
+                    select array_agg(pg_catalog.format_type(t.oid, null) order by ordinality)
                     from unnest(r.protrftypes) with ordinality as u(typid, ordinality)
                     join pg_type t on t.oid = u.typid
                 ) as protrftypes
@@ -1811,8 +1811,8 @@ impl Dump {
                 quote_ident(n.nspname) as schema_name,
                 quote_ident(c.relname) as view_name,
                 a.attname as column_name,
-                format_type(a.atttypid, a.atttypmod) as data_type,
-                (select co.collname from pg_collation co where co.oid = a.attcollation) as collation
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                (select co.collname from pg_catalog.pg_collation co where co.oid = a.attcollation) as collation
             from pg_class c
             join pg_namespace n on n.oid = c.relnamespace
             join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
