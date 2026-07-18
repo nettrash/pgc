@@ -359,3 +359,154 @@ fn test_get_alter_script_materialized_to_regular_use_drop_false() {
         }
     }
 }
+
+// --- OR-REPLACE compatibility (issue #227) ---
+
+fn vcol(name: &str, ty: &str) -> ViewColumn {
+    ViewColumn {
+        name: name.to_string(),
+        data_type: ty.to_string(),
+        collation: None,
+    }
+}
+
+fn view_with_columns(definition: &str, cols: Vec<ViewColumn>) -> View {
+    let mut v = create_view(definition);
+    v.columns = cols;
+    v.hash();
+    v
+}
+
+#[test]
+fn or_replace_compatible_same_columns() {
+    let a = view_with_columns("select id from t", vec![vcol("id", "integer")]);
+    let b = view_with_columns("select id from t where id > 0", vec![vcol("id", "integer")]);
+    assert!(a.or_replace_compatible(&b));
+}
+
+#[test]
+fn or_replace_compatible_append_at_end() {
+    let a = view_with_columns("select id from t", vec![vcol("id", "integer")]);
+    let b = view_with_columns(
+        "select id, name from t",
+        vec![vcol("id", "integer"), vcol("name", "text")],
+    );
+    assert!(a.or_replace_compatible(&b));
+}
+
+#[test]
+fn or_replace_incompatible_insert_in_middle() {
+    // The issue #227 case: a column inserted before an existing one.
+    let a = view_with_columns(
+        "select id, profile_id from t",
+        vec![vcol("id", "integer"), vcol("profile_id", "integer")],
+    );
+    let b = view_with_columns(
+        "select id, kind, profile_id from t",
+        vec![
+            vcol("id", "integer"),
+            vcol("kind", "text"),
+            vcol("profile_id", "integer"),
+        ],
+    );
+    assert!(!a.or_replace_compatible(&b));
+}
+
+#[test]
+fn or_replace_incompatible_rename_reorder_retype_drop() {
+    let base = view_with_columns(
+        "select a, b from t",
+        vec![vcol("a", "integer"), vcol("b", "text")],
+    );
+    // rename
+    assert!(!base.or_replace_compatible(&view_with_columns(
+        "select a, b as c from t",
+        vec![vcol("a", "integer"), vcol("c", "text")],
+    )));
+    // reorder
+    assert!(!base.or_replace_compatible(&view_with_columns(
+        "select b, a from t",
+        vec![vcol("b", "text"), vcol("a", "integer")],
+    )));
+    // retype (typmod counts too)
+    assert!(!base.or_replace_compatible(&view_with_columns(
+        "select a, b::varchar(10) as b from t",
+        vec![vcol("a", "integer"), vcol("b", "character varying(10)")],
+    )));
+    // drop trailing column
+    assert!(!base.or_replace_compatible(&view_with_columns(
+        "select a from t",
+        vec![vcol("a", "integer")],
+    )));
+}
+
+#[test]
+fn or_replace_incompatible_collation_change() {
+    let a = view_with_columns(
+        "select b from t",
+        vec![ViewColumn {
+            name: "b".to_string(),
+            data_type: "text".to_string(),
+            collation: Some("default".to_string()),
+        }],
+    );
+    let b = view_with_columns(
+        "select b collate \"C\" as b from t",
+        vec![ViewColumn {
+            name: "b".to_string(),
+            data_type: "text".to_string(),
+            collation: Some("C".to_string()),
+        }],
+    );
+    assert!(!a.or_replace_compatible(&b));
+}
+
+// A dump written before column capture has no column data; incompatibility cannot be
+// proven, so the check must fall back to the historical OR REPLACE behavior.
+#[test]
+fn or_replace_compatible_when_column_data_missing() {
+    let no_cols = create_view("select a from t");
+    let with_cols = view_with_columns("select b from t", vec![vcol("b", "text")]);
+    assert!(no_cols.or_replace_compatible(&with_cols));
+    assert!(with_cols.or_replace_compatible(&no_cols));
+    assert!(no_cols.or_replace_compatible(&no_cols));
+}
+
+// get_alter_script must route an incompatible column change to drop+recreate instead
+// of emitting the CREATE OR REPLACE VIEW that PostgreSQL would reject.
+#[test]
+fn get_alter_script_incompatible_columns_drops_and_recreates() {
+    let from = view_with_columns(
+        "select id, profile_id from public.users",
+        vec![vcol("id", "integer"), vcol("profile_id", "integer")],
+    );
+    let to = view_with_columns(
+        "select id, kind, profile_id from public.users",
+        vec![
+            vcol("id", "integer"),
+            vcol("kind", "text"),
+            vcol("profile_id", "integer"),
+        ],
+    );
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("drop view if exists analytics.active_users;"),
+        "incompatible column change must drop first: {script}"
+    );
+    assert!(!script.contains("CREATE OR REPLACE"));
+}
+
+#[test]
+fn get_alter_script_compatible_append_uses_or_replace() {
+    let from = view_with_columns("select id from public.users", vec![vcol("id", "integer")]);
+    let to = view_with_columns(
+        "select id, name from public.users",
+        vec![vcol("id", "integer"), vcol("name", "text")],
+    );
+    let script = from.get_alter_script(&to, true);
+    assert!(
+        script.contains("CREATE OR REPLACE VIEW"),
+        "appending at the end must keep OR REPLACE: {script}"
+    );
+    assert!(!script.to_lowercase().contains("drop view"));
+}

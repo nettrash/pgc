@@ -1090,7 +1090,7 @@ impl Dump {
                 r.proacl::text[] as routine_acl,
                 r.proconfig::text[] as proconfig,
                 agg.aggtransfn::regproc::text as agg_sfunc,
-                format_type(agg.aggtranstype, null) as agg_stype,
+                pg_catalog.format_type(agg.aggtranstype, null) as agg_stype,
                 agg.aggtransspace as agg_sspace,
                 case when agg.aggfinalfn != 0 then agg.aggfinalfn::regproc::text end as agg_finalfunc,
                 agg.aggfinalextra as agg_finalfunc_extra,
@@ -1101,7 +1101,7 @@ impl Dump {
                 agg.agginitval as agg_initcond,
                 case when agg.aggmtransfn != 0 then agg.aggmtransfn::regproc::text end as agg_msfunc,
                 case when agg.aggminvtransfn != 0 then agg.aggminvtransfn::regproc::text end as agg_minvfunc,
-                case when agg.aggmtransfn != 0 then format_type(agg.aggmtranstype, null) end as agg_mstype,
+                case when agg.aggmtransfn != 0 then pg_catalog.format_type(agg.aggmtranstype, null) end as agg_mstype,
                 agg.aggmtransspace as agg_msspace,
                 case when agg.aggmfinalfn != 0 then agg.aggmfinalfn::regproc::text end as agg_mfinalfunc,
                 agg.aggmfinalextra as agg_mfinalfunc_extra,
@@ -1114,7 +1114,7 @@ impl Dump {
                 r.prorows,
                 case when r.prosupport != 0 then r.prosupport::regproc::text else null end as prosupport,
                 (
-                    select array_agg(format_type(t.oid, null) order by ordinality)
+                    select array_agg(pg_catalog.format_type(t.oid, null) order by ordinality)
                     from unnest(r.protrftypes) with ordinality as u(typid, ordinality)
                     join pg_type t on t.oid = u.typid
                 ) as protrftypes
@@ -1507,6 +1507,29 @@ impl Dump {
                 .push((col, comment));
         }
 
+        // Output columns per regular view, ordinal order (fetched sequentially so
+        // the pool budget of this branch is unchanged). Rows arrive ordered by
+        // attnum, so pushing preserves position.
+        let view_columns_query = Self::build_view_columns_query(schema_filter);
+        let view_column_rows = sqlx::query(view_columns_query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::other(format!("Failed to fetch view columns: {e}.")))?;
+        let mut view_columns_map: HashMap<(String, String), Vec<crate::dump::view::ViewColumn>> =
+            HashMap::new();
+        for row in &view_column_rows {
+            let schema: String = row.get("schema_name");
+            let view_name: String = row.get("view_name");
+            view_columns_map
+                .entry((schema, view_name))
+                .or_default()
+                .push(crate::dump::view::ViewColumn {
+                    name: row.get("column_name"),
+                    data_type: row.get("data_type"),
+                    collation: row.get("collation"),
+                });
+        }
+
         let mut views = Vec::new();
 
         if regular_rows.is_empty() {
@@ -1525,6 +1548,9 @@ impl Dump {
                 let schema: String = row.get("table_schema");
                 let name: String = row.get("table_name");
                 let column_comments = col_comments_map
+                    .remove(&(schema.clone(), name.clone()))
+                    .unwrap_or_default();
+                let columns = view_columns_map
                     .remove(&(schema.clone(), name.clone()))
                     .unwrap_or_default();
                 let definition = Self::require_view_definition(
@@ -1554,6 +1580,7 @@ impl Dump {
                     column_comments,
                     storage_parameters: None,
                     tablespace: None,
+                    columns,
                 };
                 view.hash();
                 println!(
@@ -1616,6 +1643,9 @@ impl Dump {
                     column_comments,
                     storage_parameters,
                     tablespace,
+                    // Materialized views never use CREATE OR REPLACE, so the
+                    // OR-REPLACE compatibility column list is not collected for them.
+                    columns: Vec::new(),
                 };
                 view.hash();
                 println!(
@@ -1765,6 +1795,43 @@ impl Dump {
             where c.relkind in ('v', 'm')
                 and n.nspname not in ('pg_catalog', 'information_schema')
                 and n.nspname in {}
+            order by n.nspname, c.relname, a.attnum;",
+            schema_filter
+        )
+    }
+
+    /// Output columns of every regular view, in ordinal order. Captured so the
+    /// comparer can tell whether a changed view can be updated with
+    /// `CREATE OR REPLACE VIEW` (old columns an exact prefix of new: same name,
+    /// type and collation per position) or must be dropped and recreated
+    /// (issue #227). Materialized views are excluded — they never use OR REPLACE.
+    fn build_view_columns_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as schema_name,
+                quote_ident(c.relname) as view_name,
+                a.attname as column_name,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                (select case
+                            when nco.nspname = 'pg_catalog' then co.collname
+                            else nco.nspname || '.' || co.collname
+                        end
+                 from pg_catalog.pg_collation co
+                 join pg_catalog.pg_namespace nco on nco.oid = co.collnamespace
+                 where co.oid = a.attcollation) as collation
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+            where c.relkind = 'v'
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname in {}
+                and not exists (
+                    select 1 from pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = c.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
             order by n.nspname, c.relname, a.attnum;",
             schema_filter
         )

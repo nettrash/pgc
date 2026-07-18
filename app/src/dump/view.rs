@@ -2,6 +2,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::utils::string_extensions::StringExt;
 
+/// One output column of a regular view, as PostgreSQL records it in
+/// `pg_attribute`. Captured at dump time solely to decide whether a changed view
+/// can be updated with `CREATE OR REPLACE VIEW` or must be dropped and recreated
+/// (issue #227).
+///
+/// Deliberately excluded from `View::hash`: dumps written before this field
+/// existed carry no column data, so hashing it would make every regular view
+/// compare as changed against an older dump, and `format_type` renderings could
+/// in principle drift across server versions and churn the hash. Exclusion is
+/// safe for change *detection* because the deparsed definition — which is hashed
+/// — always reflects the current column names and expressions (verified live:
+/// `ALTER VIEW ... RENAME COLUMN` re-renders the select list with an `AS` alias
+/// for the new name). The column list therefore only decides *how* an
+/// already-detected change is emitted, never *whether* a change exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewColumn {
+    /// Column name (`pg_attribute.attname`)
+    pub name: String,
+    /// Formatted type including any typmod, e.g. `character varying(10)`
+    /// (`format_type(atttypid, atttypmod)`)
+    pub data_type: String,
+    /// Collation of the column when it is collatable; `None` for non-collatable
+    /// types. `pg_catalog` collations are recorded by bare name (`default`, `C`);
+    /// any other collation is schema-qualified (`myschema.mycoll`), because
+    /// collations are schema-scoped and two different collations may share a bare
+    /// name — PostgreSQL rejects an OR REPLACE across them ("cannot change
+    /// collation of view column ... from \"mycoll\" to \"mycoll\""), so the
+    /// captured value must distinguish them too
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+}
+
 // This is an information about a PostgreSQL view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
@@ -49,6 +81,11 @@ pub struct View {
     /// Tablespace for materialized views
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tablespace: Option<String>,
+    /// Output columns in ordinal order (regular views only; empty for materialized
+    /// views and for dumps written by older pgc versions). Used only by
+    /// [`View::or_replace_compatible`]; not part of the hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<ViewColumn>,
 }
 
 impl View {
@@ -75,6 +112,7 @@ impl View {
             column_comments: Vec::new(),
             storage_parameters: None,
             tablespace: None,
+            columns: Vec::new(),
         };
         view.hash();
         view
@@ -82,6 +120,31 @@ impl View {
 
     fn default_is_populated() -> bool {
         true
+    }
+
+    /// Whether `CREATE OR REPLACE VIEW` can turn this view into `target`.
+    ///
+    /// PostgreSQL accepts `OR REPLACE` only when every existing column keeps its
+    /// name, type (including typmod) and collation at the same position, and any
+    /// new columns are appended strictly at the end — inserting, reordering,
+    /// renaming, retyping or dropping a column is rejected (`cannot change name of
+    /// view column ...`, verified live on PostgreSQL 16). In prefix terms: the old
+    /// column list must be an exact prefix of the new one.
+    ///
+    /// When column data is missing on either side — a dump written by an older pgc
+    /// — incompatibility cannot be proven and this returns `true`, preserving the
+    /// historical `CREATE OR REPLACE` behavior for old dumps.
+    pub fn or_replace_compatible(&self, target: &View) -> bool {
+        if self.columns.is_empty() || target.columns.is_empty() {
+            return true;
+        }
+        if target.columns.len() < self.columns.len() {
+            return false;
+        }
+        self.columns
+            .iter()
+            .zip(&target.columns)
+            .all(|(a, b)| a == b)
     }
 
     /// Returns the SQL keyword for this view type ("view" or "materialized view")
@@ -282,8 +345,14 @@ impl View {
         // When the view kind changes (regular <-> materialized) or the target is
         // a materialized view, we must drop and recreate because neither kind
         // supports an in-place ALTER to the other, and materialized views do not
-        // support CREATE OR REPLACE.
-        if target.is_materialized || has_kind_change {
+        // support CREATE OR REPLACE. The same applies when the column list changed
+        // incompatibly (issue #227): CREATE OR REPLACE VIEW only allows appending
+        // columns at the end, so inserting/reordering/renaming/retyping requires
+        // drop+recreate as well.
+        if target.is_materialized
+            || has_kind_change
+            || (has_definition_change && !self.or_replace_compatible(target))
+        {
             // DROP must match the *current* object type so the existing object
             // is actually removed.
             let drop_script = self.get_drop_script();

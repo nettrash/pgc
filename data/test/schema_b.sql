@@ -2082,3 +2082,22 @@ CREATE TABLE test_schema.innorm_typmod (
 ALTER TABLE test_schema.innorm_typmod
     ADD CONSTRAINT chk_innorm_typmod
     CHECK (code IN ('A'::varchar(10), 'B'::varchar(10)));
+
+-- =============================================================================
+-- Regression: incompatible view column change needs DROP+CREATE (issue #227)
+-- =============================================================================
+-- See schema_a.sql. `kind` is inserted before profile_id, which CREATE OR
+-- REPLACE VIEW cannot express; v227_dep is textually unchanged but must ride
+-- along through drop+recreate.
+CREATE TABLE test_schema.v227_item (
+    id         integer PRIMARY KEY,
+    status     text,
+    kind       text,
+    profile_id integer
+);
+
+CREATE VIEW test_schema.v227_base AS
+SELECT id, status, kind, profile_id FROM test_schema.v227_item;
+
+CREATE VIEW test_schema.v227_dep AS
+SELECT id, status FROM test_schema.v227_base;
