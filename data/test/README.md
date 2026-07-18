@@ -128,6 +128,7 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **get_active_usernames_sql()**: return type adds `preferred_contact` column
 - **product_price_with_tax_sql()**: new parameter `p_currency varchar DEFAULT 'USD'`
 - **cascade_compute(integer)**: return type `INTEGER` → `BIGINT` — return type change requires `DROP FUNCTION ... CASCADE` (PostgreSQL has no `ALTER FUNCTION` for return types). The argument list (`integer`) is unchanged, so the function's signature in PostgreSQL terms is identical between FROM and TO; the cascade still fires. Exercises Phase 7 of `compare_routines_and_views`, which must re-emit every dependent (CHECK / functional index / generated column / DEFAULT / RLS policy) silently dropped by CASCADE; see _CASCADE-Drop Dependent Recreation (Issue #179)_ in section 46.
+- **cascade_part_fn(text)**: same return-type-change cascade, but the dependent is a functional index on the **partitioned parent** `cascade_part`. Phase 7's recreate must leave that index valid (guarded by the integration job's `indisvalid` assertion): default mode emits a plain `CREATE INDEX` that builds and attaches every partition, and production mode routes the recreate through the same `ON ONLY` + per-partition `CONCURRENTLY`/`ATTACH PARTITION` split as any other index creation — a plain blocking build (or, before issue #223, a permanently invalid `ON ONLY` parent) is not acceptable there.
 
 #### Removed Functions
 - **calculate_order_total()**: depends on removed `orders` table

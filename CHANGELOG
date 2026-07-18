@@ -77,10 +77,15 @@
                       INDEX ... ON, so PostgreSQL builds and attaches
                       the partition indexes itself and the parent index
                       is valid immediately. Production output
-                      (OUTPUT_FOR_PRODUCTION=true) is unchanged: it
-                      still emits ON ONLY followed by the per-partition
-                      CREATE INDEX CONCURRENTLY and ATTACH PARTITION
-                      sequence.
+                      (OUTPUT_FOR_PRODUCTION=true) keeps emitting ON
+                      ONLY followed by the per-partition CREATE INDEX
+                      CONCURRENTLY and ATTACH PARTITION sequence, and
+                      indexes recreated after a DROP FUNCTION ...
+                      CASCADE now go through that same partition-aware
+                      concurrent sequence too — previously that path
+                      re-emitted the raw definition, leaving the
+                      recreated parent index permanently invalid in
+                      every mode.
                     - Resolved issue #218 (spurious DROP CONSTRAINT
                       and ADD CONSTRAINT for inline NOT NULL). A
                       column's inline NOT NULL is surfaced by
