@@ -937,6 +937,24 @@ fn build_view_columns_query_extension_filter_is_precise() {
     assert_extension_filter(&query, "pg_class", "view columns");
 }
 
+// Collations are schema-scoped: two different collations may share a bare name, and
+// PostgreSQL rejects OR REPLACE across them ("cannot change collation of view column
+// ... from \"mycoll\" to \"mycoll\"", verified live). The capture must therefore
+// schema-qualify non-pg_catalog collations or or_replace_compatible could call two
+// different collations equal and emit an OR REPLACE the server refuses.
+#[test]
+fn build_view_columns_query_qualifies_non_catalog_collations() {
+    let query = Dump::build_view_columns_query("('public')");
+    assert!(
+        query.contains("nco.nspname || '.' || co.collname"),
+        "non-pg_catalog collations must be captured schema-qualified"
+    );
+    assert!(
+        query.contains("when nco.nspname = 'pg_catalog' then co.collname"),
+        "pg_catalog collations must stay bare for dump stability"
+    );
+}
+
 #[test]
 fn build_materialized_views_query_extension_filter_is_precise() {
     let query = Dump::build_materialized_views_query("('public')");

@@ -23,8 +23,13 @@ pub struct ViewColumn {
     /// Formatted type including any typmod, e.g. `character varying(10)`
     /// (`format_type(atttypid, atttypmod)`)
     pub data_type: String,
-    /// Collation name when the column is collatable (`pg_collation.collname`,
-    /// e.g. `default` or `C`); `None` for non-collatable types
+    /// Collation of the column when it is collatable; `None` for non-collatable
+    /// types. `pg_catalog` collations are recorded by bare name (`default`, `C`);
+    /// any other collation is schema-qualified (`myschema.mycoll`), because
+    /// collations are schema-scoped and two different collations may share a bare
+    /// name — PostgreSQL rejects an OR REPLACE across them ("cannot change
+    /// collation of view column ... from \"mycoll\" to \"mycoll\""), so the
+    /// captured value must distinguish them too
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
 }

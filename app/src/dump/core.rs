@@ -1812,7 +1812,13 @@ impl Dump {
                 quote_ident(c.relname) as view_name,
                 a.attname as column_name,
                 pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
-                (select co.collname from pg_catalog.pg_collation co where co.oid = a.attcollation) as collation
+                (select case
+                            when nco.nspname = 'pg_catalog' then co.collname
+                            else nco.nspname || '.' || co.collname
+                        end
+                 from pg_catalog.pg_collation co
+                 join pg_catalog.pg_namespace nco on nco.oid = co.collnamespace
+                 where co.oid = a.attcollation) as collation
             from pg_class c
             join pg_namespace n on n.oid = c.relnamespace
             join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
