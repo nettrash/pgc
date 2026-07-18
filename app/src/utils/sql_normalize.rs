@@ -47,10 +47,16 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Whether `chars[at..]` starts with the ASCII `prefix`, compared
-/// case-insensitively, without allocating. The array-literal matchers run this at
-/// every scan position, so it must stay allocation-free.
+/// Whether `chars[at..]` starts with `prefix`, compared ASCII-case-insensitively,
+/// without allocating. The array-literal matchers run this at every scan position,
+/// so it must stay allocation-free.
+///
+/// `prefix` must be pure ASCII: the length arithmetic uses `prefix.len()` as a char
+/// count (valid only when every char is one byte) and the comparison folds ASCII
+/// case only. Enforced with a debug assertion so a non-ASCII prefix fails loudly in
+/// tests instead of producing silent false negatives near end-of-input.
 fn starts_with_ascii_ci(chars: &[char], at: usize, prefix: &str) -> bool {
+    debug_assert!(prefix.is_ascii(), "prefix must be ASCII: {prefix:?}");
     at + prefix.len() <= chars.len()
         && chars[at..at + prefix.len()]
             .iter()
