@@ -1845,3 +1845,28 @@ SELECT id, status, profile_id FROM test_schema.v227_item;
 
 CREATE VIEW test_schema.v227_dep AS
 SELECT id, status FROM test_schema.v227_base;
+
+-- =============================================================================
+-- CASCADE recreation of an index on a partitioned parent (PR #234 review)
+-- =============================================================================
+-- cascade_part_fn's return type changes in TO, so its drop CASCADEs through the
+-- functional index on the partitioned parent; Phase 7 must recreate that index
+-- valid. In production mode the recreate must use the ON ONLY + per-partition
+-- CONCURRENTLY/ATTACH sequence rather than a blocking plain CREATE INDEX; in
+-- default mode a plain CREATE INDEX builds and attaches everything itself. The
+-- integration job's indisvalid assertion guards the result.
+CREATE FUNCTION test_schema.cascade_part_fn(text)
+RETURNS integer IMMUTABLE LANGUAGE sql AS $$ SELECT length($1) $$;
+
+CREATE TABLE test_schema.cascade_part (
+    id integer,
+    s  text,
+    d  date NOT NULL
+) PARTITION BY RANGE (d);
+
+CREATE TABLE test_schema.cascade_part_2024 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.cascade_part_2025 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX ix_cascade_part_fn ON test_schema.cascade_part (test_schema.cascade_part_fn(s));

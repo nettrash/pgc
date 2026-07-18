@@ -2101,3 +2101,24 @@ SELECT id, status, kind, profile_id FROM test_schema.v227_item;
 
 CREATE VIEW test_schema.v227_dep AS
 SELECT id, status FROM test_schema.v227_base;
+
+-- =============================================================================
+-- CASCADE recreation of an index on a partitioned parent (PR #234 review)
+-- =============================================================================
+-- See schema_a.sql: the return type changed integer -> bigint, forcing
+-- DROP FUNCTION ... CASCADE which takes ix_cascade_part_fn with it.
+CREATE FUNCTION test_schema.cascade_part_fn(text)
+RETURNS bigint IMMUTABLE LANGUAGE sql AS $$ SELECT length($1)::bigint $$;
+
+CREATE TABLE test_schema.cascade_part (
+    id integer,
+    s  text,
+    d  date NOT NULL
+) PARTITION BY RANGE (d);
+
+CREATE TABLE test_schema.cascade_part_2024 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE test_schema.cascade_part_2025 PARTITION OF test_schema.cascade_part
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE INDEX ix_cascade_part_fn ON test_schema.cascade_part (test_schema.cascade_part_fn(s));
