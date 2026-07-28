@@ -15,6 +15,7 @@ use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::statistic::Statistic;
 use crate::dump::table::{PgCatalogCaps, Table};
+use crate::dump::table_index::TableIndex;
 use crate::dump::text_search::{TextSearchConfig, TextSearchDict};
 use crate::dump::view::View;
 use crate::{config::dump_config::DumpConfig, dump::extension::Extension};
@@ -1544,6 +1545,37 @@ impl Dump {
                 });
         }
 
+        // Indexes per materialized view (fetched sequentially for the same
+        // pool-budget reason as the view columns above). Keyed by the *raw*
+        // catalog schema/name because that is what `build_materialized_views_query`
+        // stores on the view itself.
+        let matview_indexes_query = Self::build_materialized_view_indexes_query(schema_filter);
+        let matview_index_rows = sqlx::query(matview_indexes_query.as_str())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                Error::other(format!("Failed to fetch materialized view indexes: {e}."))
+            })?;
+        let mut matview_indexes_map: HashMap<(String, String), Vec<TableIndex>> = HashMap::new();
+        for row in &matview_index_rows {
+            let raw_schema: String = row.get("raw_schemaname");
+            let raw_name: String = row.get("raw_matviewname");
+            matview_indexes_map
+                .entry((raw_schema, raw_name))
+                .or_default()
+                .push(TableIndex {
+                    schema: row.get("schemaname"),
+                    table: row.get("matviewname"),
+                    name: row.get("indexname"),
+                    catalog: row.get("tablespace"),
+                    indexdef: row.get("indexdef"),
+                    // A materialized view cannot be partitioned, so none of its
+                    // indexes is inherited from a partitioned parent.
+                    is_partition_index: false,
+                    comment: row.get("index_comment"),
+                });
+        }
+
         let mut views = Vec::new();
 
         if regular_rows.is_empty() {
@@ -1595,6 +1627,8 @@ impl Dump {
                     storage_parameters: None,
                     tablespace: None,
                     columns,
+                    // Only materialized views can be indexed.
+                    indexes: Vec::new(),
                 };
                 view.hash();
                 println!(
@@ -1617,6 +1651,10 @@ impl Dump {
                 let column_comments = col_comments_map
                     .remove(&(schema.clone(), name.clone()))
                     .unwrap_or_default();
+                let mut indexes = matview_indexes_map
+                    .remove(&(schema.clone(), name.clone()))
+                    .unwrap_or_default();
+                indexes.sort_by_key(|i| i.name.to_lowercase());
                 let storage_opts: Option<Vec<String>> = row.get("storage_options");
                 let storage_parameters = storage_opts.and_then(|v| {
                     // Filter out security_invoker from reloptions (it's handled separately)
@@ -1660,6 +1698,7 @@ impl Dump {
                     // Materialized views never use CREATE OR REPLACE, so the
                     // OR-REPLACE compatibility column list is not collected for them.
                     columns: Vec::new(),
+                    indexes,
                 };
                 view.hash();
                 println!(
@@ -1790,6 +1829,51 @@ impl Dump {
                 );",
             Self::view_table_relation_subquery(),
             schema_filter
+        )
+    }
+
+    /// Indexes defined on materialized views.
+    ///
+    /// `Table::build_indexes_bulk_query` also sees these rows (`pg_indexes`
+    /// spans relkind `r`/`m`/`p`) but distributes them by `(schema, table)` into
+    /// the dump's table list, which only holds relkind `r`/`p` — so a
+    /// materialized view's indexes matched nothing and were silently discarded,
+    /// and a recreated view came back without them (issue #235). They are
+    /// captured here instead, alongside the view they belong to.
+    ///
+    /// Unlike a table, a materialized view can carry no constraints at all, so
+    /// there is no primary-key/unique-constraint-backed index to filter out:
+    /// every index on one is a standalone `CREATE [UNIQUE] INDEX`.
+    fn build_materialized_view_indexes_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as schemaname,
+                quote_ident(mv.relname) as matviewname,
+                n.nspname as raw_schemaname,
+                mv.relname as raw_matviewname,
+                quote_ident(ic.relname) as indexname,
+                (select spcname from pg_catalog.pg_tablespace ts where ts.oid = ic.reltablespace) as tablespace,
+                pg_catalog.pg_get_indexdef(ic.oid) as indexdef,
+                d.description as index_comment
+            from pg_catalog.pg_index idx
+            join pg_catalog.pg_class ic on ic.oid = idx.indexrelid
+            join pg_catalog.pg_class mv on mv.oid = idx.indrelid
+            join pg_catalog.pg_namespace n on n.oid = mv.relnamespace
+            left join pg_catalog.pg_description d
+                on d.objoid = ic.oid
+                and d.classoid = 'pg_class'::regclass
+                and d.objsubid = 0
+            where mv.relkind = 'm'
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname in {schema_filter}
+                and not exists (
+                    select 1 from pg_catalog.pg_depend ext_dep
+                    where ext_dep.classid = 'pg_class'::regclass
+                    and ext_dep.objid = ic.oid
+                    and ext_dep.objsubid = 0
+                    and ext_dep.deptype = 'e'
+                )
+            order by n.nspname, mv.relname, ic.relname;"
         )
     }
 

@@ -232,6 +232,28 @@ These schemas are designed to test comparison capabilities for the following Pos
   `innorm` is identical in both schemas; the matview exists only in TO so the diff
   creates it and applying it re-parses the expression. The companion partial index
   `ix_innorm_trust` (§6) exercises the same non-idempotency in an index predicate.
+- **Indexes on a materialized view** (issue #235): `pg_indexes` rows for a
+  materialized view were only ever distributed into the dump's *table* list, so they
+  matched nothing and never reached the dump. Nothing re-emitted them either, and
+  because `DROP MATERIALIZED VIEW` takes the indexes with it, a recreated view came
+  back unindexed — silently, since neither dump carried the indexes and the second
+  diff was therefore empty. Three views over the shared base table `mv235_base` cover
+  the paths:
+  - **Modified**: `mv235_recreated` — gains the `amount` column, so it is dropped and
+    rebuilt; its unique index, its partial index and that index's comment must all be
+    recreated with it.
+  - **Unchanged**: `mv235_stable` — same definition in both, so the view survives and
+    its indexes are reconciled in place: `ix_mv235_stable_drop` removed,
+    `ix_mv235_stable_redef` redefined `ASC` → `DESC` (drop + rebuild, not a
+    comment-only edit), `ix_mv235_stable_cmt` re-commented without touching the index,
+    and `ix_mv235_stable_added` created. Index changes stay out of `View::hash` on
+    purpose: hashing them would turn "an index was added" into a full rebuild of the
+    view's contents.
+  - **Added**: `mv235_new` (TO-only) — its index is emitted with the initial CREATE.
+
+  In production mode every one of these builds runs `CREATE INDEX CONCURRENTLY` (and
+  drops run `DROP INDEX CONCURRENTLY`) in the post-commit section, exactly as a
+  table's indexes do.
 
 ### 14. Row-Level Security Policies
 - **Modified**: `users_rls_select` — changed to `RESTRICTIVE`, role changed to `tenant_reader`, added `AND two_factor_enabled = TRUE` condition

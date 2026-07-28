@@ -1,3 +1,36 @@
+2026-07-28      v1.0.26
+
+                Bug fixes:
+                    - Resolved issue #235 (materialized view
+                      recreation did not restore its indexes). A
+                      materialized view can be indexed, but the index
+                      rows PostgreSQL reports for one were only ever
+                      distributed into the dump's table list, which
+                      holds ordinary and partitioned tables alone, so
+                      they matched nothing and never reached the
+                      dump. Nothing re-emitted them either: a
+                      materialized view is always dropped and
+                      recreated when its definition changes, and DROP
+                      MATERIALIZED VIEW takes the indexes with it, so
+                      the migration silently left the view unindexed.
+                      Because neither dump carried the indexes the
+                      second diff was empty, and the loss went
+                      unreported. The dump now captures the indexes
+                      of every materialized view alongside the view
+                      itself. A view that is recreated has them
+                      rebuilt with it, and one whose definition did
+                      not change has its index set reconciled in
+                      place (created, dropped, redefined or
+                      re-commented) so that adding an index no longer
+                      forces a full rebuild of the view's contents.
+                      A view restored after DROP FUNCTION ... CASCADE
+                      gets the same treatment, and with
+                      --output-for-production the builds and drops
+                      run CONCURRENTLY after the transaction commits,
+                      exactly as a table's do. Dumps written by older
+                      versions carry no index data; they stay
+                      readable and simply report no indexes.
+
 2026-07-17      v1.0.25
 
                 Bug fixes:

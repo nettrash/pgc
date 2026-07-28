@@ -1870,3 +1870,47 @@ CREATE TABLE test_schema.cascade_part_2025 PARTITION OF test_schema.cascade_part
     FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 
 CREATE INDEX ix_cascade_part_fn ON test_schema.cascade_part (test_schema.cascade_part_fn(s));
+
+-- =============================================================================
+-- Regression: indexes on a materialized view (issue #235)
+-- =============================================================================
+-- A materialized view can be indexed, but `pg_indexes` rows for one were only
+-- ever distributed into the dump's *table* list, so they matched nothing and
+-- were dropped on the floor. Nothing then re-emitted them: a materialized view
+-- is always dropped and recreated when its definition changes, and
+-- DROP MATERIALIZED VIEW takes the indexes with it, so the migration silently
+-- left the view unindexed. Neither dump carried the indexes, so the second diff
+-- was empty and the loss went unreported.
+--
+-- mv235_recreated: definition changes in TO, so the view is dropped and rebuilt
+-- and every index has to be recreated with it.
+-- mv235_stable:    definition identical in both, so the view survives and its
+--                  indexes are reconciled in place (added / removed / redefined
+--                  / re-commented) — index changes stay out of the view hash so
+--                  that adding an index never forces a full rebuild.
+-- mv235_new:       TO-only, so its index rides along with the initial CREATE.
+CREATE TABLE test_schema.mv235_base (
+    id     integer PRIMARY KEY,
+    label  text,
+    amount numeric,
+    active boolean
+);
+
+CREATE MATERIALIZED VIEW test_schema.mv235_recreated AS
+SELECT id, label FROM test_schema.mv235_base;
+
+CREATE UNIQUE INDEX ix_mv235_recreated_id ON test_schema.mv235_recreated (id);
+CREATE INDEX ix_mv235_recreated_partial ON test_schema.mv235_recreated (label)
+    WHERE label IS NOT NULL;
+COMMENT ON INDEX test_schema.ix_mv235_recreated_partial IS 'partial index on a matview';
+
+CREATE MATERIALIZED VIEW test_schema.mv235_stable AS
+SELECT id, label, amount FROM test_schema.mv235_base;
+
+-- Dropped in TO.
+CREATE INDEX ix_mv235_stable_drop ON test_schema.mv235_stable (amount);
+-- Definition changes in TO (ASC -> DESC): drop + rebuild, not a comment-only edit.
+CREATE INDEX ix_mv235_stable_redef ON test_schema.mv235_stable (label);
+-- Only the comment changes in TO: the index itself must be left alone.
+CREATE INDEX ix_mv235_stable_cmt ON test_schema.mv235_stable (id, amount);
+COMMENT ON INDEX test_schema.ix_mv235_stable_cmt IS 'comment before';
