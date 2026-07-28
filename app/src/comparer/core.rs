@@ -417,6 +417,44 @@ impl Comparer {
         }
     }
 
+    /// Emit the index changes of an [`IndexAlterPlan`] in default (non-production)
+    /// mode: drops first, then comment-only changes, then (re)creates — the same
+    /// ordering `Table::build_alter_script` uses for a table's own indexes. Used
+    /// for a materialized view that is not being recreated, whose indexes
+    /// therefore survive and have to be reconciled in place (issue #235).
+    fn emit_index_alter_plan(script: &mut String, plan: &IndexAlterPlan, use_drop: bool) {
+        for old_index in &plan.drop {
+            let drop_cmd = format!(
+                "drop index if exists {}.{};",
+                old_index.schema, old_index.name
+            )
+            .with_empty_lines();
+            if use_drop {
+                script.push_str(&drop_cmd);
+            } else {
+                script.push_str(&format!("-- {drop_cmd}"));
+            }
+        }
+        for index in &plan.comment_changes {
+            if let Some(comment) = &index.comment {
+                script.append_block(&format!(
+                    "comment on index {}.{} is '{}';",
+                    index.schema,
+                    index.name,
+                    comment.replace('\'', "''")
+                ));
+            } else {
+                script.append_block(&format!(
+                    "comment on index {}.{} is null;",
+                    index.schema, index.name
+                ));
+            }
+        }
+        for index in &plan.create {
+            script.push_str(&index.get_script());
+        }
+    }
+
     /// Emit the index changes of an ALTER for production: drops (concurrent
     /// unless on a partitioned table), comment-only changes (in-txn), then
     /// (re)creates (concurrent / partition-aware). Mirrors the ordering of
@@ -3220,7 +3258,11 @@ impl Comparer {
     }
 
     /// Emit the CREATE (or CREATE OR REPLACE) script for a single target view.
-    fn emit_view_create(&mut self, to_view: &View) {
+    ///
+    /// `prod_ctx` is `Some` only in production mode, where a materialized view's
+    /// indexes are split out of the CREATE and built concurrently after the
+    /// transaction commits, exactly as a new table's are.
+    fn emit_view_create(&mut self, to_view: &View, prod_ctx: Option<&PartitionContext>) {
         self.script
             .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
 
@@ -3233,6 +3275,8 @@ impl Comparer {
                 .unwrap_or(true);
             if !drop_was_active {
                 // DROP was commented out, so CREATE would fail; comment it out too.
+                // The indexes ride along: without the view they have nothing to
+                // build on.
                 let create_script = to_view.get_script();
                 self.script.push_str(&format!(
                     "-- use_drop=false: materialized view {}.{} requires drop+recreate; create commented out (manual intervention needed)\n",
@@ -3244,6 +3288,13 @@ impl Comparer {
                         .map(|l| format!("-- {}\n", l))
                         .collect::<String>(),
                 );
+            } else if let Some(ctx) = prod_ctx {
+                self.script.push_str(&to_view.get_script_without_indexes());
+                for index in &to_view.indexes {
+                    let split = production::index_create_split(index, ctx, true);
+                    self.script.push_str(&split.in_txn);
+                    self.production_post_script.push_str(&split.post_commit);
+                }
             } else {
                 self.script.push_str(&to_view.get_script());
             }
@@ -4270,10 +4321,33 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         // Phase 5 – Emit creates / updates in dependency order
         // ──────────────────────────────────────────────────────────
+        // A materialized view's indexes are emitted with it (Phase 5) or
+        // reconciled in place (Phase 6); production mode routes both through the
+        // concurrent-build split, which needs the partition topology. A
+        // materialized view is never a partitioned parent, so the maps only ever
+        // steer these calls down the plain-relation branch — they are built here
+        // for the same reason the table path builds them: `index_create_split`
+        // and `index_drop_statement` take the context unconditionally.
+        let view_partition_maps = if self.output_for_production {
+            Some(self.build_partition_context_maps())
+        } else {
+            None
+        };
+        let view_prod_ctx =
+            view_partition_maps
+                .as_ref()
+                .map(
+                    |(parents, children, partitioned_indexes)| PartitionContext {
+                        partitioned_parents: parents,
+                        children,
+                        partitioned_indexes,
+                    },
+                );
+
         for &(is_view, orig_idx) in &emit_order {
             if is_view {
                 let view = self.to.views[orig_idx].clone();
-                self.emit_view_create(&view);
+                self.emit_view_create(&view, view_prod_ctx.as_ref());
             } else {
                 // Resolve the matching FROM-side routine by index so
                 // `emit_routine_diff` can borrow the `Routine` out of
@@ -4296,18 +4370,44 @@ impl Comparer {
         }
 
         // ──────────────────────────────────────────────────────────
-        // Phase 6 – Unchanged views: emit owner changes only
+        // Phase 6 – Unchanged views: owner changes and index diffs
         // ──────────────────────────────────────────────────────────
+        // A materialized view that is not being recreated keeps its indexes, so
+        // added / removed / redefined ones have to be reconciled in place —
+        // index changes deliberately stay out of `View::hash` so that adding an
+        // index does not force a full rebuild of the view's contents (#235).
         for &idx in &no_action_view_indices {
             let to_view = &self.to.views[idx];
-            if let Some(&fidx) = from_view_map.get(&(to_view.schema.clone(), to_view.name.clone()))
-            {
-                let fv = &self.from.views[fidx];
-                if fv.owner != to_view.owner {
-                    self.script.push_str(
-                        format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str(),
+            let Some(&fidx) = from_view_map.get(&(to_view.schema.clone(), to_view.name.clone()))
+            else {
+                continue;
+            };
+            let from_view = &self.from.views[fidx];
+            let owner_changed = from_view.owner != to_view.owner;
+            let plan = from_view.index_alter_plan(to_view);
+            let has_index_changes = !plan.create.is_empty()
+                || !plan.drop.is_empty()
+                || !plan.comment_changes.is_empty();
+            if !owner_changed && !has_index_changes {
+                continue;
+            }
+
+            self.script
+                .push_str(format!("/* View: {}.{}*/\n", to_view.schema, to_view.name).as_str());
+            if owner_changed {
+                self.script.push_str(&to_view.get_owner_script());
+            }
+            if has_index_changes {
+                if let Some(ctx) = view_prod_ctx.as_ref() {
+                    Self::emit_index_alter_plan_prod(
+                        &mut self.script,
+                        &mut self.production_post_script,
+                        &plan,
+                        self.use_drop,
+                        ctx,
                     );
-                    self.script.push_str(&to_view.get_owner_script());
+                } else {
+                    Self::emit_index_alter_plan(&mut self.script, &plan, self.use_drop);
                 }
             }
         }
@@ -5828,12 +5928,19 @@ fn inject_if_not_exists_into_add_column(script: &str) -> String {
 /// that PostgreSQL never actually dropped, and an unconditional CREATE
 /// would fail against a surviving view.
 fn view_recreate_block(view: &View) -> String {
-    let script = view.get_script();
-    if view.is_materialized {
-        inject_if_not_exists_into_create_materialized_view(&script)
-    } else {
-        rewrite_create_view_to_create_or_replace(&script)
+    if !view.is_materialized {
+        return rewrite_create_view_to_create_or_replace(&view.get_script());
     }
+    // The view's indexes went with it if CASCADE really did drop it, so they are
+    // recreated too — each guarded the same way and for the same reason as the
+    // view itself, since an unconditional CREATE INDEX would fail against the
+    // indexes of a view PostgreSQL never actually dropped.
+    let mut block =
+        inject_if_not_exists_into_create_materialized_view(&view.get_script_without_indexes());
+    for index in &view.indexes {
+        block.push_str(&inject_if_not_exists_into_create_index(&index.get_script()));
+    }
+    block
 }
 
 /// Rewrites the lowercase `create view ` prefix produced by

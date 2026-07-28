@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::dump::table::IndexAlterPlan;
+use crate::dump::table_index::TableIndex;
 use crate::utils::string_extensions::StringExt;
 
 /// One output column of a regular view, as PostgreSQL records it in
@@ -86,6 +88,19 @@ pub struct View {
     /// [`View::or_replace_compatible`]; not part of the hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<ViewColumn>,
+    /// Indexes defined on a materialized view, ordered by name. Always empty for
+    /// regular views — PostgreSQL only allows indexing a materialized one — and
+    /// for dumps written before this field existed (issue #235).
+    ///
+    /// Deliberately excluded from `View::hash`: a materialized view is dropped and
+    /// fully rebuilt whenever its hash changes, so hashing the index list would
+    /// turn "an index was added" into a full refresh of the view's contents, and
+    /// would additionally make every materialized view compare as changed against
+    /// an older dump that carries no index data. The comparer diffs this list on
+    /// its own and emits plain `CREATE INDEX` / `DROP INDEX` for a view whose
+    /// definition did not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<TableIndex>,
 }
 
 impl View {
@@ -113,6 +128,7 @@ impl View {
             storage_parameters: None,
             tablespace: None,
             columns: Vec::new(),
+            indexes: Vec::new(),
         };
         view.hash();
         view
@@ -190,8 +206,22 @@ impl View {
         ));
     }
 
-    /// Returns a string to create the view.
+    /// Returns a string to create the view, including the indexes of a
+    /// materialized view. A materialized view is always dropped and recreated
+    /// rather than replaced in place, and `DROP MATERIALIZED VIEW` takes its
+    /// indexes with it, so the CREATE has to put them back (issue #235).
     pub fn get_script(&self) -> String {
+        let mut script = self.get_script_without_indexes();
+        for index in &self.indexes {
+            script.push_str(&index.get_script());
+        }
+        script
+    }
+
+    /// The CREATE script without the materialized view's indexes. Used by the
+    /// production output path, which emits them separately so they can be built
+    /// concurrently, mirroring `Table::get_script_without_triggers_no_indexes`.
+    pub fn get_script_without_indexes(&self) -> String {
         let keyword = self.view_keyword();
         let with_clause = if self.security_invoker {
             " with (security_invoker = true)"
@@ -287,6 +317,41 @@ impl View {
             self.name
         )
         .with_empty_lines()
+    }
+
+    /// Structured index diff between `self` (FROM) and `to_view` (TO) for a
+    /// materialized view whose definition did not change, so it is not being
+    /// dropped and recreated and its indexes have to be reconciled in place.
+    /// Mirrors `Table::index_alter_plan`; a materialized view can never carry a
+    /// partition-inherited index, so there is nothing to skip.
+    pub fn index_alter_plan<'a>(&'a self, to_view: &'a View) -> IndexAlterPlan<'a> {
+        let mut plan = IndexAlterPlan::default();
+
+        for new_index in &to_view.indexes {
+            if let Some(old_index) = self.indexes.iter().find(|i| i.name == new_index.name) {
+                if old_index != new_index {
+                    if crate::dump::table_index::indexdefs_equivalent(
+                        &old_index.indexdef,
+                        &new_index.indexdef,
+                    ) {
+                        plan.comment_changes.push(new_index);
+                    } else {
+                        plan.drop.push(old_index);
+                        plan.create.push(new_index);
+                    }
+                }
+            } else {
+                plan.create.push(new_index);
+            }
+        }
+
+        for old_index in &self.indexes {
+            if !to_view.indexes.iter().any(|i| i.name == old_index.name) {
+                plan.drop.push(old_index);
+            }
+        }
+
+        plan
     }
 
     pub fn get_owner_script(&self) -> String {

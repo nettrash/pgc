@@ -2122,3 +2122,40 @@ CREATE TABLE test_schema.cascade_part_2025 PARTITION OF test_schema.cascade_part
     FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
 
 CREATE INDEX ix_cascade_part_fn ON test_schema.cascade_part (test_schema.cascade_part_fn(s));
+
+-- =============================================================================
+-- Regression: indexes on a materialized view (issue #235)
+-- =============================================================================
+-- See schema_a.sql for the full description. Here mv235_recreated gains a column
+-- (forcing the drop+recreate that used to lose every index), mv235_stable keeps
+-- its definition while its index set changes underneath it, and mv235_new is a
+-- TO-only view whose index has to be created with it.
+CREATE TABLE test_schema.mv235_base (
+    id     integer PRIMARY KEY,
+    label  text,
+    amount numeric,
+    active boolean
+);
+
+CREATE MATERIALIZED VIEW test_schema.mv235_recreated AS
+SELECT id, label, amount FROM test_schema.mv235_base;
+
+CREATE UNIQUE INDEX ix_mv235_recreated_id ON test_schema.mv235_recreated (id);
+CREATE INDEX ix_mv235_recreated_partial ON test_schema.mv235_recreated (label)
+    WHERE label IS NOT NULL;
+COMMENT ON INDEX test_schema.ix_mv235_recreated_partial IS 'partial index on a matview';
+
+CREATE MATERIALIZED VIEW test_schema.mv235_stable AS
+SELECT id, label, amount FROM test_schema.mv235_base;
+
+-- ix_mv235_stable_drop is gone.
+CREATE INDEX ix_mv235_stable_redef ON test_schema.mv235_stable (label DESC);
+CREATE INDEX ix_mv235_stable_cmt ON test_schema.mv235_stable (id, amount);
+COMMENT ON INDEX test_schema.ix_mv235_stable_cmt IS 'comment after';
+-- TO-only index on a view that is not being recreated.
+CREATE UNIQUE INDEX ix_mv235_stable_added ON test_schema.mv235_stable (id);
+
+CREATE MATERIALIZED VIEW test_schema.mv235_new AS
+SELECT id, label, active FROM test_schema.mv235_base WHERE active;
+
+CREATE INDEX ix_mv235_new_label ON test_schema.mv235_new (label);

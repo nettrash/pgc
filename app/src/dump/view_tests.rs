@@ -510,3 +510,176 @@ fn get_alter_script_compatible_append_uses_or_replace() {
     );
     assert!(!script.to_lowercase().contains("drop view"));
 }
+
+// ── Issue #235: indexes on a materialized view ──────────────────────────────
+
+fn mv_index(name: &str, indexdef: &str) -> TableIndex {
+    TableIndex {
+        schema: "analytics".to_string(),
+        table: "active_users".to_string(),
+        name: name.to_string(),
+        catalog: None,
+        indexdef: indexdef.to_string(),
+        is_partition_index: false,
+        comment: None,
+    }
+}
+
+fn indexed_materialized_view(indexes: Vec<TableIndex>) -> View {
+    let mut view = create_materialized_view("select id from public.users");
+    view.indexes = indexes;
+    view.hash();
+    view
+}
+
+#[test]
+fn matview_get_script_recreates_its_indexes() {
+    let view = indexed_materialized_view(vec![
+        mv_index(
+            "ix_id",
+            "CREATE UNIQUE INDEX ix_id ON analytics.active_users USING btree (id)",
+        ),
+        mv_index(
+            "ix_name",
+            "CREATE INDEX ix_name ON analytics.active_users USING btree (name)",
+        ),
+    ]);
+
+    let script = view.get_script();
+    assert!(script.contains("create materialized view analytics.active_users"));
+    assert!(
+        script.contains("CREATE UNIQUE INDEX ix_id ON analytics.active_users USING btree (id);"),
+        "DROP MATERIALIZED VIEW takes the indexes with it, so the CREATE must put \
+         them back: {script}"
+    );
+    assert!(script.contains("CREATE INDEX ix_name ON analytics.active_users USING btree (name);"));
+}
+
+#[test]
+fn matview_index_comment_is_emitted_with_the_index() {
+    let mut index = mv_index(
+        "ix_id",
+        "CREATE INDEX ix_id ON analytics.active_users USING btree (id)",
+    );
+    index.comment = Some("lookup by id".to_string());
+    let view = indexed_materialized_view(vec![index]);
+
+    assert!(
+        view.get_script()
+            .contains("comment on index analytics.ix_id is 'lookup by id';")
+    );
+}
+
+#[test]
+fn matview_get_script_without_indexes_omits_them() {
+    let view = indexed_materialized_view(vec![mv_index(
+        "ix_id",
+        "CREATE UNIQUE INDEX ix_id ON analytics.active_users USING btree (id)",
+    )]);
+
+    let script = view.get_script_without_indexes();
+    assert!(script.contains("create materialized view analytics.active_users"));
+    assert!(
+        !script.contains("CREATE UNIQUE INDEX"),
+        "the production path emits the indexes itself: {script}"
+    );
+}
+
+#[test]
+fn regular_view_script_is_unchanged_by_the_index_field() {
+    // A regular view can never be indexed, so its script must be byte-identical
+    // to what it was before the field existed.
+    let view = create_view("select id from public.users");
+    assert_eq!(view.get_script(), view.get_script_without_indexes());
+}
+
+#[test]
+fn matview_indexes_do_not_affect_the_hash() {
+    // Hashing the index list would turn "an index was added" into a full drop +
+    // rebuild of the view's contents, and would make every materialized view
+    // look changed against a dump written before the field existed.
+    let plain = indexed_materialized_view(Vec::new());
+    let indexed = indexed_materialized_view(vec![mv_index(
+        "ix_id",
+        "CREATE UNIQUE INDEX ix_id ON analytics.active_users USING btree (id)",
+    )]);
+
+    assert_eq!(plain.hash, indexed.hash);
+}
+
+#[test]
+fn view_without_index_field_deserializes_from_an_older_dump() {
+    let json = r#"{
+        "schema": "analytics",
+        "name": "active_users",
+        "definition": "select id from public.users",
+        "table_relation": [],
+        "is_materialized": true
+    }"#;
+    let view: View = serde_json::from_str(json).expect("older dumps must stay readable");
+    assert!(view.indexes.is_empty());
+}
+
+#[test]
+fn matview_index_alter_plan_classifies_every_change() {
+    let from = indexed_materialized_view(vec![
+        mv_index(
+            "ix_dropped",
+            "CREATE INDEX ix_dropped ON analytics.active_users USING btree (amount)",
+        ),
+        mv_index(
+            "ix_redefined",
+            "CREATE INDEX ix_redefined ON analytics.active_users USING btree (name)",
+        ),
+        mv_index(
+            "ix_recommented",
+            "CREATE INDEX ix_recommented ON analytics.active_users USING btree (id)",
+        ),
+    ]);
+
+    let mut recommented = mv_index(
+        "ix_recommented",
+        "CREATE INDEX ix_recommented ON analytics.active_users USING btree (id)",
+    );
+    recommented.comment = Some("after".to_string());
+    let to = indexed_materialized_view(vec![
+        mv_index(
+            "ix_redefined",
+            "CREATE INDEX ix_redefined ON analytics.active_users USING btree (name DESC)",
+        ),
+        recommented,
+        mv_index(
+            "ix_added",
+            "CREATE INDEX ix_added ON analytics.active_users USING btree (active)",
+        ),
+    ]);
+
+    let plan = from.index_alter_plan(&to);
+
+    let dropped: Vec<&str> = plan.drop.iter().map(|i| i.name.as_str()).collect();
+    let created: Vec<&str> = plan.create.iter().map(|i| i.name.as_str()).collect();
+    let recommented: Vec<&str> = plan
+        .comment_changes
+        .iter()
+        .map(|i| i.name.as_str())
+        .collect();
+
+    assert_eq!(dropped, vec!["ix_redefined", "ix_dropped"]);
+    assert_eq!(created, vec!["ix_redefined", "ix_added"]);
+    assert_eq!(recommented, vec!["ix_recommented"]);
+}
+
+#[test]
+fn matview_index_alter_plan_ignores_an_unchanged_index() {
+    let index = mv_index(
+        "ix_id",
+        "CREATE INDEX ix_id ON analytics.active_users USING btree (id)",
+    );
+    let from = indexed_materialized_view(vec![index.clone()]);
+    let to = indexed_materialized_view(vec![index]);
+
+    let plan = from.index_alter_plan(&to);
+    assert!(plan.drop.is_empty());
+    assert!(plan.create.is_empty());
+    assert!(plan.comment_changes.is_empty());
+}
