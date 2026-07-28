@@ -761,6 +761,46 @@ fn build_materialized_views_query_filters_by_pg_class() {
     );
 }
 
+// Issue #235: a materialized view's indexes were fetched only by the table-side
+// bulk query, which distributes rows into the dump's table list (relkind r/p) —
+// so they matched nothing and never reached the dump.
+#[test]
+fn build_materialized_view_indexes_query_targets_matviews_only() {
+    let query = Dump::build_materialized_view_indexes_query("('public')");
+    assert!(
+        query.contains("mv.relkind = 'm'"),
+        "expected the index query to be anchored on the indexed relation being a \
+         materialized view: {query}"
+    );
+    assert!(
+        query.contains("mv.oid = idx.indrelid"),
+        "the relkind filter has to be on the indexed relation, not the index itself"
+    );
+    assert!(
+        query.contains("n.nspname in ('public')"),
+        "expected the schema filter to be applied: {query}"
+    );
+    assert!(
+        query.contains("d.classoid = 'pg_class'::regclass"),
+        "expected pg_class classoid filter for materialized view index comments"
+    );
+    assert!(
+        query.contains("ext_dep.deptype = 'e'"),
+        "expected extension-owned indexes to be excluded, as every other dump query does"
+    );
+}
+
+// The join key has to be the raw catalog name: build_materialized_views_query
+// stores the view's schema/name unquoted, so a quote_ident'd key would not match
+// and the indexes would silently be dropped again.
+#[test]
+fn build_materialized_view_indexes_query_exposes_raw_join_keys() {
+    let query = Dump::build_materialized_view_indexes_query("('public')");
+    assert!(query.contains("n.nspname as raw_schemaname"));
+    assert!(query.contains("mv.relname as raw_matviewname"));
+    assert!(query.contains("quote_ident(ic.relname) as indexname"));
+}
+
 #[test]
 fn build_view_column_comments_query_filters_by_pg_class() {
     let query = Dump::build_view_column_comments_query("('public')");
