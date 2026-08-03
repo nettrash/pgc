@@ -4,8 +4,8 @@
 //! string literals, E-strings, quoted identifiers and dollar-quoted bodies
 //! byte-for-byte intact.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::table::Table;

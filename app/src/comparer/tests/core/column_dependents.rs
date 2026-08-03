@@ -1,13 +1,12 @@
 //! Issue #188 — pg_depend-driven secondary dependent restoration.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::column_dependent::ColumnDependent;
 use crate::dump::column_dependent::ColumnDependentKind;
 use crate::dump::table::Table;
-use crate::dump::table_column::TableColumn;
 use crate::dump::table_constraint::TableConstraint;
 use crate::dump::table_index::TableIndex;
 

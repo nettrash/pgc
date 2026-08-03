@@ -3,8 +3,8 @@
 //! column DEFAULT expressions, RLS policies). Phase 7 of
 //! `compare_routines_and_views` re-emits them; these tests cover it.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::routine::Routine;

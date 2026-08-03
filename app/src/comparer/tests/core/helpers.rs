@@ -2,7 +2,6 @@
 //!
 //! Helpers used by a single module live in that module instead.
 
-use crate::comparer::core::*;
 use crate::dump::pg_type::PgType;
 use crate::dump::routine::Routine;
 use crate::dump::table::Table;

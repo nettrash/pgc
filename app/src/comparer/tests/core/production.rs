@@ -1,7 +1,6 @@
 //! Tests for `--output-for-production` script rewriting.
 
 use crate::comparer::core::*;
-use super::helpers::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::table::Table;

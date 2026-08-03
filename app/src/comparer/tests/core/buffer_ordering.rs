@@ -5,11 +5,10 @@
 //! These tests pin that order so dependency-aware rearrangements cannot
 //! regress silently.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
-use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::dump::table_trigger::TableTrigger;

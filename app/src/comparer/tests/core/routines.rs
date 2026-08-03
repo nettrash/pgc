@@ -2,7 +2,6 @@
 //! recreate rules, dependency ordering, overloads, owner and config changes.
 
 use crate::comparer::core::*;
-use super::helpers::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::routine::Routine;

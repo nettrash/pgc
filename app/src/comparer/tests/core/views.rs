@@ -2,8 +2,8 @@
 //! kind transitions, the `CREATE OR REPLACE` compatibility rules from
 //! issue #227, and the byte-identical recreation of issue #189.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::view::View;

@@ -2,8 +2,8 @@
 //! [`GrantsMode`] settings (`ignore`, `addonly`, `full`), including owner
 //! changes and the default-ACL handling for recreated or dropped objects.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::default_privilege::DefaultPrivilege;

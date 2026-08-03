@@ -2,7 +2,6 @@
 //! sequences that must not be emitted independently of their table.
 
 use crate::comparer::core::*;
-use super::helpers::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::sequence::Sequence;

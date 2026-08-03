@@ -1,7 +1,7 @@
 //! Issue #235 — indexes on a materialized view.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::table_index::TableIndex;

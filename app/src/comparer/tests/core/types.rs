@@ -1,8 +1,8 @@
 //! Tests for `compare_types` and `compare_enums`, including composite and
 //! multirange types.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::pg_type::CompositeAttribute;

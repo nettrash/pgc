@@ -4,11 +4,10 @@
 //! cascade already propagates. Also covers the FK-parsing fixes from
 //! PR #187 and the cycle-breaking work in issues #190 and #191.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
-use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::dump::table_constraint::TableConstraint;
 

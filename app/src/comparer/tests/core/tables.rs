@@ -1,11 +1,10 @@
 //! Tests for `compare_tables`: partition and inheritance ordering, serial
 //! columns, and the pre-drop of foreign keys and triggers.
 
-use crate::comparer::core::*;
 use super::helpers::*;
+use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
-use crate::dump::schema::Schema;
 use crate::dump::sequence::Sequence;
 use crate::dump::table::Table;
 use crate::dump::table_column::TableColumn;
