@@ -152,5 +152,5 @@ impl PartialEq for TableTrigger {
 }
 
 #[cfg(test)]
-#[path = "table_trigger_tests.rs"]
+#[path = "tests/table_trigger.rs"]
 mod tests;

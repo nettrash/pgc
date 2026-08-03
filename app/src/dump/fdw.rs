@@ -438,5 +438,5 @@ impl UserMapping {
 }
 
 #[cfg(test)]
-#[path = "fdw_tests.rs"]
+#[path = "tests/fdw.rs"]
 mod tests;

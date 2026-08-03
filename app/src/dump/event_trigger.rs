@@ -188,5 +188,5 @@ impl EventTrigger {
 }
 
 #[cfg(test)]
-#[path = "event_trigger_tests.rs"]
+#[path = "tests/event_trigger.rs"]
 mod tests;

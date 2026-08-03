@@ -99,5 +99,5 @@ impl PartialEq for TableIndex {
 }
 
 #[cfg(test)]
-#[path = "table_index_tests.rs"]
+#[path = "tests/table_index.rs"]
 mod tests;

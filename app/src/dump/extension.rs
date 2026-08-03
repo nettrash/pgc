@@ -72,5 +72,5 @@ impl Extension {
 }
 
 #[cfg(test)]
-#[path = "extension_tests.rs"]
+#[path = "tests/extension.rs"]
 mod tests;

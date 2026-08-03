@@ -819,5 +819,5 @@ impl Routine {
 }
 
 #[cfg(test)]
-#[path = "routine_tests.rs"]
+#[path = "tests/routine.rs"]
 mod tests;

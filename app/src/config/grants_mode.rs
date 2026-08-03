@@ -41,5 +41,5 @@ impl FromStr for GrantsMode {
 }
 
 #[cfg(test)]
-#[path = "grants_mode_tests.rs"]
+#[path = "tests/grants_mode.rs"]
 mod tests;

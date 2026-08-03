@@ -218,5 +218,5 @@ impl Operator {
 }
 
 #[cfg(test)]
-#[path = "operator_tests.rs"]
+#[path = "tests/operator.rs"]
 mod tests;

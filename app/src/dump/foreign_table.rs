@@ -355,5 +355,5 @@ impl ForeignTable {
 }
 
 #[cfg(test)]
-#[path = "foreign_table_tests.rs"]
+#[path = "tests/foreign_table.rs"]
 mod tests;

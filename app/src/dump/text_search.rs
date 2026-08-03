@@ -283,5 +283,5 @@ impl TextSearchDict {
 }
 
 #[cfg(test)]
-#[path = "text_search_tests.rs"]
+#[path = "tests/text_search.rs"]
 mod tests;

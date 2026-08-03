@@ -602,5 +602,5 @@ impl PartialEq for TableConstraint {
 }
 
 #[cfg(test)]
-#[path = "table_constraint_tests.rs"]
+#[path = "tests/table_constraint.rs"]
 mod tests;

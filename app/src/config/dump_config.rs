@@ -62,5 +62,5 @@ impl Default for DumpConfig {
 }
 
 #[cfg(test)]
-#[path = "dump_config_tests.rs"]
+#[path = "tests/dump_config.rs"]
 mod tests;

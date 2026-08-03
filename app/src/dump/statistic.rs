@@ -238,5 +238,5 @@ impl Statistic {
 }
 
 #[cfg(test)]
-#[path = "statistic_tests.rs"]
+#[path = "tests/statistic.rs"]
 mod tests;

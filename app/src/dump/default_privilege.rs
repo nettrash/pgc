@@ -166,5 +166,5 @@ fn expand_privilege_chars(chars: &str, object_type: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[path = "default_privilege_tests.rs"]
+#[path = "tests/default_privilege.rs"]
 mod tests;

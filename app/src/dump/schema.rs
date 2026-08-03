@@ -110,5 +110,5 @@ impl Schema {
 }
 
 #[cfg(test)]
-#[path = "schema_tests.rs"]
+#[path = "tests/schema.rs"]
 mod tests;

@@ -104,5 +104,5 @@ impl Rule {
 }
 
 #[cfg(test)]
-#[path = "rule_tests.rs"]
+#[path = "tests/rule.rs"]
 mod tests;

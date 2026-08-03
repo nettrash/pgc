@@ -1,16 +1,11 @@
-use crate::{
+use chrono::Datelike;
+use clap::{CommandFactory, Parser};
+use pgc::{
     comparer::core::Comparer,
     config::{core::Config, dump_config::DumpConfig, grants_mode::GrantsMode},
     dump::core::Dump,
 };
-use chrono::Datelike;
-use clap::{CommandFactory, Parser};
 use std::{io::Error, path::Path, time::Instant};
-
-pub mod comparer;
-pub mod config;
-pub mod dump;
-pub mod utils;
 
 // Command line arguments.
 #[derive(Parser, Debug)]

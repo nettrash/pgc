@@ -188,5 +188,5 @@ impl Collation {
 }
 
 #[cfg(test)]
-#[path = "collation_tests.rs"]
+#[path = "tests/collation.rs"]
 mod tests;

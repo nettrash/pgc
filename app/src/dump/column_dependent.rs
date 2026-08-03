@@ -39,5 +39,5 @@ pub struct ColumnDependent {
 }
 
 #[cfg(test)]
-#[path = "column_dependent_tests.rs"]
+#[path = "tests/column_dependent.rs"]
 mod tests;

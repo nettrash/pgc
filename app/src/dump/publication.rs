@@ -270,5 +270,5 @@ impl Subscription {
 }
 
 #[cfg(test)]
-#[path = "publication_tests.rs"]
+#[path = "tests/publication.rs"]
 mod tests;

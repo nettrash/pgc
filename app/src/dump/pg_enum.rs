@@ -11,5 +11,5 @@ pub struct PgEnum {
 }
 
 #[cfg(test)]
-#[path = "pg_enum_tests.rs"]
+#[path = "tests/pg_enum.rs"]
 mod tests;

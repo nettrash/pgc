@@ -544,5 +544,5 @@ pub fn generate_column_grants_script(
 }
 
 #[cfg(test)]
-#[path = "acl_tests.rs"]
+#[path = "tests/acl.rs"]
 mod tests;

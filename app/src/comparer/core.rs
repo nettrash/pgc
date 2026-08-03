@@ -5986,5 +5986,5 @@ fn policy_recreate_block(policy: &TablePolicy) -> String {
 }
 
 #[cfg(test)]
-#[path = "core_tests.rs"]
+#[path = "tests/core.rs"]
 mod tests;

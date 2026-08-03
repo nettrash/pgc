@@ -2412,5 +2412,5 @@ impl Table {
 }
 
 #[cfg(test)]
-#[path = "table_tests.rs"]
+#[path = "tests/table.rs"]
 mod tests;

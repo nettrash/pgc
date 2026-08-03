@@ -137,5 +137,5 @@ impl Cast {
 }
 
 #[cfg(test)]
-#[path = "cast_tests.rs"]
+#[path = "tests/cast.rs"]
 mod tests;

@@ -3791,5 +3791,5 @@ impl Dump {
 }
 
 #[cfg(test)]
-#[path = "core_tests.rs"]
+#[path = "tests/core.rs"]
 mod tests;

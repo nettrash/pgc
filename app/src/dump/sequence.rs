@@ -367,5 +367,5 @@ impl Sequence {
 }
 
 #[cfg(test)]
-#[path = "sequence_tests.rs"]
+#[path = "tests/sequence.rs"]
 mod tests;

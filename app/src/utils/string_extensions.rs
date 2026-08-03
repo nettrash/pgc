@@ -58,5 +58,5 @@ impl StringExt for String {
 }
 
 #[cfg(test)]
-#[path = "string_extensions_tests.rs"]
+#[path = "tests/string_extensions.rs"]
 mod tests;

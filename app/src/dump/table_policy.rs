@@ -144,5 +144,5 @@ impl PartialEq for TablePolicy {
 }
 
 #[cfg(test)]
-#[path = "table_policy_tests.rs"]
+#[path = "tests/table_policy.rs"]
 mod tests;

@@ -615,5 +615,5 @@ pub fn make_idempotent(script: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "production_tests.rs"]
+#[path = "tests/production.rs"]
 mod tests;

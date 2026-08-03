@@ -809,5 +809,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "pg_type_tests.rs"]
+#[path = "tests/pg_type.rs"]
 mod tests;

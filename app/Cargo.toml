@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 authors = ["nettrash <nettrash@nettrash.me>"]
 
+[lib]
+name = "pgc"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pgc"
 path = "src/main.rs"

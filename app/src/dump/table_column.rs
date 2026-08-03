@@ -926,5 +926,5 @@ impl PartialEq for TableColumn {
 }
 
 #[cfg(test)]
-#[path = "table_column_tests.rs"]
+#[path = "tests/table_column.rs"]
 mod tests;

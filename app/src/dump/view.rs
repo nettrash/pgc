@@ -544,5 +544,5 @@ impl View {
 }
 
 #[cfg(test)]
-#[path = "view_tests.rs"]
+#[path = "tests/view.rs"]
 mod tests;
