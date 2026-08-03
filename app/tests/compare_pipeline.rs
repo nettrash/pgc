@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{ScratchDir, assert_no_ddl, populated_dump, table, view};
+use common::{ScratchDir, assert_no_ddl, index, populated_dump, schema, table, view};
 use pgc::comparer::core::Comparer;
 use pgc::config::grants_mode::GrantsMode;
 use pgc::dump::core::Dump;
@@ -141,14 +141,32 @@ async fn single_transaction_wraps_the_script_in_begin_and_commit() {
     assert!(begin < commit, "begin must precede commit:\n{script}");
 }
 
-/// `--output-for-production` moves statements that cannot run inside a
-/// transaction into a post-commit section. Off by default, and toggling it must
-/// not change anything else about how the comparison is driven.
+/// `--output-for-production` adds idempotency guards and moves statements that
+/// cannot run inside a transaction into a post-commit section. Off by default.
+///
+/// The assertions below deliberately name whole statements rather than looking
+/// for a bare `if not exists`. That substring is **not** production-specific:
+/// `Schema::get_script` and `Extension::get_script` emit `create schema if not
+/// exists` / `create extension if not exists` on the default path too, so the
+/// fixture below — which adds a schema — contains it either way. A test
+/// matching only the substring would keep passing if the rewrite stopped
+/// working entirely.
 #[tokio::test]
 async fn production_mode_is_opt_in() {
     let build = |production: bool| async move {
         let mut to = populated_dump("shop");
-        to.tables.push(table("app", "invoices", &["id"]));
+        // A new schema: emits `create schema if not exists` on BOTH paths, and
+        // is what makes the naive substring check useless.
+        to.schemas.push(schema("reporting"));
+        // A new table with an index: `create table` gains a guard and the index
+        // build becomes CONCURRENTLY, only under production mode.
+        let mut invoices = table("app", "invoices", &["id"]);
+        invoices
+            .indexes
+            .push(index("app", "invoices", "ix_invoices_id", "id"));
+        invoices.hash();
+        to.tables.push(invoices);
+
         let mut comparer = Comparer::new(
             populated_dump("shop"),
             to,
@@ -162,19 +180,64 @@ async fn production_mode_is_opt_in() {
         let dir = ScratchDir::new(if production { "prod-on" } else { "prod-off" });
         let out = dir.path_str("output.sql");
         comparer.save_script(&out).await.expect("save script");
-        std::fs::read_to_string(&out).expect("read script")
+        std::fs::read_to_string(&out)
+            .expect("read script")
+            .to_lowercase()
     };
 
     let default_script = build(false).await;
     let production_script = build(true).await;
 
+    // The confound, pinned: present on both paths, so it discriminates nothing.
+    for (label, script) in [
+        ("default", &default_script),
+        ("production", &production_script),
+    ] {
+        assert!(
+            script.contains("create schema if not exists reporting;"),
+            "{label} output should carry the unguarded-by-production schema create:\n{script}"
+        );
+    }
+
+    // Default path: no guard on CREATE TABLE, index built inline, no
+    // post-commit section.
     assert!(
-        !default_script.to_lowercase().contains("post-commit"),
-        "default output must not carry a post-commit section:\n{default_script}"
+        default_script.contains("create table app.invoices"),
+        "default output must create the table without a guard:\n{default_script}"
     );
     assert!(
-        production_script.to_lowercase().contains("if not exists")
-            || production_script.to_lowercase().contains("post-commit"),
-        "production output must add idempotency guards:\n{production_script}"
+        !default_script.contains("create table if not exists app.invoices"),
+        "the CREATE TABLE guard is production-only:\n{default_script}"
+    );
+    assert!(
+        !default_script.contains("concurrently"),
+        "default output must build indexes inline:\n{default_script}"
+    );
+    assert!(
+        !default_script.contains("post-commit"),
+        "default output must not carry a post-commit section:\n{default_script}"
+    );
+
+    // Production path: guarded CREATE TABLE, CONCURRENTLY index, and the
+    // statement that cannot run in a transaction emitted after the commit.
+    assert!(
+        production_script.contains("create table if not exists app.invoices"),
+        "production output must guard CREATE TABLE:\n{production_script}"
+    );
+    assert!(
+        production_script.contains("create index concurrently if not exists ix_invoices_id"),
+        "production output must build the index concurrently:\n{production_script}"
+    );
+
+    let commit = production_script
+        .rfind("commit;")
+        .expect("production script commits");
+    let concurrent_index = production_script
+        .find("create index concurrently")
+        .expect("production script builds the index concurrently");
+    assert!(
+        concurrent_index > commit,
+        "CREATE INDEX CONCURRENTLY cannot run inside a transaction, so it must \
+         be emitted after commit:\n{production_script}"
     );
 }

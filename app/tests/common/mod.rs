@@ -21,6 +21,7 @@ use pgc::dump::sequence::Sequence;
 use pgc::dump::table::Table;
 use pgc::dump::table_column::TableColumn;
 use pgc::dump::table_constraint::TableConstraint;
+use pgc::dump::table_index::TableIndex;
 use pgc::dump::view::View;
 use sqlx::postgres::types::Oid;
 use std::path::{Path, PathBuf};
@@ -260,6 +261,19 @@ pub fn foreign_key(
         is_enforced: true,
         no_inherit: false,
         nulls_not_distinct: false,
+        comment: None,
+    }
+}
+
+/// A plain btree index on `column`.
+pub fn index(schema: &str, table: &str, name: &str, column: &str) -> TableIndex {
+    TableIndex {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        name: name.to_string(),
+        catalog: Some("postgres".to_string()),
+        indexdef: format!("CREATE INDEX {name} ON {schema}.{table} USING btree ({column})"),
+        is_partition_index: false,
         comment: None,
     }
 }
