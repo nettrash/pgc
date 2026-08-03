@@ -1,3 +1,5 @@
+//! User-defined casts (`pg_cast`) — `CREATE CAST`.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -137,5 +139,5 @@ impl Cast {
 }
 
 #[cfg(test)]
-#[path = "cast_tests.rs"]
+#[path = "tests/cast.rs"]
 mod tests;

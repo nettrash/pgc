@@ -1,9 +1,13 @@
 [package]
 name = "pgc"
-version = "1.0.26"
+version = "1.0.27"
 edition = "2024"
 license = "MIT"
 authors = ["nettrash <nettrash@nettrash.me>"]
+
+[lib]
+name = "pgc"
+path = "src/lib.rs"
 
 [[bin]]
 name = "pgc"

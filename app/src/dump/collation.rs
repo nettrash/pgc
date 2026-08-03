@@ -1,3 +1,5 @@
+//! Collations (`pg_collation`) — `CREATE COLLATION`.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -188,5 +190,5 @@ impl Collation {
 }
 
 #[cfg(test)]
-#[path = "collation_tests.rs"]
+#[path = "tests/collation.rs"]
 mod tests;

@@ -1,8 +1,13 @@
+//! Installed extensions (`pg_extension`) — `CREATE EXTENSION`.
+//!
+//! Only the name, version and schema are compared; an extension's own objects are
+//! owned by the extension and are never emitted individually.
+
 use serde::{Deserialize, Serialize};
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL extension.
+/// This is an information about a PostgreSQL extension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extension {
     /// Name of the extension
@@ -72,5 +77,5 @@ impl Extension {
 }
 
 #[cfg(test)]
-#[path = "extension_tests.rs"]
+#[path = "tests/extension.rs"]
 mod tests;

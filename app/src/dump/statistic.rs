@@ -1,3 +1,5 @@
+//! Extended statistics (`pg_statistic_ext`) — `CREATE STATISTICS`.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -238,5 +240,5 @@ impl Statistic {
 }
 
 #[cfg(test)]
-#[path = "statistic_tests.rs"]
+#[path = "tests/statistic.rs"]
 mod tests;

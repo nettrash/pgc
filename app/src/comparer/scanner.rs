@@ -185,5 +185,5 @@ pub(crate) fn dollar_tag_at(src: &[u8], pos: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-#[path = "scanner_tests.rs"]
+#[path = "tests/scanner.rs"]
 mod tests;

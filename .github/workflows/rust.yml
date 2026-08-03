@@ -42,6 +42,16 @@ jobs:
       run:
         cd ${{ github.workspace }}/app ;
         cargo build --verbose
+    # Documents private items too: pgc ships as a binary, so most of the code
+    # a contributor reads (comparer::core is 4 pub fns out of 47) is private,
+    # and a broken intra-doc link there is just as wrong. -D warnings turns
+    # unresolved links into a build failure instead of silent plain text.
+    - name: Check docs
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run:
+        cd ${{ github.workspace }}/app ;
+        cargo doc --no-deps --lib --document-private-items
     - name: Run tests
       run:
         cd ${{ github.workspace }}/app ;

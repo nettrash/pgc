@@ -1,3 +1,12 @@
+//! Functions, procedures and aggregates (`pg_proc`).
+//!
+//! Routines are compared by their full signature, not just their name: overloads
+//! are distinct objects, and an argument- or return-type change forces a drop and
+//! recreate rather than `CREATE OR REPLACE`. Because `DROP FUNCTION … CASCADE`
+//! silently takes dependent indexes, constraints, generated columns, defaults and
+//! policies with it, the comparer re-emits those afterwards — see
+//! [`column_dependent`](super::column_dependent).
+
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::types::Oid;
 
@@ -172,7 +181,7 @@ impl AggregateInfo {
     }
 }
 
-// This is an information about a PostgreSQL routine.
+/// This is an information about a PostgreSQL routine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Routine {
     /// The schema name of the routine.
@@ -819,5 +828,5 @@ impl Routine {
 }
 
 #[cfg(test)]
-#[path = "routine_tests.rs"]
+#[path = "tests/routine.rs"]
 mod tests;

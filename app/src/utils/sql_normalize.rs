@@ -514,5 +514,5 @@ fn trailing_array_cast(chars: &[char], pos: usize) -> Option<(String, usize)> {
 }
 
 #[cfg(test)]
-#[path = "sql_normalize_tests.rs"]
+#[path = "tests/sql_normalize.rs"]
 mod tests;

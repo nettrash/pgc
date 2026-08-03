@@ -1,3 +1,91 @@
+2026-08-03      v1.0.27
+
+                No change to what pgc emits. This release reorganises
+                the test suite, adds a library target and integration
+                tests, and documents the crate. The dump file format,
+                the CLI and the generated SQL are all unchanged.
+
+                Internals:
+                    - Added a library target (`app/src/lib.rs`)
+                      exporting the four existing modules. `main.rs`
+                      is now a thin binary over it and holds only CLI
+                      parsing and command dispatch. A binary-only
+                      crate cannot have integration tests or run
+                      doctests, so this is what the two sections below
+                      are built on. The binary's behaviour, its flags
+                      and its output are unaffected.
+
+                Tests:
+                    - Unit tests moved out of the source directories:
+                      `src/<module>/<name>_tests.rs` is now
+                      `src/<module>/tests/<name>.rs`. They remain
+                      `#[cfg(test)] #[path = ...] mod tests;` children
+                      of the module they cover, so they still reach
+                      its private items; only the file layout changed.
+                      `src/dump/` no longer interleaves 27 test files
+                      with the 28 sources beside them.
+                    - `comparer/core_tests.rs`, at 11,772 lines the
+                      largest file in the project, was split by
+                      concern into fifteen files under
+                      `src/comparer/tests/core/` — grants, views,
+                      persistence, routines, sequences, tables and so
+                      on — with the fixtures used by more than one of
+                      them in `helpers.rs`. The before and after test
+                      name sets are identical. Note that these
+                      submodules need explicit `#[path]` attributes:
+                      their parent is itself loaded through `#[path]`,
+                      so rustc resolves children against
+                      `src/comparer/tests/` rather than the `core/`
+                      subdirectory, and a bare `mod production;`
+                      silently binds to the unrelated
+                      `tests/production.rs`.
+                    - New integration suite in `app/tests/`, thirty
+                      tests over the public API only, covering ground
+                      the in-memory unit tests cannot reach: the zip
+                      dump file round-trip and the `#[serde(default)]`
+                      contract that keeps dumps from older versions
+                      readable; the full dump → file → dump → compare
+                      → script path the `compare` command takes,
+                      including that a schema compared against itself
+                      emits no DDL; `Config::load` against real files,
+                      among them the shipped `data/pgc.conf`; and the
+                      drop ordering of the `clear` command. Three
+                      further tests exercise a live server and are
+                      `#[ignore]`d by default — run them with
+                      `cargo test -- --ignored` and the standard `PG*`
+                      environment variables.
+                    - `cargo test` now runs 1106 tests, up from 1062.
+
+                Documentation:
+                    - Module-level documentation on all 36 modules.
+                      `dump/mod.rs` describes the
+                      hash / get_script / get_drop_script /
+                      get_alter_script shape that nearly every object
+                      module repeats, and what adding a new object
+                      kind requires, so the individual module headers
+                      only carry what is specific to that kind.
+                    - 245 comments on public items that were written
+                      with `//`, and therefore invisible to rustdoc,
+                      promoted to `///`. Trailing comments moved above
+                      the field they describe.
+                    - Fourteen doctests on the primary public API.
+                      They compile and run under `cargo test`, so the
+                      examples cannot drift from the code.
+                    - Fixed eight broken intra-doc links that had been
+                      rendering as plain text. Four were only visible
+                      with `--document-private-items`.
+
+                Tooling:
+                    - CI gained a docs step running
+                      `cargo doc --no-deps --lib
+                      --document-private-items` under
+                      `RUSTDOCFLAGS="-D warnings"`, so an unresolved
+                      link fails the build instead of degrading
+                      silently. Private items are included because pgc
+                      ships as a binary: most of what a contributor
+                      reads is private, and a broken link there is
+                      just as wrong.
+
 2026-07-28      v1.0.26
 
                 Bug fixes:
