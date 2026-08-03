@@ -37,7 +37,11 @@ async fn write_then_read_round_trips_every_object_kind() {
     // a dropped hash would silently turn "unchanged" into "recreate".
     for (before, after) in original.tables.iter().zip(&reloaded.tables) {
         assert_eq!(before.name, after.name);
-        assert_eq!(before.hash, after.hash, "table {} hash changed", before.name);
+        assert_eq!(
+            before.hash, after.hash,
+            "table {} hash changed",
+            before.name
+        );
     }
     for (before, after) in original.views.iter().zip(&reloaded.views) {
         assert_eq!(before.hash, after.hash, "view {} hash changed", before.name);
@@ -49,7 +53,9 @@ async fn round_trip_of_an_empty_dump_produces_an_empty_dump() {
     let dir = ScratchDir::new("empty");
     let path = dir.path_str("empty.dump");
 
-    empty_dump("blank").write_to_file(&path).expect("write dump");
+    empty_dump("blank")
+        .write_to_file(&path)
+        .expect("write dump");
     let reloaded = Dump::read_from_file(&path).await.expect("read dump");
 
     assert!(reloaded.schemas.is_empty());
@@ -61,7 +67,9 @@ async fn round_trip_of_an_empty_dump_produces_an_empty_dump() {
 async fn dump_file_is_a_zip_holding_a_single_dump_io_entry() {
     let dir = ScratchDir::new("layout");
     let path = dir.path_str("layout.dump");
-    populated_dump("shop").write_to_file(&path).expect("write dump");
+    populated_dump("shop")
+        .write_to_file(&path)
+        .expect("write dump");
 
     let mut archive =
         zip::ZipArchive::new(std::fs::File::open(&path).expect("open dump")).expect("read zip");
@@ -71,9 +79,14 @@ async fn dump_file_is_a_zip_holding_a_single_dump_io_entry() {
     assert_eq!(entry.name(), "dump.io");
 
     let mut json = String::new();
-    entry.read_to_string(&mut json).expect("entry is utf-8 json");
+    entry
+        .read_to_string(&mut json)
+        .expect("entry is utf-8 json");
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("entry is valid json");
-    assert!(parsed.get("tables").is_some(), "tables key is always present");
+    assert!(
+        parsed.get("tables").is_some(),
+        "tables key is always present"
+    );
     // `configuration` is `skip_serializing`: connection details, including the
     // password, must never reach the dump file.
     assert!(

@@ -112,7 +112,9 @@ fn single_transaction_wraps_the_clear_script() {
 
     let mut dump = populated_dump("shop");
     dump.types.clear();
-    let without_tx = dump.generate_clear_script(false, true, false).to_lowercase();
+    let without_tx = dump
+        .generate_clear_script(false, true, false)
+        .to_lowercase();
     assert!(
         !without_tx.contains("begin;"),
         "use_single_transaction=false must not open a transaction:\n{without_tx}"
@@ -141,7 +143,10 @@ fn use_comments_false_strips_the_per_statement_commentary() {
             "use_comments=false left a comment behind: {line}"
         );
     }
-    assert!(!after_header.contains("---> Drop"), "section banners are dropped");
+    assert!(
+        !after_header.contains("---> Drop"),
+        "section banners are dropped"
+    );
     // Stripping comments must not strip the statements.
     assert!(after_header.to_lowercase().contains("drop table if exists"));
 }

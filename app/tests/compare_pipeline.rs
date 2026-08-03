@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{ScratchDir, populated_dump, table, view};
+use common::{ScratchDir, assert_no_ddl, populated_dump, table, view};
 use pgc::comparer::core::Comparer;
 use pgc::config::grants_mode::GrantsMode;
 use pgc::dump::core::Dump;
@@ -22,7 +22,9 @@ async fn compare_via_files(from: Dump, to: Dump, use_drop: bool, label: &str) ->
     from.write_to_file(&from_path).expect("write FROM dump");
     to.write_to_file(&to_path).expect("write TO dump");
 
-    let from = Dump::read_from_file(&from_path).await.expect("read FROM dump");
+    let from = Dump::read_from_file(&from_path)
+        .await
+        .expect("read FROM dump");
     let to = Dump::read_from_file(&to_path).await.expect("read TO dump");
 
     let mut comparer = Comparer::new(from, to, use_drop, false, true, GrantsMode::Ignore);
@@ -44,13 +46,7 @@ async fn comparing_a_dump_against_itself_emits_no_ddl() {
     )
     .await;
 
-    for line in script.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("--") || line.starts_with("/*") {
-            continue;
-        }
-        panic!("self-comparison emitted DDL:\n{script}");
-    }
+    assert_no_ddl(&script, "self-comparison");
 }
 
 #[tokio::test]
@@ -138,7 +134,9 @@ async fn single_transaction_wraps_the_script_in_begin_and_commit() {
 
     let script = std::fs::read_to_string(&out_path).expect("read script");
     let lower = script.to_lowercase();
-    let begin = lower.find("begin;").expect("script must open a transaction");
+    let begin = lower
+        .find("begin;")
+        .expect("script must open a transaction");
     let commit = lower.rfind("commit;").expect("script must commit");
     assert!(begin < commit, "begin must precede commit:\n{script}");
 }
@@ -151,8 +149,14 @@ async fn production_mode_is_opt_in() {
     let build = |production: bool| async move {
         let mut to = populated_dump("shop");
         to.tables.push(table("app", "invoices", &["id"]));
-        let mut comparer =
-            Comparer::new(populated_dump("shop"), to, true, true, true, GrantsMode::Ignore);
+        let mut comparer = Comparer::new(
+            populated_dump("shop"),
+            to,
+            true,
+            true,
+            true,
+            GrantsMode::Ignore,
+        );
         comparer.set_output_for_production(production);
         comparer.compare().await.expect("compare");
         let dir = ScratchDir::new(if production { "prod-on" } else { "prod-off" });

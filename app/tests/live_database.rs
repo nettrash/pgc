@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::ScratchDir;
+use common::{ScratchDir, assert_no_ddl};
 use pgc::comparer::core::Comparer;
 use pgc::config::dump_config::DumpConfig;
 use pgc::config::grants_mode::GrantsMode;
@@ -23,9 +23,8 @@ use pgc::dump::core::Dump;
 /// Connection details from the standard `PG*` environment variables, with the
 /// same defaults as the `pgc` CLI.
 fn env_config(file: &str) -> DumpConfig {
-    let var = |name: &str, fallback: &str| {
-        std::env::var(name).unwrap_or_else(|_| fallback.to_string())
-    };
+    let var =
+        |name: &str, fallback: &str| std::env::var(name).unwrap_or_else(|_| fallback.to_string());
     DumpConfig {
         host: var("PGHOST", "localhost"),
         port: var("PGPORT", "5432"),
@@ -74,13 +73,7 @@ async fn live_database_compared_against_itself_emits_no_ddl() {
     comparer.save_script(&out).await.expect("save script");
     let script = std::fs::read_to_string(&out).expect("read script");
 
-    for line in script.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("--") || line.starts_with("/*") {
-            continue;
-        }
-        panic!("self-comparison of a live database emitted DDL:\n{script}");
-    }
+    assert_no_ddl(&script, "self-comparison of a live database");
 }
 
 #[tokio::test]
@@ -92,7 +85,10 @@ async fn inspect_populates_a_dump_without_writing_a_file() {
     let mut dump = Dump::new(env_config(&path));
     dump.inspect(8).await.expect("inspect the live database");
 
-    assert!(!dump.schemas.is_empty(), "inspect must find at least one schema");
+    assert!(
+        !dump.schemas.is_empty(),
+        "inspect must find at least one schema"
+    );
     assert!(
         !std::path::Path::new(&path).exists(),
         "inspect must not write the dump file"

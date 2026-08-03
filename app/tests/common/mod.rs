@@ -40,10 +40,7 @@ impl ScratchDir {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "pgc-it-{label}-{}-{n}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("pgc-it-{label}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create scratch dir");
         Self { path }
@@ -63,6 +60,50 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// Strip SQL comments so a generated script can be checked for "contains no
+/// statements at all".
+///
+/// Handles `--` to end-of-line and nested `/* … */` blocks, which the headers
+/// and section banners `pgc` emits are built from. It does *not* skip string
+/// literals — it does not need to: a script containing a literal necessarily
+/// contains a statement, so the caller's emptiness assertion fails either way.
+pub fn strip_sql_comments(script: &str) -> String {
+    let bytes: Vec<char> = script.chars().collect();
+    let mut out = String::with_capacity(script.len());
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '/' && bytes.get(i + 1) == Some(&'*') {
+            depth += 1;
+            i += 2;
+        } else if depth > 0 && bytes[i] == '*' && bytes.get(i + 1) == Some(&'/') {
+            depth -= 1;
+            i += 2;
+        } else if depth > 0 {
+            i += 1;
+        } else if bytes[i] == '-' && bytes.get(i + 1) == Some(&'-') {
+            while i < bytes.len() && bytes[i] != '\n' {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Panic with the full script unless it consists purely of comments and
+/// whitespace — the shape a no-op migration must have.
+pub fn assert_no_ddl(script: &str, context: &str) {
+    let stripped = strip_sql_comments(script);
+    let remaining = stripped.trim();
+    assert!(
+        remaining.is_empty(),
+        "{context} emitted DDL:\n--- statements ---\n{remaining}\n--- full script ---\n{script}"
+    );
 }
 
 /// Absolute path to a file under the repository's `data/` directory.
