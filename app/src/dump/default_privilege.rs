@@ -1,3 +1,11 @@
+//! Default privileges (`pg_default_acl`) — the
+//! `ALTER DEFAULT PRIVILEGES … GRANT … TO …` statements that decide what ACL a
+//! newly created object starts with.
+//!
+//! This is why [`Comparer`](crate::comparer::core::Comparer) tracks
+//! `recreated_tables`: a table dropped and recreated during a migration inherits
+//! these defaults, so re-emitting the same grants would be redundant.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

@@ -1,3 +1,16 @@
+//! The [`Dump`] snapshot: every object `pgc` knows how to compare, for one
+//! database, plus the code that fills it and moves it to and from disk.
+//!
+//! The private `Dump::fill` runs the per-object-kind queries in parallel over a single
+//! [`PgPool`]. Connection budgeting there is a hard correctness concern — see
+//! `FILL_SIBLING_BRANCH_COUNT` and the `fill_try_join!` macro at the top of this
+//! file.
+//!
+//! On disk a dump is a zip archive holding one `dump.io` entry with the
+//! JSON-serialized `Dump`. Fields added after the initial release carry
+//! `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so dumps written by
+//! older `pgc` versions stay readable; preserve that when adding object kinds.
+
 use crate::dump::cast::Cast;
 use crate::dump::collation::Collation;
 use crate::dump::column_dependent::{ColumnDependent, ColumnDependentKind};
@@ -39,7 +52,7 @@ use zip::write::SimpleFileOptions;
 /// possible.
 ///
 /// This constant is statically asserted to equal the actual arity of the
-/// [`fill_try_join!`] invocation in [`Dump::fill`]; adding or removing a
+/// `fill_try_join!` invocation in [`Dump::fill`]; adding or removing a
 /// branch without updating this value is a compile error.
 pub(crate) const FILL_SIBLING_BRANCH_COUNT: u32 = 13;
 
@@ -70,109 +83,132 @@ macro_rules! fill_try_join {
     }};
 }
 
-// This file defines the Dump struct and its serialization/deserialization logic.
+/// This file defines the Dump struct and its serialization/deserialization logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dump {
-    // Configuration of the dump.
+    /// Configuration of the dump.
     #[serde(skip_serializing, skip_deserializing)]
     pub configuration: DumpConfig,
 
-    // List of schemas in the dump.
+    /// List of schemas in the dump.
     pub schemas: Vec<Schema>,
 
-    // List of extensions in the dump.
+    /// List of extensions in the dump.
     pub extensions: Vec<Extension>,
 
-    // List of PostgreSQL types in the dump.
+    /// List of PostgreSQL types in the dump.
     pub types: Vec<PgType>,
 
-    // List of PostgreSQL enums in the dump.
+    /// List of PostgreSQL enums in the dump.
     pub enums: Vec<PgEnum>,
 
-    // List of sequences in the dump.
+    /// List of sequences in the dump.
     pub sequences: Vec<Sequence>,
 
-    // List of routines in the dump.
+    /// List of routines in the dump.
     pub routines: Vec<Routine>,
 
-    // List of tables in the dump.
+    /// List of tables in the dump.
     pub tables: Vec<Table>,
 
-    // List of views in the dump.
+    /// List of views in the dump.
     pub views: Vec<View>,
 
-    // List of foreign tables in the dump.
+    /// List of foreign tables in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_tables: Vec<ForeignTable>,
 
-    // List of extended statistics in the dump.
+    /// List of extended statistics in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statistics: Vec<Statistic>,
 
-    // List of rules in the dump.
+    /// List of rules in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
 
-    // List of event triggers in the dump.
+    /// List of event triggers in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_triggers: Vec<EventTrigger>,
 
-    // List of collations in the dump.
+    /// List of collations in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collations: Vec<Collation>,
 
-    // List of text search configurations in the dump.
+    /// List of text search configurations in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ts_configs: Vec<TextSearchConfig>,
 
-    // List of text search dictionaries in the dump.
+    /// List of text search dictionaries in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ts_dicts: Vec<TextSearchDict>,
 
-    // List of user-defined casts in the dump.
+    /// List of user-defined casts in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub casts: Vec<Cast>,
 
-    // List of user-defined operators in the dump.
+    /// List of user-defined operators in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operators: Vec<Operator>,
 
-    // List of default ACL entries in the dump.
+    /// List of default ACL entries in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_privileges: Vec<DefaultPrivilege>,
 
-    // List of publications in the dump.
+    /// List of publications in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub publications: Vec<Publication>,
 
-    // List of subscriptions in the dump.
+    /// List of subscriptions in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<Subscription>,
 
-    // List of foreign-data wrappers in the dump.
+    /// List of foreign-data wrappers in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_data_wrappers: Vec<ForeignDataWrapper>,
 
-    // List of foreign servers in the dump.
+    /// List of foreign servers in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_servers: Vec<ForeignServer>,
 
-    // List of user mappings in the dump.
+    /// List of user mappings in the dump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_mappings: Vec<UserMapping>,
 
-    // Column → dependent-object edges from pg_depend. Powers Phase 7's
-    // restoration of secondary dependents (indexes/constraints/policies)
-    // that PostgreSQL silently CASCADE-drops along with a generated
-    // column. Empty in pre-issue-#188 dumps; the comparer degrades to the
-    // previous behaviour (the documented "run pgc compare twice"
-    // workaround) when the field is absent.
+    /// Column → dependent-object edges from pg_depend. Powers Phase 7's
+    /// restoration of secondary dependents (indexes/constraints/policies)
+    /// that PostgreSQL silently CASCADE-drops along with a generated
+    /// column. Empty in pre-issue-#188 dumps; the comparer degrades to the
+    /// previous behaviour (the documented "run pgc compare twice"
+    /// workaround) when the field is absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_dependents: Vec<ColumnDependent>,
 }
 
 impl Dump {
-    // Create a new Dump instance.
+    /// Create a new Dump instance.
+    /// An empty dump bound to `config`. Nothing is read from the database until
+    /// [`process`](Self::process) or [`inspect`](Self::inspect) is called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pgc::config::dump_config::DumpConfig;
+    /// use pgc::dump::core::Dump;
+    ///
+    /// let dump = Dump::new(DumpConfig {
+    ///     host: "localhost".to_string(),
+    ///     port: "5432".to_string(),
+    ///     user: "postgres".to_string(),
+    ///     password: String::new(),
+    ///     database: "shop".to_string(),
+    ///     scheme: "public".to_string(),
+    ///     ssl: false,
+    ///     file: "shop.dump".to_string(),
+    /// });
+    ///
+    /// assert!(dump.schemas.is_empty());
+    /// assert!(dump.tables.is_empty());
+    /// ```
     pub fn new(config: DumpConfig) -> Self {
         Dump {
             configuration: config,
@@ -203,7 +239,33 @@ impl Dump {
         }
     }
 
-    // Retrieve the dump from the configuration.
+    /// Retrieve the dump from the configuration.
+    /// Connect, introspect every object kind, and write the dump to
+    /// `config.file`. This is the `pgc --command dump` path.
+    ///
+    /// `max_connections` sizes the pool the parallel fill runs over.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// # use pgc::dump::core::Dump;
+    /// # fn main() -> Result<(), std::io::Error> {
+    /// # tokio::runtime::Runtime::new()?.block_on(async {
+    /// # let config = DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: "shop.dump".to_string(),
+    /// # };
+    /// let mut dump = Dump::new(config);
+    /// dump.process(16).await?;
+    /// println!("{}", dump.get_info());
+    /// # Ok::<(), std::io::Error>(())
+    /// # })?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn process(&mut self, max_connections: u32) -> Result<(), Error> {
         if max_connections < FILL_SIBLING_BRANCH_COUNT {
             eprintln!(
@@ -244,6 +306,45 @@ impl Dump {
     /// Buffering keeps peak memory bounded (no full intermediate `String`
     /// copy of the payload) while still amortising the compressor overhead.
     /// Pairs with [`Dump::read_from_file`].
+    /// The connection configuration is deliberately *not* written, so a dump
+    /// file never carries a password.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pgc::config::dump_config::DumpConfig;
+    /// use pgc::dump::core::Dump;
+    /// use pgc::dump::schema::Schema;
+    ///
+    /// # fn main() -> Result<(), std::io::Error> {
+    /// # tokio::runtime::Runtime::new()?.block_on(async {
+    /// # let config = DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: "hunter2".to_string(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let path = std::env::temp_dir().join("pgc-doctest-write.dump");
+    /// let path = path.to_str().unwrap();
+    ///
+    /// let mut dump = Dump::new(config);
+    /// dump.schemas.push(Schema::new("app".to_string(), "app".to_string(), None));
+    /// dump.write_to_file(path)?;
+    ///
+    /// let reloaded = Dump::read_from_file(path).await?;
+    /// assert_eq!(reloaded.schemas.len(), 1);
+    ///
+    /// // The credentials did not survive the round-trip, because they were
+    /// // never written: the reloaded dump carries `DumpConfig::default()`.
+    /// assert_ne!(reloaded.configuration.password, "hunter2");
+    /// assert_eq!(reloaded.configuration.password, DumpConfig::default().password);
+    ///
+    /// std::fs::remove_file(path)?;
+    /// # Ok::<(), std::io::Error>(())
+    /// # })?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn write_to_file(&self, path: &str) -> Result<(), Error> {
         const WRITE_BUF_BYTES: usize = 256 * 1024;
         let file = File::create(path)?;
@@ -3379,7 +3480,7 @@ impl Dump {
         }
     }
 
-    // Read a dump from a file and deserialize it.
+    /// Read a dump from a file and deserialize it.
     pub async fn read_from_file(file: &str) -> Result<Self, Error> {
         let file = File::open(file)?;
         let mut zip = zip::ZipArchive::new(file)?;
@@ -3441,6 +3542,36 @@ impl Dump {
     /// The drop order respects dependencies: views (topologically sorted by
     /// table_relation), tables (with foreign keys dropped first), routines,
     /// sequences, types/enums, extensions, schemas.
+    /// `use_cascade` is destructive across schema boundaries: `CASCADE` can drop
+    /// dependents outside the selected schemas. Without it, the ordering above
+    /// is the only guarantee, and unresolved cross-schema dependencies make the
+    /// script fail rather than silently over-drop.
+    ///
+    /// ```
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// use pgc::dump::core::Dump;
+    /// use pgc::dump::schema::Schema;
+    ///
+    /// # let config = DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let mut dump = Dump::new(config);
+    /// dump.schemas.push(Schema::new("app".to_string(), "app".to_string(), None));
+    ///
+    /// let script = dump.generate_clear_script(
+    ///     true,   // use_single_transaction
+    ///     true,   // use_comments
+    ///     false,  // use_cascade
+    /// );
+    ///
+    /// assert!(script.contains("begin;"));
+    /// assert!(script.contains("drop schema if exists app;"));
+    /// assert!(script.contains("commit;"));
+    /// assert!(!script.to_lowercase().contains("cascade"));
+    /// ```
     pub fn generate_clear_script(
         &self,
         use_single_transaction: bool,

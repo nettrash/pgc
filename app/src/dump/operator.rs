@@ -1,3 +1,5 @@
+//! User-defined operators (`pg_operator`) — `CREATE OPERATOR`. Schema-scoped.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

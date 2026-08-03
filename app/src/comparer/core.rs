@@ -1,3 +1,19 @@
+//! The [`Comparer`] — reads two [`Dump`]s and emits the
+//! migration SQL that makes `FROM` equal to `TO`.
+//!
+//! Output is assembled from several ordered buffers rather than one string,
+//! because PostgreSQL dependency rules do not match the order objects are
+//! compared in. They are concatenated as:
+//!
+//! ```text
+//! script  →  sequence_post  →  type_post  →  enum_post  →  trigger_post
+//! ```
+//!
+//! The comparer also tracks cross-cutting state that individual passes need:
+//! `dropped_views` and `recreated_tables` coordinate drop/recreate sequencing,
+//! and `serial_columns` keeps owned sequences from being emitted independently
+//! of their table.
+
 use crate::comparer::production::{self, ChildRef, PartitionContext};
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
@@ -15,8 +31,8 @@ use std::{
     io::{Error, Write},
 };
 
-// This is a Dump comparer that generates a script comparing two PostgreSQL dumps.
-// The result script, if it will be applied on "from" dump database, will make it equal to "to" dump database.
+/// This is a Dump comparer that generates a script comparing two PostgreSQL dumps.
+/// The result script, if it will be applied on "from" dump database, will make it equal to "to" dump database.
 pub struct Comparer {
     // The dump to compare from
     from: Dump,
@@ -58,7 +74,7 @@ pub struct Comparer {
 }
 
 impl Comparer {
-    // Creates a new Comparer with the given dumps
+    /// Creates a new Comparer with the given dumps
     pub fn new(
         from: Dump,
         to: Dump,
@@ -108,12 +124,35 @@ impl Comparer {
     /// built concurrently (partition-aware), foreign keys are added `NOT VALID`
     /// then validated after commit, and indexes are dropped concurrently — all
     /// post-commit statements are emitted after the main transaction.
+    /// Returns `&mut Self` so it can be chained after construction.
+    ///
+    /// ```
+    /// # use pgc::comparer::core::Comparer;
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// # use pgc::config::grants_mode::GrantsMode;
+    /// # use pgc::dump::core::Dump;
+    /// # let config = || DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let mut comparer = Comparer::new(
+    ///     Dump::new(config()),
+    ///     Dump::new(config()),
+    ///     true,
+    ///     true,
+    ///     true,
+    ///     GrantsMode::Ignore,
+    /// );
+    /// comparer.set_output_for_production(true);
+    /// ```
     pub fn set_output_for_production(&mut self, value: bool) -> &mut Self {
         self.output_for_production = value;
         self
     }
 
-    // Compare dumps and generate the script
+    /// Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
         if self.output_for_production {
             // The statements that cannot run inside a transaction block are
@@ -657,7 +696,7 @@ impl Comparer {
         Self::kahn_toposort_detect_cycle(n, depends_on, sort_key).0
     }
 
-    /// Like [`kahn_toposort`], but also returns the set of nodes that
+    /// Like [`Comparer::kahn_toposort`], but also returns the set of nodes that
     /// could not be ordered acyclically — i.e. nodes whose in-degree
     /// never reached zero during the BFS. Those nodes still appear in
     /// the returned `Vec` (appended in `sort_key` order so the result
@@ -671,7 +710,7 @@ impl Comparer {
     /// Kahn was unable to remove — that includes nodes *blocked by*
     /// a cycle (e.g. `C` in `A↔B + A→C`), not only nodes *in* a
     /// cycle. Callers that need to act on *true* cycle members
-    /// should pair this with [`strongly_connected_components`] —
+    /// should pair this with [`Comparer::strongly_connected_components`] —
     /// `topo_order_within_subset_detect_cycle` does exactly that
     /// (PR #198 review).
     fn kahn_toposort_detect_cycle<K: Ord>(
@@ -980,7 +1019,7 @@ impl Comparer {
         dependent_views
     }
 
-    // Saves the generated script to a file
+    /// Saves the generated script to a file
     pub async fn save_script(&self, output: &str) -> Result<(), Error> {
         let mut file = File::create(output)?;
         file.write_all(self.get_script().as_bytes())?;
@@ -2636,7 +2675,7 @@ impl Comparer {
     /// restricted to `subset` is acyclic the cyclic set is empty.
     ///
     /// PR #198 review: the cyclic set is computed via
-    /// [`strongly_connected_components`] (Tarjan), not the raw Kahn
+    /// [`Comparer::strongly_connected_components`] (Tarjan), not the raw Kahn
     /// remainder. The remainder would include nodes merely *blocked
     /// by* a cycle (e.g. `C` in `A↔B + A→C`), and treating them as
     /// cycle participants would drop FKs that are not actually in

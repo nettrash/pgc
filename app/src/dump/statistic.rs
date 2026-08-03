@@ -1,3 +1,5 @@
+//! Extended statistics (`pg_statistic_ext`) — `CREATE STATISTICS`.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

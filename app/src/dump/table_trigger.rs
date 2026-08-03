@@ -1,15 +1,24 @@
+//! Triggers (`pg_trigger`) — `CREATE TRIGGER`.
+//!
+//! A trigger needs both its table and its trigger function, so creation is
+//! deferred to the comparer's `trigger_post_script` buffer, which is emitted last.
+//! Constraint triggers backing a foreign key are excluded.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::types::Oid;
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL table trigger.
+/// This is an information about a PostgreSQL table trigger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableTrigger {
-    pub oid: Oid,           // Object identifier of the trigger
-    pub name: String,       // Name of the trigger
-    pub definition: String, // Definition of the trigger
+    /// Object identifier of the trigger
+    pub oid: Oid,
+    /// Name of the trigger
+    pub name: String,
+    /// Definition of the trigger
+    pub definition: String,
     /// Trigger enabled state from pg_trigger.tgenabled:
     /// 'O' = fires in "origin" and "local" modes (the default),
     /// 'D' = disabled,

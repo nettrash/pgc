@@ -418,10 +418,11 @@ const ALTER_GUARDS: &[AlterGuard] = &[
 
 /// Make a production migration script re-runnable by injecting idempotency
 /// guards into the DDL forms PostgreSQL supports them for. Applied once, at the
-/// end of [`Comparer::compare`], only when `output_for_production` is set.
+/// end of [`crate::comparer::core::Comparer::compare`], only when
+/// `output_for_production` is set.
 ///
-/// The scan is literal-, comment- and dollar-quote-aware (mirroring
-/// [`crate::comparer::scanner::strip_comments_and_collapse`]) so a keyword that
+/// The scan is literal-, comment- and dollar-quote-aware (mirroring the private
+/// `comparer::scanner::strip_comments_and_collapse`) so a keyword that
 /// appears inside a string literal, quoted identifier, or comment is never
 /// mistaken for a statement to rewrite — including the `-- ` line-commented
 /// drops emitted when `use_drop` is off, which must stay untouched.

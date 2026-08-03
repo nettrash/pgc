@@ -1,3 +1,15 @@
+//! Access control lists — parsing PostgreSQL `aclitem` strings and turning the
+//! difference between two of them into `GRANT` / `REVOKE` statements.
+//!
+//! An `aclitem` renders as `grantee=privileges/grantor`, where each privilege is
+//! a single character (`r` SELECT, `a` INSERT, `w` UPDATE, `d` DELETE,
+//! `D` TRUNCATE, `x` REFERENCES, `t` TRIGGER, `X` EXECUTE, `U` USAGE, `C` CREATE,
+//! `c` CONNECT, `T` TEMPORARY) and a trailing `*` means WITH GRANT OPTION. An
+//! empty grantee means `PUBLIC`.
+//!
+//! What actually gets emitted depends on
+//! [`GrantsMode`](crate::config::grants_mode::GrantsMode).
+
 use crate::utils::string_extensions::StringExt;
 
 /// Represents a single parsed PostgreSQL ACL entry.
@@ -54,7 +66,28 @@ fn find_unquoted(s: &str, target: u8) -> Option<usize> {
 impl AclEntry {
     /// Parse a single ACL item string like `"user=arwdDxt/owner"`. Quoted
     /// role names with embedded `=` or `/` (e.g. `"weird=name"=r/owner`) are
-    /// handled correctly via [`find_unquoted`].
+    /// handled correctly via the private `find_unquoted` scanner.
+    /// # Examples
+    ///
+    /// ```
+    /// use pgc::dump::acl::AclEntry;
+    ///
+    /// let entry = AclEntry::parse("alice=arwd/postgres").unwrap();
+    /// assert_eq!(entry.grantee, "alice");
+    /// assert_eq!(entry.privileges, "arwd");
+    /// assert_eq!(entry.grantor, "postgres");
+    ///
+    /// // An empty grantee is PUBLIC.
+    /// assert_eq!(AclEntry::parse("=r/postgres").unwrap().grantee, "");
+    ///
+    /// // Separators inside a quoted role name do not confuse the parser.
+    /// let quoted = AclEntry::parse("\"weird=name\"=r/postgres").unwrap();
+    /// assert_eq!(quoted.grantee, "\"weird=name\"");
+    /// assert_eq!(quoted.privileges, "r");
+    ///
+    /// // An item granting nothing is not an entry.
+    /// assert!(AclEntry::parse("alice=/postgres").is_none());
+    /// ```
     pub fn parse(acl_item: &str) -> Option<Self> {
         let eq_pos = find_unquoted(acl_item, b'=')?;
         // Search for `/` only after the `=` so a slash inside the grantee
@@ -156,6 +189,20 @@ impl AclEntry {
 
     /// Generate GRANT statement(s) for this ACL entry on the given object.
     /// Privileges with and without GRANT OPTION are emitted as separate statements.
+    /// # Examples
+    ///
+    /// ```
+    /// use pgc::dump::acl::AclEntry;
+    ///
+    /// let script = AclEntry::get_grant_script("alice=rw/postgres", "TABLE", "app.orders");
+    /// assert!(script.contains("GRANT SELECT, UPDATE ON TABLE app.orders TO alice;"));
+    ///
+    /// // Privileges valid for one object kind are dropped for another: a
+    /// // sequence has no TRIGGER privilege, so `t` is ignored.
+    /// let seq = AclEntry::get_grant_script("alice=rt/postgres", "SEQUENCE", "app.s");
+    /// assert!(seq.contains("SELECT"));
+    /// assert!(!seq.contains("TRIGGER"));
+    /// ```
     pub fn get_grant_script(acl_item: &str, object_kind: &str, object_name: &str) -> String {
         let entry = match AclEntry::parse(acl_item) {
             Some(e) => e,

@@ -1,3 +1,11 @@
+//! Identifier quoting and script-assembly helpers.
+//!
+//! [`unquote_ident`] reverses PostgreSQL's `quote_ident()` rendering, recovering
+//! the raw catalog name. Case-sensitivity is the reason this matters: `"Foo"` and
+//! `foo` are different relations, and a dump stores both spellings.
+//!
+//! The [`StringExt`] trait adds the small append helpers the script builders use.
+
 const EMPTY_LINES: &str = "\n\n";
 
 pub trait StringExt {
@@ -24,6 +32,22 @@ pub trait StringExt {
 /// - The one input it cannot round-trip is a raw, never-quoted name that itself
 ///   begins and ends with a double quote; such a name is indistinguishable from a
 ///   quoted rendering of its own interior.
+/// # Examples
+///
+/// ```
+/// use pgc::utils::string_extensions::unquote_ident;
+///
+/// // A quoted identifier gives back its raw catalog name…
+/// assert_eq!(unquote_ident("\"MyView\""), "MyView");
+/// // …and an unquoted one is already raw.
+/// assert_eq!(unquote_ident("myview"), "myview");
+///
+/// // Doubled quotes inside a quoted identifier collapse to one.
+/// assert_eq!(unquote_ident("\"say \"\"hi\"\"\""), "say \"hi\"");
+///
+/// // Case matters: these are two different relations.
+/// assert_ne!(unquote_ident("\"Foo\""), unquote_ident("foo"));
+/// ```
 pub fn unquote_ident(part: &str) -> String {
     let trimmed = part.trim();
     match trimmed

@@ -1,3 +1,6 @@
+//! Full-text search objects: [`TextSearchConfig`] (`pg_ts_config`) and
+//! [`TextSearchDict`] (`pg_ts_dict`).
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

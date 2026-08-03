@@ -1,3 +1,5 @@
+//! Event triggers (`pg_event_trigger`) — database-wide `CREATE EVENT TRIGGER`.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -11,11 +13,15 @@ fn escape_single_quotes(value: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventTrigger {
     pub name: String,
-    pub event: String, // e.g. "ddl_command_start", "ddl_command_end", "sql_drop", "table_rewrite"
-    pub function_name: String, // Fully-qualified function name
+    /// e.g. "ddl_command_start", "ddl_command_end", "sql_drop", "table_rewrite"
+    pub event: String,
+    /// Fully-qualified function name
+    pub function_name: String,
+    /// Filter tags (e.g. "CREATE TABLE", "DROP TABLE")
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>, // Filter tags (e.g. "CREATE TABLE", "DROP TABLE")
-    pub enabled: String, // O=origin/local, D=disabled, R=replica, A=always
+    pub tags: Vec<String>,
+    /// O=origin/local, D=disabled, R=replica, A=always
+    pub enabled: String,
     pub owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,

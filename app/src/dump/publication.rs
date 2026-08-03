@@ -1,3 +1,9 @@
+//! Logical replication: [`Publication`] (`pg_publication`) and [`Subscription`]
+//! (`pg_subscription`).
+//!
+//! Creating a publication needs the server running with `wal_level = logical`,
+//! which is why CI starts PostgreSQL that way for the fixture schemas.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

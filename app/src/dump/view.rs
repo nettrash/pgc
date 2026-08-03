@@ -1,3 +1,15 @@
+//! Views and materialized views (`pg_class`), carried as their deparsed
+//! definition.
+//!
+//! Ordering is the whole problem: a view may read other views, so creation is
+//! topologically sorted and dropping runs in reverse. A change is applied with
+//! `CREATE OR REPLACE` where PostgreSQL allows it — which requires the existing
+//! column list to be a prefix of the new one — and otherwise degrades to a drop
+//! and recreate that also takes every dependent view with it.
+//!
+//! Materialized views are separate objects with their own indexes, and a regular ↔
+//! materialized transition is always a drop and recreate.
+
 use serde::{Deserialize, Serialize};
 
 use crate::dump::table::IndexAlterPlan;
@@ -36,7 +48,7 @@ pub struct ViewColumn {
     pub collation: Option<String>,
 }
 
-// This is an information about a PostgreSQL view.
+/// This is an information about a PostgreSQL view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
     /// Schema where the view is defined

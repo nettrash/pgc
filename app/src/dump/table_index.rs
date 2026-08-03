@@ -1,3 +1,10 @@
+//! Indexes (`pg_index`), carried as their `pg_get_indexdef` text.
+//!
+//! Indexes backing a constraint are owned by that constraint and must not be
+//! emitted independently. Under `--output-for-production` index builds and drops
+//! become `CONCURRENTLY`, which cannot run inside a transaction and so moves to
+//! the post-commit section.
+
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
@@ -5,16 +12,22 @@ use sha2::{Digest, Sha256};
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL table.
+/// This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableIndex {
-    pub schema: String,          // Schema name
-    pub table: String,           // Table name
-    pub name: String,            // Index name
-    pub catalog: Option<String>, // Catalog name
-    pub indexdef: String,        // Index definition
+    /// Schema name
+    pub schema: String,
+    /// Table name
+    pub table: String,
+    /// Index name
+    pub name: String,
+    /// Catalog name
+    pub catalog: Option<String>,
+    /// Index definition
+    pub indexdef: String,
+    /// Whether this index is inherited from a partitioned parent
     #[serde(default)]
-    pub is_partition_index: bool, // Whether this index is inherited from a partitioned parent
+    pub is_partition_index: bool,
     /// Optional comment on the index
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,

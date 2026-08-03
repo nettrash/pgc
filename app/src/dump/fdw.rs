@@ -1,3 +1,10 @@
+//! Foreign-data infrastructure: [`ForeignDataWrapper`] (`pg_foreign_data_wrapper`),
+//! [`ForeignServer`] (`pg_foreign_server`) and [`UserMapping`] (`pg_user_mapping`).
+//!
+//! They are ordered by dependency — a server needs its wrapper, a user mapping
+//! needs its server — and [`ForeignTable`](super::foreign_table::ForeignTable)
+//! needs all three.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

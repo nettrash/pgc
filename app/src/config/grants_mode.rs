@@ -1,9 +1,39 @@
+//! How privilege differences are handled — the `--grants-mode` flag.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
 /// Controls how grants (privileges) are handled during comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// Parsed from the `--grants-mode` flag or the `GRANTS_MODE` config key, and
+/// rendered back with [`Display`](std::fmt::Display).
+///
+/// ```
+/// use pgc::config::grants_mode::GrantsMode;
+///
+/// assert_eq!("ignore".parse(), Ok(GrantsMode::Ignore));
+/// assert_eq!("full".parse(), Ok(GrantsMode::Full));
+///
+/// // The additive mode accepts three spellings.
+/// for spelling in ["addonly", "add_only", "add-only"] {
+///     assert_eq!(spelling.parse(), Ok(GrantsMode::AddOnly));
+/// }
+///
+/// // Matching is case-insensitive, and Display round-trips.
+/// assert_eq!("FULL".parse::<GrantsMode>().unwrap().to_string(), "full");
+///
+/// assert!("sometimes".parse::<GrantsMode>().is_err());
+/// ```
+///
+/// The default is [`GrantsMode::Ignore`] — privilege diffs are not emitted
+/// unless asked for.
+///
+/// ```
+/// # use pgc::config::grants_mode::GrantsMode;
+/// assert_eq!(GrantsMode::default(), GrantsMode::Ignore);
+/// ```
 pub enum GrantsMode {
     /// Ignore grants entirely (default, current behaviour).
     #[default]

@@ -1,3 +1,10 @@
+//! User-defined types (`pg_type`) — domains, composites, ranges and multiranges,
+//! along with their domain constraints and composite attributes.
+//!
+//! Types are dropped *after* routines and recreated *before* them, since a routine
+//! signature can name a type. Multirange types are created and dropped implicitly
+//! with their range type and must never be emitted on their own.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::types::Oid;
@@ -25,69 +32,115 @@ fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-// This is an information about a PostgreSQL type.
+/// This is an information about a PostgreSQL type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PgType {
-    pub oid: Oid,          // Unique identifier of the type
-    pub schema: String,    // Schema where the type is defined
-    pub typname: String,   // Name of the type
-    pub typnamespace: Oid, // Schema where the type is defined
-    pub typowner: Oid,     // Owner of the type
+    /// Unique identifier of the type
+    pub oid: Oid,
+    /// Schema where the type is defined
+    pub schema: String,
+    /// Name of the type
+    pub typname: String,
+    /// Schema where the type is defined
+    pub typnamespace: Oid,
+    /// Owner of the type
+    pub typowner: Oid,
+    /// Owner role name of the type
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub owner: String, // Owner role name of the type
-    pub typlen: i16,       // Length of the type in bytes
-    pub typbyval: bool,    // Whether the type is passed by value
-    pub typtype: i8,       // Type of the type (e.g., base, composite, domain)
-    pub typcategory: i8,   // Category of the type (e.g., numeric, string)
-    pub typispreferred: bool, // Whether the type is preferred for implicit casts
-    pub typisdefined: bool, // Whether the type is defined
-    pub typdelim: i8,      // Delimiter for array types
-    pub typrelid: Option<Oid>, // Type of the type if it is a domain
-    pub typsubscript: Option<String>, // Subscript type if it is an array
-    pub typelem: Option<Oid>, // Element type if it is an array
-    pub typarray: Option<Oid>, // Array type if it is an array
-    pub typinput: String,  // Input function for the type
-    pub typoutput: String, // Output function for the type
-    pub typreceive: Option<String>, // Receive function for the type
-    pub typsend: Option<String>, // Send function for the type
-    pub typmodin: Option<String>, // Type modifier input function
-    pub typmodout: Option<String>, // Type modifier output function
-    pub typanalyze: Option<String>, // Analyze function for the type
-    pub typalign: i8,      // Alignment of the type (e.g., char, int, double)
-    pub typstorage: i8,    // Storage type of the type (e.g., plain, extended)
-    pub typnotnull: bool,  // Whether the type is not null
-    pub typbasetype: Option<Oid>, // Base type if it is a domain
-    pub typtypmod: Option<i32>, // Type modifier for the type
-    pub typndims: i32,     // Number of dimensions if it is an array
-    pub typcollation: Option<Oid>, // Collation for the type
-    pub typdefault: Option<String>, // Default value for the type
+    pub owner: String,
+    /// Length of the type in bytes
+    pub typlen: i16,
+    /// Whether the type is passed by value
+    pub typbyval: bool,
+    /// Type of the type (e.g., base, composite, domain)
+    pub typtype: i8,
+    /// Category of the type (e.g., numeric, string)
+    pub typcategory: i8,
+    /// Whether the type is preferred for implicit casts
+    pub typispreferred: bool,
+    /// Whether the type is defined
+    pub typisdefined: bool,
+    /// Delimiter for array types
+    pub typdelim: i8,
+    /// Type of the type if it is a domain
+    pub typrelid: Option<Oid>,
+    /// Subscript type if it is an array
+    pub typsubscript: Option<String>,
+    /// Element type if it is an array
+    pub typelem: Option<Oid>,
+    /// Array type if it is an array
+    pub typarray: Option<Oid>,
+    /// Input function for the type
+    pub typinput: String,
+    /// Output function for the type
+    pub typoutput: String,
+    /// Receive function for the type
+    pub typreceive: Option<String>,
+    /// Send function for the type
+    pub typsend: Option<String>,
+    /// Type modifier input function
+    pub typmodin: Option<String>,
+    /// Type modifier output function
+    pub typmodout: Option<String>,
+    /// Analyze function for the type
+    pub typanalyze: Option<String>,
+    /// Alignment of the type (e.g., char, int, double)
+    pub typalign: i8,
+    /// Storage type of the type (e.g., plain, extended)
+    pub typstorage: i8,
+    /// Whether the type is not null
+    pub typnotnull: bool,
+    /// Base type if it is a domain
+    pub typbasetype: Option<Oid>,
+    /// Type modifier for the type
+    pub typtypmod: Option<i32>,
+    /// Number of dimensions if it is an array
+    pub typndims: i32,
+    /// Collation for the type
+    pub typcollation: Option<Oid>,
+    /// Default value for the type
+    pub typdefault: Option<String>,
+    /// Human-readable base type (for domains)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub formatted_basetype: Option<String>, // Human-readable base type (for domains)
+    pub formatted_basetype: Option<String>,
+    /// Enum labels ordered by sort order
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub enum_labels: Vec<String>, // Enum labels ordered by sort order
+    pub enum_labels: Vec<String>,
+    /// Domain constraints (check, etc.)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub domain_constraints: Vec<DomainConstraint>, // Domain constraints (check, etc.)
+    pub domain_constraints: Vec<DomainConstraint>,
+    /// Composite type attributes ordered by attnum
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub composite_attributes: Vec<CompositeAttribute>, // Composite type attributes ordered by attnum
+    pub composite_attributes: Vec<CompositeAttribute>,
+    /// Subtype for range types
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_subtype: Option<String>, // Subtype for range types
+    pub range_subtype: Option<String>,
+    /// Collation for range types
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_collation: Option<String>, // Collation for range types
+    pub range_collation: Option<String>,
+    /// Operator class for range types
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_opclass: Option<String>, // Operator class for range types
+    pub range_opclass: Option<String>,
+    /// Canonical function for range types
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_canonical: Option<String>, // Canonical function for range types
+    pub range_canonical: Option<String>,
+    /// Subtype diff function for range types
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_subdiff: Option<String>, // Subtype diff function for range types
+    pub range_subdiff: Option<String>,
+    /// Multirange type name (for range types)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multirange_name: Option<String>, // Multirange type name (for range types)
+    pub multirange_name: Option<String>,
+    /// Resolved collation name for domain types
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain_collation_name: Option<String>, // Resolved collation name for domain types
+    pub domain_collation_name: Option<String>,
+    /// Optional comment on the type
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>, // Optional comment on the type
+    pub comment: Option<String>,
+    /// ACL entries for GRANT/REVOKE
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub acl: Vec<String>, // ACL entries for GRANT/REVOKE
-    pub hash: Option<String>, // SHA256 hash of the type definition
+    pub acl: Vec<String>,
+    /// SHA256 hash of the type definition
+    pub hash: Option<String>,
 }
 
 impl PgType {

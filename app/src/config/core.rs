@@ -1,35 +1,79 @@
+//! The `pgc.conf` parser.
+//!
+//! The format is one `KEY=VALUE` per line; blank lines and `#` comments are
+//! skipped, keys are matched case-insensitively, and values keep their original
+//! case. Unknown keys are an error rather than a silent no-op, so a typo surfaces
+//! at load time instead of as a baffling connection failure later.
+
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
 
-// Configuration file representation.
+/// Configuration file representation.
 #[derive(Debug, Clone)]
 pub struct Config {
-    // From Dump Configuration
+    /// From Dump Configuration
     pub from: DumpConfig,
-    // To Dump Configuration
+    /// To Dump Configuration
     pub to: DumpConfig,
-    // Output file name for the comparison result
+    /// Output file name for the comparison result
     pub output: String,
-    // Whether to use DROP statements in the output
+    /// Whether to use DROP statements in the output
     pub use_drop: bool,
-    // True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
+    /// True - if explicit begin...commit statement has to be added into resulting diff file; False - otherwise
     pub use_single_transaction: bool,
-    // Whether to include comments in the output script
+    /// Whether to include comments in the output script
     pub use_comments: bool,
-    // How to handle grants (privileges) during comparison
+    /// How to handle grants (privileges) during comparison
     pub grants_mode: GrantsMode,
-    // Maximum number of connections in the PostgreSQL connection pool
+    /// Maximum number of connections in the PostgreSQL connection pool
     pub max_connections: u32,
-    // Whether to emit a migration script that is safe/convenient to run on a
-    // live production database (concurrent index builds, partition-aware index
-    // creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops,
-    // and a split transaction so the concurrent statements run outside it).
+    /// Whether to emit a migration script that is safe/convenient to run on a
+    /// live production database (concurrent index builds, partition-aware index
+    /// creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops,
+    /// and a split transaction so the concurrent statements run outside it).
     pub output_for_production: bool,
 }
 
 impl Config {
     /// Load configuration from `file`. Returns a descriptive error instead of
     /// panicking on malformed input so callers can format it however they want.
+    /// # Examples
+    ///
+    /// ```
+    /// use pgc::config::core::Config;
+    /// use pgc::config::grants_mode::GrantsMode;
+    ///
+    /// let path = std::env::temp_dir().join("pgc-doctest-load.conf");
+    /// // A leading `#` is a comment. (Written with `\n` rather than a
+    /// // multi-line literal because rustdoc treats a `#` at the start of a
+    /// // doctest line as a hidden-line marker.)
+    /// std::fs::write(
+    ///     &path,
+    ///     "# comments and blank lines are ignored\n\
+    ///      \n\
+    ///      FROM_HOST=old.example\n\
+    ///      TO_HOST=new.example\n\
+    ///      FROM_SCHEME=public|app\n\
+    ///      GRANTS_MODE=full\n",
+    /// )?;
+    ///
+    /// let config = Config::load(path.to_str().unwrap())?;
+    /// assert_eq!(config.from.host, "old.example");
+    /// assert_eq!(config.from.scheme, "public|app");
+    /// assert_eq!(config.grants_mode, GrantsMode::Full);
+    ///
+    /// // Keys that were not set fall back to their documented defaults.
+    /// assert_eq!(config.from.port, "5432");
+    /// assert_eq!(config.output, "data.out");
+    /// assert_eq!(config.max_connections, 16);
+    ///
+    /// // A typo is an error rather than a silently ignored line.
+    /// std::fs::write(&path, "FROM_HOST=a\nFROM_FLAVOUR=vanilla\n")?;
+    /// assert!(Config::load(path.to_str().unwrap()).is_err());
+    ///
+    /// std::fs::remove_file(&path)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn load(file: &str) -> Result<Self, String> {
         let binding = std::fs::read_to_string(file)
             .map_err(|e| format!("Error reading configuration file {file}: {e}"))?;

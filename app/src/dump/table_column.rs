@@ -1,3 +1,12 @@
+//! Table columns (`pg_attribute` / `information_schema.columns`).
+//!
+//! Most changes are an in-place `ALTER COLUMN`, but some — a type change with no
+//! valid cast, a stored ↔ virtual generated-column flip — require `DROP COLUMN`
+//! plus `ADD COLUMN`. That distinction matters beyond this module:
+//! [`TableColumn::would_drop_and_re_add`] is what tells the comparer that
+//! PostgreSQL will CASCADE away the column's indexes, constraints and policies,
+//! which then have to be re-emitted.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -17,68 +26,120 @@ fn generation_expressions_equivalent(a: &Option<String>, b: &Option<String>) -> 
     }
 }
 
-// This is an information about a PostgreSQL table.
+/// This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableColumn {
-    pub catalog: String,                       // Catalog name
-    pub schema: String,                        // Schema name
-    pub table: String,                         // Table name
-    pub name: String,                          // Column name
-    pub ordinal_position: i32,                 // Ordinal position of the column
-    pub column_default: Option<String>,        // Default value of the column
-    pub is_nullable: bool,                     // Whether the column is nullable
-    pub data_type: String,                     // Data type of the column
-    pub character_maximum_length: Option<i32>, // Maximum length for character types
-    pub character_octet_length: Option<i32>,   // Octet length for character types
-    pub numeric_precision: Option<i32>,        // Numeric precision
-    pub numeric_precision_radix: Option<i32>,  // Numeric precision radix
-    pub numeric_scale: Option<i32>,            // Numeric scale
-    pub datetime_precision: Option<i32>,       // Datetime precision
-    pub interval_type: Option<String>,         // Interval type
-    pub interval_precision: Option<i32>,       // Interval precision
-    pub character_set_catalog: Option<String>, // Character set catalog
-    pub character_set_schema: Option<String>,  // Character set schema
-    pub character_set_name: Option<String>,    // Character set name
-    pub collation_catalog: Option<String>,     // Collation catalog
-    pub collation_schema: Option<String>,      // Collation schema
-    pub collation_name: Option<String>,        // Collation name
-    pub domain_catalog: Option<String>,        // Domain catalog
-    pub domain_schema: Option<String>,         // Domain schema
-    pub domain_name: Option<String>,           // Domain name
-    pub udt_catalog: Option<String>,           // UDT catalog
-    pub udt_schema: Option<String>,            // UDT schema
-    pub udt_name: Option<String>,              // UDT name
-    pub scope_catalog: Option<String>,         // Scope catalog
-    pub scope_schema: Option<String>,          // Scope schema
-    pub scope_name: Option<String>,            // Scope name
-    pub maximum_cardinality: Option<i32>,      // Maximum cardinality
-    pub dtd_identifier: Option<String>,        // DTD identifier
-    pub is_self_referencing: bool,             // Whether the column is self-referencing
-    pub is_identity: bool,                     // Whether the column is an identity column
-    pub identity_generation: Option<String>,   // Identity generation method
-    pub identity_start: Option<String>,        // Identity start value
-    pub identity_increment: Option<String>,    // Identity increment value
-    pub identity_maximum: Option<String>,      // Identity maximum value
-    pub identity_minimum: Option<String>,      // Identity minimum value
-    pub identity_cycle: bool,                  // Whether the identity column cycles
-    pub is_generated: String,                  // Whether the column is generated
-    pub generation_expression: Option<String>, // Generation expression for the column
+    /// Catalog name
+    pub catalog: String,
+    /// Schema name
+    pub schema: String,
+    /// Table name
+    pub table: String,
+    /// Column name
+    pub name: String,
+    /// Ordinal position of the column
+    pub ordinal_position: i32,
+    /// Default value of the column
+    pub column_default: Option<String>,
+    /// Whether the column is nullable
+    pub is_nullable: bool,
+    /// Data type of the column
+    pub data_type: String,
+    /// Maximum length for character types
+    pub character_maximum_length: Option<i32>,
+    /// Octet length for character types
+    pub character_octet_length: Option<i32>,
+    /// Numeric precision
+    pub numeric_precision: Option<i32>,
+    /// Numeric precision radix
+    pub numeric_precision_radix: Option<i32>,
+    /// Numeric scale
+    pub numeric_scale: Option<i32>,
+    /// Datetime precision
+    pub datetime_precision: Option<i32>,
+    /// Interval type
+    pub interval_type: Option<String>,
+    /// Interval precision
+    pub interval_precision: Option<i32>,
+    /// Character set catalog
+    pub character_set_catalog: Option<String>,
+    /// Character set schema
+    pub character_set_schema: Option<String>,
+    /// Character set name
+    pub character_set_name: Option<String>,
+    /// Collation catalog
+    pub collation_catalog: Option<String>,
+    /// Collation schema
+    pub collation_schema: Option<String>,
+    /// Collation name
+    pub collation_name: Option<String>,
+    /// Domain catalog
+    pub domain_catalog: Option<String>,
+    /// Domain schema
+    pub domain_schema: Option<String>,
+    /// Domain name
+    pub domain_name: Option<String>,
+    /// UDT catalog
+    pub udt_catalog: Option<String>,
+    /// UDT schema
+    pub udt_schema: Option<String>,
+    /// UDT name
+    pub udt_name: Option<String>,
+    /// Scope catalog
+    pub scope_catalog: Option<String>,
+    /// Scope schema
+    pub scope_schema: Option<String>,
+    /// Scope name
+    pub scope_name: Option<String>,
+    /// Maximum cardinality
+    pub maximum_cardinality: Option<i32>,
+    /// DTD identifier
+    pub dtd_identifier: Option<String>,
+    /// Whether the column is self-referencing
+    pub is_self_referencing: bool,
+    /// Whether the column is an identity column
+    pub is_identity: bool,
+    /// Identity generation method
+    pub identity_generation: Option<String>,
+    /// Identity start value
+    pub identity_start: Option<String>,
+    /// Identity increment value
+    pub identity_increment: Option<String>,
+    /// Identity maximum value
+    pub identity_maximum: Option<String>,
+    /// Identity minimum value
+    pub identity_minimum: Option<String>,
+    /// Whether the identity column cycles
+    pub identity_cycle: bool,
+    /// Whether the column is generated
+    pub is_generated: String,
+    /// Generation expression for the column
+    pub generation_expression: Option<String>,
+    /// 's' for stored, 'v' for virtual (PG18+); None treated as stored
     #[serde(default)]
-    pub generation_type: Option<String>, // 's' for stored, 'v' for virtual (PG18+); None treated as stored
-    pub is_updatable: bool,                 // Whether the column is updatable
-    pub related_views: Option<Vec<String>>, // Related views (optional)
+    pub generation_type: Option<String>,
+    /// Whether the column is updatable
+    pub is_updatable: bool,
+    /// Related views (optional)
+    pub related_views: Option<Vec<String>>,
+    /// Column comment
     #[serde(default)]
-    pub comment: Option<String>, // Column comment
+    pub comment: Option<String>,
+    /// TOAST storage strategy (PLAIN, EXTERNAL, MAIN, EXTENDED)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<String>, // TOAST storage strategy (PLAIN, EXTERNAL, MAIN, EXTENDED)
+    pub storage: Option<String>,
+    /// Column compression method (pglz, lz4; PG14+)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compression: Option<String>, // Column compression method (pglz, lz4; PG14+)
+    pub compression: Option<String>,
+    /// Per-column statistics target (attstattarget; -1 = use default)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub statistics_target: Option<i32>, // Per-column statistics target (attstattarget; -1 = use default)
+    pub statistics_target: Option<i32>,
+    /// Column-level ACL entries (attacl)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub acl: Vec<String>, // Column-level ACL entries (attacl)
+    pub acl: Vec<String>,
+    /// Transient: set at comparison time to "serial", "bigserial", or "smallserial"
     #[serde(skip)]
-    pub serial_type: Option<String>, // Transient: set at comparison time to "serial", "bigserial", or "smallserial"
+    pub serial_type: Option<String>,
 }
 
 impl TableColumn {
@@ -161,7 +222,7 @@ impl TableColumn {
 
     /// True when comparing `self` (the new TO-side column) against
     /// `existing` (the FROM-side column) would route through the
-    /// `needs_full_recreate` branch in [`get_alter_script`] — i.e., the
+    /// `needs_full_recreate` branch in [`TableColumn::get_alter_script`] — i.e., the
     /// migration is `DROP COLUMN` + `ADD COLUMN` rather than an
     /// in-place ALTER. This is the Path B trigger from issue #188:
     /// PostgreSQL CASCADE-drops every index / FK / CHECK / EXCLUDE
