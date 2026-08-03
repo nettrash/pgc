@@ -35,21 +35,26 @@ fn shipped_sample_config_parses() {
     assert!(config.use_comments);
 }
 
-#[test]
-fn shipped_test_config_parses() {
-    let path = data_path("test.conf");
-    let config = Config::load(path.to_str().expect("utf-8 path"))
-        .unwrap_or_else(|e| panic!("data/test.conf must stay loadable: {e}"));
+// Note: `data/test.conf` is deliberately *not* covered here. It is listed in
+// `.gitignore` — a developer-local file holding real credentials and absolute
+// paths — so a test reading it passes only on the machine that has it. The
+// keys it exercises are covered by `every_key_round_trips_from_a_file` below,
+// which builds its own fixture.
 
-    // The multi-schema pattern is passed through verbatim: `--scheme` is
-    // matched with SQL `SIMILAR TO`, so the alternation must survive parsing.
-    assert!(config.from.scheme.contains('|'));
+/// The `|` alternation in a scheme pattern has to survive parsing verbatim:
+/// `--scheme` is matched against `nspname` with SQL `SIMILAR TO`, not equality,
+/// so mangling it would silently change which schemas are dumped.
+#[test]
+fn multi_schema_patterns_survive_parsing() {
+    let dir = ScratchDir::new("scheme-pattern");
+    let path = write_config(
+        &dir,
+        "FROM_HOST=a.example\nFROM_SCHEME=public|app\nTO_HOST=b.example\nTO_SCHEME=public|app\n",
+    );
+
+    let config = Config::load(&path).expect("load config");
+    assert_eq!(config.from.scheme, "public|app");
     assert_eq!(config.from.scheme, config.to.scheme);
-    assert!(config.use_drop);
-    assert!(!config.use_comments);
-    assert_eq!(config.grants_mode, GrantsMode::Full);
-    assert_eq!(config.max_connections, 10);
-    assert!(config.output_for_production);
 }
 
 #[test]

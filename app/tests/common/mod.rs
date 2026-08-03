@@ -107,12 +107,24 @@ pub fn assert_no_ddl(script: &str, context: &str) {
 }
 
 /// Absolute path to a file under the repository's `data/` directory.
+///
+/// **Only pass files that are committed to git.** `data/` also holds
+/// developer-local files that `.gitignore` excludes — `test.conf` among them —
+/// and a test reading one of those passes on the machine that has it and fails
+/// everywhere else, CI included. Panics with that reminder rather than letting
+/// the caller hit a bare "No such file or directory".
 pub fn data_path(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("app/ has a parent")
         .join("data")
-        .join(relative)
+        .join(relative);
+    assert!(
+        path.exists(),
+        "data/{relative} is missing. Tests may only depend on git-tracked files \
+         under data/; check whether this one is excluded by .gitignore."
+    );
+    path
 }
 
 /// A `DumpConfig` that is never connected to — dumps built in-process still
