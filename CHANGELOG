@@ -1,13 +1,37 @@
 2026-09-05      v1.0.27
 
-                Fixes the routine ordering bug behind issue #240 and
-                adds one opt-in flag for it. Beyond that this release
-                reorganises the test suite, adds a library target and
-                integration tests, and documents the crate. The dump
-                file format is unchanged, and so is the generated SQL
-                for any schema the ordering bug did not touch.
+                Fixes two ways a migration could quietly destroy what
+                it was meant to migrate: the routine ordering bug
+                behind issue #240, with one opt-in flag for it, and
+                the schema-moved extension of issue #241. Beyond
+                those this release reorganises the test suite, adds a
+                library target and integration tests, and documents
+                the crate. The dump file format is unchanged, and so
+                is the generated SQL for any schema neither bug
+                touched.
 
                 Bug fixes:
+                    - Resolved issue #241 (an extension moved between
+                      schemas was deleted instead of relocated).
+                      Extensions were matched between the two dumps on
+                      (schema, name), but an extension's name is its
+                      identity: pg_extension has a unique index on
+                      extname, and the schema only records where it was
+                      installed. A move therefore paired with nothing
+                      and was emitted as two unrelated events, a create
+                      in the new schema and a drop in the old. That pair
+                      destroys the extension without reporting anything:
+                      create extension if not exists is a no-op once the
+                      name is taken, so the drop that follows removes
+                      the only copy, the migration applies cleanly, and
+                      every function the extension provided is gone.
+                      Extensions are now matched by name, which routes a
+                      move to the alter extension ... set schema branch
+                      that Extension already had and that nothing could
+                      reach. Caveat: an extension that PostgreSQL marks
+                      non-relocatable cannot be moved by ALTER at all,
+                      so that case now fails loudly on replay rather
+                      than deleting anything.
                     - Resolved issue #240 (a routine named in a comment
                       or a string literal was read as a call, and the
                       migration then created routines before the
