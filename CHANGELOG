@@ -1,9 +1,65 @@
-2026-08-03      v1.0.27
+2026-09-05      v1.0.27
 
-                No change to what pgc emits. This release reorganises
-                the test suite, adds a library target and integration
-                tests, and documents the crate. The dump file format,
-                the CLI and the generated SQL are all unchanged.
+                Fixes the routine ordering bug behind issue #240 and
+                adds one opt-in flag for it. Beyond that this release
+                reorganises the test suite, adds a library target and
+                integration tests, and documents the crate. The dump
+                file format is unchanged, and so is the generated SQL
+                for any schema the ordering bug did not touch.
+
+                Bug fixes:
+                    - Resolved issue #240 (a routine named in a comment
+                      or a string literal was read as a call, and the
+                      migration then created routines before the
+                      routines they call). PostgreSQL records no
+                      dependency for a call inside a function body, so
+                      pgc infers routine creation order by scanning each
+                      body's text for qualified schema.name references.
+                      The scan could not tell a call from a name written
+                      in prose or quoted inside dynamic SQL, and neither
+                      of those is resolved when the routine is created.
+                      Each such name added a graph edge that was not
+                      real; one of them pointing back along a real edge
+                      closed a cycle, and a cycle cannot be
+                      topologically sorted, so the routines in it and
+                      everything blocked behind them fell back to plain
+                      name order. A schema where one routine's comment
+                      mentioned its caller was enough to emit a
+                      migration that failed on function ... does not
+                      exist. Comments and string literal bodies, both
+                      single-quoted and dollar-quoted, are now blanked
+                      before the scan; double-quoted identifiers are
+                      kept, because a quoted identifier is a reference.
+                      This covers the same scan wherever it decides an
+                      order: routine creates and drops, view drops, and
+                      the combined routine and view pass.
+
+                Features:
+                    - New --guard-sql-routine-bodies flag (config key
+                      GUARD_SQL_ROUTINE_BODIES), default false. When
+                      set, the migration opens with set
+                      check_function_bodies = false, so PostgreSQL does
+                      not resolve the names inside a routine body at
+                      CREATE time and a routine is created even if its
+                      callee is not there yet. A defensive net for the
+                      whole class of ordering problem above, since a
+                      text scan can only ever approximate what a body
+                      calls. The cost, and the reason it is opt-in, is
+                      that a genuine mistake in a routine body is no
+                      longer caught while the migration runs. The
+                      statement is SET rather than SET LOCAL so it also
+                      covers a production script's post-commit section;
+                      a migration with nothing to do withdraws it, so an
+                      empty diff is unchanged.
+                    - A dependency cycle among routines or views is now
+                      named on stderr instead of passing silently. The
+                      report is narrowed to the objects that actually
+                      form the cycle rather than everything Kahn's sort
+                      was left holding, which also includes whatever was
+                      merely blocked behind it. A genuine cycle is
+                      possible: mutually recursive routines really do
+                      depend on each other, and no ordering satisfies
+                      them.
 
                 Internals:
                     - Added a library target (`app/src/lib.rs`)

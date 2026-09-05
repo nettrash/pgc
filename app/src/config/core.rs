@@ -32,6 +32,10 @@ pub struct Config {
     /// creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops,
     /// and a split transaction so the concurrent statements run outside it).
     pub output_for_production: bool,
+    /// Whether to emit `set check_function_bodies = false;` as the
+    /// migration's first statement — a safety net for routine ordering
+    /// (issue #240). Default false; when false the output is unchanged.
+    pub guard_sql_routine_bodies: bool,
 }
 
 impl Config {
@@ -105,6 +109,7 @@ impl Config {
         let mut grants_mode = GrantsMode::Ignore;
         let mut max_connections: u32 = 16;
         let mut output_for_production = false;
+        let mut guard_sql_routine_bodies = false;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -140,6 +145,7 @@ impl Config {
                 && key != "GRANTS_MODE"
                 && key != "MAX_CONNECTIONS"
                 && key != "OUTPUT_FOR_PRODUCTION"
+                && key != "GUARD_SQL_ROUTINE_BODIES"
             {
                 return Err(format!("Unknown configuration key: {}", parts[0]));
             }
@@ -170,6 +176,17 @@ impl Config {
                 "OUTPUT" => output = raw_value.to_string(),
                 "USE_DROP" => use_drop = value == "TRUE",
                 "USE_SINGLE_TRANSACTION" => use_single_transaction = value == "TRUE",
+                "GUARD_SQL_ROUTINE_BODIES" => {
+                    guard_sql_routine_bodies = match value.as_str() {
+                        "TRUE" => true,
+                        "FALSE" => false,
+                        _ => {
+                            return Err(format!(
+                                "Invalid value for GUARD_SQL_ROUTINE_BODIES: {raw_value}"
+                            ));
+                        }
+                    }
+                }
                 "OUTPUT_FOR_PRODUCTION" => {
                     output_for_production = match value.as_str() {
                         "TRUE" => true,
@@ -271,6 +288,7 @@ impl Config {
             grants_mode,
             max_connections,
             output_for_production,
+            guard_sql_routine_bodies,
         })
     }
 

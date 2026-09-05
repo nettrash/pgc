@@ -1033,3 +1033,138 @@ fn get_script_multiple_e_strings_on_same_line() {
         out
     );
 }
+
+// ── --guard-sql-routine-bodies (issue #240) ────────────────────────────
+// The opt-in safety net: `set check_function_bodies = false;` as the
+// migration's first statement, so a routine whose callee is not there yet
+// still creates. Off by default, and off means byte-identical output.
+
+const GUARD: &str = "set check_function_bodies = false;";
+
+/// A comparer over one added table — enough to make a non-empty migration
+/// without dragging routine machinery into a test about script framing.
+fn guard_comparer(use_single_transaction: bool) -> Comparer {
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    let mut table = Table::new(
+        "public".to_string(),
+        "widgets".to_string(),
+        "public".to_string(),
+        "widgets".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![int_column("public", "widgets", "id", 1)],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.hash();
+    to_dump.tables.push(table);
+    Comparer::new(
+        from_dump,
+        to_dump,
+        false,
+        use_single_transaction,
+        false,
+        GrantsMode::Ignore,
+    )
+}
+
+#[tokio::test]
+async fn guard_is_absent_by_default() {
+    let mut comparer = guard_comparer(true);
+    comparer.compare().await.unwrap();
+
+    assert!(
+        !comparer.get_script().contains("check_function_bodies"),
+        "the guard must be opt-in"
+    );
+}
+
+#[tokio::test]
+async fn guard_is_the_first_statement_after_begin() {
+    let mut comparer = guard_comparer(true);
+    comparer.set_guard_sql_routine_bodies(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    let begin = script.find("begin;").expect("begin; missing");
+    let guard = script.find(GUARD).expect("guard missing");
+    let create = script.find("create table").expect("no table create");
+
+    assert!(begin < guard, "the guard belongs inside the transaction");
+    assert!(
+        guard < create,
+        "the guard must precede every statement it protects:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn guard_is_emitted_without_a_transaction_too() {
+    // Nothing to sit after, so it leads the script. Still session-scoped,
+    // so it still covers what follows.
+    let mut comparer = guard_comparer(false);
+    comparer.set_guard_sql_routine_bodies(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(!script.contains("begin;"));
+    assert!(
+        script.find(GUARD) < script.find("create table"),
+        "the guard must precede every statement it protects:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn guard_is_withdrawn_from_an_empty_migration() {
+    // A no-op diff renders as an empty file, and callers read that emptiness
+    // as "nothing to apply" — the round-trip check asserts a second compare
+    // is 0 bytes. A lone SET would look like work.
+    let mut comparer = Comparer::new(
+        Dump::new(DumpConfig::default()),
+        Dump::new(DumpConfig::default()),
+        false,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.set_guard_sql_routine_bodies(true);
+    comparer.compare().await.unwrap();
+
+    assert_eq!(
+        comparer.get_script(),
+        "",
+        "an empty migration must stay empty"
+    );
+}
+
+#[tokio::test]
+async fn guard_is_withdrawn_from_an_empty_migration_inside_a_transaction_too() {
+    // With `--use-single-transaction` an empty diff was already `begin;
+    // commit;` rather than nothing, so this is not about byte count — it is
+    // that turning the flag on must not change what a no-op migration looks
+    // like.
+    let mut plain = Comparer::new(
+        Dump::new(DumpConfig::default()),
+        Dump::new(DumpConfig::default()),
+        false,
+        true,
+        false,
+        GrantsMode::Ignore,
+    );
+    plain.compare().await.unwrap();
+
+    let mut guarded = Comparer::new(
+        Dump::new(DumpConfig::default()),
+        Dump::new(DumpConfig::default()),
+        false,
+        true,
+        false,
+        GrantsMode::Ignore,
+    );
+    guarded.set_guard_sql_routine_bodies(true);
+    guarded.compare().await.unwrap();
+
+    assert_eq!(guarded.get_script(), plain.get_script());
+}

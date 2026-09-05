@@ -460,3 +460,34 @@ fn test_max_connections_negative_panics() {
     let _ = Config::new(file.clone());
     let _ = std::fs::remove_file(file);
 }
+
+// ── GUARD_SQL_ROUTINE_BODIES (issue #240) ──────────────────────────────
+
+#[test]
+fn test_guard_sql_routine_bodies_parses_true() {
+    let config_content = "FROM_HOST=localhost\nTO_HOST=remotehost\nGUARD_SQL_ROUTINE_BODIES=true";
+    let file = write_temp_config(config_content, "test_guard_sql_routine_bodies_true.cfg");
+    let config = Config::new(file.clone());
+    assert!(config.guard_sql_routine_bodies);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn test_guard_sql_routine_bodies_defaults_false() {
+    // The whole point of the flag is that it is opt-in: a config that has
+    // never heard of it must keep emitting exactly what it emitted before.
+    let config_content = "FROM_HOST=localhost\nTO_HOST=remotehost";
+    let file = write_temp_config(config_content, "test_guard_sql_routine_bodies_default.cfg");
+    let config = Config::new(file.clone());
+    assert!(!config.guard_sql_routine_bodies);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+#[should_panic]
+fn test_invalid_guard_sql_routine_bodies_value_panics() {
+    let config_content = "FROM_HOST=localhost\nGUARD_SQL_ROUTINE_BODIES=maybe";
+    let file = write_temp_config(config_content, "test_invalid_guard_value.cfg");
+    let _ = Config::new(file.clone());
+    let _ = std::fs::remove_file(file);
+}

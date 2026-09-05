@@ -1077,3 +1077,223 @@ async fn compare_routines_config_removal_triggers_update() {
         script
     );
 }
+
+// ── issue #240: a mention is not a call ────────────────────────────────
+// The dependency graph is built by reading qualified names out of a
+// routine's source text. Text cannot tell a call from a name written in
+// prose, so before the fix a comment naming another routine added an edge
+// — and one invented edge pointing back along a real one is a cycle. Kahn's
+// sort cannot order a cycle: it appends the whole blocked subgraph in plain
+// name order, which is how a script came to create a routine before the
+// routine it calls.
+
+fn issue240_sql_fn(oid: u32, name: &str, body: &str) -> Routine {
+    Routine::new(
+        "test_schema".to_string(),
+        Oid(oid),
+        name.to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "text".to_string(),
+        "pvalue text".to_string(),
+        None,
+        None,
+        body.to_string(),
+    )
+}
+
+/// Position of a routine's `create` in the script, or a failure naming it.
+fn create_pos(script: &str, name: &str) -> usize {
+    script
+        .find(&format!(
+            "create or replace function test_schema.{name}(pvalue text)"
+        ))
+        .unwrap_or_else(|| panic!("{name} was never created:\n{script}"))
+}
+
+#[tokio::test]
+async fn compare_routines_and_views_ignores_a_routine_named_only_in_a_comment() {
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    // util_a is called by helper_d, and names helper_d back in a comment.
+    // The real edge is helper_d -> util_a; the comment must not add the
+    // reverse one.
+    to_dump.routines.push(issue240_sql_fn(
+        1,
+        "util_a",
+        "\n\t-- NB: mirrors test_schema.helper_d's normalization rules, keep them in sync.\n\
+         \tselect translate(coalesce(pvalue, ''), 'ao', 'AO');\n",
+    ));
+    to_dump.routines.push(issue240_sql_fn(
+        2,
+        "helper_d",
+        "\n\tselect regexp_replace(test_schema.util_a(pvalue), '[^A-Za-z -]', '', 'g');\n",
+    ));
+    // A third routine downstream of the pair. Before the fix this one was
+    // the visible symptom: blocked behind the cycle, it was appended in name
+    // order and so came out FIRST, ahead of everything it calls.
+    to_dump.routines.push(issue240_sql_fn(
+        3,
+        "a_caller",
+        "\n\tselect test_schema.helper_d(pvalue);\n",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let util_a = create_pos(&script, "util_a");
+    let helper_d = create_pos(&script, "helper_d");
+    let a_caller = create_pos(&script, "a_caller");
+
+    assert!(
+        util_a < helper_d,
+        "util_a is called by helper_d and must be created first:\n{script}"
+    );
+    assert!(
+        helper_d < a_caller,
+        "helper_d is called by a_caller and must be created first:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_and_views_ignores_a_routine_named_only_in_a_literal() {
+    // Same defect through the other door: a name inside dynamic SQL. The
+    // routine is not resolved when the caller is created, so it is not a
+    // creation-order dependency — and treating it as one closes the same
+    // false loop.
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    to_dump.routines.push(issue240_sql_fn(
+        1,
+        "util_a",
+        "\n\tselect coalesce(pvalue, 'test_schema.helper_d');\n",
+    ));
+    to_dump.routines.push(issue240_sql_fn(
+        2,
+        "helper_d",
+        "\n\tselect test_schema.util_a(pvalue);\n",
+    ));
+    to_dump.routines.push(issue240_sql_fn(
+        3,
+        "a_caller",
+        "\n\tselect test_schema.helper_d(pvalue);\n",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        create_pos(&script, "util_a") < create_pos(&script, "helper_d"),
+        "util_a is called by helper_d and must be created first:\n{script}"
+    );
+    assert!(
+        create_pos(&script, "helper_d") < create_pos(&script, "a_caller"),
+        "helper_d is called by a_caller and must be created first:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn compare_routines_ignores_a_routine_named_only_in_a_comment() {
+    // `compare_routines` runs the same scan over the same bodies through a
+    // different entry point, and had the same bug.
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    to_dump.routines.push(issue240_sql_fn(
+        1,
+        "util_a",
+        "\n\t/* paired with test_schema.helper_d */\n\tselect pvalue;\n",
+    ));
+    to_dump.routines.push(issue240_sql_fn(
+        2,
+        "helper_d",
+        "\n\tselect test_schema.util_a(pvalue);\n",
+    ));
+    to_dump.routines.push(issue240_sql_fn(
+        3,
+        "a_caller",
+        "\n\tselect test_schema.helper_d(pvalue);\n",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        create_pos(&script, "util_a") < create_pos(&script, "helper_d"),
+        "util_a is called by helper_d and must be created first:\n{script}"
+    );
+    assert!(
+        create_pos(&script, "helper_d") < create_pos(&script, "a_caller"),
+        "helper_d is called by a_caller and must be created first:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn a_real_call_inside_a_body_is_still_a_dependency() {
+    // The guard against over-blanking: only comments and literals go. A
+    // plain call still orders the pair, and a body with nothing to blank
+    // must be scanned exactly as before.
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    to_dump
+        .routines
+        .push(issue240_sql_fn(1, "z_callee", "\n\tselect pvalue;\n"));
+    to_dump.routines.push(issue240_sql_fn(
+        2,
+        "a_caller",
+        "\n\tselect test_schema.z_callee(pvalue);\n",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        create_pos(&script, "z_callee") < create_pos(&script, "a_caller"),
+        "the call is real, so z_callee must still be created first:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn a_quoted_identifier_in_a_body_is_still_a_dependency() {
+    // Double quotes are the one quoted form that survives blanking, because
+    // a quoted identifier is a reference rather than a literal.
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+
+    to_dump.routines.push(Routine::new(
+        "test_schema".to_string(),
+        Oid(1),
+        "\"ZCallee\"".to_string(),
+        "sql".to_string(),
+        "FUNCTION".to_string(),
+        "text".to_string(),
+        "pvalue text".to_string(),
+        None,
+        None,
+        "\n\tselect pvalue;\n".to_string(),
+    ));
+    to_dump.routines.push(issue240_sql_fn(
+        2,
+        "a_caller",
+        "\n\tselect test_schema.\"ZCallee\"(pvalue);\n",
+    ));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, true, GrantsMode::Ignore);
+    comparer.compare_routines_and_views().await.unwrap();
+    let script = comparer.get_script();
+
+    let callee = script
+        .find("create or replace function test_schema.\"ZCallee\"(pvalue text)")
+        .expect("ZCallee was never created");
+    assert!(
+        callee < create_pos(&script, "a_caller"),
+        "the quoted call is real, so \"ZCallee\" must be created first:\n{script}"
+    );
+}
