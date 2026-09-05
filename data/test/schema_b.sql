@@ -2159,3 +2159,35 @@ CREATE MATERIALIZED VIEW test_schema.mv235_new AS
 SELECT id, label, active FROM test_schema.mv235_base WHERE active;
 
 CREATE INDEX ix_mv235_new_label ON test_schema.mv235_new (label);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #240: a routine named in prose or in a literal is not a call.
+--
+-- Three TO-only routines forming one real chain, util_a <- helper_d <-
+-- z_caller, with a false back-edge planted at each link:
+--   * i240_util_a's comment names i240_helper_d, which calls it;
+--   * i240_helper_d's string literal names i240_z_caller, which calls it.
+-- Each false edge closes a 2-cycle with the real one. Kahn's sort cannot
+-- order a cycle, so it appends all three in name order — i240_helper_d
+-- first, which fails because i240_util_a does not exist yet, and the
+-- round-2 diff is then non-empty.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE FUNCTION test_schema.i240_util_a(pvalue text) RETURNS text
+    LANGUAGE sql IMMUTABLE
+AS $$
+    -- NB: mirrors test_schema.i240_helper_d's normalization rules.
+    SELECT translate(coalesce(pvalue, ''), 'ao', 'AO');
+$$;
+
+CREATE FUNCTION test_schema.i240_helper_d(pvalue text) RETURNS text
+    LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT test_schema.i240_util_a(pvalue) || ''
+        || coalesce(nullif('', 'test_schema.i240_z_caller'), '');
+$$;
+
+CREATE FUNCTION test_schema.i240_z_caller(pvalue text) RETURNS text
+    LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT test_schema.i240_helper_d(pvalue);
+$$;

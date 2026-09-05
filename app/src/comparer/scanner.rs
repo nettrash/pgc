@@ -184,6 +184,190 @@ pub(crate) fn dollar_tag_at(src: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
+/// Blank every region of `sql` that cannot carry a real object reference —
+/// comments and string-literal bodies — by replacing each of its bytes with
+/// a space. Newlines survive, so the result stays line-addressable, and the
+/// byte length is unchanged, so token boundaries in the surrounding code are
+/// exactly where they were.
+///
+/// Double-quoted identifiers are copied through **verbatim**: `"MySchema"."Fn"`
+/// *is* a reference, and `Comparer::text_references_qualified_name_pre` matches
+/// quoted needles as well as bare ones.
+///
+/// This is the scan-preparation counterpart to
+/// [`strip_comments_and_collapse`], which cannot do the job: that one passes
+/// dollar-quoted content through untouched, because it cleans up the generated
+/// script and a routine body there has to survive byte-for-byte. Here the
+/// opposite is wanted. A routine's `prosrc` is scanned to decide what must be
+/// created before it (issue #240), and inside a body:
+///
+/// - a comment naming another routine is documentation, not a call;
+/// - a single-quoted or dollar-quoted literal naming one is dynamic SQL,
+///   which PostgreSQL does not resolve when the routine is created.
+///
+/// Counting either as a dependency invents a graph edge, and one invented edge
+/// pointing back at a real one is a cycle — which Kahn's sort cannot order, so
+/// it falls back to alphabetical and emits routines before the routines they
+/// call.
+///
+/// Related but deliberately separate: `Comparer::blank_single_quoted_literals`
+/// serves the Phase-7 CASCADE matcher, which runs over deparsed catalog
+/// expressions (`pg_get_expr`, `pg_get_indexdef`) rather than routine source —
+/// text that has neither comments nor dollar quoting.
+pub(crate) fn blank_comments_and_literals(sql: &str) -> String {
+    let src = sql.as_bytes();
+    let len = src.len();
+    let mut out: Vec<u8> = Vec::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        // Dollar-quoted literal: keep both tags, blank the body between them.
+        if src[i] == b'$'
+            && let Some(tag_len) = dollar_tag_at(src, i)
+        {
+            let tag = &src[i..i + tag_len];
+            out.extend_from_slice(tag);
+            i += tag_len;
+            let body_start = i;
+            let mut closed_at: Option<usize> = None;
+            while i < len {
+                if src[i] == b'$'
+                    && let Some(close_len) = dollar_tag_at(src, i)
+                    && close_len == tag_len
+                    && &src[i..i + close_len] == tag
+                {
+                    closed_at = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            match closed_at {
+                Some(close) => {
+                    blank_into(src, &mut out, body_start, close);
+                    out.extend_from_slice(&src[close..close + tag_len]);
+                    i = close + tag_len;
+                }
+                None => {
+                    // Unterminated — `$` that opens nothing. Treat the whole
+                    // tail as literal body rather than re-scanning it as code,
+                    // which is what PostgreSQL's own lexer would do.
+                    blank_into(src, &mut out, body_start, len);
+                    i = len;
+                }
+            }
+            continue;
+        }
+        // E-string literal `E'…'` — backslash escapes are honoured.
+        if (src[i] == b'E' || src[i] == b'e') && i + 1 < len && src[i + 1] == b'\'' {
+            out.push(src[i]);
+            out.push(b'\'');
+            i += 2;
+            blank_quoted_literal(src, &mut out, &mut i, b'\'', true);
+            continue;
+        }
+        // Single-quoted string literal.
+        if src[i] == b'\'' {
+            out.push(b'\'');
+            i += 1;
+            blank_quoted_literal(src, &mut out, &mut i, b'\'', false);
+            continue;
+        }
+        // Double-quoted identifier — a reference, so copy it verbatim.
+        if src[i] == b'"' {
+            out.push(b'"');
+            i += 1;
+            copy_quoted_literal(src, &mut out, &mut i, b'"', false);
+            continue;
+        }
+        // Block comment `/* … */`, arbitrarily nested as PostgreSQL allows.
+        if i + 1 < len && src[i] == b'/' && src[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            let mut depth: usize = 1;
+            while i + 1 < len && depth > 0 {
+                if src[i] == b'/' && src[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if src[i] == b'*' && src[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                i = len;
+            }
+            blank_into(src, &mut out, start, i);
+            continue;
+        }
+        // Line comment `-- …`, up to but not including the newline.
+        if i + 1 < len && src[i] == b'-' && src[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < len && src[i] != b'\n' {
+                i += 1;
+            }
+            blank_into(src, &mut out, start, i);
+            continue;
+        }
+        out.push(src[i]);
+        i += 1;
+    }
+
+    // Safety: every byte pushed is either copied from `sql` (valid UTF-8) or
+    // an ASCII space / newline, and multi-byte sequences are blanked whole —
+    // `blank_into` walks a byte range and replaces each byte individually, so
+    // no partial sequence can survive.
+    String::from_utf8(out).expect("output must be valid UTF-8")
+}
+
+/// Push `src[from..to]` into `out` with every byte replaced by a space,
+/// except newlines, which are kept so line structure survives.
+fn blank_into(src: &[u8], out: &mut Vec<u8>, from: usize, to: usize) {
+    for &b in &src[from..to] {
+        out.push(if b == b'\n' { b'\n' } else { b' ' });
+    }
+}
+
+/// The blanking twin of [`copy_quoted_literal`]: same termination rules —
+/// including the doubled-delimiter escape and, for E-strings, backslash
+/// pairs — but the body is replaced with spaces. The closing delimiter is
+/// emitted as itself, so `'a''b'` becomes `'    '`.
+fn blank_quoted_literal(
+    src: &[u8],
+    out: &mut Vec<u8>,
+    i: &mut usize,
+    delimiter: u8,
+    backslash_escapes: bool,
+) {
+    let len = src.len();
+    while *i < len {
+        if backslash_escapes && src[*i] == b'\\' {
+            out.push(b' ');
+            *i += 1;
+            if *i < len {
+                out.push(if src[*i] == b'\n' { b'\n' } else { b' ' });
+                *i += 1;
+            }
+        } else if src[*i] == delimiter {
+            *i += 1;
+            if *i < len && src[*i] == delimiter {
+                // Doubled-delimiter escape: still inside the literal.
+                out.push(b' ');
+                out.push(b' ');
+                *i += 1;
+            } else {
+                out.push(delimiter); // closing delimiter
+                break;
+            }
+        } else {
+            out.push(if src[*i] == b'\n' { b'\n' } else { b' ' });
+            *i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/scanner.rs"]
 mod tests;

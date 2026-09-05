@@ -73,6 +73,8 @@ Command line arguments can be used to execute just one function in one time.
 
 `--output-for-production {true|false}` - set to `true` to generate a migration script that is convenient to run against a live production database (default `false` — output is unchanged). See [Production-friendly output](#production-friendly-output).
 
+`--guard-sql-routine-bodies {true|false}` - set to `true` to emit `set check_function_bodies = false;` as the migration's first statement, so PostgreSQL does not resolve the names inside a routine body when the routine is created (default `false` — output is unchanged). See [Routine ordering](#routine-ordering).
+
 `--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `16`. Used by all concurrent introspection queries; table metadata is pulled schema-wide in one query per resource kind (columns, indexes, constraints, triggers, policies, partition info, definitions) so connection count mostly matters for the sibling queries (extensions, sequences, routines, views, etc.) running in parallel.
 
 `--use-cascade` - add `CASCADE` to every `DROP` statement in the clear script. **Warning:** `CASCADE` can silently drop dependent objects that live outside the selected schema(s) (e.g., foreign keys or views in other schemas referencing the dropped objects). Use only when you are certain no cross-schema dependencies should survive. Without this flag the generated drops rely on the explicit dependency ordering and will fail cleanly if unresolved dependencies exist.
@@ -114,6 +116,29 @@ By default the delta script favours brevity and is meant to be applied to an idl
 Because `CREATE/DROP INDEX CONCURRENTLY`, `VALIDATE CONSTRAINT` and `ALTER INDEX ... ATTACH PARTITION` **cannot run inside a transaction block**, every such statement is moved to a clearly marked `Production post-commit` section emitted **after** the `commit;`. The rest of the migration still runs inside the single transaction when `--use-single-transaction` is set. Each post-commit statement runs in its own implicit transaction; most are safe to re-run thanks to idempotency guards, but `ALTER INDEX ... ATTACH PARTITION` has no built-in guard, so already-successful ATTACH steps may need to be skipped when replaying the section.
 
 `--output-for-production` defaults to `false`; when off the output is byte-for-byte identical to previous behaviour.
+
+### Routine ordering
+
+Routines have to be created before the routines that call them, and PostgreSQL's catalog does not record what a function body calls — `pg_depend` carries no edge for a call inside `prosrc`. So pgc infers the order by reading each body's text and looking for qualified `schema.name` references, then topologically sorting what it finds.
+
+Text can only approximate a call. Two kinds of name are read past deliberately, because neither is resolved when the routine is created:
+
+- **Comments.** A body that documents its relationship to another routine (`-- mirrors schema.other's rules`) names it without calling it.
+- **String literals**, single-quoted or dollar-quoted. A name inside dynamic SQL is resolved when that SQL is executed, not when the routine is created.
+
+Counting either as a dependency invents a graph edge, and an invented edge pointing back along a real one closes a cycle. A cycle cannot be topologically sorted, so the routines in it — and everything blocked behind it — fall back to plain name order, which is how a migration could come to create a routine before the one it calls (issue #240).
+
+When a cycle does survive, pgc names the routines or views involved on **stderr**. A genuine cycle is possible: mutually recursive routines really do depend on each other, and no ordering can satisfy them.
+
+`--guard-sql-routine-bodies true` (config `GUARD_SQL_ROUTINE_BODIES=true`) is the defensive answer to both cases. It emits
+
+```sql
+set check_function_bodies = false;
+```
+
+as the migration's first statement, which tells PostgreSQL not to resolve the names inside a routine body at `CREATE` time — so a `sql`-language routine is created even if its callee is not there yet. The trade is that a genuine mistake in a routine body is no longer caught while the migration runs; it waits until something calls it. That is why the flag is opt-in.
+
+The statement is `SET`, not `SET LOCAL`, so it also covers the post-commit section of a production-mode script. It stays in effect for the rest of the **session**, which matters only if the same connection is reused for other work after the migration — the usual one-shot `psql -f` replay ends the session with the script. A migration that turns out to have nothing to do drops the statement again, so an empty diff stays byte-for-byte what it is with the flag off.
 
 ### Generate a clear (drop-all) script for a database
 
@@ -174,9 +199,12 @@ USE_COMMENTS=false
 GRANTS_MODE=ignore
 MAX_CONNECTIONS=16
 OUTPUT_FOR_PRODUCTION=false
+GUARD_SQL_ROUTINE_BODIES=false
 ```
 
 `OUTPUT_FOR_PRODUCTION` (default `false`) is the configuration-file equivalent of the `--output-for-production` flag described in [Production-friendly output](#production-friendly-output).
+
+`GUARD_SQL_ROUTINE_BODIES` (default `false`) is the configuration-file equivalent of the `--guard-sql-routine-bodies` flag described in [Routine ordering](#routine-ordering).
 
 ## Choosing `MAX_CONNECTIONS`
 

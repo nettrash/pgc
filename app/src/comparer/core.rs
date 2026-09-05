@@ -50,6 +50,10 @@ pub struct Comparer {
     // live production database (concurrent index builds, partition-aware index
     // creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops).
     output_for_production: bool,
+    /// Emit `set check_function_bodies = false;` as the migration's first
+    /// statement (issue #240). Off by default; when off the output is
+    /// byte-for-byte what it always was.
+    guard_sql_routine_bodies: bool,
 
     // The script that will be generated
     script: String,
@@ -73,6 +77,11 @@ pub struct Comparer {
     serial_columns: HashMap<(String, String, String), String>,
 }
 
+/// The statement `--guard-sql-routine-bodies` emits. `SET`, not `SET LOCAL`,
+/// so it also covers the post-commit section (see
+/// `Comparer::set_guard_sql_routine_bodies`).
+const FUNCTION_BODY_GUARD: &str = "set check_function_bodies = false;";
+
 impl Comparer {
     /// Creates a new Comparer with the given dumps
     pub fn new(
@@ -91,6 +100,7 @@ impl Comparer {
             use_comments,
             grants_mode,
             output_for_production: false,
+            guard_sql_routine_bodies: false,
             script: String::new(),
             production_post_script: String::new(),
             enum_pre_script: String::new(),
@@ -152,6 +162,55 @@ impl Comparer {
         self
     }
 
+    /// Ask PostgreSQL not to validate function bodies while the migration
+    /// runs, by emitting `set check_function_bodies = false;` as its first
+    /// statement.
+    ///
+    /// A defensive net for the whole class of ordering bug behind issue #240:
+    /// pgc infers routine dependencies by reading names out of `prosrc`, and
+    /// text can only ever be an approximation of what a body really calls. If
+    /// the order still comes out wrong, this makes a `sql`-language routine
+    /// create anyway instead of failing on a callee that does not exist yet.
+    ///
+    /// The trade is real, which is why this is opt-in: with body checking off
+    /// a genuine typo in a routine body is no longer caught when the migration
+    /// runs — it waits until something calls it.
+    ///
+    /// `check_function_bodies` is `SET` (not `SET LOCAL`), so it holds for the
+    /// rest of the session. That is what makes it survive past the `commit;`
+    /// into any post-commit section, and it is why a connection reused for
+    /// other work after the migration keeps the setting until it is reset or
+    /// the session ends. For the usual one-shot `psql -f` replay this does not
+    /// arise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pgc::comparer::core::Comparer;
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// # use pgc::config::grants_mode::GrantsMode;
+    /// # use pgc::dump::core::Dump;
+    /// # let config = || DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let mut comparer = Comparer::new(
+    ///     Dump::new(config()),
+    ///     Dump::new(config()),
+    ///     true,
+    ///     true,
+    ///     true,
+    ///     GrantsMode::Ignore,
+    /// );
+    /// comparer.set_guard_sql_routine_bodies(true);
+    /// ```
+    pub fn set_guard_sql_routine_bodies(&mut self, value: bool) -> &mut Self {
+        self.guard_sql_routine_bodies = value;
+        self
+    }
+
     /// Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
         if self.output_for_production {
@@ -174,6 +233,12 @@ impl Comparer {
         }
         if self.use_single_transaction {
             self.script.append_block("begin;");
+        }
+        // First statement of the migration, so every routine created below is
+        // covered — including any emitted in the post-commit section, since
+        // this is a session-scoped SET rather than SET LOCAL.
+        if self.guard_sql_routine_bodies {
+            self.script.append_block(FUNCTION_BODY_GUARD);
         }
 
         self.compare_schemas().await?;
@@ -257,6 +322,29 @@ impl Comparer {
         // (concurrent index) statements appended above.
         if self.output_for_production {
             self.script = production::make_idempotent(&self.script);
+        }
+
+        // A no-op migration has to stay a no-op. Without
+        // `--use-single-transaction` an unchanged schema renders as an empty
+        // file, and callers read that emptiness as "nothing to apply" — the
+        // repo's own round-trip check asserts a second compare is 0 bytes. So
+        // the guard is withdrawn when it is the only thing the migration would
+        // do, which makes a no-op diff byte-identical with the flag on and off
+        // in both transaction modes.
+        if self.guard_sql_routine_bodies {
+            let bare = super::scanner::strip_comments_and_collapse(&self.script);
+            // Whitespace-insensitive so this does not silently stop working if
+            // the framing's blank lines are ever laid out differently.
+            let remainder = bare
+                .replacen(FUNCTION_BODY_GUARD, "", 1)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if remainder.is_empty() || remainder == "begin; commit;" {
+                self.script = self
+                    .script
+                    .replacen(&format!("{FUNCTION_BODY_GUARD}\n\n"), "", 1);
+            }
         }
 
         Ok(())
@@ -629,6 +717,26 @@ impl Comparer {
         (lower, unquoted)
     }
 
+    /// [`Comparer::prelower_pair`] for text whose references are about to be
+    /// read as **dependency edges** — a routine's `prosrc`, a view's
+    /// definition — rather than merely searched.
+    ///
+    /// Comments and string-literal bodies are blanked first
+    /// (`scanner::blank_comments_and_literals`), because neither can hold a
+    /// reference PostgreSQL resolves when the object is created: a comment
+    /// naming another routine is documentation, and a name inside a quoted
+    /// literal is dynamic SQL. Counting either invents an edge, and one
+    /// invented edge pointing back along a real one is a cycle Kahn's sort
+    /// cannot order — at which point it appends the whole blocked subgraph in
+    /// plain name order and the script creates routines before their callees
+    /// (issue #240).
+    ///
+    /// Only the dependency scans use this. Plain `prelower_pair` stays for
+    /// haystacks where a literal match is still a match.
+    fn prelower_pair_for_dependency_scan(text: &str) -> (String, String) {
+        Self::prelower_pair(&super::scanner::blank_comments_and_literals(text))
+    }
+
     /// Check whether a routine's `aggregate_info` references a function
     /// identified by `(schema, name)` (both lowercase).  Aggregate transition
     /// functions, final functions, etc. are stored as qualified or unqualified
@@ -682,6 +790,58 @@ impl Comparer {
             return true;
         }
         false
+    }
+
+    /// Name, on stderr, the objects caught in a dependency cycle.
+    ///
+    /// `kahn_toposort` cannot order a cycle. It appends every node whose
+    /// in-degree never reached zero in plain sort-key order, so the script
+    /// still contains all of them — in an order that ignores their real
+    /// dependencies, and which therefore may not replay. Before issue #240
+    /// that happened silently; the reported symptom was a migration failing on
+    /// `function ... does not exist` with nothing in the output to suggest
+    /// why.
+    ///
+    /// The set is narrowed to true SCC members (size >= 2) rather than
+    /// reported straight from `kahn_toposort_detect_cycle`, whose remainder
+    /// also contains everything merely *blocked behind* a cycle — the same
+    /// distinction `topo_order_within_subset_detect_cycle` draws. Naming a
+    /// routine that is only downstream of the problem sends the reader to the
+    /// wrong file.
+    ///
+    /// stderr rather than a comment in the script: `USE_COMMENTS=false` strips
+    /// commented-out DDL from the output, and a diagnostic a config flag can
+    /// delete is not a diagnostic.
+    fn warn_dependency_cycle(
+        what: &str,
+        n: usize,
+        depends_on: &[HashSet<usize>],
+        label: impl Fn(usize) -> String,
+    ) {
+        let mut cycles: Vec<Vec<String>> = Self::strongly_connected_components(n, depends_on)
+            .into_iter()
+            .filter(|scc| scc.len() >= 2)
+            .map(|scc| {
+                let mut names: Vec<String> = scc.into_iter().map(&label).collect();
+                names.sort();
+                names
+            })
+            .collect();
+        if cycles.is_empty() {
+            return;
+        }
+        // Deterministic order, so the same schemas always warn the same way.
+        cycles.sort();
+        for names in cycles {
+            eprintln!(
+                "Warning: dependency cycle among {what}: {}. pgc cannot order these, \
+                 so the script emits them in name order and may not replay as written. \
+                 A cycle here is either genuine (mutually recursive routines) or an \
+                 artefact of the text scan; if the migration fails on a missing \
+                 function, --guard-sql-routine-bodies will get it through.",
+                names.join(", ")
+            );
+        }
     }
 
     /// Kahn's topological sort for an index-based dependency graph.
@@ -1726,7 +1886,7 @@ impl Comparer {
             // this the haystack would be re-lowered on every iteration.
             let drop_sources: Vec<(String, String)> = routines_to_drop
                 .iter()
-                .map(|r| Self::prelower_pair(&r.source_code))
+                .map(|r| Self::prelower_pair_for_dependency_scan(&r.source_code))
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
@@ -1745,6 +1905,15 @@ impl Comparer {
                 }
             }
 
+            Self::warn_dependency_cycle(
+                "routines being dropped",
+                routines_to_drop.len(),
+                &drop_deps,
+                |i| {
+                    let r = routines_to_drop[i];
+                    format!("{}.{}({})", r.schema, r.name, r.arguments)
+                },
+            );
             let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
                 drop_names[i].clone()
             });
@@ -1804,7 +1973,7 @@ impl Comparer {
             // routine's source_code once so the quadratic scan doesn't.
             let create_sources: Vec<(String, String)> = create_routines
                 .iter()
-                .map(|(_, r)| Self::prelower_pair(&r.source_code))
+                .map(|(_, r)| Self::prelower_pair_for_dependency_scan(&r.source_code))
                 .collect();
             for (i, (_, routine)) in create_routines.iter().enumerate() {
                 let (src_lower, src_unquoted) = &create_sources[i];
@@ -1822,6 +1991,10 @@ impl Comparer {
                 }
             }
 
+            Self::warn_dependency_cycle("routines", n, &depends_on, |i| {
+                let r = create_routines[i].1;
+                format!("{}.{}({})", r.schema, r.name, r.arguments)
+            });
             let sorted = Self::kahn_toposort(n, &depends_on, |i| {
                 let r = create_routines[i].1;
                 let priority: u8 = if r.lang.eq_ignore_ascii_case("sql") {
@@ -3065,7 +3238,7 @@ impl Comparer {
             self.from
                 .views
                 .iter()
-                .map(|v| Self::prelower_pair(&v.definition))
+                .map(|v| Self::prelower_pair_for_dependency_scan(&v.definition))
                 .collect()
         };
         let names_lc: Vec<(String, String)> = if candidates.is_empty() {
@@ -3159,6 +3332,16 @@ impl Comparer {
             }
 
             // Topological sort in creation order, then reverse for drops.
+            Self::warn_dependency_cycle(
+                "views being dropped",
+                candidates.len(),
+                &depends_on,
+                |i| {
+                    let (idx, _, _) = &candidates[i];
+                    let v = &self.from.views[*idx];
+                    format!("{}.{}", v.schema, v.name)
+                },
+            );
             let mut sorted = Self::kahn_toposort(candidates.len(), &depends_on, |i| {
                 let (idx, _, _) = &candidates[i];
                 let v = &self.from.views[*idx];
@@ -4126,7 +4309,7 @@ impl Comparer {
             // count and previously re-lowered the full source on every call.
             let drop_sources: Vec<(String, String)> = routines_to_drop
                 .iter()
-                .map(|r| Self::prelower_pair(&r.source_code))
+                .map(|r| Self::prelower_pair_for_dependency_scan(&r.source_code))
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
@@ -4145,6 +4328,15 @@ impl Comparer {
                 }
             }
 
+            Self::warn_dependency_cycle(
+                "routines being dropped",
+                routines_to_drop.len(),
+                &drop_deps,
+                |i| {
+                    let r = routines_to_drop[i];
+                    format!("{}.{}({})", r.schema, r.name, r.arguments)
+                },
+            );
             let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
                 drop_names[i].clone()
             });
@@ -4248,7 +4440,8 @@ impl Comparer {
                         .iter()
                         .map(|rel| Self::normalized_view_reference(rel))
                         .collect();
-                    let (text_lower, text_unquoted_lower) = Self::prelower_pair(&v.definition);
+                    let (text_lower, text_unquoted_lower) =
+                        Self::prelower_pair_for_dependency_scan(&v.definition);
                     ItemInfo {
                         text_lower,
                         text_unquoted_lower,
@@ -4266,7 +4459,8 @@ impl Comparer {
                     } else {
                         0
                     };
-                    let (text_lower, text_unquoted_lower) = Self::prelower_pair(&r.source_code);
+                    let (text_lower, text_unquoted_lower) =
+                        Self::prelower_pair_for_dependency_scan(&r.source_code);
                     ItemInfo {
                         text_lower,
                         text_unquoted_lower,
@@ -4349,6 +4543,11 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         // Phase 4 – Topological sort
         // ──────────────────────────────────────────────────────────
+        Self::warn_dependency_cycle("routines and views", items.len(), &depends_on, |i| {
+            let item = &items[i];
+            let kind = if item.is_view { "view" } else { "routine" };
+            format!("{kind} {}.{}", item.schema_lower, item.name_lower)
+        });
         let sorted = Self::kahn_toposort(items.len(), &depends_on, |i| items[i].sort_key.clone());
 
         // Prepare the emit plan (is_view, orig_idx) so we can drop `items`.
