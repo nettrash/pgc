@@ -1711,6 +1711,7 @@ impl Dump {
                     name,
                     definition,
                     table_relation: row.get("table_relation"),
+                    column_relation: Some(row.get("column_relation")),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
                         .unwrap_or_default(),
@@ -1781,6 +1782,7 @@ impl Dump {
                     name,
                     definition,
                     table_relation: row.get("table_relation"),
+                    column_relation: Some(row.get("column_relation")),
                     owner: row
                         .get::<Option<String>, _>("view_owner")
                         .unwrap_or_default(),
@@ -1867,6 +1869,32 @@ impl Dump {
                     )"
     }
 
+    /// The column-level twin of [`Dump::view_table_relation_subquery`]: the
+    /// individual columns the view's `_RETURN` rule depends on, which is exactly
+    /// the set PostgreSQL refuses to drop or retype while the view exists.
+    ///
+    /// Same filters as the table-level query, plus `refobjsubid > 0` — a
+    /// `pg_depend` row with subid 0 is the whole relation (what
+    /// `table_relation` already collects), and a row with a positive subid is
+    /// one column of it.
+    fn view_column_relation_subquery() -> &'static str {
+        "array(
+                        select distinct dn.nspname || '.' || dc.relname || '.' || da.attname
+                        from pg_rewrite r
+                        join pg_depend dep on dep.classid = 'pg_rewrite'::regclass and dep.objid = r.oid
+                        join pg_class dc on dc.oid = dep.refobjid
+                        join pg_namespace dn on dn.oid = dc.relnamespace
+                        join pg_attribute da on da.attrelid = dc.oid and da.attnum = dep.refobjsubid
+                        where r.ev_class = c.oid
+                          and r.rulename = '_RETURN'
+                          and dep.refclassid = 'pg_class'::regclass
+                          and dep.deptype = 'n'
+                          and dep.refobjsubid > 0
+                          and dc.oid <> c.oid
+                          and dc.relkind in ('r', 'v', 'm', 'f', 'p')
+                    )"
+    }
+
     fn build_regular_views_query(schema_filter: &str) -> String {
         format!(
             "select
@@ -1875,6 +1903,7 @@ impl Dump {
                     v.view_definition,
                     quote_ident(pv.viewowner) as view_owner,
                     {} as table_relation,
+                    {} as column_relation,
                     d.description as view_comment,
                     (select cc.relacl::text[] from pg_class cc where cc.oid = c.oid) as view_acl,
                     coalesce(c.reloptions::text[] @> array['security_invoker=true']::text[], false) as security_invoker,
@@ -1896,6 +1925,7 @@ impl Dump {
                     and ext_dep.deptype = 'e'
                 );",
             Self::view_table_relation_subquery(),
+            Self::view_column_relation_subquery(),
             schema_filter
         )
     }
@@ -1908,6 +1938,7 @@ impl Dump {
                     mv.definition as view_definition,
                     mv.matviewowner as view_owner,
                     {} as table_relation,
+                    {} as column_relation,
                     d.description as view_comment,
                     c.relacl::text[] as view_acl,
                     c.reloptions as storage_options,
@@ -1929,6 +1960,7 @@ impl Dump {
                     and ext_dep.deptype = 'e'
                 );",
             Self::view_table_relation_subquery(),
+            Self::view_column_relation_subquery(),
             schema_filter
         )
     }

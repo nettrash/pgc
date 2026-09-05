@@ -1,16 +1,41 @@
 2026-09-05      v1.0.27
 
-                Fixes two ways a migration could quietly destroy what
-                it was meant to migrate: the routine ordering bug
-                behind issue #240, with one opt-in flag for it, and
-                the schema-moved extension of issue #241. Beyond
-                those this release reorganises the test suite, adds a
-                library target and integration tests, and documents
-                the crate. The dump file format is unchanged, and so
-                is the generated SQL for any schema neither bug
-                touched.
+                Fixes three ways a migration could quietly destroy or
+                rebuild what it was meant to migrate: the routine
+                ordering bug behind issue #240, with one opt-in flag
+                for it, the schema-moved extension of issue #241, and
+                the materialized view rebuilt on an unrelated column
+                change of issue #242. Beyond those this release
+                reorganises the test suite, adds a library target and
+                integration tests, and documents the crate. The dump
+                gains one optional field, which older dumps may omit,
+                and the generated SQL is unchanged for any schema
+                none of the three bugs touched.
 
                 Bug fixes:
+                    - Resolved issue #242 (a materialized view was
+                      dropped and fully rebuilt whenever any column of
+                      any table it reads changed, even a column it never
+                      reads). The set of views that have to be dropped
+                      before the table DDL runs was decided at table
+                      granularity: a view over a table whose hash
+                      differed at all went first. PostgreSQL's own rule
+                      is much narrower. It refuses to drop or retype a
+                      column a view depends on, and refuses nothing
+                      else, so adding a column is permitted with every
+                      view in place. A metadata-only ADD COLUMN
+                      therefore turned into a DROP MATERIALIZED VIEW, a
+                      full rebuild of its contents and a rebuild of each
+                      of its indexes, with the data missing until the
+                      refresh finished. Regular views over the same
+                      table were dropped and recreated for the same
+                      reason. The dump now records which columns each
+                      view actually reads, taken from pg_depend for the
+                      view's _RETURN rule, and only a change to one of
+                      those columns drags the view along. A table that
+                      is dropped, or dropped and recreated, still takes
+                      every view over it. Dumps written before this
+                      field exists keep the old table-level answer.
                     - Resolved issue #241 (an extension moved between
                       schemas was deleted instead of relocated).
                       Extensions were matched between the two dumps on

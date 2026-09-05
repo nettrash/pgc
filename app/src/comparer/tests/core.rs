@@ -36,5 +36,7 @@ mod sequences;
 mod tables;
 #[path = "core/types.rs"]
 mod types;
+#[path = "core/view_column_dependencies.rs"]
+mod view_column_dependencies;
 #[path = "core/views.rs"]
 mod views;

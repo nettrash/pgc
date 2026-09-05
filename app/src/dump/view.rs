@@ -59,6 +59,30 @@ pub struct View {
     pub definition: String,
     /// Table relation (list of tables that used by this view)
     pub table_relation: Vec<String>,
+    /// The individual **columns** this view reads, as PostgreSQL records them in
+    /// `pg_depend` for the view's `_RETURN` rule: unquoted, lowercase-as-stored
+    /// `schema.table.column` entries. `None` in dumps written before this field
+    /// existed; `Some([])` for a view that reads no column of any table at all
+    /// (`select count(*) from t`, `select 1`), which is a real and different
+    /// answer (issue #242).
+    ///
+    /// This is the column-level twin of [`View::table_relation`], and it exists
+    /// because that one is too coarse to decide whether a view has to be dropped
+    /// before a table it reads is altered. PostgreSQL refuses to drop or retype
+    /// a column that a view depends on, and refuses nothing else: adding a
+    /// column, or dropping or retyping a column the view never reads, is
+    /// allowed with the view in place (verified live on PostgreSQL 16). Deciding
+    /// at table granularity turned a metadata-only `ADD COLUMN` into a full
+    /// `DROP` and rebuild of every materialized view over that table.
+    ///
+    /// Deliberately excluded from `View::hash`, for the same reasons as
+    /// [`View::columns`] and [`View::indexes`]: hashing it would make every view
+    /// compare as changed against a dump that predates the field, and for a
+    /// materialized view a changed hash means a full rebuild. It only decides
+    /// *what else* an already-detected table change drags with it, never whether
+    /// the view itself changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_relation: Option<Vec<String>>,
     /// Owner of the view
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner: String,
@@ -128,6 +152,7 @@ impl View {
             name,
             definition,
             table_relation,
+            column_relation: None,
             owner: String::new(),
             comment: None,
             is_materialized: false,

@@ -385,6 +385,24 @@ impl TableColumn {
     }
 
     /// Hash
+    /// Whether this column's **type** differs from `other`'s.
+    ///
+    /// Exactly the attributes PostgreSQL refuses to change while a view or rule
+    /// depends on the column ("cannot alter type of a column used by a view or
+    /// rule"), and nothing else: nullability, defaults, comments and storage
+    /// settings can all be altered underneath a dependent view.
+    ///
+    /// One predicate for two callers that must not drift — `Table`'s
+    /// partition-recreate gate and the comparer's decision about which views
+    /// have to be dropped first (issue #242).
+    pub fn type_differs(&self, other: &TableColumn) -> bool {
+        self.data_type != other.data_type
+            || self.udt_name != other.udt_name
+            || self.numeric_precision != other.numeric_precision
+            || self.numeric_scale != other.numeric_scale
+            || self.character_maximum_length != other.character_maximum_length
+    }
+
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.name.as_bytes());
         hasher.update(self.data_type.as_bytes());

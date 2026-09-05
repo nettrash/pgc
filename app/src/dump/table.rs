@@ -2307,12 +2307,7 @@ impl Table {
         old_col: &TableColumn,
         new_col: &TableColumn,
     ) -> bool {
-        let type_changed = old_col.data_type != new_col.data_type
-            || old_col.udt_name != new_col.udt_name
-            || old_col.numeric_precision != new_col.numeric_precision
-            || old_col.numeric_scale != new_col.numeric_scale
-            || old_col.character_maximum_length != new_col.character_maximum_length;
-        if !type_changed {
+        if !old_col.type_differs(new_col) {
             return false;
         }
         let is_partition_child = self.partition_of.is_some();
