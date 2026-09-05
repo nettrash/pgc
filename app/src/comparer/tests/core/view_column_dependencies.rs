@@ -281,3 +281,93 @@ async fn a_dump_without_column_dependencies_keeps_the_table_level_answer() {
         comparer.get_script()
     );
 }
+
+// ── PR #247 review: what counts as a "retype" ──────────────────────────
+// The gate has to answer for the statement the comparer actually emits,
+// not for a hand-written list of type attributes. `TableColumn::
+// get_alter_script` emits `ALTER COLUMN ... TYPE` whenever the rendered
+// type *clause* differs, and that clause carries the interval qualifier
+// and the collation as well as the type name — neither of which a field
+// list remembers. PostgreSQL rejects the statement for a collation-only
+// change exactly as firmly as for a real one (verified live on
+// PostgreSQL 16).
+
+#[tokio::test]
+async fn a_collation_change_on_a_read_column_still_drops_the_views() {
+    // The collation alone is invisible to the table hash, so this pairs it
+    // with a default change — which is what makes the comparer produce an
+    // alter script for the table at all, and therefore what makes the
+    // collation reach `ALTER COLUMN ... TYPE`.
+    let mut from_status = text_column("orders", "status", 2);
+    from_status.collation_name = Some("C".to_string());
+    from_status.column_default = Some("'x'::text".to_string());
+
+    let mut to_status = text_column("orders", "status", 2);
+    to_status.collation_name = Some("POSIX".to_string());
+    to_status.column_default = Some("'y'::text".to_string());
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(orders(vec![
+        int_column("repro", "orders", "id", 1),
+        from_status,
+    ]));
+    to_dump.tables.push(orders(vec![
+        int_column("repro", "orders", "id", 1),
+        to_status,
+    ]));
+    for dump in [&mut from_dump, &mut to_dump] {
+        dump.views.push(view_over_orders("mv", true, &["status"]));
+        dump.views.push(view_over_orders("v", false, &["status"]));
+    }
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.drop_views().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.contains("drop materialized view if exists repro.mv"),
+        "a collation change is emitted as ALTER COLUMN ... TYPE, which \
+         PostgreSQL refuses while the view exists:\n{script}"
+    );
+    assert!(script.contains("drop view if exists repro.v"), "{script}");
+}
+
+#[tokio::test]
+async fn an_interval_qualifier_change_on_a_read_column_still_drops_the_views() {
+    // Same shape, the other field `render_type_clause` carries and a field
+    // list forgets: `interval` -> `interval day`.
+    let mut from_status = text_column("orders", "status", 2);
+    from_status.data_type = "interval".to_string();
+    from_status.udt_name = Some("interval".to_string());
+    from_status.column_default = Some("'1 day'::interval".to_string());
+
+    let mut to_status = from_status.clone();
+    to_status.interval_type = Some("DAY".to_string());
+    to_status.column_default = Some("'2 days'::interval".to_string());
+
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(orders(vec![
+        int_column("repro", "orders", "id", 1),
+        from_status,
+    ]));
+    to_dump.tables.push(orders(vec![
+        int_column("repro", "orders", "id", 1),
+        to_status,
+    ]));
+    for dump in [&mut from_dump, &mut to_dump] {
+        dump.views.push(view_over_orders("mv", true, &["status"]));
+    }
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, false, true, GrantsMode::Ignore);
+    comparer.drop_views().await.unwrap();
+
+    assert!(
+        comparer
+            .get_script()
+            .contains("drop materialized view if exists repro.mv"),
+        "{}",
+        comparer.get_script()
+    );
+}

@@ -385,18 +385,35 @@ impl TableColumn {
     }
 
     /// Hash
-    /// Whether this column's **type** differs from `other`'s.
+    /// Whether this column's **type** differs from `other`'s, in any way that
+    /// makes the comparer emit `ALTER TABLE ... ALTER COLUMN ... TYPE`.
     ///
-    /// Exactly the attributes PostgreSQL refuses to change while a view or rule
-    /// depends on the column ("cannot alter type of a column used by a view or
-    /// rule"), and nothing else: nullability, defaults, comments and storage
-    /// settings can all be altered underneath a dependent view.
+    /// That statement is what PostgreSQL refuses while a view or rule depends on
+    /// the column ("cannot alter type of a column used by a view or rule"), and
+    /// it refuses it for the *statement*, not for whether the type meaningfully
+    /// changed — a collation-only retype is rejected just as firmly. So this
+    /// predicate has to answer for exactly the set of changes that produce the
+    /// statement, and its first term is the emission's own test.
     ///
-    /// One predicate for two callers that must not drift — `Table`'s
-    /// partition-recreate gate and the comparer's decision about which views
-    /// have to be dropped first (issue #242).
+    /// Defining it any other way is a trap this codebase already fell into
+    /// (PR #247 review). Spelling out a list of type attributes here left
+    /// `interval_type` and `collation_name` off it, because they reach the type
+    /// clause through `render_type_clause` rather than through a field
+    /// comparison. A column whose collation changed *and* whose default changed
+    /// then produced a migration that altered the type with the materialized
+    /// view still in place, and PostgreSQL rejected it — verified live on
+    /// PostgreSQL 16, and the reason there is a test for it.
+    ///
+    /// The remaining terms are what the partition-recreate gate compared before
+    /// this became shared, and they stay: `udt_name` distinguishes two
+    /// `USER-DEFINED` columns of different types, which the rendered clause
+    /// cannot, and the precision and length comparisons are unconditional where
+    /// the clause only renders them for the types they apply to. The union is at
+    /// least as eager as either caller was on its own — and for both callers,
+    /// eager is the safe direction: an unnecessary drop or recreate costs time,
+    /// a missing one produces SQL PostgreSQL will not run.
     pub fn type_differs(&self, other: &TableColumn) -> bool {
-        self.data_type != other.data_type
+        self.type_clause_differs(other)
             || self.udt_name != other.udt_name
             || self.numeric_precision != other.numeric_precision
             || self.numeric_scale != other.numeric_scale
