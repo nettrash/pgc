@@ -505,6 +505,15 @@ Requires `wal_level = logical`. Comment out these statements if the test server 
 - **Unquoted list round-trip** (Issue #217): `set_config_roundtrip(p_id integer)` has no config in FROM; TO adds `SECURITY DEFINER`, an **unquoted** list-valued `SET search_path = test_schema, pg_temp`, a scalar `SET lock_timeout = '5s'`, and a numeric `SET statement_timeout = 30000`. `search_path` is a `GUC_LIST_QUOTE` parameter, so its `proconfig` value is a bare comma-separated list; emitting it as a single-quoted literal (`'test_schema, pg_temp'`) makes PostgreSQL re-store it as one schema named `test_schema, pg_temp`, and the second diff keeps re-emitting the routine. The list must be emitted verbatim, the scalars as literals. The pre-existing `'public, pg_temp'` fixtures above could not catch this: a single-quoted value stores as one element and round-trips regardless
 - PostgreSQL stores these in `pg_proc.proconfig` as an array (e.g. `{search_path=public\, pg_temp,lock_timeout=5s}`)
 
+#### Views Dragged Along by an Unread Column Change (Issue #242)
+
+- `test_schema.i242_orders` differs in two ways between FROM and TO: it gains `unrelated_2`, and `status` goes `text` → `varchar(50)`.
+- Three views sit on it. `i242_mv_untouched` (materialized, with index `ix_i242_mv_untouched_id`) and `i242_v_untouched` (regular) read only `id`. `i242_mv_touched` reads `status`.
+- PostgreSQL refuses exactly two things while a view depends on a column: dropping it and retyping it. Adding a column, or dropping/retyping a column the view never reads, succeeds with the view in place (verified live on PG 16). So the diff must drop `i242_mv_touched` and recreate it, and must leave the other two — and the index — completely alone.
+- Before the fix the drop set was decided at *table* granularity: any view over a table whose hash differed at all was dropped first. Both `i242_mv_untouched` and `i242_v_untouched` were dropped and rebuilt, and the materialized one's index was rebuilt with `CREATE INDEX CONCURRENTLY`, purely because an unrelated column was added to a table they happen to read.
+- **The round-2 diff does not catch this** — an unnecessary drop and recreate still converges on the right schema, so the second compare is empty either way (verified: 0 bytes with the bug present). The guard is the dedicated `Assert unread-column changes did not drag views along` step in `.github/workflows/rust.yml`, which greps the round-1 script directly, in the same spirit as the existing invalid-index assertion.
+- The dependency data comes from `View::column_relation`, captured from `pg_depend` for the view's `_RETURN` rule. It covers every position a column can appear in, not just the select list — `WHERE`, `JOIN ... ON` and `GROUP BY` references are all recorded (verified live).
+
 #### Extension Moved Between Schemas (Issue #241)
 
 - `fuzzystrmatch` is installed `WITH SCHEMA shared_schema` in FROM and `WITH SCHEMA public` in TO. Nothing else about it changes.

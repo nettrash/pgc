@@ -182,6 +182,37 @@ jobs:
         psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=0 \
           -f /tmp/output.sql
 
+    - name: Assert unread-column changes did not drag views along
+      run: |
+        # A materialized view is dropped and fully rebuilt whenever the diff
+        # decides it depends on a changing table. Deciding that at table
+        # granularity turned a metadata-only ADD COLUMN into a full refresh
+        # (issue #242). The round-2 diff cannot catch it — an unnecessary
+        # drop+recreate still converges, so the compare is empty either way —
+        # so assert directly against the round-1 script.
+        #
+        # The fixtures: test_schema.i242_orders gains a column and retypes
+        # `status`. i242_mv_untouched and i242_v_untouched read only `id`, so
+        # PostgreSQL permits both changes with them in place and neither may
+        # be dropped; i242_mv_touched reads `status` and must still go.
+        fail=0
+        for v in i242_mv_untouched i242_v_untouched; do
+          if grep -qE "drop (materialized )?view if exists test_schema.${v}" /tmp/output.sql; then
+            echo "ERROR: ${v} was dropped although it reads no changed column (PG ${{ matrix.pg_version }})"
+            fail=1
+          fi
+        done
+        if grep -q "ix_i242_mv_untouched_id" /tmp/output.sql; then
+          echo "ERROR: the index of an untouched materialized view was rebuilt (PG ${{ matrix.pg_version }})"
+          fail=1
+        fi
+        if ! grep -q "drop materialized view if exists test_schema.i242_mv_touched" /tmp/output.sql; then
+          echo "ERROR: i242_mv_touched reads a retyped column and must be dropped first (PG ${{ matrix.pg_version }})"
+          fail=1
+        fi
+        [ "${fail}" -eq 0 ] || exit 1
+        echo "OK: only the views reading changed columns were dropped on PG ${{ matrix.pg_version }}"
+
     - name: Assert all indexes are valid
       env:
         PGPASSWORD: postgres

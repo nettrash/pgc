@@ -1919,3 +1919,30 @@ CREATE INDEX ix_mv235_stable_redef ON test_schema.mv235_stable (label);
 -- Only the comment changes in TO: the index itself must be left alone.
 CREATE INDEX ix_mv235_stable_cmt ON test_schema.mv235_stable (id, amount);
 COMMENT ON INDEX test_schema.ix_mv235_stable_cmt IS 'comment before';
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #242: a table change must only drag in the views that actually
+-- read the affected columns.
+--
+-- `i242_orders` gains an unrelated column in TO. Neither view below reads
+-- it, so PostgreSQL is happy to add it with both in place and the diff
+-- must leave them alone — no DROP MATERIALIZED VIEW, no rebuild, no index
+-- rebuild. `i242_mv_touched` is the control: it reads `status`, which is
+-- retyped in TO, so it must still be dropped and recreated.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE test_schema.i242_orders (
+    id         integer PRIMARY KEY,
+    status     text NOT NULL,
+    unrelated  integer
+);
+
+CREATE MATERIALIZED VIEW test_schema.i242_mv_untouched AS
+SELECT id, count(*) AS cnt FROM test_schema.i242_orders GROUP BY id;
+
+CREATE INDEX ix_i242_mv_untouched_id ON test_schema.i242_mv_untouched (id);
+
+CREATE VIEW test_schema.i242_v_untouched AS
+SELECT id FROM test_schema.i242_orders;
+
+CREATE MATERIALIZED VIEW test_schema.i242_mv_touched AS
+SELECT status, count(*) AS cnt FROM test_schema.i242_orders GROUP BY status;

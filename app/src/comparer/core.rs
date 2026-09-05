@@ -1107,9 +1107,35 @@ impl Comparer {
         ordered
     }
 
+    /// Views — regular and materialized — that must be dropped before the table
+    /// DDL runs, because a table they read is going away or a column they read
+    /// is being dropped or retyped.
+    ///
+    /// PostgreSQL is precise about what a dependent view forbids, and this now
+    /// matches it. It refuses `DROP COLUMN` and `ALTER COLUMN ... TYPE` for a
+    /// column a view depends on, and refuses nothing else: adding a column, or
+    /// dropping or retyping a column the view never reads, succeeds with the
+    /// view in place (verified live on PostgreSQL 16). Deciding at *table*
+    /// granularity — "this view reads a table that changed at all" — turned a
+    /// metadata-only `ADD COLUMN` into a `DROP` and full rebuild of every
+    /// materialized view over that table, its indexes included, with the data
+    /// gone until the rebuild finished (issue #242).
+    ///
+    /// The column dependencies come from `View::column_relation`, which
+    /// `pg_depend` records for the view's `_RETURN` rule and which covers every
+    /// position a column can appear in, not just the select list — `WHERE`,
+    /// `JOIN ... ON` and `GROUP BY` references are all there.
+    ///
+    /// Two things still take a view wholesale, whatever columns it reads: the
+    /// table being dropped, and the table being dropped and recreated by the
+    /// alter path (a partition-key change, say), because the view's own
+    /// definition cannot outlive the relation it names.
+    ///
+    /// A dump written before `column_relation` existed carries no column
+    /// dependencies, and every view in it keeps the historical table-level
+    /// answer — over-eager, but never wrong in the direction that breaks a
+    /// migration.
     fn dependent_view_keys(&self) -> HashSet<String> {
-        let mut dependent_views = HashSet::new();
-
         // Build O(1) lookup for target tables
         let to_table_map: HashMap<(&str, &str), usize> = self
             .to
@@ -1119,27 +1145,22 @@ impl Comparer {
             .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
             .collect();
 
-        // Collect normalised keys for every table that will be altered or dropped,
-        // so we can cheaply look them up when scanning materialized view relations.
-        let altered_or_dropped: HashSet<String> = self
-            .from
-            .tables
-            .iter()
-            .filter(|table| {
-                let matching_idx = to_table_map.get(&(table.schema.as_str(), table.name.as_str()));
-                let matching = matching_idx.map(|&idx| &self.to.tables[idx]);
-                let will_be_dropped = matching.is_none() && self.use_drop;
-                let will_be_altered = matching
-                    .map(|target| Self::hashes_differ(&target.hash, &table.hash))
-                    .unwrap_or(false);
-                will_be_dropped || will_be_altered
-            })
-            .map(|table| Self::normalized_view_key(&table.schema, &table.name))
-            .collect();
+        // Tables that stop existing in the form the view names them, so every
+        // view over one has to go regardless of columns.
+        let mut wholesale_tables: HashSet<String> = HashSet::new();
+        // Columns whose drop or retype PostgreSQL would refuse while a
+        // dependent view exists.
+        let mut changed_columns: HashSet<String> = HashSet::new();
+        // Every table touched at all — the historical, table-level test, kept
+        // for views from dumps that carry no column dependencies.
+        let mut altered_or_dropped: HashSet<String> = HashSet::new();
+        // The historical regular-view answer, likewise kept for those dumps.
+        let mut legacy_dependent: HashSet<String> = HashSet::new();
 
         for table in &self.from.tables {
-            let matching_idx = to_table_map.get(&(table.schema.as_str(), table.name.as_str()));
-            let matching_table = matching_idx.map(|&idx| &self.to.tables[idx]);
+            let matching_table = to_table_map
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .map(|&idx| &self.to.tables[idx]);
 
             let will_be_dropped = matching_table.is_none() && self.use_drop;
             let will_be_altered = matching_table
@@ -1150,29 +1171,93 @@ impl Comparer {
                 continue;
             }
 
+            let table_key = Self::normalized_view_key(&table.schema, &table.name);
+            altered_or_dropped.insert(table_key.clone());
+
             for column in &table.columns {
                 if let Some(related_views) = &column.related_views {
                     for view_ref in related_views {
                         let normalized = Self::normalized_view_reference(view_ref);
                         if !normalized.is_empty() {
-                            dependent_views.insert(normalized);
+                            legacy_dependent.insert(normalized);
+                        }
+                    }
+                }
+            }
+
+            match matching_table {
+                // Gone, or rebuilt from scratch: nothing that reads it survives.
+                None => {
+                    wholesale_tables.insert(table_key);
+                }
+                Some(target) if table.will_be_dropped_and_recreated(target) => {
+                    wholesale_tables.insert(table_key);
+                }
+                Some(target) => {
+                    let to_columns: HashMap<&str, &TableColumn> = target
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.as_str(), c))
+                        .collect();
+                    for column in &table.columns {
+                        let forbidden = match to_columns.get(column.name.as_str()) {
+                            // Dropped.
+                            None => true,
+                            // Retyped. Anything else about a column — its
+                            // nullability, default, comment, storage — can be
+                            // altered underneath a view that reads it.
+                            Some(target_column) => column.type_differs(target_column),
+                        };
+                        if forbidden {
+                            changed_columns.insert(Self::normalized_view_reference(&format!(
+                                "{}.{}.{}",
+                                table.schema, table.name, column.name
+                            )));
                         }
                     }
                 }
             }
         }
 
-        // Materialized views are not tracked in information_schema.view_column_usage,
-        // so they may be absent from column.related_views in older dumps.  Use the
-        // view's table_relation as a reliable fallback: if a mat-view touches any
-        // table that is being altered or dropped, it must be dropped first.
-        for view in self.from.views.iter().filter(|v| v.is_materialized) {
-            let touches = view
+        let mut dependent_views = HashSet::new();
+        for view in &self.from.views {
+            let view_key = Self::normalized_view_key(&view.schema, &view.name);
+
+            let reads_a_wholesale_table = view
                 .table_relation
                 .iter()
-                .any(|rel| altered_or_dropped.contains(&Self::normalized_view_reference(rel)));
-            if touches {
-                dependent_views.insert(Self::normalized_view_key(&view.schema, &view.name));
+                .any(|rel| wholesale_tables.contains(&Self::normalized_view_reference(rel)));
+            if reads_a_wholesale_table {
+                dependent_views.insert(view_key);
+                continue;
+            }
+
+            match &view.column_relation {
+                Some(columns) => {
+                    let reads_a_changed_column = columns
+                        .iter()
+                        .any(|col| changed_columns.contains(&Self::normalized_view_reference(col)));
+                    if reads_a_changed_column {
+                        dependent_views.insert(view_key);
+                    }
+                }
+                // Pre-`column_relation` dump: the historical answer, which is
+                // `related_views` for a regular view and `table_relation` for a
+                // materialized one (materialized views never appear in
+                // `information_schema.view_column_usage`, so they had no other
+                // source).
+                None => {
+                    let touched = if view.is_materialized {
+                        view.table_relation.iter().any(|rel| {
+                            altered_or_dropped.contains(&Self::normalized_view_reference(rel))
+                        })
+                    } else {
+                        legacy_dependent.contains(&view_key)
+                    };
+                    if touched {
+                        dependent_views.insert(view_key);
+                    }
+                }
             }
         }
 

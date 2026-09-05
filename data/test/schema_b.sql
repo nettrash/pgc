@@ -2194,3 +2194,26 @@ CREATE FUNCTION test_schema.i240_z_caller(pvalue text) RETURNS text
 AS $$
     SELECT test_schema.i240_helper_d(pvalue);
 $$;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #242: `unrelated_2` is added and `status` is retyped. The two
+-- views reading only `id` must survive untouched; the one reading
+-- `status` must still be dropped and recreated.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE test_schema.i242_orders (
+    id           integer PRIMARY KEY,
+    status       varchar(50) NOT NULL,
+    unrelated    integer,
+    unrelated_2  timestamptz
+);
+
+CREATE MATERIALIZED VIEW test_schema.i242_mv_untouched AS
+SELECT id, count(*) AS cnt FROM test_schema.i242_orders GROUP BY id;
+
+CREATE INDEX ix_i242_mv_untouched_id ON test_schema.i242_mv_untouched (id);
+
+CREATE VIEW test_schema.i242_v_untouched AS
+SELECT id FROM test_schema.i242_orders;
+
+CREATE MATERIALIZED VIEW test_schema.i242_mv_touched AS
+SELECT status, count(*) AS cnt FROM test_schema.i242_orders GROUP BY status;
