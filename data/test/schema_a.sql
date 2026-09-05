@@ -31,6 +31,11 @@ $$;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA public;
+-- Issue #241: an extension that MOVES schema between FROM and TO. Its name,
+-- not its schema, is its identity (pg_extension has a unique index on
+-- extname), so the diff must relocate it with ALTER EXTENSION ... SET SCHEMA
+-- rather than treat the move as an unrelated create plus drop.
+CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch" WITH SCHEMA shared_schema;
 
 -- Custom types
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending');

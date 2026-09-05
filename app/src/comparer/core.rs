@@ -1254,23 +1254,33 @@ impl Comparer {
         // We will find all new extensions from "to" dump that are not in "from" dump
         // and add them to the script.
         // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
-        let from_ext_map: HashMap<(&str, &str), usize> = self
+        //
+        // Keyed by NAME alone, not `(schema, name)`. An extension's name is
+        // unique per database — `pg_extension` has a unique index on
+        // `extname` — and its schema is an attribute of where it was
+        // installed, not part of its identity. Keying by the pair made a
+        // moved extension look like two unrelated events: a new one in the
+        // new schema and a removed one in the old. The pair replays as
+        // `create extension if not exists`, a no-op because the name is
+        // already taken, followed by `drop extension if exists`, which
+        // removes the only copy — the extension ends up gone rather than
+        // moved, and everything calling its functions breaks (issue #241).
+        // Matched by name, the move reaches `Extension::get_alter_script`,
+        // which has always known how to emit `alter extension ... set
+        // schema ...`.
+        let from_ext_map: HashMap<&str, usize> = self
             .from
             .extensions
             .iter()
             .enumerate()
-            .map(|(i, e)| ((e.schema.as_str(), e.name.as_str()), i))
+            .map(|(i, e)| (e.name.as_str(), i))
             .collect();
 
-        let to_ext_keys: HashSet<(&str, &str)> = self
-            .to
-            .extensions
-            .iter()
-            .map(|e| (e.schema.as_str(), e.name.as_str()))
-            .collect();
+        let to_ext_keys: HashSet<&str> =
+            self.to.extensions.iter().map(|e| e.name.as_str()).collect();
 
         for ext in &self.to.extensions {
-            if let Some(&idx) = from_ext_map.get(&(ext.schema.as_str(), ext.name.as_str())) {
+            if let Some(&idx) = from_ext_map.get(ext.name.as_str()) {
                 let from_ext = &self.from.extensions[idx];
                 let alter = from_ext.get_alter_script(ext);
                 if !alter.is_empty() {
@@ -1299,7 +1309,7 @@ impl Comparer {
         }
 
         for ext in &self.from.extensions {
-            if to_ext_keys.contains(&(ext.schema.as_str(), ext.name.as_str())) {
+            if to_ext_keys.contains(ext.name.as_str()) {
                 continue; // Extension is present in both dumps, we already processed it
             } else {
                 // Extension is not present in 'to' dump and should be dropped.

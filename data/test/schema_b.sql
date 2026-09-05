@@ -36,6 +36,9 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 -- pgcrypto removed
 CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA public;  -- NEW EXTENSION
+-- Issue #241: same extension as FROM, different schema (shared_schema ->
+-- public). Expect one `alter extension fuzzystrmatch set schema public;`.
+CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch" WITH SCHEMA public;
 
 -- Custom types (some modified, some removed, some added)
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending', 'suspended');  -- MODIFIED: added 'suspended'
