@@ -1,18 +1,38 @@
 2026-09-05      v1.0.27
 
-                Fixes three ways a migration could quietly destroy or
-                rebuild what it was meant to migrate: the routine
-                ordering bug behind issue #240, with one opt-in flag
-                for it, the schema-moved extension of issue #241, and
-                the materialized view rebuilt on an unrelated column
-                change of issue #242. Beyond those this release
-                reorganises the test suite, adds a library target and
-                integration tests, and documents the crate. The dump
-                gains one optional field, which older dumps may omit,
-                and the generated SQL is unchanged for any schema
-                none of the three bugs touched.
+                Fixes four migrations that did not do what they said:
+                the routine ordering bug behind issue #240, with one
+                opt-in flag for it, the schema-moved extension of
+                issue #241, the materialized view rebuilt on an
+                unrelated column change of issue #242, and the
+                identity column dropped in the wrong order of issue
+                #243. Beyond those this release reorganises the test
+                suite, adds a library target and integration tests,
+                and documents the crate. The dump gains one optional
+                field, which older dumps may omit, and the generated
+                SQL is unchanged for any schema none of the four bugs
+                touched.
 
                 Bug fixes:
+                    - Resolved issue #243 (a column that stopped being
+                      an identity column produced a migration PostgreSQL
+                      refused to run). One column's ALTER statements
+                      were emitted in a fixed source order - type,
+                      default, nullability, identity - so the identity
+                      came off last. PostgreSQL holds an identity column
+                      NOT NULL, forbids it a default and restricts it to
+                      an integer type, and enforces each of those at the
+                      moment of the ALTER, so every statement that
+                      relaxed one of them ran while the column was still
+                      an identity column and was rejected. The reported
+                      case was DROP NOT NULL; SET DEFAULT and a move to
+                      a non-integer type failed the same way and are
+                      fixed with it. The identity drop now leads the
+                      column's statements. Adding an identity needs the
+                      opposite order and already had it, so the add side
+                      is untouched: a column must already be NOT NULL
+                      and have no default before ADD GENERATED AS
+                      IDENTITY will take.
                     - Resolved issue #242 (a materialized view was
                       dropped and fully rebuilt whenever any column of
                       any table it reads changed, even a column it never

@@ -600,6 +600,52 @@ impl TableColumn {
         let new_generated = Self::normalized_generated(&self.is_generated);
         let old_generated = Self::normalized_generated(&existing.is_generated);
 
+        // Identity is dropped FIRST, ahead of the type, default and
+        // nullability changes below, and added LAST, after all three. Both
+        // ends of that follow from what an identity column *is*: PostgreSQL
+        // holds it NOT NULL, forbids it a default, and restricts it to an
+        // integer type, and it enforces all three at the moment of the ALTER
+        // rather than at the end of the transaction. So while the column is
+        // still an identity column none of the three can be relaxed, and
+        // before it can become one all three have to be true already.
+        //
+        // Verified live on PostgreSQL 16 — each of these is the error the
+        // wrong order produces:
+        //
+        //   drop not null   before drop identity  -> column "id" ... is an
+        //                                            identity column
+        //   set default     before drop identity  -> column "id" ... is an
+        //                                            identity column
+        //   alter type text before drop identity  -> identity column type must
+        //                                            be smallint, integer, or
+        //                                            bigint
+        //   add identity    before set not null   -> column "id" ... must be
+        //                                            declared NOT NULL before
+        //                                            identity can be added
+        //   add identity    before drop default   -> column "id" ... already
+        //                                            has a default value
+        //
+        // Only the first of those was reported (issue #243); the other two
+        // drop-side orderings were broken the same way and fail the same way.
+        let identity_dropped = existing.is_identity && !self.is_identity;
+        if identity_dropped {
+            let drop_cmd = format!(
+                "alter table {}.{} alter column {} drop identity if exists;",
+                self.schema, self.table, self.name
+            )
+            .with_empty_lines();
+            if use_drop {
+                statements.push(drop_cmd);
+            } else {
+                statements.push(
+                    drop_cmd
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>(),
+                );
+            }
+        }
+
         if self.type_clause_differs(existing) {
             statements.push(
                 format!(
@@ -670,27 +716,14 @@ impl TableColumn {
             }
         }
 
-        if self.is_identity != existing.is_identity {
-            if self.is_identity {
-                statements.push(self.build_identity_add_statement(existing));
-            } else {
-                let drop_cmd = format!(
-                    "alter table {}.{} alter column {} drop identity if exists;",
-                    self.schema, self.table, self.name
-                )
-                .with_empty_lines();
-                if use_drop {
-                    statements.push(drop_cmd);
-                } else {
-                    statements.push(
-                        drop_cmd
-                            .lines()
-                            .map(|l| format!("-- {}\n", l))
-                            .collect::<String>(),
-                    );
-                }
-            }
-        } else if self.is_identity {
+        // The add side. Its drop counterpart was emitted at the top of this
+        // function; see the ordering note there.
+        if self.is_identity && !existing.is_identity {
+            statements.push(self.build_identity_add_statement(existing));
+        } else if self.is_identity && existing.is_identity {
+            // Still an identity column on both sides, only its parameters
+            // moved — no ordering constraint, the column never stops being
+            // NOT NULL or gains a default.
             self.build_identity_update_statements(existing, &mut statements);
         }
 
