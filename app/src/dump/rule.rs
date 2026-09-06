@@ -1,3 +1,8 @@
+//! Rewrite rules (`pg_rewrite`) — `CREATE RULE`.
+//!
+//! The rule that backs a view (`_RETURN`) is excluded; views are handled by
+//! [`view`](super::view).
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -104,5 +109,5 @@ impl Rule {
 }
 
 #[cfg(test)]
-#[path = "rule_tests.rs"]
+#[path = "tests/rule.rs"]
 mod tests;

@@ -1,3 +1,14 @@
+//! Column → dependent-object edges read from `pg_depend`.
+//!
+//! When a column is dropped, PostgreSQL silently CASCADEs the drop to the indexes,
+//! constraints and policies attached to it. The text-based scanner cannot see
+//! these: the dependent's definition references the *column*, not the routine
+//! whose change triggered the CASCADE chain. Recording the edges at dump time lets
+//! the comparer re-emit them afterwards (issue #188).
+//!
+//! Empty in dumps written before that issue; the comparer then degrades to the
+//! previously documented "run `pgc compare` twice" workaround.
+
 use serde::{Deserialize, Serialize};
 
 /// Kind of database object that depends on a column. When the column is
@@ -39,5 +50,5 @@ pub struct ColumnDependent {
 }
 
 #[cfg(test)]
-#[path = "column_dependent_tests.rs"]
+#[path = "tests/column_dependent.rs"]
 mod tests;

@@ -1,3 +1,241 @@
+2026-09-06      v1.0.27
+
+                Fixes four migrations that did not do what they said -
+                the routine ordering bug behind issue #240, with one
+                opt-in flag for it, the schema-moved extension of
+                issue #241, the materialized view rebuilt on an
+                unrelated column change of issue #242, and the
+                identity column dropped in the wrong order of issue
+                #243 - and one class of password that could not be
+                used to connect at all (issue #244). Beyond those
+                this release reorganises the test suite, adds a
+                library target and integration tests, and documents
+                the crate. The dump gains one optional field, which
+                older dumps may omit, and the generated SQL is
+                unchanged for any schema none of the four migration
+                bugs touched.
+
+                Bug fixes:
+                    - Resolved issue #244 (a password containing
+                      characters that are reserved in a URL could not be
+                      used, and one kind of password was silently
+                      changed). Connection details were interpolated
+                      into a postgres://user:password@host:port/database
+                      string and handed back to sqlx to parse, so every
+                      reserved character in a credential was read as URL
+                      syntax rather than as data. A password containing
+                      #, / or ? ended the authority section early and
+                      the parser eventually read the port out of
+                      something that was not a number, reporting invalid
+                      port number - naming the one part of the
+                      connection that was never wrong, before any socket
+                      was opened. Worse and quieter, a password
+                      containing a valid percent-escape was decoded:
+                      pass%41word was sent as passAword, so the wrong
+                      password was accepted and the real one could not
+                      be used at all. The connection now goes through
+                      PgConnectOptions with the fields set individually,
+                      which sqlx passes to the wire protocol unaltered,
+                      and a port that is not a number is reported as a
+                      port instead of as a failed connection. The masked
+                      connection string in log output is unchanged.
+                    - Resolved issue #243 (a column that stopped being
+                      an identity column produced a migration PostgreSQL
+                      refused to run). One column's ALTER statements
+                      were emitted in a fixed source order - type,
+                      default, nullability, identity - so the identity
+                      came off last. PostgreSQL holds an identity column
+                      NOT NULL, forbids it a default and restricts it to
+                      an integer type, and enforces each of those at the
+                      moment of the ALTER, so every statement that
+                      relaxed one of them ran while the column was still
+                      an identity column and was rejected. The reported
+                      case was DROP NOT NULL; SET DEFAULT and a move to
+                      a non-integer type failed the same way and are
+                      fixed with it. The identity drop now leads the
+                      column's statements. Adding an identity needs the
+                      opposite order and already had it, so the add side
+                      is untouched: a column must already be NOT NULL
+                      and have no default before ADD GENERATED AS
+                      IDENTITY will take.
+                    - Resolved issue #242 (a materialized view was
+                      dropped and fully rebuilt whenever any column of
+                      any table it reads changed, even a column it never
+                      reads). The set of views that have to be dropped
+                      before the table DDL runs was decided at table
+                      granularity: a view over a table whose hash
+                      differed at all went first. PostgreSQL's own rule
+                      is much narrower. It refuses to drop or retype a
+                      column a view depends on, and refuses nothing
+                      else, so adding a column is permitted with every
+                      view in place. A metadata-only ADD COLUMN
+                      therefore turned into a DROP MATERIALIZED VIEW, a
+                      full rebuild of its contents and a rebuild of each
+                      of its indexes, with the data missing until the
+                      refresh finished. Regular views over the same
+                      table were dropped and recreated for the same
+                      reason. The dump now records which columns each
+                      view actually reads, taken from pg_depend for the
+                      view's _RETURN rule, and only a change to one of
+                      those columns drags the view along. A table that
+                      is dropped, or dropped and recreated, still takes
+                      every view over it. Dumps written before this
+                      field exists keep the old table-level answer.
+                    - Resolved issue #241 (an extension moved between
+                      schemas was deleted instead of relocated).
+                      Extensions were matched between the two dumps on
+                      (schema, name), but an extension's name is its
+                      identity: pg_extension has a unique index on
+                      extname, and the schema only records where it was
+                      installed. A move therefore paired with nothing
+                      and was emitted as two unrelated events, a create
+                      in the new schema and a drop in the old. That pair
+                      destroys the extension without reporting anything:
+                      create extension if not exists is a no-op once the
+                      name is taken, so the drop that follows removes
+                      the only copy, the migration applies cleanly, and
+                      every function the extension provided is gone.
+                      Extensions are now matched by name, which routes a
+                      move to the alter extension ... set schema branch
+                      that Extension already had and that nothing could
+                      reach. Caveat: an extension that PostgreSQL marks
+                      non-relocatable cannot be moved by ALTER at all,
+                      so that case now fails loudly on replay rather
+                      than deleting anything.
+                    - Resolved issue #240 (a routine named in a comment
+                      or a string literal was read as a call, and the
+                      migration then created routines before the
+                      routines they call). PostgreSQL records no
+                      dependency for a call inside a function body, so
+                      pgc infers routine creation order by scanning each
+                      body's text for qualified schema.name references.
+                      The scan could not tell a call from a name written
+                      in prose or quoted inside dynamic SQL, and neither
+                      of those is resolved when the routine is created.
+                      Each such name added a graph edge that was not
+                      real; one of them pointing back along a real edge
+                      closed a cycle, and a cycle cannot be
+                      topologically sorted, so the routines in it and
+                      everything blocked behind them fell back to plain
+                      name order. A schema where one routine's comment
+                      mentioned its caller was enough to emit a
+                      migration that failed on function ... does not
+                      exist. Comments and string literal bodies, both
+                      single-quoted and dollar-quoted, are now blanked
+                      before the scan; double-quoted identifiers are
+                      kept, because a quoted identifier is a reference.
+                      This covers the same scan wherever it decides an
+                      order: routine creates and drops, view drops, and
+                      the combined routine and view pass.
+
+                Features:
+                    - New --guard-sql-routine-bodies flag (config key
+                      GUARD_SQL_ROUTINE_BODIES), default false. When
+                      set, the migration opens with set
+                      check_function_bodies = false, so PostgreSQL does
+                      not resolve the names inside a routine body at
+                      CREATE time and a routine is created even if its
+                      callee is not there yet. A defensive net for the
+                      whole class of ordering problem above, since a
+                      text scan can only ever approximate what a body
+                      calls. The cost, and the reason it is opt-in, is
+                      that a genuine mistake in a routine body is no
+                      longer caught while the migration runs. The
+                      statement is SET rather than SET LOCAL so it also
+                      covers a production script's post-commit section;
+                      a migration with nothing to do withdraws it, so an
+                      empty diff is unchanged.
+                    - A dependency cycle among routines or views is now
+                      named on stderr instead of passing silently. The
+                      report is narrowed to the objects that actually
+                      form the cycle rather than everything Kahn's sort
+                      was left holding, which also includes whatever was
+                      merely blocked behind it. A genuine cycle is
+                      possible: mutually recursive routines really do
+                      depend on each other, and no ordering satisfies
+                      them.
+
+                Internals:
+                    - Added a library target (`app/src/lib.rs`)
+                      exporting the four existing modules. `main.rs`
+                      is now a thin binary over it and holds only CLI
+                      parsing and command dispatch. A binary-only
+                      crate cannot have integration tests or run
+                      doctests, so this is what the two sections below
+                      are built on. The binary's behaviour, its flags
+                      and its output are unaffected.
+
+                Tests:
+                    - Unit tests moved out of the source directories:
+                      `src/<module>/<name>_tests.rs` is now
+                      `src/<module>/tests/<name>.rs`. They remain
+                      `#[cfg(test)] #[path = ...] mod tests;` children
+                      of the module they cover, so they still reach
+                      its private items; only the file layout changed.
+                      `src/dump/` no longer interleaves 27 test files
+                      with the 28 sources beside them.
+                    - `comparer/core_tests.rs`, at 11,772 lines the
+                      largest file in the project, was split by
+                      concern into fifteen files under
+                      `src/comparer/tests/core/` — grants, views,
+                      persistence, routines, sequences, tables and so
+                      on — with the fixtures used by more than one of
+                      them in `helpers.rs`. The before and after test
+                      name sets are identical. Note that these
+                      submodules need explicit `#[path]` attributes:
+                      their parent is itself loaded through `#[path]`,
+                      so rustc resolves children against
+                      `src/comparer/tests/` rather than the `core/`
+                      subdirectory, and a bare `mod production;`
+                      silently binds to the unrelated
+                      `tests/production.rs`.
+                    - New integration suite in `app/tests/`, thirty
+                      tests over the public API only, covering ground
+                      the in-memory unit tests cannot reach: the zip
+                      dump file round-trip and the `#[serde(default)]`
+                      contract that keeps dumps from older versions
+                      readable; the full dump → file → dump → compare
+                      → script path the `compare` command takes,
+                      including that a schema compared against itself
+                      emits no DDL; `Config::load` against real files,
+                      among them the shipped `data/pgc.conf`; and the
+                      drop ordering of the `clear` command. Three
+                      further tests exercise a live server and are
+                      `#[ignore]`d by default — run them with
+                      `cargo test -- --ignored` and the standard `PG*`
+                      environment variables.
+                    - `cargo test` now runs 1106 tests, up from 1062.
+
+                Documentation:
+                    - Module-level documentation on all 36 modules.
+                      `dump/mod.rs` describes the
+                      hash / get_script / get_drop_script /
+                      get_alter_script shape that nearly every object
+                      module repeats, and what adding a new object
+                      kind requires, so the individual module headers
+                      only carry what is specific to that kind.
+                    - 245 comments on public items that were written
+                      with `//`, and therefore invisible to rustdoc,
+                      promoted to `///`. Trailing comments moved above
+                      the field they describe.
+                    - Fourteen doctests on the primary public API.
+                      They compile and run under `cargo test`, so the
+                      examples cannot drift from the code.
+                    - Fixed eight broken intra-doc links that had been
+                      rendering as plain text. Four were only visible
+                      with `--document-private-items`.
+
+                Tooling:
+                    - CI gained a docs step running
+                      `cargo doc --no-deps --lib
+                      --document-private-items` under
+                      `RUSTDOCFLAGS="-D warnings"`, so an unresolved
+                      link fails the build instead of degrading
+                      silently. Private items are included because pgc
+                      ships as a binary: most of what a contributor
+                      reads is private, and a broken link there is
+                      just as wrong.
+
 2026-07-28      v1.0.26
 
                 Bug fixes:

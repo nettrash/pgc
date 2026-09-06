@@ -42,6 +42,16 @@ jobs:
       run:
         cd ${{ github.workspace }}/app ;
         cargo build --verbose
+    # Documents private items too: pgc ships as a binary, so most of the code
+    # a contributor reads (comparer::core is 4 pub fns out of 47) is private,
+    # and a broken intra-doc link there is just as wrong. -D warnings turns
+    # unresolved links into a build failure instead of silent plain text.
+    - name: Check docs
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run:
+        cd ${{ github.workspace }}/app ;
+        cargo doc --no-deps --lib --document-private-items
     - name: Run tests
       run:
         cd ${{ github.workspace }}/app ;
@@ -156,6 +166,38 @@ jobs:
         USE_SINGLE_TRANSACTION=false
         EOF
 
+    - name: Assert a password of URL-reserved characters connects
+      env:
+        PGPASSWORD: postgres
+      run: |
+        # The connection details used to be interpolated into a
+        # postgres://user:password@host:port/db string and parsed back, so
+        # every RFC 3986 reserved character in a password was read as syntax
+        # (issue #244). `#`, `/` and `?` failed as "invalid port number"
+        # before any socket was opened, and `%41` was silently decoded, so
+        # `pass%41word` authenticated as `passAword`.
+        #
+        # Nothing about a schema diff exercises this, so it gets its own step:
+        # create a role whose password holds every character that misbehaved,
+        # then dump as that role.
+        password='p#ss/w?rd%41@x%'
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=1 -c \
+          "drop role if exists pgc_issue244_role;"
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=1 -c \
+          "create role pgc_issue244_role login password '${password}';"
+        if ! ./app/target/release/pgc --command dump \
+              --server 127.0.0.1 --port 5432 --database a --scheme public \
+              --output /tmp/issue244.dump \
+              --user pgc_issue244_role --password "${password}" > /tmp/issue244.log 2>&1; then
+          echo "ERROR: a password of URL-reserved characters was refused on PG ${{ matrix.pg_version }}"
+          cat /tmp/issue244.log
+          psql -h 127.0.0.1 -U postgres -d a -c "drop role if exists pgc_issue244_role;" || true
+          exit 1
+        fi
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=1 -c \
+          "drop role if exists pgc_issue244_role;"
+        echo "OK: reserved characters in a password survive on PG ${{ matrix.pg_version }}"
+
     - name: Run pgc compare (round 1) — generate diff
       run: |
         ./app/target/release/pgc --config /tmp/pgc.conf
@@ -171,6 +213,37 @@ jobs:
         # empty) the test still validates idempotency.
         psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=0 \
           -f /tmp/output.sql
+
+    - name: Assert unread-column changes did not drag views along
+      run: |
+        # A materialized view is dropped and fully rebuilt whenever the diff
+        # decides it depends on a changing table. Deciding that at table
+        # granularity turned a metadata-only ADD COLUMN into a full refresh
+        # (issue #242). The round-2 diff cannot catch it — an unnecessary
+        # drop+recreate still converges, so the compare is empty either way —
+        # so assert directly against the round-1 script.
+        #
+        # The fixtures: test_schema.i242_orders gains a column and retypes
+        # `status`. i242_mv_untouched and i242_v_untouched read only `id`, so
+        # PostgreSQL permits both changes with them in place and neither may
+        # be dropped; i242_mv_touched reads `status` and must still go.
+        fail=0
+        for v in i242_mv_untouched i242_v_untouched; do
+          if grep -qE "drop (materialized )?view if exists test_schema.${v}" /tmp/output.sql; then
+            echo "ERROR: ${v} was dropped although it reads no changed column (PG ${{ matrix.pg_version }})"
+            fail=1
+          fi
+        done
+        if grep -q "ix_i242_mv_untouched_id" /tmp/output.sql; then
+          echo "ERROR: the index of an untouched materialized view was rebuilt (PG ${{ matrix.pg_version }})"
+          fail=1
+        fi
+        if ! grep -q "drop materialized view if exists test_schema.i242_mv_touched" /tmp/output.sql; then
+          echo "ERROR: i242_mv_touched reads a retyped column and must be dropped first (PG ${{ matrix.pg_version }})"
+          fail=1
+        fi
+        [ "${fail}" -eq 0 ] || exit 1
+        echo "OK: only the views reading changed columns were dropped on PG ${{ matrix.pg_version }}"
 
     - name: Assert all indexes are valid
       env:

@@ -1,8 +1,20 @@
+//! Installed extensions (`pg_extension`) — `CREATE EXTENSION`.
+//!
+//! Only the name, version and schema are compared; an extension's own objects are
+//! owned by the extension and are never emitted individually.
+//!
+//! An extension is identified by its **name alone**: `pg_extension` carries a
+//! unique index on `extname`, so a database holds at most one extension of a
+//! given name and [`Extension::schema`] only records where it was installed.
+//! `Comparer::compare_extensions` matches on name for that reason — pairing on
+//! `(schema, name)` made a relocated extension match nothing, and the create
+//! plus drop that produced deleted it outright (issue #241).
+
 use serde::{Deserialize, Serialize};
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL extension.
+/// This is an information about a PostgreSQL extension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extension {
     /// Name of the extension
@@ -53,6 +65,15 @@ impl Extension {
     }
 
     /// Returns a script to alter this extension to match the target.
+    ///
+    /// A schema difference is emitted as `ALTER EXTENSION ... SET SCHEMA`,
+    /// which PostgreSQL accepts only for a **relocatable** extension. The
+    /// dump does not capture `pg_extension.extrelocatable`, so a move of a
+    /// non-relocatable extension (the PL languages, `xml2`, …) is emitted the
+    /// same way and fails on replay with "does not support SET SCHEMA".
+    /// There is no correct alternative to emit: such an extension can only
+    /// change schema by being dropped and recreated, which takes its objects
+    /// with it — so failing is the honest outcome.
     pub fn get_alter_script(&self, target: &Extension) -> String {
         let mut script = String::new();
         if self.version != target.version {
@@ -72,5 +93,5 @@ impl Extension {
 }
 
 #[cfg(test)]
-#[path = "extension_tests.rs"]
+#[path = "tests/extension.rs"]
 mod tests;

@@ -321,3 +321,115 @@ fn mixed_literal_types_with_newlines() {
     assert!(out.contains("\"id\n\n\n\ncol\""));
     assert!(out.contains("BEGIN\n\n\n\n  NULL;"));
 }
+
+// ── blank_comments_and_literals ────────────────────────────────────────
+// The scan-preparation pass behind issue #240. Its contract is narrow and
+// each half matters: everything that cannot hold a resolvable reference is
+// blanked, everything that can is preserved byte-for-byte, and the length
+// never changes so a caller's offsets stay valid.
+
+#[test]
+fn blanks_a_line_comment_but_keeps_the_newline() {
+    let out = blank_comments_and_literals("-- calls a.b\nselect a.b();\n");
+    assert_eq!(out, "            \nselect a.b();\n");
+}
+
+#[test]
+fn blanks_a_block_comment_including_nested_ones() {
+    let out = blank_comments_and_literals("select /* a.b /* a.c */ */ 1;");
+    assert_eq!(out, "select                     1;");
+}
+
+#[test]
+fn blanks_an_unterminated_block_comment_to_the_end() {
+    let out = blank_comments_and_literals("select 1; /* a.b");
+    assert_eq!(out, "select 1;       ");
+}
+
+#[test]
+fn blanks_a_single_quoted_literal_body_but_keeps_its_quotes() {
+    let out = blank_comments_and_literals("select 'a.b';");
+    assert_eq!(out, "select '   ';");
+}
+
+#[test]
+fn blanks_a_literal_containing_a_doubled_quote_escape() {
+    // The escape pair costs two bytes and blanks to two spaces, so the
+    // literal ends where it always did.
+    // `'it''s a.b'` — the escape is inside the literal, so the literal does
+    // not end at it and `a.b` must not survive.
+    let out = blank_comments_and_literals("select 'it''s a.b';");
+    assert_eq!(out, "select '         ';");
+}
+
+#[test]
+fn blanks_an_e_string_and_is_not_ended_by_a_backslash_quote() {
+    // `E'\' a.b'` is ONE literal: the escaped quote does not close it. A
+    // scanner that thought it did would resume "code" mode inside the string
+    // and read `a.b` as a reference.
+    let out = blank_comments_and_literals(r"select E'\' a.b';");
+    assert_eq!(out, "select E'      ';");
+}
+
+#[test]
+fn blanks_a_dollar_quoted_body_but_keeps_both_tags() {
+    let out = blank_comments_and_literals("execute $sql$ select a.b() $sql$;");
+    assert_eq!(out, "execute $sql$              $sql$;");
+}
+
+#[test]
+fn blanks_a_dollar_quoted_body_that_is_never_closed() {
+    let out = blank_comments_and_literals("execute $sql$ select a.b()");
+    assert_eq!(out, "execute $sql$             ");
+}
+
+#[test]
+fn a_nested_dollar_tag_of_a_different_name_does_not_close_the_outer_one() {
+    let out = blank_comments_and_literals("$outer$ $inner$ a.b $outer$");
+    assert_eq!(out, "$outer$             $outer$");
+}
+
+#[test]
+fn keeps_double_quoted_identifiers_verbatim() {
+    // A quoted identifier IS a reference — the matcher looks for quoted
+    // needles too — so this is the one quoted form that must survive.
+    let src = r#"select "MySchema"."MyFn"();"#;
+    assert_eq!(blank_comments_and_literals(src), src);
+}
+
+#[test]
+fn a_comment_marker_inside_a_literal_does_not_start_a_comment() {
+    // `'--'` is a string, not the start of a comment; treating it as one
+    // would blank the rest of the line, including the real call after it.
+    let out = blank_comments_and_literals("select '--', a.b();");
+    assert_eq!(out, "select '  ', a.b();");
+}
+
+#[test]
+fn a_quote_inside_a_comment_does_not_open_a_literal() {
+    // The apostrophe in "helper_d's" is what makes this the issue #240 body.
+    // If the comment were stripped by a pass that still tracked quotes, the
+    // lone `'` would swallow the rest of the routine.
+    let out = blank_comments_and_literals("-- mirrors a.b's rules\nselect a.c();\n");
+    assert_eq!(out, "                      \nselect a.c();\n");
+}
+
+#[test]
+fn preserves_byte_length_and_line_structure_through_multibyte_text() {
+    let src = "-- зависит от a.b\nselect a.c();\n/* тоже a.b */\n";
+    let out = blank_comments_and_literals(src);
+    assert_eq!(out.len(), src.len(), "byte length must be preserved");
+    assert_eq!(
+        out.lines().count(),
+        src.lines().count(),
+        "newlines must survive"
+    );
+    assert!(!out.contains("a.b"), "commented references must be gone");
+    assert!(out.contains("a.c"), "real call must survive");
+}
+
+#[test]
+fn leaves_a_body_with_nothing_to_blank_untouched() {
+    let src = "\n\tselect regexp_replace(s.util_a(v), 1, 2);\n";
+    assert_eq!(blank_comments_and_literals(src), src);
+}

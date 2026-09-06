@@ -1,3 +1,19 @@
+//! The [`Comparer`] — reads two [`Dump`]s and emits the
+//! migration SQL that makes `FROM` equal to `TO`.
+//!
+//! Output is assembled from several ordered buffers rather than one string,
+//! because PostgreSQL dependency rules do not match the order objects are
+//! compared in. They are concatenated as:
+//!
+//! ```text
+//! script  →  sequence_post  →  type_post  →  enum_post  →  trigger_post
+//! ```
+//!
+//! The comparer also tracks cross-cutting state that individual passes need:
+//! `dropped_views` and `recreated_tables` coordinate drop/recreate sequencing,
+//! and `serial_columns` keeps owned sequences from being emitted independently
+//! of their table.
+
 use crate::comparer::production::{self, ChildRef, PartitionContext};
 use crate::config::grants_mode::GrantsMode;
 use crate::dump::acl;
@@ -15,8 +31,8 @@ use std::{
     io::{Error, Write},
 };
 
-// This is a Dump comparer that generates a script comparing two PostgreSQL dumps.
-// The result script, if it will be applied on "from" dump database, will make it equal to "to" dump database.
+/// This is a Dump comparer that generates a script comparing two PostgreSQL dumps.
+/// The result script, if it will be applied on "from" dump database, will make it equal to "to" dump database.
 pub struct Comparer {
     // The dump to compare from
     from: Dump,
@@ -34,6 +50,10 @@ pub struct Comparer {
     // live production database (concurrent index builds, partition-aware index
     // creation, NOT VALID + VALIDATE for foreign keys, concurrent index drops).
     output_for_production: bool,
+    /// Emit `set check_function_bodies = false;` as the migration's first
+    /// statement (issue #240). Off by default; when off the output is
+    /// byte-for-byte what it always was.
+    guard_sql_routine_bodies: bool,
 
     // The script that will be generated
     script: String,
@@ -57,8 +77,13 @@ pub struct Comparer {
     serial_columns: HashMap<(String, String, String), String>,
 }
 
+/// The statement `--guard-sql-routine-bodies` emits. `SET`, not `SET LOCAL`,
+/// so it also covers the post-commit section (see
+/// `Comparer::set_guard_sql_routine_bodies`).
+const FUNCTION_BODY_GUARD: &str = "set check_function_bodies = false;";
+
 impl Comparer {
-    // Creates a new Comparer with the given dumps
+    /// Creates a new Comparer with the given dumps
     pub fn new(
         from: Dump,
         to: Dump,
@@ -75,6 +100,7 @@ impl Comparer {
             use_comments,
             grants_mode,
             output_for_production: false,
+            guard_sql_routine_bodies: false,
             script: String::new(),
             production_post_script: String::new(),
             enum_pre_script: String::new(),
@@ -108,12 +134,84 @@ impl Comparer {
     /// built concurrently (partition-aware), foreign keys are added `NOT VALID`
     /// then validated after commit, and indexes are dropped concurrently — all
     /// post-commit statements are emitted after the main transaction.
+    /// Returns `&mut Self` so it can be chained after construction.
+    ///
+    /// ```
+    /// # use pgc::comparer::core::Comparer;
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// # use pgc::config::grants_mode::GrantsMode;
+    /// # use pgc::dump::core::Dump;
+    /// # let config = || DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let mut comparer = Comparer::new(
+    ///     Dump::new(config()),
+    ///     Dump::new(config()),
+    ///     true,
+    ///     true,
+    ///     true,
+    ///     GrantsMode::Ignore,
+    /// );
+    /// comparer.set_output_for_production(true);
+    /// ```
     pub fn set_output_for_production(&mut self, value: bool) -> &mut Self {
         self.output_for_production = value;
         self
     }
 
-    // Compare dumps and generate the script
+    /// Ask PostgreSQL not to validate function bodies while the migration
+    /// runs, by emitting `set check_function_bodies = false;` as its first
+    /// statement.
+    ///
+    /// A defensive net for the whole class of ordering bug behind issue #240:
+    /// pgc infers routine dependencies by reading names out of `prosrc`, and
+    /// text can only ever be an approximation of what a body really calls. If
+    /// the order still comes out wrong, this makes a `sql`-language routine
+    /// create anyway instead of failing on a callee that does not exist yet.
+    ///
+    /// The trade is real, which is why this is opt-in: with body checking off
+    /// a genuine typo in a routine body is no longer caught when the migration
+    /// runs — it waits until something calls it.
+    ///
+    /// `check_function_bodies` is `SET` (not `SET LOCAL`), so it holds for the
+    /// rest of the session. That is what makes it survive past the `commit;`
+    /// into any post-commit section, and it is why a connection reused for
+    /// other work after the migration keeps the setting until it is reset or
+    /// the session ends. For the usual one-shot `psql -f` replay this does not
+    /// arise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pgc::comparer::core::Comparer;
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// # use pgc::config::grants_mode::GrantsMode;
+    /// # use pgc::dump::core::Dump;
+    /// # let config = || DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let mut comparer = Comparer::new(
+    ///     Dump::new(config()),
+    ///     Dump::new(config()),
+    ///     true,
+    ///     true,
+    ///     true,
+    ///     GrantsMode::Ignore,
+    /// );
+    /// comparer.set_guard_sql_routine_bodies(true);
+    /// ```
+    pub fn set_guard_sql_routine_bodies(&mut self, value: bool) -> &mut Self {
+        self.guard_sql_routine_bodies = value;
+        self
+    }
+
+    /// Compare dumps and generate the script
     pub async fn compare(&mut self) -> Result<(), Error> {
         if self.output_for_production {
             // The statements that cannot run inside a transaction block are
@@ -135,6 +233,12 @@ impl Comparer {
         }
         if self.use_single_transaction {
             self.script.append_block("begin;");
+        }
+        // First statement of the migration, so every routine created below is
+        // covered — including any emitted in the post-commit section, since
+        // this is a session-scoped SET rather than SET LOCAL.
+        if self.guard_sql_routine_bodies {
+            self.script.append_block(FUNCTION_BODY_GUARD);
         }
 
         self.compare_schemas().await?;
@@ -218,6 +322,29 @@ impl Comparer {
         // (concurrent index) statements appended above.
         if self.output_for_production {
             self.script = production::make_idempotent(&self.script);
+        }
+
+        // A no-op migration has to stay a no-op. Without
+        // `--use-single-transaction` an unchanged schema renders as an empty
+        // file, and callers read that emptiness as "nothing to apply" — the
+        // repo's own round-trip check asserts a second compare is 0 bytes. So
+        // the guard is withdrawn when it is the only thing the migration would
+        // do, which makes a no-op diff byte-identical with the flag on and off
+        // in both transaction modes.
+        if self.guard_sql_routine_bodies {
+            let bare = super::scanner::strip_comments_and_collapse(&self.script);
+            // Whitespace-insensitive so this does not silently stop working if
+            // the framing's blank lines are ever laid out differently.
+            let remainder = bare
+                .replacen(FUNCTION_BODY_GUARD, "", 1)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if remainder.is_empty() || remainder == "begin; commit;" {
+                self.script = self
+                    .script
+                    .replacen(&format!("{FUNCTION_BODY_GUARD}\n\n"), "", 1);
+            }
         }
 
         Ok(())
@@ -590,6 +717,26 @@ impl Comparer {
         (lower, unquoted)
     }
 
+    /// [`Comparer::prelower_pair`] for text whose references are about to be
+    /// read as **dependency edges** — a routine's `prosrc`, a view's
+    /// definition — rather than merely searched.
+    ///
+    /// Comments and string-literal bodies are blanked first
+    /// (`scanner::blank_comments_and_literals`), because neither can hold a
+    /// reference PostgreSQL resolves when the object is created: a comment
+    /// naming another routine is documentation, and a name inside a quoted
+    /// literal is dynamic SQL. Counting either invents an edge, and one
+    /// invented edge pointing back along a real one is a cycle Kahn's sort
+    /// cannot order — at which point it appends the whole blocked subgraph in
+    /// plain name order and the script creates routines before their callees
+    /// (issue #240).
+    ///
+    /// Only the dependency scans use this. Plain `prelower_pair` stays for
+    /// haystacks where a literal match is still a match.
+    fn prelower_pair_for_dependency_scan(text: &str) -> (String, String) {
+        Self::prelower_pair(&super::scanner::blank_comments_and_literals(text))
+    }
+
     /// Check whether a routine's `aggregate_info` references a function
     /// identified by `(schema, name)` (both lowercase).  Aggregate transition
     /// functions, final functions, etc. are stored as qualified or unqualified
@@ -645,6 +792,58 @@ impl Comparer {
         false
     }
 
+    /// Name, on stderr, the objects caught in a dependency cycle.
+    ///
+    /// `kahn_toposort` cannot order a cycle. It appends every node whose
+    /// in-degree never reached zero in plain sort-key order, so the script
+    /// still contains all of them — in an order that ignores their real
+    /// dependencies, and which therefore may not replay. Before issue #240
+    /// that happened silently; the reported symptom was a migration failing on
+    /// `function ... does not exist` with nothing in the output to suggest
+    /// why.
+    ///
+    /// The set is narrowed to true SCC members (size >= 2) rather than
+    /// reported straight from `kahn_toposort_detect_cycle`, whose remainder
+    /// also contains everything merely *blocked behind* a cycle — the same
+    /// distinction `topo_order_within_subset_detect_cycle` draws. Naming a
+    /// routine that is only downstream of the problem sends the reader to the
+    /// wrong file.
+    ///
+    /// stderr rather than a comment in the script: `USE_COMMENTS=false` strips
+    /// commented-out DDL from the output, and a diagnostic a config flag can
+    /// delete is not a diagnostic.
+    fn warn_dependency_cycle(
+        what: &str,
+        n: usize,
+        depends_on: &[HashSet<usize>],
+        label: impl Fn(usize) -> String,
+    ) {
+        let mut cycles: Vec<Vec<String>> = Self::strongly_connected_components(n, depends_on)
+            .into_iter()
+            .filter(|scc| scc.len() >= 2)
+            .map(|scc| {
+                let mut names: Vec<String> = scc.into_iter().map(&label).collect();
+                names.sort();
+                names
+            })
+            .collect();
+        if cycles.is_empty() {
+            return;
+        }
+        // Deterministic order, so the same schemas always warn the same way.
+        cycles.sort();
+        for names in cycles {
+            eprintln!(
+                "Warning: dependency cycle among {what}: {}. pgc cannot order these, \
+                 so the script emits them in name order and may not replay as written. \
+                 A cycle here is either genuine (mutually recursive routines) or an \
+                 artefact of the text scan; if the migration fails on a missing \
+                 function, --guard-sql-routine-bodies will get it through.",
+                names.join(", ")
+            );
+        }
+    }
+
     /// Kahn's topological sort for an index-based dependency graph.
     /// Returns indices so that dependencies come before dependents.
     /// Ties are broken by `sort_key` for deterministic output.
@@ -657,7 +856,7 @@ impl Comparer {
         Self::kahn_toposort_detect_cycle(n, depends_on, sort_key).0
     }
 
-    /// Like [`kahn_toposort`], but also returns the set of nodes that
+    /// Like [`Comparer::kahn_toposort`], but also returns the set of nodes that
     /// could not be ordered acyclically — i.e. nodes whose in-degree
     /// never reached zero during the BFS. Those nodes still appear in
     /// the returned `Vec` (appended in `sort_key` order so the result
@@ -671,7 +870,7 @@ impl Comparer {
     /// Kahn was unable to remove — that includes nodes *blocked by*
     /// a cycle (e.g. `C` in `A↔B + A→C`), not only nodes *in* a
     /// cycle. Callers that need to act on *true* cycle members
-    /// should pair this with [`strongly_connected_components`] —
+    /// should pair this with [`Comparer::strongly_connected_components`] —
     /// `topo_order_within_subset_detect_cycle` does exactly that
     /// (PR #198 review).
     fn kahn_toposort_detect_cycle<K: Ord>(
@@ -908,9 +1107,35 @@ impl Comparer {
         ordered
     }
 
+    /// Views — regular and materialized — that must be dropped before the table
+    /// DDL runs, because a table they read is going away or a column they read
+    /// is being dropped or retyped.
+    ///
+    /// PostgreSQL is precise about what a dependent view forbids, and this now
+    /// matches it. It refuses `DROP COLUMN` and `ALTER COLUMN ... TYPE` for a
+    /// column a view depends on, and refuses nothing else: adding a column, or
+    /// dropping or retyping a column the view never reads, succeeds with the
+    /// view in place (verified live on PostgreSQL 16). Deciding at *table*
+    /// granularity — "this view reads a table that changed at all" — turned a
+    /// metadata-only `ADD COLUMN` into a `DROP` and full rebuild of every
+    /// materialized view over that table, its indexes included, with the data
+    /// gone until the rebuild finished (issue #242).
+    ///
+    /// The column dependencies come from `View::column_relation`, which
+    /// `pg_depend` records for the view's `_RETURN` rule and which covers every
+    /// position a column can appear in, not just the select list — `WHERE`,
+    /// `JOIN ... ON` and `GROUP BY` references are all there.
+    ///
+    /// Two things still take a view wholesale, whatever columns it reads: the
+    /// table being dropped, and the table being dropped and recreated by the
+    /// alter path (a partition-key change, say), because the view's own
+    /// definition cannot outlive the relation it names.
+    ///
+    /// A dump written before `column_relation` existed carries no column
+    /// dependencies, and every view in it keeps the historical table-level
+    /// answer — over-eager, but never wrong in the direction that breaks a
+    /// migration.
     fn dependent_view_keys(&self) -> HashSet<String> {
-        let mut dependent_views = HashSet::new();
-
         // Build O(1) lookup for target tables
         let to_table_map: HashMap<(&str, &str), usize> = self
             .to
@@ -920,27 +1145,22 @@ impl Comparer {
             .map(|(i, t)| ((t.schema.as_str(), t.name.as_str()), i))
             .collect();
 
-        // Collect normalised keys for every table that will be altered or dropped,
-        // so we can cheaply look them up when scanning materialized view relations.
-        let altered_or_dropped: HashSet<String> = self
-            .from
-            .tables
-            .iter()
-            .filter(|table| {
-                let matching_idx = to_table_map.get(&(table.schema.as_str(), table.name.as_str()));
-                let matching = matching_idx.map(|&idx| &self.to.tables[idx]);
-                let will_be_dropped = matching.is_none() && self.use_drop;
-                let will_be_altered = matching
-                    .map(|target| Self::hashes_differ(&target.hash, &table.hash))
-                    .unwrap_or(false);
-                will_be_dropped || will_be_altered
-            })
-            .map(|table| Self::normalized_view_key(&table.schema, &table.name))
-            .collect();
+        // Tables that stop existing in the form the view names them, so every
+        // view over one has to go regardless of columns.
+        let mut wholesale_tables: HashSet<String> = HashSet::new();
+        // Columns whose drop or retype PostgreSQL would refuse while a
+        // dependent view exists.
+        let mut changed_columns: HashSet<String> = HashSet::new();
+        // Every table touched at all — the historical, table-level test, kept
+        // for views from dumps that carry no column dependencies.
+        let mut altered_or_dropped: HashSet<String> = HashSet::new();
+        // The historical regular-view answer, likewise kept for those dumps.
+        let mut legacy_dependent: HashSet<String> = HashSet::new();
 
         for table in &self.from.tables {
-            let matching_idx = to_table_map.get(&(table.schema.as_str(), table.name.as_str()));
-            let matching_table = matching_idx.map(|&idx| &self.to.tables[idx]);
+            let matching_table = to_table_map
+                .get(&(table.schema.as_str(), table.name.as_str()))
+                .map(|&idx| &self.to.tables[idx]);
 
             let will_be_dropped = matching_table.is_none() && self.use_drop;
             let will_be_altered = matching_table
@@ -951,36 +1171,100 @@ impl Comparer {
                 continue;
             }
 
+            let table_key = Self::normalized_view_key(&table.schema, &table.name);
+            altered_or_dropped.insert(table_key.clone());
+
             for column in &table.columns {
                 if let Some(related_views) = &column.related_views {
                     for view_ref in related_views {
                         let normalized = Self::normalized_view_reference(view_ref);
                         if !normalized.is_empty() {
-                            dependent_views.insert(normalized);
+                            legacy_dependent.insert(normalized);
+                        }
+                    }
+                }
+            }
+
+            match matching_table {
+                // Gone, or rebuilt from scratch: nothing that reads it survives.
+                None => {
+                    wholesale_tables.insert(table_key);
+                }
+                Some(target) if table.will_be_dropped_and_recreated(target) => {
+                    wholesale_tables.insert(table_key);
+                }
+                Some(target) => {
+                    let to_columns: HashMap<&str, &TableColumn> = target
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.as_str(), c))
+                        .collect();
+                    for column in &table.columns {
+                        let forbidden = match to_columns.get(column.name.as_str()) {
+                            // Dropped.
+                            None => true,
+                            // Retyped. Anything else about a column — its
+                            // nullability, default, comment, storage — can be
+                            // altered underneath a view that reads it.
+                            Some(target_column) => column.type_differs(target_column),
+                        };
+                        if forbidden {
+                            changed_columns.insert(Self::normalized_view_reference(&format!(
+                                "{}.{}.{}",
+                                table.schema, table.name, column.name
+                            )));
                         }
                     }
                 }
             }
         }
 
-        // Materialized views are not tracked in information_schema.view_column_usage,
-        // so they may be absent from column.related_views in older dumps.  Use the
-        // view's table_relation as a reliable fallback: if a mat-view touches any
-        // table that is being altered or dropped, it must be dropped first.
-        for view in self.from.views.iter().filter(|v| v.is_materialized) {
-            let touches = view
+        let mut dependent_views = HashSet::new();
+        for view in &self.from.views {
+            let view_key = Self::normalized_view_key(&view.schema, &view.name);
+
+            let reads_a_wholesale_table = view
                 .table_relation
                 .iter()
-                .any(|rel| altered_or_dropped.contains(&Self::normalized_view_reference(rel)));
-            if touches {
-                dependent_views.insert(Self::normalized_view_key(&view.schema, &view.name));
+                .any(|rel| wholesale_tables.contains(&Self::normalized_view_reference(rel)));
+            if reads_a_wholesale_table {
+                dependent_views.insert(view_key);
+                continue;
+            }
+
+            match &view.column_relation {
+                Some(columns) => {
+                    let reads_a_changed_column = columns
+                        .iter()
+                        .any(|col| changed_columns.contains(&Self::normalized_view_reference(col)));
+                    if reads_a_changed_column {
+                        dependent_views.insert(view_key);
+                    }
+                }
+                // Pre-`column_relation` dump: the historical answer, which is
+                // `related_views` for a regular view and `table_relation` for a
+                // materialized one (materialized views never appear in
+                // `information_schema.view_column_usage`, so they had no other
+                // source).
+                None => {
+                    let touched = if view.is_materialized {
+                        view.table_relation.iter().any(|rel| {
+                            altered_or_dropped.contains(&Self::normalized_view_reference(rel))
+                        })
+                    } else {
+                        legacy_dependent.contains(&view_key)
+                    };
+                    if touched {
+                        dependent_views.insert(view_key);
+                    }
+                }
             }
         }
 
         dependent_views
     }
 
-    // Saves the generated script to a file
+    /// Saves the generated script to a file
     pub async fn save_script(&self, output: &str) -> Result<(), Error> {
         let mut file = File::create(output)?;
         file.write_all(self.get_script().as_bytes())?;
@@ -1055,23 +1339,33 @@ impl Comparer {
         // We will find all new extensions from "to" dump that are not in "from" dump
         // and add them to the script.
         // Also we will find only in "from" dump extensions that are not in "to" dump and drop them.
-        let from_ext_map: HashMap<(&str, &str), usize> = self
+        //
+        // Keyed by NAME alone, not `(schema, name)`. An extension's name is
+        // unique per database — `pg_extension` has a unique index on
+        // `extname` — and its schema is an attribute of where it was
+        // installed, not part of its identity. Keying by the pair made a
+        // moved extension look like two unrelated events: a new one in the
+        // new schema and a removed one in the old. The pair replays as
+        // `create extension if not exists`, a no-op because the name is
+        // already taken, followed by `drop extension if exists`, which
+        // removes the only copy — the extension ends up gone rather than
+        // moved, and everything calling its functions breaks (issue #241).
+        // Matched by name, the move reaches `Extension::get_alter_script`,
+        // which has always known how to emit `alter extension ... set
+        // schema ...`.
+        let from_ext_map: HashMap<&str, usize> = self
             .from
             .extensions
             .iter()
             .enumerate()
-            .map(|(i, e)| ((e.schema.as_str(), e.name.as_str()), i))
+            .map(|(i, e)| (e.name.as_str(), i))
             .collect();
 
-        let to_ext_keys: HashSet<(&str, &str)> = self
-            .to
-            .extensions
-            .iter()
-            .map(|e| (e.schema.as_str(), e.name.as_str()))
-            .collect();
+        let to_ext_keys: HashSet<&str> =
+            self.to.extensions.iter().map(|e| e.name.as_str()).collect();
 
         for ext in &self.to.extensions {
-            if let Some(&idx) = from_ext_map.get(&(ext.schema.as_str(), ext.name.as_str())) {
+            if let Some(&idx) = from_ext_map.get(ext.name.as_str()) {
                 let from_ext = &self.from.extensions[idx];
                 let alter = from_ext.get_alter_script(ext);
                 if !alter.is_empty() {
@@ -1100,7 +1394,7 @@ impl Comparer {
         }
 
         for ext in &self.from.extensions {
-            if to_ext_keys.contains(&(ext.schema.as_str(), ext.name.as_str())) {
+            if to_ext_keys.contains(ext.name.as_str()) {
                 continue; // Extension is present in both dumps, we already processed it
             } else {
                 // Extension is not present in 'to' dump and should be dropped.
@@ -1687,7 +1981,7 @@ impl Comparer {
             // this the haystack would be re-lowered on every iteration.
             let drop_sources: Vec<(String, String)> = routines_to_drop
                 .iter()
-                .map(|r| Self::prelower_pair(&r.source_code))
+                .map(|r| Self::prelower_pair_for_dependency_scan(&r.source_code))
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
@@ -1706,6 +2000,15 @@ impl Comparer {
                 }
             }
 
+            Self::warn_dependency_cycle(
+                "routines being dropped",
+                routines_to_drop.len(),
+                &drop_deps,
+                |i| {
+                    let r = routines_to_drop[i];
+                    format!("{}.{}({})", r.schema, r.name, r.arguments)
+                },
+            );
             let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
                 drop_names[i].clone()
             });
@@ -1765,7 +2068,7 @@ impl Comparer {
             // routine's source_code once so the quadratic scan doesn't.
             let create_sources: Vec<(String, String)> = create_routines
                 .iter()
-                .map(|(_, r)| Self::prelower_pair(&r.source_code))
+                .map(|(_, r)| Self::prelower_pair_for_dependency_scan(&r.source_code))
                 .collect();
             for (i, (_, routine)) in create_routines.iter().enumerate() {
                 let (src_lower, src_unquoted) = &create_sources[i];
@@ -1783,6 +2086,10 @@ impl Comparer {
                 }
             }
 
+            Self::warn_dependency_cycle("routines", n, &depends_on, |i| {
+                let r = create_routines[i].1;
+                format!("{}.{}({})", r.schema, r.name, r.arguments)
+            });
             let sorted = Self::kahn_toposort(n, &depends_on, |i| {
                 let r = create_routines[i].1;
                 let priority: u8 = if r.lang.eq_ignore_ascii_case("sql") {
@@ -2636,7 +2943,7 @@ impl Comparer {
     /// restricted to `subset` is acyclic the cyclic set is empty.
     ///
     /// PR #198 review: the cyclic set is computed via
-    /// [`strongly_connected_components`] (Tarjan), not the raw Kahn
+    /// [`Comparer::strongly_connected_components`] (Tarjan), not the raw Kahn
     /// remainder. The remainder would include nodes merely *blocked
     /// by* a cycle (e.g. `C` in `A↔B + A→C`), and treating them as
     /// cycle participants would drop FKs that are not actually in
@@ -3026,7 +3333,7 @@ impl Comparer {
             self.from
                 .views
                 .iter()
-                .map(|v| Self::prelower_pair(&v.definition))
+                .map(|v| Self::prelower_pair_for_dependency_scan(&v.definition))
                 .collect()
         };
         let names_lc: Vec<(String, String)> = if candidates.is_empty() {
@@ -3120,6 +3427,16 @@ impl Comparer {
             }
 
             // Topological sort in creation order, then reverse for drops.
+            Self::warn_dependency_cycle(
+                "views being dropped",
+                candidates.len(),
+                &depends_on,
+                |i| {
+                    let (idx, _, _) = &candidates[i];
+                    let v = &self.from.views[*idx];
+                    format!("{}.{}", v.schema, v.name)
+                },
+            );
             let mut sorted = Self::kahn_toposort(candidates.len(), &depends_on, |i| {
                 let (idx, _, _) = &candidates[i];
                 let v = &self.from.views[*idx];
@@ -4087,7 +4404,7 @@ impl Comparer {
             // count and previously re-lowered the full source on every call.
             let drop_sources: Vec<(String, String)> = routines_to_drop
                 .iter()
-                .map(|r| Self::prelower_pair(&r.source_code))
+                .map(|r| Self::prelower_pair_for_dependency_scan(&r.source_code))
                 .collect();
 
             for (i, routine) in routines_to_drop.iter().enumerate() {
@@ -4106,6 +4423,15 @@ impl Comparer {
                 }
             }
 
+            Self::warn_dependency_cycle(
+                "routines being dropped",
+                routines_to_drop.len(),
+                &drop_deps,
+                |i| {
+                    let r = routines_to_drop[i];
+                    format!("{}.{}({})", r.schema, r.name, r.arguments)
+                },
+            );
             let mut drop_order = Self::kahn_toposort(routines_to_drop.len(), &drop_deps, |i| {
                 drop_names[i].clone()
             });
@@ -4209,7 +4535,8 @@ impl Comparer {
                         .iter()
                         .map(|rel| Self::normalized_view_reference(rel))
                         .collect();
-                    let (text_lower, text_unquoted_lower) = Self::prelower_pair(&v.definition);
+                    let (text_lower, text_unquoted_lower) =
+                        Self::prelower_pair_for_dependency_scan(&v.definition);
                     ItemInfo {
                         text_lower,
                         text_unquoted_lower,
@@ -4227,7 +4554,8 @@ impl Comparer {
                     } else {
                         0
                     };
-                    let (text_lower, text_unquoted_lower) = Self::prelower_pair(&r.source_code);
+                    let (text_lower, text_unquoted_lower) =
+                        Self::prelower_pair_for_dependency_scan(&r.source_code);
                     ItemInfo {
                         text_lower,
                         text_unquoted_lower,
@@ -4310,6 +4638,11 @@ impl Comparer {
         // ──────────────────────────────────────────────────────────
         // Phase 4 – Topological sort
         // ──────────────────────────────────────────────────────────
+        Self::warn_dependency_cycle("routines and views", items.len(), &depends_on, |i| {
+            let item = &items[i];
+            let kind = if item.is_view { "view" } else { "routine" };
+            format!("{kind} {}.{}", item.schema_lower, item.name_lower)
+        });
         let sorted = Self::kahn_toposort(items.len(), &depends_on, |i| items[i].sort_key.clone());
 
         // Prepare the emit plan (is_view, orig_idx) so we can drop `items`.
@@ -5986,5 +6319,5 @@ fn policy_recreate_block(policy: &TablePolicy) -> String {
 }
 
 #[cfg(test)]
-#[path = "core_tests.rs"]
+#[path = "tests/core.rs"]
 mod tests;

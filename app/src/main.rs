@@ -1,16 +1,11 @@
-use crate::{
+use chrono::Datelike;
+use clap::{CommandFactory, Parser};
+use pgc::{
     comparer::core::Comparer,
     config::{core::Config, dump_config::DumpConfig, grants_mode::GrantsMode},
     dump::core::Dump,
 };
-use chrono::Datelike;
-use clap::{CommandFactory, Parser};
 use std::{io::Error, path::Path, time::Instant};
-
-pub mod comparer;
-pub mod config;
-pub mod dump;
-pub mod utils;
 
 // Command line arguments.
 #[derive(Parser, Debug)]
@@ -105,6 +100,18 @@ struct Args {
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     output_for_production: bool,
 
+    /// Emit `set check_function_bodies = false;` as the migration's first
+    /// statement, so PostgreSQL does not resolve the names inside a routine
+    /// body when the routine is created. A safety net for routine ordering:
+    /// pgc infers what a routine calls by reading its source text, and a
+    /// script that still gets the order wrong will create the routine anyway
+    /// instead of failing on a callee that does not exist yet. The cost is
+    /// that a genuine mistake in a routine body is no longer caught while the
+    /// migration runs. Session-scoped, so it also covers any post-commit
+    /// section. Default: false (output unchanged).
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
+    guard_sql_routine_bodies: bool,
+
     /// Use CASCADE in DROP statements for the clear command. WARNING: CASCADE can drop
     /// dependent objects outside the selected schema(s) (e.g., foreign keys or views in
     /// other schemas that reference the dropped objects). Without this flag, drops rely
@@ -167,6 +174,7 @@ async fn run_main() -> Result<(), Error> {
                     args.use_comments,
                     args.grants_mode,
                     args.output_for_production,
+                    args.guard_sql_routine_bodies,
                 )
                 .await;
             }
@@ -274,6 +282,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             cfg.use_comments,
             cfg.grants_mode,
             cfg.output_for_production,
+            cfg.guard_sql_routine_bodies,
         )
         .await;
 
@@ -332,6 +341,7 @@ async fn compare_dumps(
     use_comments: bool,
     grants_mode: GrantsMode,
     output_for_production: bool,
+    guard_sql_routine_bodies: bool,
 ) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
@@ -348,6 +358,7 @@ async fn compare_dumps(
         grants_mode,
     );
     comparer.set_output_for_production(output_for_production);
+    comparer.set_guard_sql_routine_bodies(guard_sql_routine_bodies);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");

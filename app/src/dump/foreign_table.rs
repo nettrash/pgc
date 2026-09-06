@@ -1,3 +1,6 @@
+//! Foreign tables (`pg_foreign_table`) — `CREATE FOREIGN TABLE`, including the
+//! per-column definitions and the `OPTIONS (…)` attached to each.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -355,5 +358,5 @@ impl ForeignTable {
 }
 
 #[cfg(test)]
-#[path = "foreign_table_tests.rs"]
+#[path = "tests/foreign_table.rs"]
 mod tests;

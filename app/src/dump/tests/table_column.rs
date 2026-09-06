@@ -1196,3 +1196,150 @@ fn test_serde_default_generation_type() {
         "missing generation_type should default to None"
     );
 }
+
+// ── issue #243: identity ordering within one column's ALTERs ───────────
+// An identity column is NOT NULL, has no default, and has an integer
+// type — and PostgreSQL enforces all three at the moment of each ALTER,
+// not at the end of the transaction. So the identity has to come off
+// before any of the three is relaxed, and go on only once all three
+// already hold. The statements for one column are emitted in a single
+// list, so that ordering is this function's responsibility.
+
+/// A bigint identity column, the FROM side of every case below.
+fn identity_column() -> TableColumn {
+    let mut column = create_test_column();
+    column.name = "id".to_string();
+    column.data_type = "bigint".to_string();
+    column.character_maximum_length = None;
+    column.character_octet_length = None;
+    column.is_nullable = false;
+    column.is_identity = true;
+    column.identity_generation = Some("BY DEFAULT".to_string());
+    column
+}
+
+/// Byte offset of `needle` in `script`, or a failure naming what is missing.
+fn position_of(script: &str, needle: &str) -> usize {
+    script
+        .find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+}
+
+#[test]
+fn identity_is_dropped_before_not_null() {
+    // The reported case: `drop not null` first fails with
+    // `column "id" of relation "test_table" is an identity column`.
+    let from = identity_column();
+    let mut to = identity_column();
+    to.is_identity = false;
+    to.identity_generation = None;
+    to.is_nullable = true;
+
+    let script = to.get_alter_script(&from, true).expect("no alter emitted");
+
+    assert!(
+        position_of(&script, "drop identity if exists") < position_of(&script, "drop not null"),
+        "identity must come off before the column may become nullable:\n{script}"
+    );
+}
+
+#[test]
+fn identity_is_dropped_before_a_default_is_set() {
+    // Same failure, other statement: PostgreSQL refuses `set default` on a
+    // column that is still an identity column.
+    let from = identity_column();
+    let mut to = identity_column();
+    to.is_identity = false;
+    to.identity_generation = None;
+    to.column_default = Some("42".to_string());
+
+    let script = to.get_alter_script(&from, true).expect("no alter emitted");
+
+    assert!(
+        position_of(&script, "drop identity if exists") < position_of(&script, "set default 42"),
+        "identity must come off before the column may take a default:\n{script}"
+    );
+}
+
+#[test]
+fn identity_is_dropped_before_the_type_changes() {
+    // `identity column type must be smallint, integer, or bigint` — so a
+    // move to a non-integer type has to wait for the identity to go.
+    let from = identity_column();
+    let mut to = identity_column();
+    to.is_identity = false;
+    to.identity_generation = None;
+    to.data_type = "text".to_string();
+
+    let script = to.get_alter_script(&from, true).expect("no alter emitted");
+
+    assert!(
+        position_of(&script, "drop identity if exists") < position_of(&script, "type text"),
+        "identity must come off before the column may leave integer types:\n{script}"
+    );
+}
+
+#[test]
+fn identity_is_added_after_not_null_and_after_the_default_is_dropped() {
+    // The mirror image, which the historical order already got right and
+    // which the fix must not disturb: PostgreSQL rejects `add generated ...
+    // as identity` on a nullable column, and on one that still has a
+    // default.
+    let mut from = identity_column();
+    from.is_identity = false;
+    from.identity_generation = None;
+    from.is_nullable = true;
+    from.column_default = Some("7".to_string());
+    let to = identity_column();
+
+    let script = to.get_alter_script(&from, true).expect("no alter emitted");
+
+    let add = position_of(&script, "add generated");
+    assert!(
+        position_of(&script, "set not null") < add,
+        "the column must be NOT NULL before identity is added:\n{script}"
+    );
+    assert!(
+        position_of(&script, "drop default") < add,
+        "the default must be gone before identity is added:\n{script}"
+    );
+}
+
+#[test]
+fn a_kept_identity_still_emits_its_parameter_changes() {
+    // The third branch: identity on both sides, only its parameters moved.
+    // Nothing is dropped, so nothing needs reordering — but hoisting the
+    // drop must not have cost this path its statements.
+    let from = identity_column();
+    let mut to = identity_column();
+    to.identity_generation = Some("ALWAYS".to_string());
+
+    let script = to.get_alter_script(&from, true).expect("no alter emitted");
+
+    assert!(script.contains("set generated ALWAYS"), "{script}");
+    assert!(!script.contains("drop identity"), "{script}");
+}
+
+#[test]
+fn dropping_identity_honours_use_drop_false() {
+    // With `use_drop = false` the statement is still emitted, commented out,
+    // and still in the leading position — moving it must not have changed
+    // which side of the comment marker it lands on.
+    let from = identity_column();
+    let mut to = identity_column();
+    to.is_identity = false;
+    to.identity_generation = None;
+    to.is_nullable = true;
+
+    let script = to.get_alter_script(&from, false).expect("no alter emitted");
+
+    assert!(
+        script
+            .contains("-- alter table public.test_table alter column id drop identity if exists;"),
+        "{script}"
+    );
+    assert!(
+        !script.contains("\nalter table public.test_table alter column id drop identity"),
+        "the drop must stay commented out:\n{script}"
+    );
+}

@@ -36,6 +36,9 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
 -- pgcrypto removed
 CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA public;  -- NEW EXTENSION
+-- Issue #241: same extension as FROM, different schema (shared_schema ->
+-- public). Expect one `alter extension fuzzystrmatch set schema public;`.
+CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch" WITH SCHEMA public;
 
 -- Custom types (some modified, some removed, some added)
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending', 'suspended');  -- MODIFIED: added 'suspended'
@@ -2159,3 +2162,69 @@ CREATE MATERIALIZED VIEW test_schema.mv235_new AS
 SELECT id, label, active FROM test_schema.mv235_base WHERE active;
 
 CREATE INDEX ix_mv235_new_label ON test_schema.mv235_new (label);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #240: a routine named in prose or in a literal is not a call.
+--
+-- Three TO-only routines forming one real chain, util_a <- helper_d <-
+-- z_caller, with a false back-edge planted at each link:
+--   * i240_util_a's comment names i240_helper_d, which calls it;
+--   * i240_helper_d's string literal names i240_z_caller, which calls it.
+-- Each false edge closes a 2-cycle with the real one. Kahn's sort cannot
+-- order a cycle, so it appends all three in name order — i240_helper_d
+-- first, which fails because i240_util_a does not exist yet, and the
+-- round-2 diff is then non-empty.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE FUNCTION test_schema.i240_util_a(pvalue text) RETURNS text
+    LANGUAGE sql IMMUTABLE
+AS $$
+    -- NB: mirrors test_schema.i240_helper_d's normalization rules.
+    SELECT translate(coalesce(pvalue, ''), 'ao', 'AO');
+$$;
+
+CREATE FUNCTION test_schema.i240_helper_d(pvalue text) RETURNS text
+    LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT test_schema.i240_util_a(pvalue) || ''
+        || coalesce(nullif('', 'test_schema.i240_z_caller'), '');
+$$;
+
+CREATE FUNCTION test_schema.i240_z_caller(pvalue text) RETURNS text
+    LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT test_schema.i240_helper_d(pvalue);
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #242: `unrelated_2` is added and `status` is retyped. The two
+-- views reading only `id` must survive untouched; the one reading
+-- `status` must still be dropped and recreated.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE test_schema.i242_orders (
+    id           integer PRIMARY KEY,
+    status       varchar(50) NOT NULL,
+    unrelated    integer,
+    unrelated_2  timestamptz
+);
+
+CREATE MATERIALIZED VIEW test_schema.i242_mv_untouched AS
+SELECT id, count(*) AS cnt FROM test_schema.i242_orders GROUP BY id;
+
+CREATE INDEX ix_i242_mv_untouched_id ON test_schema.i242_mv_untouched (id);
+
+CREATE VIEW test_schema.i242_v_untouched AS
+SELECT id FROM test_schema.i242_orders;
+
+CREATE MATERIALIZED VIEW test_schema.i242_mv_touched AS
+SELECT status, count(*) AS cnt FROM test_schema.i242_orders GROUP BY status;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #243: each column drops its identity and relaxes one of the three
+-- things an identity column guarantees.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE test_schema.i243_identity_drop (
+    goes_nullable   bigint,
+    gains_default   bigint NOT NULL DEFAULT 42,
+    leaves_integer  text NOT NULL,
+    label           text
+);

@@ -1,3 +1,12 @@
+//! Table columns (`pg_attribute` / `information_schema.columns`).
+//!
+//! Most changes are an in-place `ALTER COLUMN`, but some — a type change with no
+//! valid cast, a stored ↔ virtual generated-column flip — require `DROP COLUMN`
+//! plus `ADD COLUMN`. That distinction matters beyond this module:
+//! [`TableColumn::would_drop_and_re_add`] is what tells the comparer that
+//! PostgreSQL will CASCADE away the column's indexes, constraints and policies,
+//! which then have to be re-emitted.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -17,68 +26,120 @@ fn generation_expressions_equivalent(a: &Option<String>, b: &Option<String>) -> 
     }
 }
 
-// This is an information about a PostgreSQL table.
+/// This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableColumn {
-    pub catalog: String,                       // Catalog name
-    pub schema: String,                        // Schema name
-    pub table: String,                         // Table name
-    pub name: String,                          // Column name
-    pub ordinal_position: i32,                 // Ordinal position of the column
-    pub column_default: Option<String>,        // Default value of the column
-    pub is_nullable: bool,                     // Whether the column is nullable
-    pub data_type: String,                     // Data type of the column
-    pub character_maximum_length: Option<i32>, // Maximum length for character types
-    pub character_octet_length: Option<i32>,   // Octet length for character types
-    pub numeric_precision: Option<i32>,        // Numeric precision
-    pub numeric_precision_radix: Option<i32>,  // Numeric precision radix
-    pub numeric_scale: Option<i32>,            // Numeric scale
-    pub datetime_precision: Option<i32>,       // Datetime precision
-    pub interval_type: Option<String>,         // Interval type
-    pub interval_precision: Option<i32>,       // Interval precision
-    pub character_set_catalog: Option<String>, // Character set catalog
-    pub character_set_schema: Option<String>,  // Character set schema
-    pub character_set_name: Option<String>,    // Character set name
-    pub collation_catalog: Option<String>,     // Collation catalog
-    pub collation_schema: Option<String>,      // Collation schema
-    pub collation_name: Option<String>,        // Collation name
-    pub domain_catalog: Option<String>,        // Domain catalog
-    pub domain_schema: Option<String>,         // Domain schema
-    pub domain_name: Option<String>,           // Domain name
-    pub udt_catalog: Option<String>,           // UDT catalog
-    pub udt_schema: Option<String>,            // UDT schema
-    pub udt_name: Option<String>,              // UDT name
-    pub scope_catalog: Option<String>,         // Scope catalog
-    pub scope_schema: Option<String>,          // Scope schema
-    pub scope_name: Option<String>,            // Scope name
-    pub maximum_cardinality: Option<i32>,      // Maximum cardinality
-    pub dtd_identifier: Option<String>,        // DTD identifier
-    pub is_self_referencing: bool,             // Whether the column is self-referencing
-    pub is_identity: bool,                     // Whether the column is an identity column
-    pub identity_generation: Option<String>,   // Identity generation method
-    pub identity_start: Option<String>,        // Identity start value
-    pub identity_increment: Option<String>,    // Identity increment value
-    pub identity_maximum: Option<String>,      // Identity maximum value
-    pub identity_minimum: Option<String>,      // Identity minimum value
-    pub identity_cycle: bool,                  // Whether the identity column cycles
-    pub is_generated: String,                  // Whether the column is generated
-    pub generation_expression: Option<String>, // Generation expression for the column
+    /// Catalog name
+    pub catalog: String,
+    /// Schema name
+    pub schema: String,
+    /// Table name
+    pub table: String,
+    /// Column name
+    pub name: String,
+    /// Ordinal position of the column
+    pub ordinal_position: i32,
+    /// Default value of the column
+    pub column_default: Option<String>,
+    /// Whether the column is nullable
+    pub is_nullable: bool,
+    /// Data type of the column
+    pub data_type: String,
+    /// Maximum length for character types
+    pub character_maximum_length: Option<i32>,
+    /// Octet length for character types
+    pub character_octet_length: Option<i32>,
+    /// Numeric precision
+    pub numeric_precision: Option<i32>,
+    /// Numeric precision radix
+    pub numeric_precision_radix: Option<i32>,
+    /// Numeric scale
+    pub numeric_scale: Option<i32>,
+    /// Datetime precision
+    pub datetime_precision: Option<i32>,
+    /// Interval type
+    pub interval_type: Option<String>,
+    /// Interval precision
+    pub interval_precision: Option<i32>,
+    /// Character set catalog
+    pub character_set_catalog: Option<String>,
+    /// Character set schema
+    pub character_set_schema: Option<String>,
+    /// Character set name
+    pub character_set_name: Option<String>,
+    /// Collation catalog
+    pub collation_catalog: Option<String>,
+    /// Collation schema
+    pub collation_schema: Option<String>,
+    /// Collation name
+    pub collation_name: Option<String>,
+    /// Domain catalog
+    pub domain_catalog: Option<String>,
+    /// Domain schema
+    pub domain_schema: Option<String>,
+    /// Domain name
+    pub domain_name: Option<String>,
+    /// UDT catalog
+    pub udt_catalog: Option<String>,
+    /// UDT schema
+    pub udt_schema: Option<String>,
+    /// UDT name
+    pub udt_name: Option<String>,
+    /// Scope catalog
+    pub scope_catalog: Option<String>,
+    /// Scope schema
+    pub scope_schema: Option<String>,
+    /// Scope name
+    pub scope_name: Option<String>,
+    /// Maximum cardinality
+    pub maximum_cardinality: Option<i32>,
+    /// DTD identifier
+    pub dtd_identifier: Option<String>,
+    /// Whether the column is self-referencing
+    pub is_self_referencing: bool,
+    /// Whether the column is an identity column
+    pub is_identity: bool,
+    /// Identity generation method
+    pub identity_generation: Option<String>,
+    /// Identity start value
+    pub identity_start: Option<String>,
+    /// Identity increment value
+    pub identity_increment: Option<String>,
+    /// Identity maximum value
+    pub identity_maximum: Option<String>,
+    /// Identity minimum value
+    pub identity_minimum: Option<String>,
+    /// Whether the identity column cycles
+    pub identity_cycle: bool,
+    /// Whether the column is generated
+    pub is_generated: String,
+    /// Generation expression for the column
+    pub generation_expression: Option<String>,
+    /// 's' for stored, 'v' for virtual (PG18+); None treated as stored
     #[serde(default)]
-    pub generation_type: Option<String>, // 's' for stored, 'v' for virtual (PG18+); None treated as stored
-    pub is_updatable: bool,                 // Whether the column is updatable
-    pub related_views: Option<Vec<String>>, // Related views (optional)
+    pub generation_type: Option<String>,
+    /// Whether the column is updatable
+    pub is_updatable: bool,
+    /// Related views (optional)
+    pub related_views: Option<Vec<String>>,
+    /// Column comment
     #[serde(default)]
-    pub comment: Option<String>, // Column comment
+    pub comment: Option<String>,
+    /// TOAST storage strategy (PLAIN, EXTERNAL, MAIN, EXTENDED)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<String>, // TOAST storage strategy (PLAIN, EXTERNAL, MAIN, EXTENDED)
+    pub storage: Option<String>,
+    /// Column compression method (pglz, lz4; PG14+)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compression: Option<String>, // Column compression method (pglz, lz4; PG14+)
+    pub compression: Option<String>,
+    /// Per-column statistics target (attstattarget; -1 = use default)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub statistics_target: Option<i32>, // Per-column statistics target (attstattarget; -1 = use default)
+    pub statistics_target: Option<i32>,
+    /// Column-level ACL entries (attacl)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub acl: Vec<String>, // Column-level ACL entries (attacl)
+    pub acl: Vec<String>,
+    /// Transient: set at comparison time to "serial", "bigserial", or "smallserial"
     #[serde(skip)]
-    pub serial_type: Option<String>, // Transient: set at comparison time to "serial", "bigserial", or "smallserial"
+    pub serial_type: Option<String>,
 }
 
 impl TableColumn {
@@ -161,7 +222,7 @@ impl TableColumn {
 
     /// True when comparing `self` (the new TO-side column) against
     /// `existing` (the FROM-side column) would route through the
-    /// `needs_full_recreate` branch in [`get_alter_script`] — i.e., the
+    /// `needs_full_recreate` branch in [`TableColumn::get_alter_script`] — i.e., the
     /// migration is `DROP COLUMN` + `ADD COLUMN` rather than an
     /// in-place ALTER. This is the Path B trigger from issue #188:
     /// PostgreSQL CASCADE-drops every index / FK / CHECK / EXCLUDE
@@ -324,6 +385,41 @@ impl TableColumn {
     }
 
     /// Hash
+    /// Whether this column's **type** differs from `other`'s, in any way that
+    /// makes the comparer emit `ALTER TABLE ... ALTER COLUMN ... TYPE`.
+    ///
+    /// That statement is what PostgreSQL refuses while a view or rule depends on
+    /// the column ("cannot alter type of a column used by a view or rule"), and
+    /// it refuses it for the *statement*, not for whether the type meaningfully
+    /// changed — a collation-only retype is rejected just as firmly. So this
+    /// predicate has to answer for exactly the set of changes that produce the
+    /// statement, and its first term is the emission's own test.
+    ///
+    /// Defining it any other way is a trap this codebase already fell into
+    /// (PR #247 review). Spelling out a list of type attributes here left
+    /// `interval_type` and `collation_name` off it, because they reach the type
+    /// clause through `render_type_clause` rather than through a field
+    /// comparison. A column whose collation changed *and* whose default changed
+    /// then produced a migration that altered the type with the materialized
+    /// view still in place, and PostgreSQL rejected it — verified live on
+    /// PostgreSQL 16, and the reason there is a test for it.
+    ///
+    /// The remaining terms are what the partition-recreate gate compared before
+    /// this became shared, and they stay: `udt_name` distinguishes two
+    /// `USER-DEFINED` columns of different types, which the rendered clause
+    /// cannot, and the precision and length comparisons are unconditional where
+    /// the clause only renders them for the types they apply to. The union is at
+    /// least as eager as either caller was on its own — and for both callers,
+    /// eager is the safe direction: an unnecessary drop or recreate costs time,
+    /// a missing one produces SQL PostgreSQL will not run.
+    pub fn type_differs(&self, other: &TableColumn) -> bool {
+        self.type_clause_differs(other)
+            || self.udt_name != other.udt_name
+            || self.numeric_precision != other.numeric_precision
+            || self.numeric_scale != other.numeric_scale
+            || self.character_maximum_length != other.character_maximum_length
+    }
+
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.name.as_bytes());
         hasher.update(self.data_type.as_bytes());
@@ -504,6 +600,52 @@ impl TableColumn {
         let new_generated = Self::normalized_generated(&self.is_generated);
         let old_generated = Self::normalized_generated(&existing.is_generated);
 
+        // Identity is dropped FIRST, ahead of the type, default and
+        // nullability changes below, and added LAST, after all three. Both
+        // ends of that follow from what an identity column *is*: PostgreSQL
+        // holds it NOT NULL, forbids it a default, and restricts it to an
+        // integer type, and it enforces all three at the moment of the ALTER
+        // rather than at the end of the transaction. So while the column is
+        // still an identity column none of the three can be relaxed, and
+        // before it can become one all three have to be true already.
+        //
+        // Verified live on PostgreSQL 16 — each of these is the error the
+        // wrong order produces:
+        //
+        //   drop not null   before drop identity  -> column "id" ... is an
+        //                                            identity column
+        //   set default     before drop identity  -> column "id" ... is an
+        //                                            identity column
+        //   alter type text before drop identity  -> identity column type must
+        //                                            be smallint, integer, or
+        //                                            bigint
+        //   add identity    before set not null   -> column "id" ... must be
+        //                                            declared NOT NULL before
+        //                                            identity can be added
+        //   add identity    before drop default   -> column "id" ... already
+        //                                            has a default value
+        //
+        // Only the first of those was reported (issue #243); the other two
+        // drop-side orderings were broken the same way and fail the same way.
+        let identity_dropped = existing.is_identity && !self.is_identity;
+        if identity_dropped {
+            let drop_cmd = format!(
+                "alter table {}.{} alter column {} drop identity if exists;",
+                self.schema, self.table, self.name
+            )
+            .with_empty_lines();
+            if use_drop {
+                statements.push(drop_cmd);
+            } else {
+                statements.push(
+                    drop_cmd
+                        .lines()
+                        .map(|l| format!("-- {}\n", l))
+                        .collect::<String>(),
+                );
+            }
+        }
+
         if self.type_clause_differs(existing) {
             statements.push(
                 format!(
@@ -574,27 +716,14 @@ impl TableColumn {
             }
         }
 
-        if self.is_identity != existing.is_identity {
-            if self.is_identity {
-                statements.push(self.build_identity_add_statement(existing));
-            } else {
-                let drop_cmd = format!(
-                    "alter table {}.{} alter column {} drop identity if exists;",
-                    self.schema, self.table, self.name
-                )
-                .with_empty_lines();
-                if use_drop {
-                    statements.push(drop_cmd);
-                } else {
-                    statements.push(
-                        drop_cmd
-                            .lines()
-                            .map(|l| format!("-- {}\n", l))
-                            .collect::<String>(),
-                    );
-                }
-            }
-        } else if self.is_identity {
+        // The add side. Its drop counterpart was emitted at the top of this
+        // function; see the ordering note there.
+        if self.is_identity && !existing.is_identity {
+            statements.push(self.build_identity_add_statement(existing));
+        } else if self.is_identity && existing.is_identity {
+            // Still an identity column on both sides, only its parameters
+            // moved — no ordering constraint, the column never stops being
+            // NOT NULL or gains a default.
             self.build_identity_update_statements(existing, &mut statements);
         }
 
@@ -926,5 +1055,5 @@ impl PartialEq for TableColumn {
 }
 
 #[cfg(test)]
-#[path = "table_column_tests.rs"]
+#[path = "tests/table_column.rs"]
 mod tests;

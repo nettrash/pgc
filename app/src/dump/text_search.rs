@@ -1,3 +1,6 @@
+//! Full-text search objects: [`TextSearchConfig`] (`pg_ts_config`) and
+//! [`TextSearchDict`] (`pg_ts_dict`).
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -283,5 +286,5 @@ impl TextSearchDict {
 }
 
 #[cfg(test)]
-#[path = "text_search_tests.rs"]
+#[path = "tests/text_search.rs"]
 mod tests;

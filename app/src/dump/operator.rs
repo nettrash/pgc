@@ -1,3 +1,5 @@
+//! User-defined operators (`pg_operator`) — `CREATE OPERATOR`. Schema-scoped.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -218,5 +220,5 @@ impl Operator {
 }
 
 #[cfg(test)]
-#[path = "operator_tests.rs"]
+#[path = "tests/operator.rs"]
 mod tests;

@@ -1,3 +1,17 @@
+//! Tables (`pg_class`) and everything attached to them.
+//!
+//! A table aggregates the pieces held by its sibling modules — columns,
+//! constraints, indexes, triggers and policies — and hashes them together, so any
+//! change below the table surfaces as a change to the table.
+//!
+//! Partitioning drives most of the ordering rules here: a parent must be created
+//! before its partitions and dropped after them, multi-level hierarchies are
+//! ordered by depth, and an index on a partitioned parent expands to `ON ONLY`
+//! plus a per-partition `ATTACH PARTITION` under `--output-for-production`.
+//!
+//! [`PgCatalogCaps`] records which catalog columns the connected server actually
+//! has, so one binary can introspect PostgreSQL 14 through 18.
+
 use crate::{
     dump::{
         table_column::TableColumn, table_constraint::TableConstraint, table_index::TableIndex,
@@ -131,48 +145,73 @@ impl PgCatalogCaps {
     }
 }
 
-// This is an information about a PostgreSQL table.
+/// This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub schema: String,
     pub name: String,
     pub raw_schema: String,
     pub raw_name: String,
-    pub owner: String,                     // Owner of the table
-    pub space: Option<String>,             // Tablespace of the table
-    pub has_indexes: bool,                 // Whether the table has indexes
-    pub has_triggers: bool,                // Whether the table has triggers
-    pub has_rules: bool,                   // Whether the table has rules
-    pub has_rowsecurity: bool,             // Whether the table has row security
-    pub columns: Vec<TableColumn>,         // Column names
-    pub constraints: Vec<TableConstraint>, // Constraint names
-    pub indexes: Vec<TableIndex>,          // Index names
-    pub triggers: Vec<TableTrigger>,       // Trigger names
+    /// Owner of the table
+    pub owner: String,
+    /// Tablespace of the table
+    pub space: Option<String>,
+    /// Whether the table has indexes
+    pub has_indexes: bool,
+    /// Whether the table has triggers
+    pub has_triggers: bool,
+    /// Whether the table has rules
+    pub has_rules: bool,
+    /// Whether the table has row security
+    pub has_rowsecurity: bool,
+    /// Column names
+    pub columns: Vec<TableColumn>,
+    /// Constraint names
+    pub constraints: Vec<TableConstraint>,
+    /// Index names
+    pub indexes: Vec<TableIndex>,
+    /// Trigger names
+    pub triggers: Vec<TableTrigger>,
+    /// Row-level security policies
     #[serde(default)]
-    pub policies: Vec<TablePolicy>, // Row-level security policies
-    pub definition: Option<String>,        // Table definition (optional)
-    pub partition_key: Option<String>,     // Partition key (PARTITION BY ...)
-    pub partition_of: Option<String>,      // Parent table (PARTITION OF ...)
-    pub partition_bound: Option<String>,   // Partition bound (FOR VALUES ... or DEFAULT)
+    pub policies: Vec<TablePolicy>,
+    /// Table definition (optional)
+    pub definition: Option<String>,
+    /// Partition key (PARTITION BY ...)
+    pub partition_key: Option<String>,
+    /// Parent table (PARTITION OF ...)
+    pub partition_of: Option<String>,
+    /// Partition bound (FOR VALUES ... or DEFAULT)
+    pub partition_bound: Option<String>,
+    /// Table comment
     #[serde(default)]
-    pub comment: Option<String>, // Table comment
-    pub hash: Option<String>,              // Hash of the table
+    pub comment: Option<String>,
+    /// Hash of the table
+    pub hash: Option<String>,
+    /// ACL (grant) entries for this table
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub acl: Vec<String>, // ACL (grant) entries for this table
+    pub acl: Vec<String>,
+    /// Table access method (e.g., "heap", custom AM)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access_method: Option<String>, // Table access method (e.g., "heap", custom AM)
+    pub access_method: Option<String>,
+    /// Whether the table is UNLOGGED (relpersistence = 'u')
     #[serde(default)]
-    pub is_unlogged: bool, // Whether the table is UNLOGGED (relpersistence = 'u')
+    pub is_unlogged: bool,
+    /// Table-level storage parameters (reloptions)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_parameters: Option<Vec<String>>, // Table-level storage parameters (reloptions)
+    pub storage_parameters: Option<Vec<String>>,
+    /// REPLICA IDENTITY setting (d=default, n=nothing, f=full, i=index)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replica_identity: Option<String>, // REPLICA IDENTITY setting (d=default, n=nothing, f=full, i=index)
+    pub replica_identity: Option<String>,
+    /// Whether FORCE ROW LEVEL SECURITY is enabled
     #[serde(default)]
-    pub force_rowsecurity: bool, // Whether FORCE ROW LEVEL SECURITY is enabled
+    pub force_rowsecurity: bool,
+    /// Classical inheritance parents (non-partition)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inherits_from: Vec<String>, // Classical inheritance parents (non-partition)
+    pub inherits_from: Vec<String>,
+    /// OF type name for typed tables
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub typed_table_type: Option<String>, // OF type name for typed tables
+    pub typed_table_type: Option<String>,
 }
 
 /// Structured result of [`Table::index_alter_plan`]: which indexes to create,
@@ -2268,12 +2307,7 @@ impl Table {
         old_col: &TableColumn,
         new_col: &TableColumn,
     ) -> bool {
-        let type_changed = old_col.data_type != new_col.data_type
-            || old_col.udt_name != new_col.udt_name
-            || old_col.numeric_precision != new_col.numeric_precision
-            || old_col.numeric_scale != new_col.numeric_scale
-            || old_col.character_maximum_length != new_col.character_maximum_length;
-        if !type_changed {
+        if !old_col.type_differs(new_col) {
             return false;
         }
         let is_partition_child = self.partition_of.is_some();
@@ -2412,5 +2446,5 @@ impl Table {
 }
 
 #[cfg(test)]
-#[path = "table_tests.rs"]
+#[path = "tests/table.rs"]
 mod tests;

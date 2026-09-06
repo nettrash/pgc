@@ -1,27 +1,46 @@
+//! Table constraints (`pg_constraint`) — PRIMARY KEY, UNIQUE, CHECK, EXCLUDE and
+//! FOREIGN KEY.
+//!
+//! Foreign keys are emitted after every table exists, and under
+//! `--output-for-production` they are added `NOT VALID` and validated in a
+//! separate statement so the migration does not hold a lock while scanning.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL table.
+/// This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableConstraint {
-    pub catalog: String,            // Catalog name
-    pub schema: String,             // Schema name
-    pub name: String,               // Constraint name
-    pub table_name: String,         // Table name
-    pub constraint_type: String, // Type of the constraint (e.g., PRIMARY KEY, FOREIGN KEY, UNIQUE)
-    pub is_deferrable: bool,     // Whether the constraint is deferrable
-    pub initially_deferred: bool, // Whether the constraint is initially deferred
-    pub definition: Option<String>, // Definition of the constraint (e.g., check expression)
+    /// Catalog name
+    pub catalog: String,
+    /// Schema name
+    pub schema: String,
+    /// Constraint name
+    pub name: String,
+    /// Table name
+    pub table_name: String,
+    /// Type of the constraint (e.g., PRIMARY KEY, FOREIGN KEY, UNIQUE)
+    pub constraint_type: String,
+    /// Whether the constraint is deferrable
+    pub is_deferrable: bool,
+    /// Whether the constraint is initially deferred
+    pub initially_deferred: bool,
+    /// Definition of the constraint (e.g., check expression)
+    pub definition: Option<String>,
+    /// Number of direct inheritance ancestors (0 = local, >0 = inherited)
     #[serde(default)]
-    pub coninhcount: i32, // Number of direct inheritance ancestors (0 = local, >0 = inherited)
+    pub coninhcount: i32,
+    /// Whether the constraint is enforced (PG18+ supports NOT ENFORCED)
     #[serde(default = "TableConstraint::default_enforced")]
-    pub is_enforced: bool, // Whether the constraint is enforced (PG18+ supports NOT ENFORCED)
+    pub is_enforced: bool,
+    /// Whether the constraint is marked NO INHERIT
     #[serde(default)]
-    pub no_inherit: bool, // Whether the constraint is marked NO INHERIT
+    pub no_inherit: bool,
+    /// PG15+: UNIQUE constraint treats NULLs as not distinct
     #[serde(default)]
-    pub nulls_not_distinct: bool, // PG15+: UNIQUE constraint treats NULLs as not distinct
+    pub nulls_not_distinct: bool,
     /// Optional comment on the constraint
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
@@ -602,5 +621,5 @@ impl PartialEq for TableConstraint {
 }
 
 #[cfg(test)]
-#[path = "table_constraint_tests.rs"]
+#[path = "tests/table_constraint.rs"]
 mod tests;

@@ -1,3 +1,5 @@
+//! Row-level security policies (`pg_policy`) — `CREATE POLICY`.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Error, Row, postgres::PgRow};
@@ -6,15 +8,23 @@ use crate::utils::string_extensions::StringExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TablePolicy {
-    pub schema: String,   // Schema name
-    pub table: String,    // Table name
-    pub name: String,     // Policy name
-    pub command: String,  // ALL, SELECT, INSERT, UPDATE, DELETE
-    pub permissive: bool, // true = PERMISSIVE, false = RESTRICTIVE
+    /// Schema name
+    pub schema: String,
+    /// Table name
+    pub table: String,
+    /// Policy name
+    pub name: String,
+    /// ALL, SELECT, INSERT, UPDATE, DELETE
+    pub command: String,
+    /// true = PERMISSIVE, false = RESTRICTIVE
+    pub permissive: bool,
+    /// Roles the policy applies to; empty means PUBLIC
     #[serde(default)]
-    pub roles: Vec<String>, // Roles the policy applies to; empty means PUBLIC
-    pub using_clause: Option<String>, // USING (predicate)
-    pub check_clause: Option<String>, // WITH CHECK (predicate)
+    pub roles: Vec<String>,
+    /// USING (predicate)
+    pub using_clause: Option<String>,
+    /// WITH CHECK (predicate)
+    pub check_clause: Option<String>,
 }
 
 impl TablePolicy {
@@ -144,5 +154,5 @@ impl PartialEq for TablePolicy {
 }
 
 #[cfg(test)]
-#[path = "table_policy_tests.rs"]
+#[path = "tests/table_policy.rs"]
 mod tests;

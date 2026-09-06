@@ -1,9 +1,15 @@
+//! Schemas (`pg_namespace`) — `CREATE SCHEMA`.
+//!
+//! Which schemas are dumped is decided by `--scheme`, matched against
+//! `nspname` with SQL `SIMILAR TO` rather than equality, so one run can target
+//! several schemas via a pattern such as `public|app` or `app_.*`.
+
 use md5;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::string_extensions::StringExt;
 
-// This is an information about a PostgreSQL schema.
+/// This is an information about a PostgreSQL schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
     /// Schema name as returned by PostgreSQL's quote_ident() (optionally quoted)
@@ -110,5 +116,5 @@ impl Schema {
 }
 
 #[cfg(test)]
-#[path = "schema_tests.rs"]
+#[path = "tests/schema.rs"]
 mod tests;
