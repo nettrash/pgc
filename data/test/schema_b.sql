@@ -2217,3 +2217,14 @@ SELECT id FROM test_schema.i242_orders;
 
 CREATE MATERIALIZED VIEW test_schema.i242_mv_touched AS
 SELECT status, count(*) AS cnt FROM test_schema.i242_orders GROUP BY status;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Issue #243: each column drops its identity and relaxes one of the three
+-- things an identity column guarantees.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE test_schema.i243_identity_drop (
+    goes_nullable   bigint,
+    gains_default   bigint NOT NULL DEFAULT 42,
+    leaves_integer  text NOT NULL,
+    label           text
+);
