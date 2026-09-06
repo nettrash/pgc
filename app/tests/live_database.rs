@@ -97,3 +97,65 @@ async fn inspect_populates_a_dump_without_writing_a_file() {
     // buildable straight after.
     assert!(!dump.generate_clear_script(true, true, false).is_empty());
 }
+
+/// Issue #244: a password full of URL-reserved characters must reach the
+/// server as typed.
+///
+/// The unit tests can only show that the credential is not rewritten on its
+/// way into `PgConnectOptions`. Whether the server accepts it is a question
+/// only the server can answer, and it is the question that was actually
+/// wrong: `#`, `/` and `?` used to fail as `invalid port number` before any
+/// socket was opened, and `pass%41word` used to authenticate as `passAword`.
+///
+/// Needs a role-creating connection (the `PG*` user must have CREATEROLE or
+/// be a superuser), which is what the documented local and CI setups use.
+#[tokio::test]
+#[ignore = "needs a reachable PostgreSQL server; run with --ignored"]
+async fn a_password_of_reserved_characters_authenticates() {
+    // Every character the URL form mangled, in one password: the three that
+    // ended the authority section, the escape that was silently decoded, and
+    // the two that survived by luck.
+    const PASSWORD: &str = "p#ss/w?rd%41@x%";
+    const ROLE: &str = "pgc_issue244_role";
+
+    let admin = env_config("");
+    let mut admin_dump = Dump::new(admin.clone());
+    admin_dump
+        .inspect(4)
+        .await
+        .expect("connect to the live database as the configured user");
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(admin.get_connect_options().expect("admin configuration"))
+        .await
+        .expect("open an admin connection");
+
+    // `CREATE ROLE` takes the password as a plain SQL literal, so only the
+    // single quotes need escaping — this is not a URL either.
+    sqlx::query(&format!(r#"drop role if exists {ROLE}"#))
+        .execute(&pool)
+        .await
+        .expect("clean up any leftover role");
+    sqlx::query(&format!(
+        r#"create role {ROLE} login password '{}'"#,
+        PASSWORD.replace('\'', "''")
+    ))
+    .execute(&pool)
+    .await
+    .expect("create the test role");
+    let dir = ScratchDir::new("live-issue244");
+    let mut as_role = env_config(&dir.path_str("issue244.dump"));
+    as_role.user = ROLE.to_string();
+    as_role.password = PASSWORD.to_string();
+
+    let result = Dump::new(as_role).inspect(4).await;
+
+    // Drop the role before asserting, so a failure does not leave it behind.
+    let _ = sqlx::query(&format!(r#"drop role if exists {ROLE}"#))
+        .execute(&pool)
+        .await;
+    pool.close().await;
+
+    result.expect("a password of URL-reserved characters must authenticate");
+}
