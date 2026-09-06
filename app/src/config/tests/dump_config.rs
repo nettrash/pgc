@@ -1,4 +1,5 @@
 use super::*;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 
 #[test]
 fn test_dump_config_new() {
@@ -38,7 +39,7 @@ fn test_dump_config_default() {
 }
 
 #[test]
-fn test_get_connection_string_with_ssl_disabled() {
+fn test_get_connect_options_with_ssl_disabled() {
     let config = DumpConfig {
         host: "localhost".to_string(),
         port: "5432".to_string(),
@@ -50,13 +51,16 @@ fn test_get_connection_string_with_ssl_disabled() {
         file: "test.dump".to_string(),
     };
 
-    let connection_string = config.get_connection_string();
-    let expected = "postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable";
-    assert_eq!(connection_string, expected);
+    let options = config.get_connect_options().expect("valid configuration");
+    assert_eq!(options.get_host(), "localhost");
+    assert_eq!(options.get_port(), 5432);
+    assert_eq!(options.get_username(), "testuser");
+    assert_eq!(options.get_database(), Some("testdb"));
+    assert!(matches!(options.get_ssl_mode(), PgSslMode::Disable));
 }
 
 #[test]
-fn test_get_connection_string_with_ssl_enabled() {
+fn test_get_connect_options_with_ssl_enabled() {
     let config = DumpConfig {
         host: "remotehost".to_string(),
         port: "5433".to_string(),
@@ -68,9 +72,12 @@ fn test_get_connection_string_with_ssl_enabled() {
         file: "prod.dump".to_string(),
     };
 
-    let connection_string = config.get_connection_string();
-    let expected = "postgres://produser:securepass@remotehost:5433/proddb?sslmode=require";
-    assert_eq!(connection_string, expected);
+    let options = config.get_connect_options().expect("valid configuration");
+    assert_eq!(options.get_host(), "remotehost");
+    assert_eq!(options.get_port(), 5433);
+    assert_eq!(options.get_username(), "produser");
+    assert_eq!(options.get_database(), Some("proddb"));
+    assert!(matches!(options.get_ssl_mode(), PgSslMode::Require));
 }
 
 #[test]
@@ -109,8 +116,12 @@ fn test_get_masked_connection_string_with_ssl_enabled() {
     assert_eq!(masked_string, expected);
 }
 
+/// The test this replaces asserted only that `format!` had produced the
+/// string it was told to produce, and never parsed the result — so it passed
+/// while every connection using that string failed (issue #244). What matters
+/// is that the credentials survive, so that is what is asserted here.
 #[test]
-fn test_connection_string_with_special_characters() {
+fn test_connect_options_with_special_characters() {
     let config = DumpConfig {
         host: "test-host.example.com".to_string(),
         port: "5432".to_string(),
@@ -122,11 +133,13 @@ fn test_connection_string_with_special_characters() {
         file: "special.dump".to_string(),
     };
 
-    let connection_string = config.get_connection_string();
-    let expected =
-        "postgres://user@domain:pass!@#$%@test-host.example.com:5432/test_db-name?sslmode=disable";
-    assert_eq!(connection_string, expected);
+    let options = config.get_connect_options().expect("valid configuration");
+    assert_eq!(options.get_host(), "test-host.example.com");
+    assert_eq!(options.get_port(), 5432);
+    assert_eq!(options.get_username(), "user@domain");
+    assert_eq!(options.get_database(), Some("test_db-name"));
 
+    // The masked form is log output only and stays a plain string.
     let masked_string = config.get_masked_connection_string();
     let expected_masked = "postgres://*:*@test-host.example.com:5432/test_db-name?sslmode=disable";
     assert_eq!(masked_string, expected_masked);
@@ -223,11 +236,124 @@ fn test_edge_cases_empty_strings() {
         file: "".to_string(),
     };
 
-    let connection_string = config.get_connection_string();
-    let expected = "postgres://:@:/?sslmode=disable";
-    assert_eq!(connection_string, expected);
+    // An empty port is not a port. The URL path used to carry it as far as
+    // the parser and come back with `invalid port number`; now it is refused
+    // where it can still be described as what it is.
+    assert!(config.get_connect_options().is_err());
 
     let masked_string = config.get_masked_connection_string();
     let expected_masked = "postgres://*:*@:/?sslmode=disable";
     assert_eq!(masked_string, expected_masked);
+}
+
+// ── issue #244: credentials are data, not URL syntax ───────────────────
+// The connection details used to be interpolated into a
+// `postgres://user:password@host:port/db` string and parsed back by sqlx.
+// Every RFC 3986 reserved character in a password was then read as syntax.
+// These tests pin both halves: that the URL round-trip really is lossy,
+// and that `get_connect_options` does not take part in it.
+
+use std::str::FromStr;
+
+fn config_with_password(password: &str) -> DumpConfig {
+    DumpConfig {
+        host: "localhost".to_string(),
+        port: "5432".to_string(),
+        user: "alice".to_string(),
+        password: password.to_string(),
+        database: "shop".to_string(),
+        scheme: "public".to_string(),
+        ssl: false,
+        file: "test.dump".to_string(),
+    }
+}
+
+/// The URL the old code would have built for this configuration.
+fn legacy_url(config: &DumpConfig) -> String {
+    format!(
+        "postgres://{}:{}@{}:{}/{}?sslmode=disable",
+        config.user, config.password, config.host, config.port, config.database
+    )
+}
+
+#[test]
+fn reserved_characters_that_broke_the_url_leave_the_options_intact() {
+    // `#`, `/` and `?` each end the authority section early, so the parser
+    // reads the port out of something that is not a number — the reported
+    // `invalid port number`, naming the one part that was never wrong.
+    for password in ["repro#pass", "repro/pass", "repro?pass"] {
+        let config = config_with_password(password);
+
+        assert!(
+            PgConnectOptions::from_str(&legacy_url(&config)).is_err(),
+            "`{password}` was expected to break the URL form"
+        );
+
+        let options = config
+            .get_connect_options()
+            .unwrap_or_else(|e| panic!("`{password}` must still configure cleanly: {e}"));
+        assert_eq!(options.get_host(), "localhost");
+        assert_eq!(options.get_port(), 5432);
+        assert_eq!(options.get_username(), "alice");
+        assert_eq!(options.get_database(), Some("shop"));
+    }
+}
+
+#[test]
+fn a_percent_escape_in_a_password_is_no_longer_decoded() {
+    // The quiet one. `%41` is a valid percent-escape, so the URL parser
+    // decoded it and `pass%41word` authenticated as `passAword` — verified
+    // live against PostgreSQL 16 in both directions: the wrong password was
+    // accepted, and the real one could not be used at all.
+    //
+    // There is no password getter on `PgConnectOptions`, so this reads it out
+    // of the `Debug` rendering, which prints it. That couples the test to
+    // sqlx's formatting; if sqlx ever redacts it the assertion fails loudly,
+    // which is the right way round for a test whose whole subject is a
+    // credential being rewritten in transit.
+    let config = config_with_password("pass%41word");
+
+    let from_url = PgConnectOptions::from_str(&legacy_url(&config))
+        .expect("this one parses — that is exactly the problem");
+    assert!(
+        format!("{from_url:?}").contains(r#"password: Some("passAword")"#),
+        "the URL form is supposed to decode %41; if it no longer does, this \
+         test has stopped describing the bug: {from_url:?}"
+    );
+
+    let from_options = config.get_connect_options().expect("valid configuration");
+    assert!(
+        format!("{from_options:?}").contains(r#"password: Some("pass%41word")"#),
+        "the password must reach sqlx exactly as it was typed: {from_options:?}"
+    );
+}
+
+#[test]
+fn a_port_that_is_not_a_number_is_reported_as_a_port() {
+    let mut config = config_with_password("plain");
+    config.port = "not-a-port".to_string();
+
+    let error = config
+        .get_connect_options()
+        .expect_err("a non-numeric port must be refused");
+
+    assert!(
+        matches!(error, sqlx::Error::Configuration(_)),
+        "expected a configuration error, got: {error:?}"
+    );
+}
+
+#[test]
+fn a_port_with_surrounding_whitespace_is_accepted() {
+    // Config files are hand-edited; `PORT = 5432 ` is a typo, not an outage.
+    let mut config = config_with_password("plain");
+    config.port = " 5432 ".to_string();
+
+    assert_eq!(
+        config
+            .get_connect_options()
+            .expect("whitespace around a port is not an error")
+            .get_port(),
+        5432
+    );
 }

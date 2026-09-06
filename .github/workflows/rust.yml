@@ -166,6 +166,38 @@ jobs:
         USE_SINGLE_TRANSACTION=false
         EOF
 
+    - name: Assert a password of URL-reserved characters connects
+      env:
+        PGPASSWORD: postgres
+      run: |
+        # The connection details used to be interpolated into a
+        # postgres://user:password@host:port/db string and parsed back, so
+        # every RFC 3986 reserved character in a password was read as syntax
+        # (issue #244). `#`, `/` and `?` failed as "invalid port number"
+        # before any socket was opened, and `%41` was silently decoded, so
+        # `pass%41word` authenticated as `passAword`.
+        #
+        # Nothing about a schema diff exercises this, so it gets its own step:
+        # create a role whose password holds every character that misbehaved,
+        # then dump as that role.
+        password='p#ss/w?rd%41@x%'
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=1 -c \
+          "drop role if exists pgc_issue244_role;"
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=1 -c \
+          "create role pgc_issue244_role login password '${password}';"
+        if ! ./app/target/release/pgc --command dump \
+              --server 127.0.0.1 --port 5432 --database a --scheme public \
+              --output /tmp/issue244.dump \
+              --user pgc_issue244_role --password "${password}" > /tmp/issue244.log 2>&1; then
+          echo "ERROR: a password of URL-reserved characters was refused on PG ${{ matrix.pg_version }}"
+          cat /tmp/issue244.log
+          psql -h 127.0.0.1 -U postgres -d a -c "drop role if exists pgc_issue244_role;" || true
+          exit 1
+        fi
+        psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=1 -c \
+          "drop role if exists pgc_issue244_role;"
+        echo "OK: reserved characters in a password survive on PG ${{ matrix.pg_version }}"
+
     - name: Run pgc compare (round 1) — generate diff
       run: |
         ./app/target/release/pgc --config /tmp/pgc.conf

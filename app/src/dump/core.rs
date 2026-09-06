@@ -277,9 +277,20 @@ impl Dump {
             );
         }
 
+        // A bad port is a configuration error, not a connection failure, and
+        // saying so is the whole point of issue #244 — the old URL path
+        // reported every unparseable credential as `invalid port number`.
+        let connect_options = self.configuration.get_connect_options().map_err(|e| {
+            Error::other(format!(
+                "Invalid connection configuration ({}): {}.",
+                self.configuration.get_masked_connection_string(),
+                e
+            ))
+        })?;
+
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(self.configuration.get_connection_string().as_str())
+            .connect_with(connect_options)
             .await
             .map_err(|e| {
                 Error::other(format!(
@@ -3552,9 +3563,20 @@ impl Dump {
 
     /// Connect to the database and fill the dump without saving to a file.
     pub async fn inspect(&mut self, max_connections: u32) -> Result<(), Error> {
+        // A bad port is a configuration error, not a connection failure, and
+        // saying so is the whole point of issue #244 — the old URL path
+        // reported every unparseable credential as `invalid port number`.
+        let connect_options = self.configuration.get_connect_options().map_err(|e| {
+            Error::other(format!(
+                "Invalid connection configuration ({}): {}.",
+                self.configuration.get_masked_connection_string(),
+                e
+            ))
+        })?;
+
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(self.configuration.get_connection_string().as_str())
+            .connect_with(connect_options)
             .await
             .map_err(|e| {
                 Error::other(format!(

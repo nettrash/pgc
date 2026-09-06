@@ -1,19 +1,44 @@
-2026-09-05      v1.0.27
+2026-09-06      v1.0.27
 
-                Fixes four migrations that did not do what they said:
+                Fixes four migrations that did not do what they said -
                 the routine ordering bug behind issue #240, with one
                 opt-in flag for it, the schema-moved extension of
                 issue #241, the materialized view rebuilt on an
                 unrelated column change of issue #242, and the
                 identity column dropped in the wrong order of issue
-                #243. Beyond those this release reorganises the test
-                suite, adds a library target and integration tests,
-                and documents the crate. The dump gains one optional
-                field, which older dumps may omit, and the generated
-                SQL is unchanged for any schema none of the four bugs
-                touched.
+                #243 - and one class of password that could not be
+                used to connect at all (issue #244). Beyond those
+                this release reorganises the test suite, adds a
+                library target and integration tests, and documents
+                the crate. The dump gains one optional field, which
+                older dumps may omit, and the generated SQL is
+                unchanged for any schema none of the four migration
+                bugs touched.
 
                 Bug fixes:
+                    - Resolved issue #244 (a password containing
+                      characters that are reserved in a URL could not be
+                      used, and one kind of password was silently
+                      changed). Connection details were interpolated
+                      into a postgres://user:password@host:port/database
+                      string and handed back to sqlx to parse, so every
+                      reserved character in a credential was read as URL
+                      syntax rather than as data. A password containing
+                      #, / or ? ended the authority section early and
+                      the parser eventually read the port out of
+                      something that was not a number, reporting invalid
+                      port number - naming the one part of the
+                      connection that was never wrong, before any socket
+                      was opened. Worse and quieter, a password
+                      containing a valid percent-escape was decoded:
+                      pass%41word was sent as passAword, so the wrong
+                      password was accepted and the real one could not
+                      be used at all. The connection now goes through
+                      PgConnectOptions with the fields set individually,
+                      which sqlx passes to the wire protocol unaltered,
+                      and a port that is not a number is reported as a
+                      port instead of as a failed connection. The masked
+                      connection string in log output is unchanged.
                     - Resolved issue #243 (a column that stopped being
                       an identity column produced a migration PostgreSQL
                       refused to run). One column's ALTER statements
