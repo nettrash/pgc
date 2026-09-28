@@ -4,11 +4,57 @@
 //! Foreign keys are emitted after every table exists, and under
 //! `--output-for-production` they are added `NOT VALID` and validated in a
 //! separate statement so the migration does not hold a lock while scanning.
+//!
+//! Which in-place `ALTER CONSTRAINT` forms a change may use depends on the
+//! server being migrated, so the alter path takes a [`ConstraintAlterCaps`]:
+//! PostgreSQL 19 accepts `ALTER CONSTRAINT ... [NOT] ENFORCED` on a CHECK
+//! constraint, while PostgreSQL 18 rejects it ("cannot alter enforceability")
+//! and older servers lack the syntax. Without the capability a CHECK
+//! enforceability change is a drop + re-add.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::utils::string_extensions::StringExt;
+
+/// In-place constraint changes the migrated server (the FROM database)
+/// accepts. The [`Default`] — every flag off — is the form every supported
+/// server accepts, and is what a dump of unknown version gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConstraintAlterCaps {
+    /// `ALTER TABLE ... ALTER CONSTRAINT c [NOT] ENFORCED` on a CHECK
+    /// constraint (PostgreSQL 19+).
+    pub check_enforceability: bool,
+}
+
+/// Case-insensitively strips one trailing ` NOT ENFORCED` from a
+/// `pg_get_constraintdef` string. PostgreSQL always deparses it as the last
+/// clause, and a CHECK expression always ends in `)`, so a string literal
+/// that happens to contain the words can never match.
+fn strip_not_enforced(def: &str) -> &str {
+    strip_suffix_ci(def.trim_end(), " not enforced")
+}
+
+/// Case-insensitively strips one trailing ` NOT VALID` (see
+/// [`strip_not_enforced`] for why a suffix test is enough).
+fn strip_not_valid(def: &str) -> &str {
+    strip_suffix_ci(def.trim_end(), " not valid")
+}
+
+fn ends_with_not_valid(def: &str) -> bool {
+    strip_not_valid(def).len() != def.trim_end().len()
+}
+
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> &'a str {
+    if s.len() >= suffix.len()
+        && s.is_char_boundary(s.len() - suffix.len())
+        && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    {
+        &s[..s.len() - suffix.len()]
+    } else {
+        s
+    }
+}
 
 /// This is an information about a PostgreSQL table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +84,17 @@ pub struct TableConstraint {
     /// Whether the constraint is marked NO INHERIT
     #[serde(default)]
     pub no_inherit: bool,
-    /// PG15+: UNIQUE constraint treats NULLs as not distinct
+    /// Always `false`, and kept only so dump files and constraint hashes stay
+    /// exactly as every pgc version has written them.
+    ///
+    /// It was meant to hold `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+), but
+    /// pgc read it from `pg_constraint.connullsnotdistinct`, a column no
+    /// PostgreSQL version has — the flag is `pg_index.indnullsnotdistinct` —
+    /// so no dump has ever held `true`. It is not needed: `pg_get_constraintdef`
+    /// prints `UNIQUE NULLS NOT DISTINCT (…)`, so [`definition`](Self::definition)
+    /// carries it, and a change to it is detected and applied through the
+    /// definition (a drop + re-add). Reading the real flag would only make
+    /// every such constraint differ from its copy in a dump written before.
     #[serde(default)]
     pub nulls_not_distinct: bool,
     /// Optional comment on the constraint
@@ -81,9 +137,10 @@ impl TableConstraint {
             self.schema, self.table_name, self.name
         ));
 
-        // If a definition is provided, lowercase only the SQL keywords/identifiers,
-        // preserving the original case of string literal contents so that round-tripping
-        // through PGC does not produce a spurious diff.
+        // If a definition is provided, lowercase only the SQL keywords and unquoted
+        // identifiers, preserving the original case of string literal contents so that
+        // round-tripping through PGC does not produce a spurious diff, and of quoted
+        // identifiers, which lowercased would name other objects.
         // Otherwise, build from constraint_type and attribute flags.
         let clause = if let Some(def) = &self.definition {
             let mut base = Self::lowercase_outside_literals(def);
@@ -185,18 +242,14 @@ impl TableConstraint {
         crate::utils::sql_normalize::canonicalize_definition(s)
     }
 
-    /// Lowercases a SQL expression while preserving the original case of text
-    /// inside single-quoted string literals.  Handles the standard `''` escape
-    /// for embedded quotes.  Iterates by `char` so multi-byte UTF-8 sequences
-    /// are never split.
     /// True when `needle` (must already be lowercase) appears in `s`
-    /// OUTSIDE every single-quoted string literal. Mirrors the
-    /// quote-tracking state machine used by [`Self::lowercase_outside_
-    /// literals`] so a `CHECK (msg <> 'not enforced')` predicate
-    /// doesn't get confused with the keyword position. PR #187 review
-    /// (issue #182): a plain `clause.contains("not enforced")` would
-    /// also match string literals and silently suppress the
-    /// constraint flag.
+    /// OUTSIDE every single-quoted string literal and double-quoted
+    /// identifier. Mirrors the quote-tracking state machine used by
+    /// [`Self::lowercase_outside_literals`] so a `CHECK (msg <> 'not
+    /// enforced')` predicate doesn't get confused with the keyword position.
+    /// PR #187 review (issue #182): a plain `clause.contains("not
+    /// enforced")` would also match string literals and silently suppress
+    /// the constraint flag.
     fn lowercased_contains_outside_literals(s: &str, needle: &str) -> bool {
         debug_assert!(needle.chars().all(|c| !c.is_ascii_uppercase()));
         if needle.is_empty() {
@@ -205,13 +258,13 @@ impl TableConstraint {
         let mut buf = String::with_capacity(needle.len());
         let mut chars = s.chars();
         while let Some(c) = chars.next() {
-            if c == '\'' {
-                // Skip past the literal entirely; nothing inside it
-                // counts toward keyword detection.
+            if c == '\'' || c == '"' {
+                // Skip past the literal or quoted identifier entirely;
+                // nothing inside it counts toward keyword detection.
                 loop {
                     match chars.next() {
-                        Some('\'') => {
-                            if chars.as_str().starts_with('\'') {
+                        Some(q) if q == c => {
+                            if chars.as_str().starts_with(c) {
                                 chars.next(); // doubled-quote escape
                             } else {
                                 break;
@@ -246,21 +299,32 @@ impl TableConstraint {
         false
     }
 
+    /// Lowercases a SQL expression while preserving the original case of text
+    /// inside single-quoted string literals and double-quoted identifiers.
+    /// Handles the standard doubled-quote escape in both. Iterates by `char`
+    /// so multi-byte UTF-8 sequences are never split.
+    ///
+    /// A quoted identifier keeps its case: lowercasing one changes it only
+    /// when it holds an uppercase letter, and then names another object —
+    /// `pg_get_constraintdef` spells `REFERENCES "My Schema"."Orders"("Id")`,
+    /// and the lowercased form fails with `schema "my schema" does not
+    /// exist`.
     fn lowercase_outside_literals(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars();
         while let Some(c) = chars.next() {
-            if c == '\'' {
-                // Inside a single-quoted literal — copy verbatim.
-                out.push('\'');
+            if c == '\'' || c == '"' {
+                // Inside a single-quoted literal or a double-quoted
+                // identifier — copy verbatim.
+                out.push(c);
                 loop {
                     match chars.next() {
-                        Some('\'') => {
-                            out.push('\'');
+                        Some(q) if q == c => {
+                            out.push(c);
                             // Doubled-quote escape — copy the second quote
                             // and stay inside the literal.
-                            if chars.as_str().starts_with('\'') {
-                                out.push('\'');
+                            if chars.as_str().starts_with(c) {
+                                out.push(c);
                                 chars.next();
                             } else {
                                 break; // closing quote
@@ -282,7 +346,21 @@ impl TableConstraint {
 
     /// Get alter script to change this constraint to match the target constraint
     /// Returns None if the constraint needs to be dropped and recreated
+    ///
+    /// Assumes a server that accepts only the in-place forms every supported
+    /// version does; see [`TableConstraint::get_alter_script_with_caps`].
     pub fn get_alter_script(&self, target: &TableConstraint) -> Option<String> {
+        self.get_alter_script_with_caps(target, ConstraintAlterCaps::default())
+    }
+
+    /// Like [`TableConstraint::get_alter_script`], for a migrated server with
+    /// the in-place capabilities in `caps`. Returns `None` when the
+    /// constraint has to be dropped and re-added.
+    pub fn get_alter_script_with_caps(
+        &self,
+        target: &TableConstraint,
+        caps: ConstraintAlterCaps,
+    ) -> Option<String> {
         // Helper: emit comment change SQL if needed
         let comment_script = |s: &mut String| {
             if self.comment != target.comment {
@@ -303,12 +381,13 @@ impl TableConstraint {
             }
         };
 
-        // FOREIGN KEY constraints can have their deferrable and enforced properties altered
-        // CHECK constraints can have their enforced property altered (PG18+)
+        // FOREIGN KEY constraints can have their deferrable and enforced properties altered.
+        // CHECK constraints can have their enforced property altered on PostgreSQL 19+
+        // (`caps.check_enforceability`); PostgreSQL 18 rejects that for CHECK.
         // All other changes require drop/recreate
         if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
             && target.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
-            && self.can_be_altered_to(target)
+            && self.can_be_altered_to_with_caps(target, caps)
         {
             let mut script = String::new();
 
@@ -368,14 +447,17 @@ impl TableConstraint {
 
             comment_script(&mut script);
             Some(script)
-        } else if (self.constraint_type.eq_ignore_ascii_case("CHECK")
-            || self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY"))
-            && self.can_be_altered_to(target)
-            && (self.is_enforced != target.is_enforced
-                || self.no_inherit != target.no_inherit
-                || self.comment != target.comment)
+        } else if self.constraint_type.eq_ignore_ascii_case("CHECK")
+            && self.can_be_altered_to_with_caps(target, caps)
+            && (self.is_enforced != target.is_enforced || self.comment != target.comment)
         {
-            // CHECK/FK constraint enforced or no_inherit property change (PG18+)
+            // CHECK enforceability change, in place (PostgreSQL 19+; the
+            // capability gate lives in `can_be_altered_to_with_caps`). No
+            // `ONLY`: the statement recurses to inheritance children and
+            // partitions, which PostgreSQL requires when they exist. A
+            // `NO INHERIT` change is never emitted here — `ALTER CONSTRAINT
+            // ... [NO] INHERIT` applies only to NOT NULL constraints — so
+            // it stays a drop + re-add.
             let mut script = String::new();
             if self.is_enforced != target.is_enforced {
                 if target.is_enforced {
@@ -386,19 +468,6 @@ impl TableConstraint {
                 } else {
                     script.append_block(&format!(
                         "alter table {}.{} alter constraint {} not enforced;",
-                        self.schema, self.table_name, target.name
-                    ));
-                }
-            }
-            if self.no_inherit != target.no_inherit {
-                if target.no_inherit {
-                    script.append_block(&format!(
-                        "alter table {}.{} alter constraint {} no inherit;",
-                        self.schema, self.table_name, target.name
-                    ));
-                } else {
-                    script.append_block(&format!(
-                        "alter table {}.{} alter constraint {} inherit;",
                         self.schema, self.table_name, target.name
                     ));
                 }
@@ -427,11 +496,50 @@ impl TableConstraint {
         }
     }
 
+    /// Whether this CHECK constraint is enforced and `target` is
+    /// `NOT ENFORCED`, i.e. an in-place alter to `target` (see
+    /// [`TableConstraint::get_alter_script_with_caps`]) relaxes it.
+    ///
+    /// The table alter runs such an `ALTER CONSTRAINT ... NOT ENFORCED`
+    /// before its column changes: an `ALTER COLUMN ... TYPE` or
+    /// `SET EXPRESSION` rewrites the table and checks every row against the
+    /// CHECK constraints that are still enforced at that moment. The opposite
+    /// flip validates the rows, so it runs after them. Always false for a
+    /// foreign key, whose in-place alters the foreign-key section emits.
+    pub fn relaxes_enforcement_to(&self, target: &TableConstraint) -> bool {
+        self.constraint_type.eq_ignore_ascii_case("CHECK")
+            && target.constraint_type.eq_ignore_ascii_case("CHECK")
+            && self.is_enforced
+            && !target.is_enforced
+    }
+
     /// Check if this constraint can be altered to match the target constraint
     /// without dropping and recreating
+    ///
+    /// Assumes a server that accepts only the in-place forms every supported
+    /// version does; see [`TableConstraint::can_be_altered_to_with_caps`].
     pub fn can_be_altered_to(&self, target: &TableConstraint) -> bool {
-        // FOREIGN KEY constraints can have deferrable and enforced properties altered
-        // CHECK constraints can have enforced property altered (PG18+)
+        self.can_be_altered_to_with_caps(target, ConstraintAlterCaps::default())
+    }
+
+    /// Like [`TableConstraint::can_be_altered_to`], for a migrated server with
+    /// the in-place capabilities in `caps`.
+    ///
+    /// A CHECK constraint is alterable when nothing but its comment and — with
+    /// `caps.check_enforceability` — its enforceability differ. Its
+    /// `pg_get_constraintdef` text carries the enforceability itself
+    /// (`CHECK (x) NOT ENFORCED`, which replaces a `NOT VALID` suffix), so the
+    /// definitions are compared with that suffix stripped. `ALTER CONSTRAINT
+    /// ... ENFORCED` always validates existing rows, so a target that is
+    /// enforced but `NOT VALID` cannot be reached in place and stays a
+    /// drop + re-add. A `NO INHERIT` difference is never alterable.
+    pub fn can_be_altered_to_with_caps(
+        &self,
+        target: &TableConstraint,
+        caps: ConstraintAlterCaps,
+    ) -> bool {
+        // FOREIGN KEY constraints can have deferrable and enforced properties altered.
+        // CHECK constraints can have their enforced property altered on PostgreSQL 19+.
         // All other changes require drop/recreate
         if self.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
             && target.constraint_type.eq_ignore_ascii_case("FOREIGN KEY")
@@ -449,27 +557,95 @@ impl TableConstraint {
         } else if self.constraint_type.eq_ignore_ascii_case("CHECK")
             && target.constraint_type.eq_ignore_ascii_case("CHECK")
         {
-            // CHECK constraints: enforced and no_inherit can be altered (PG18+)
-            self.catalog == target.catalog
-                && self.schema == target.schema
+            // `catalog` is deliberately not compared: it is the dumped
+            // database's name (`current_database()`), which differs between
+            // FROM and TO in every real compare, and `PartialEq` ignores it
+            // too.
+            let same_identity = self.schema == target.schema
                 && self.name == target.name
                 && self.table_name == target.table_name
                 && self.constraint_type == target.constraint_type
                 && self.is_deferrable == target.is_deferrable
                 && self.initially_deferred == target.initially_deferred
                 && self.nulls_not_distinct == target.nulls_not_distinct
-                && self.definition.as_deref().map(Self::normalize_definition)
+                && self.no_inherit == target.no_inherit;
+            if !same_identity {
+                return false;
+            }
+            if self.is_enforced == target.is_enforced {
+                self.definition.as_deref().map(Self::normalize_definition)
                     == target.definition.as_deref().map(Self::normalize_definition)
-            // is_enforced and no_inherit can differ
+            } else if !caps.check_enforceability {
+                false
+            } else if target.is_enforced {
+                // NOT ENFORCED -> ENFORCED. The ALTER validates, so the
+                // target must be a validated constraint.
+                !target
+                    .definition
+                    .as_deref()
+                    .is_some_and(ends_with_not_valid)
+                    && self
+                        .definition
+                        .as_deref()
+                        .map(|d| Self::normalize_definition(strip_not_enforced(d)))
+                        == target.definition.as_deref().map(Self::normalize_definition)
+            } else {
+                // ENFORCED (validated or NOT VALID) -> NOT ENFORCED.
+                self.definition
+                    .as_deref()
+                    .map(|d| Self::normalize_definition(strip_not_valid(d)))
+                    == target
+                        .definition
+                        .as_deref()
+                        .map(|d| Self::normalize_definition(strip_not_enforced(d)))
+            }
         } else {
             false
         }
+    }
+
+    /// This constraint as the copy a table that inherits it holds: on
+    /// `schema.table_name`, inherited (`coninhcount` 1), without a comment
+    /// (PostgreSQL copies none), and ENFORCED when `enforced`, which drops a
+    /// `NOT ENFORCED` suffix from the definition. A copy may be enforced
+    /// under a `NOT ENFORCED` parent (PostgreSQL 18+), never the reverse, so
+    /// `enforced` false keeps this constraint's own enforceability.
+    pub(crate) fn inherited_copy(
+        &self,
+        schema: &str,
+        table_name: &str,
+        enforced: bool,
+    ) -> TableConstraint {
+        let mut copy = self.clone();
+        copy.schema = schema.to_string();
+        copy.table_name = table_name.to_string();
+        copy.coninhcount = 1;
+        copy.comment = None;
+        if enforced && !self.is_enforced {
+            copy.is_enforced = true;
+            copy.definition = self
+                .definition
+                .as_deref()
+                .map(|d| strip_not_enforced(d).to_string());
+        }
+        copy
     }
 
     /// Get drop script for this constraint
     pub fn get_drop_script(&self) -> String {
         format!(
             "alter table {}.{} drop constraint {};",
+            self.schema, self.table_name, self.name
+        )
+        .with_empty_lines()
+    }
+
+    /// [`TableConstraint::get_drop_script`] with `IF EXISTS`, for a
+    /// constraint that PostgreSQL may already have dropped along with its
+    /// column earlier in the same migration.
+    pub(crate) fn get_drop_if_exists_script(&self) -> String {
+        format!(
+            "alter table {}.{} drop constraint if exists {};",
             self.schema, self.table_name, self.name
         )
         .with_empty_lines()
@@ -619,6 +795,9 @@ impl PartialEq for TableConstraint {
                 == other.definition.as_deref().map(Self::normalize_definition)
     }
 }
+
+/// `PartialEq` compares normalized fields only, which is still an equivalence.
+impl Eq for TableConstraint {}
 
 #[cfg(test)]
 #[path = "tests/table_constraint.rs"]

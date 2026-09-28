@@ -92,10 +92,12 @@ pub(crate) fn strip_comments_and_collapse(script: &str) -> String {
             }
             continue;
         }
-        // Line comment -- ... — strip
+        // Line comment -- ... — strip. It ends at a line feed or a bare
+        // carriage return, as in PostgreSQL's lexer (`non_newline = [^\n\r]`)
+        // and psql: whatever follows a `\r` is SQL, so it must survive here.
         if i + 1 < len && src[i] == b'-' && src[i + 1] == b'-' {
             i += 2;
-            while i < len && src[i] != b'\n' {
+            while i < len && !is_line_end(src[i]) {
                 i += 1;
             }
             continue;
@@ -116,6 +118,13 @@ pub(crate) fn strip_comments_and_collapse(script: &str) -> String {
     // Safety: result is built entirely from slices of `script` (valid UTF-8),
     // so it is guaranteed to be valid UTF-8.
     String::from_utf8(result).expect("output must be valid UTF-8")
+}
+
+/// Whether `byte` ends a `--` line comment. PostgreSQL's lexer defines a line
+/// comment as `--` followed by `[^\n\r]*`, so a bare carriage return ends one
+/// just like a line feed does.
+pub(crate) fn is_line_end(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r'
 }
 
 /// Copies a quoted literal body (everything after the opening delimiter has
@@ -301,11 +310,12 @@ pub(crate) fn blank_comments_and_literals(sql: &str) -> String {
             blank_into(src, &mut out, start, i);
             continue;
         }
-        // Line comment `-- …`, up to but not including the newline.
+        // Line comment `-- …`, up to but not including the line feed or bare
+        // carriage return that ends it (see `strip_comments_and_collapse`).
         if i + 1 < len && src[i] == b'-' && src[i + 1] == b'-' {
             let start = i;
             i += 2;
-            while i < len && src[i] != b'\n' {
+            while i < len && !is_line_end(src[i]) {
                 i += 1;
             }
             blank_into(src, &mut out, start, i);

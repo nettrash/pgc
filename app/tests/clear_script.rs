@@ -220,3 +220,48 @@ fn every_object_kind_present_in_the_dump_is_dropped() {
         );
     }
 }
+
+// ==== pre-clear tests ====
+
+/// The clear command reorders its sections by the dependencies `inspect`
+/// reads from `pg_depend`, keyed through `pgc::dump::drop_order`: a table
+/// whose column default calls a function has to go before the function (the
+/// default order already does that), and a classic `INHERITS` child before
+/// its parent, which the dump lists first.
+#[test]
+fn a_dependency_read_from_the_catalog_reorders_the_clear_script() {
+    use pgc::dump::drop_order::{DropDependency, relation_key, routine_key, schema_key};
+
+    let mut dump = empty_dump("shop");
+    dump.schemas.push(schema("app"));
+    dump.tables.push(table("app", "a_parent", &["id"]));
+    dump.tables.push(table("app", "b_child", &["id"]));
+    let compute = routine("app", 900, "compute", "integer", "SELECT 1");
+    dump.drop_dependencies = vec![
+        DropDependency::new(
+            relation_key("app", "b_child"),
+            relation_key("app", "a_parent"),
+        ),
+        DropDependency::new(
+            relation_key("app", "b_child"),
+            routine_key(&compute.dependency_key()),
+        ),
+        DropDependency::new(relation_key("app", "a_parent"), schema_key("app")),
+    ];
+    dump.routines.push(compute);
+
+    let script = dump.generate_clear_script(true, true, false);
+    let child = position_of(&script, "drop table if exists app.b_child;");
+    let parent = position_of(&script, "drop table if exists app.a_parent;");
+    let function = position_of(&script, "drop function if exists app.compute (");
+    assert!(child < parent && parent < function, "{script}");
+
+    // Without the catalog's word for it, the dump order stands.
+    dump.drop_dependencies.clear();
+    let script = dump.generate_clear_script(true, true, false);
+    assert!(
+        position_of(&script, "drop table if exists app.a_parent;")
+            < position_of(&script, "drop table if exists app.b_child;"),
+        "{script}"
+    );
+}

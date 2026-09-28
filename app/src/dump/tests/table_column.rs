@@ -56,6 +56,8 @@ fn create_test_column() -> TableColumn {
         statistics_target: None,
         acl: vec![],
         serial_type: None,
+        generation_blocks_retype: false,
+        generation_routine_dropped: false,
     }
 }
 
@@ -772,6 +774,10 @@ fn test_get_alter_script_add_generated_always_use_drop_false() {
 
 #[test]
 fn test_get_alter_script_update_generated_expression() {
+    // A STORED expression change on a server that cannot SET EXPRESSION
+    // (PostgreSQL 14-16, or a dump of unknown version) is a drop + add.
+    // pgc used to emit `drop expression` + `add generated always as (...)
+    // stored`, and no PostgreSQL version accepts the second statement.
     let mut existing = create_test_column();
     existing.is_generated = "ALWAYS".to_string();
     existing.generation_expression = Some("(id * 2)".to_string());
@@ -785,8 +791,10 @@ fn test_get_alter_script_update_generated_expression() {
 
     assert_eq!(
         script,
-        "alter table public.test_table alter column test_column drop expression;\n\nalter table public.test_table alter column test_column add generated always as (id * 3) stored;\n\n"
+        "alter table public.test_table drop column test_column;\n\n".to_owned()
+            + "alter table public.test_table add column test_column varchar(255) generated always as (id * 3) stored;\n\n"
     );
+    assert!(updated.would_drop_and_re_add(&existing));
 }
 
 #[test]
@@ -914,19 +922,18 @@ fn test_get_alter_script_update_generated_expression_use_drop_false() {
         .get_alter_script(&existing, false)
         .expect("expected output when use_drop is false for expression update");
 
-    // Should contain a warning about manual intervention
-    assert!(
-        script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should contain a warning comment, script:\n{}",
-        script
+    assert_eq!(
+        script,
+        "-- use_drop=false: changing a stored generated column's expression needs drop/add on this server (SET EXPRESSION requires PostgreSQL 17+); statements commented out\n\
+         -- alter table public.test_table drop column test_column;\n\
+         -- \n\
+         -- alter table public.test_table add column test_column varchar(255) generated always as (id * 3) stored;\n\
+         -- \n"
     );
-
-    // Both drop expression and add generated should be commented out
-    for line in script.lines() {
-        if line.contains("drop expression") || line.contains("add generated always") {
-            assert!(line.starts_with("--"), "should be commented out: {}", line);
-        }
-    }
+    assert!(
+        !script.contains("add generated always"),
+        "the invalid ADD GENERATED form must not be emitted: {script}"
+    );
 }
 
 // ---- PG18: generation_type (virtual generated columns) tests ----
@@ -1104,12 +1111,11 @@ fn issue181_virtual_to_stored_flip_emits_drop_and_add_column() {
 }
 
 #[test]
-fn issue181_stored_expression_change_keeps_in_place_alter() {
-    // Sanity check: the in-place `DROP EXPRESSION` + `ADD
-    // GENERATED ... STORED` path is still used for the case that
-    // PG18 accepts — STORED → STORED with a new expression. Only
-    // VIRTUAL participants get routed to the heavier DROP COLUMN
-    // path.
+fn issue181_stored_expression_change_uses_set_expression_or_drop_add() {
+    // STORED -> STORED with a new expression: SET EXPRESSION where the
+    // migrated server has it (PostgreSQL 17+), otherwise a drop + add. Never
+    // the old `drop expression` + `add generated ... stored` pair, whose
+    // second statement is a syntax error on every version.
     let mut existing = create_test_column();
     existing.is_generated = "ALWAYS".to_string();
     existing.generation_expression = Some("(id * 2)".to_string());
@@ -1119,21 +1125,25 @@ fn issue181_stored_expression_change_keeps_in_place_alter() {
     updated.generation_expression = Some("(id * 3)".to_string());
 
     let script = updated
+        .get_alter_script_with_caps(&existing, true, PG17_CAPS)
+        .expect("STORED expression change must emit an alter");
+    assert_eq!(
+        script,
+        "alter table public.test_table alter column test_column set expression as (id * 3);\n\n"
+    );
+
+    let fallback = updated
         .get_alter_script(&existing, true)
         .expect("STORED expression change must emit an alter");
-
+    assert!(fallback.contains("drop column test_column"), "{fallback}");
     assert!(
-        script.contains("drop expression"),
-        "STORED → STORED expression change still uses the in-place ALTER: {script}"
+        fallback.contains("generated always as (id * 3) stored"),
+        "{fallback}"
     );
-    assert!(
-        script.contains("generated always as (id * 3) stored"),
-        "expected the new STORED expression to be re-added: {script}"
-    );
-    assert!(
-        !script.contains("drop column"),
-        "STORED expression change must not destroy the column: {script}"
-    );
+    for script in [&script, &fallback] {
+        assert!(!script.contains("drop expression"), "{script}");
+        assert!(!script.contains("add generated"), "{script}");
+    }
 }
 
 #[test]
@@ -1342,4 +1352,1104 @@ fn dropping_identity_honours_use_drop_false() {
         !script.contains("\nalter table public.test_table alter column id drop identity"),
         "the drop must stay commented out:\n{script}"
     );
+}
+
+// ---- PG17/PG19: ALTER COLUMN ... SET EXPRESSION ----
+
+/// PostgreSQL 17/18 without the VIRTUAL arm: STORED only.
+const PG17_CAPS: GeneratedAlterCaps = GeneratedAlterCaps {
+    stored_set_expression: true,
+    virtual_set_expression: false,
+};
+
+/// PostgreSQL 19 (or 18 with no CHECK constraints), no publication block.
+const PG19_CAPS: GeneratedAlterCaps = GeneratedAlterCaps {
+    stored_set_expression: true,
+    virtual_set_expression: true,
+};
+
+fn generated_column(kind: &str, expr: &str) -> TableColumn {
+    let mut column = create_test_column();
+    column.data_type = "integer".to_string();
+    column.character_maximum_length = None;
+    column.character_octet_length = None;
+    column.is_generated = "ALWAYS".to_string();
+    column.generation_expression = Some(expr.to_string());
+    column.generation_type = Some(kind.to_string());
+    column
+}
+
+#[test]
+fn set_expression_caps_default_is_conservative() {
+    let caps = GeneratedAlterCaps::default();
+    assert!(!caps.stored_set_expression && !caps.virtual_set_expression);
+}
+
+#[test]
+fn set_expression_virtual_with_caps() {
+    let existing = generated_column("v", "(id * 2)");
+    let updated = generated_column("v", "(id * 3)");
+
+    assert_eq!(
+        updated
+            .get_alter_script_with_caps(&existing, true, PG19_CAPS)
+            .as_deref(),
+        Some(
+            "alter table public.test_table alter column test_column set expression as (id * 3);\n\n"
+        )
+    );
+    assert!(!updated.would_drop_and_re_add_with_caps(&existing, PG19_CAPS));
+    // STORED-only capability (PG17, PG18 with CHECKs): still drop + add.
+    assert!(updated.would_drop_and_re_add_with_caps(&existing, PG17_CAPS));
+    let script = updated
+        .get_alter_script_with_caps(&existing, true, PG17_CAPS)
+        .unwrap();
+    assert!(script.contains("drop column test_column"), "{script}");
+    assert!(
+        script.contains("generated always as (id * 3) virtual"),
+        "{script}"
+    );
+}
+
+#[test]
+fn set_expression_stored_needs_the_stored_capability() {
+    let existing = generated_column("s", "(id * 2)");
+    let updated = generated_column("s", "(id * 3)");
+    let virtual_only = GeneratedAlterCaps {
+        stored_set_expression: false,
+        virtual_set_expression: true,
+    };
+    assert!(updated.would_drop_and_re_add_with_caps(&existing, virtual_only));
+    assert!(!updated.would_drop_and_re_add_with_caps(&existing, PG17_CAPS));
+}
+
+#[test]
+fn set_expression_is_emitted_even_with_use_drop_false() {
+    // Non-destructive: the column keeps its attnum, grants, comment and
+    // dependents, and generated values are derived data.
+    let existing = generated_column("s", "(id * 2)");
+    let updated = generated_column("s", "(id * 3)");
+    let script = updated
+        .get_alter_script_with_caps(&existing, false, PG17_CAPS)
+        .unwrap();
+    assert_eq!(
+        script,
+        "alter table public.test_table alter column test_column set expression as (id * 3);\n\n"
+    );
+}
+
+#[test]
+fn set_expression_never_used_for_kind_flips_or_new_generated_columns() {
+    // STORED <-> VIRTUAL and plain -> generated have no in-place form.
+    let stored = generated_column("s", "(id * 2)");
+    let virtual_new_expr = generated_column("v", "(id * 3)");
+    let virtual_same_expr = generated_column("v", "(id * 2)");
+    let mut plain = generated_column("s", "(id * 2)");
+    plain.is_generated = "NEVER".to_string();
+    plain.generation_expression = None;
+    plain.generation_type = None;
+
+    for (to, from) in [
+        (&virtual_new_expr, &stored),
+        (&virtual_same_expr, &stored),
+        (&stored, &virtual_same_expr),
+        (&stored, &plain),
+        (&virtual_same_expr, &plain),
+    ] {
+        assert!(to.would_drop_and_re_add_with_caps(from, PG19_CAPS));
+        let script = to
+            .get_alter_script_with_caps(from, true, PG19_CAPS)
+            .unwrap();
+        assert!(!script.contains("set expression"), "{script}");
+        assert!(script.contains("drop column test_column"), "{script}");
+    }
+}
+
+#[test]
+fn set_expression_caps_leave_stored_to_plain_as_drop_expression() {
+    let existing = generated_column("s", "(id * 2)");
+    let mut updated = existing.clone();
+    updated.is_generated = "NEVER".to_string();
+    updated.generation_expression = None;
+    updated.generation_type = None;
+    for caps in [GeneratedAlterCaps::default(), PG19_CAPS] {
+        assert!(!updated.would_drop_and_re_add_with_caps(&existing, caps));
+        assert_eq!(
+            updated
+                .get_alter_script_with_caps(&existing, true, caps)
+                .as_deref(),
+            Some("alter table public.test_table alter column test_column drop expression;\n\n")
+        );
+    }
+    // VIRTUAL -> plain has no DROP EXPRESSION: drop + add, whatever the caps.
+    let virtual_existing = generated_column("v", "(id * 2)");
+    assert!(updated.would_drop_and_re_add_with_caps(&virtual_existing, PG19_CAPS));
+}
+
+#[test]
+fn a_type_change_with_the_expression_change_is_drop_and_add() {
+    // Review finding: `ALTER COLUMN ... TYPE` on a generated column casts the
+    // OLD expression to the new type (no USING allowed), so `int -> date`
+    // fails ("generation expression ... cannot be cast automatically") and
+    // the SET EXPRESSION behind it fails too ("column ... is of type integer
+    // but default expression is of type date"). Verified live on 17, 18, 19.
+    // A drop + add changes both at once, and the TYPE statement is left out.
+    for kind in ["s", "v"] {
+        let existing = generated_column(kind, "(id * 2)");
+        let mut updated = generated_column(kind, "('2020-01-01'::date + id)");
+        updated.data_type = "date".to_string();
+        assert!(updated.would_drop_and_re_add_with_caps(&existing, PG19_CAPS));
+        let script = updated
+            .get_alter_script_with_caps(&existing, true, PG19_CAPS)
+            .unwrap();
+        let gen_kind = if kind == "v" { "virtual" } else { "stored" };
+        assert_eq!(
+            script,
+            format!(
+                "alter table public.test_table drop column test_column;\n\n\
+                 alter table public.test_table add column test_column date generated always as \
+                 ('2020-01-01'::date + id) {gen_kind};\n\n"
+            ),
+            "kind {kind}"
+        );
+    }
+}
+
+#[test]
+fn a_live_drop_and_add_leaves_out_the_statements_it_supersedes() {
+    // The re-added column carries the TO type, default and nullability, so
+    // the ALTERs that would precede the drop are redundant (and a TYPE change
+    // can fail). use_drop=false keeps them: the drop + add is only a comment.
+    let mut existing = generated_column("s", "(id * 2)");
+    existing.is_generated = "NEVER".to_string();
+    existing.generation_expression = None;
+    existing.generation_type = None;
+    existing.data_type = "integer".to_string();
+    existing.column_default = Some("0".to_string());
+    let mut updated = generated_column("s", "(id * 2)");
+    updated.data_type = "bigint".to_string();
+    updated.is_nullable = false;
+    let live = updated
+        .get_alter_script_with_caps(&existing, true, PG19_CAPS)
+        .unwrap();
+    assert_eq!(
+        live,
+        "alter table public.test_table drop column test_column;\n\n\
+         alter table public.test_table add column test_column bigint generated always as \
+         (id * 2) stored not null;\n\n"
+    );
+    let commented = updated
+        .get_alter_script_with_caps(&existing, false, PG19_CAPS)
+        .unwrap();
+    assert!(
+        commented
+            .starts_with("alter table public.test_table alter column test_column type bigint;"),
+        "{commented}"
+    );
+    assert!(
+        commented.contains("-- alter table public.test_table drop column test_column;"),
+        "{commented}"
+    );
+}
+
+#[test]
+fn alter_parts_defer_the_generated_part() {
+    // SET EXPRESSION and the drop + add may read a column the migration
+    // adds, so the table emits them after its ADD COLUMNs: they come out of
+    // `alter_parts` separately, and concatenate to the plain script.
+    let existing = generated_column("s", "(id * 2)");
+    let mut updated = generated_column("s", "(id * 3)");
+    updated.is_nullable = false;
+    updated.statistics_target = Some(500);
+    updated.comment = Some("tripled".to_string());
+
+    let parts = updated.alter_parts(&existing, true, PG17_CAPS, true);
+    assert!(parts.is_deferred());
+    assert_eq!(
+        parts.inline,
+        "alter table public.test_table alter column test_column set not null;\n\n"
+    );
+    assert_eq!(parts.drop, "");
+    assert_eq!(
+        parts.deferred,
+        "alter table only public.test_table alter column test_column set expression as (id * 3);\n\n"
+    );
+    assert_eq!(
+        parts.post,
+        "alter table public.test_table alter column test_column set statistics 500;\n\n"
+    );
+    assert_eq!(
+        parts.comment,
+        "comment on column public.test_table.test_column is 'tripled';\n\n"
+    );
+    // Without ONLY it is exactly the column's alter script.
+    let recursive = updated.alter_parts(&existing, true, PG17_CAPS, false);
+    assert_eq!(
+        Some(
+            [
+                recursive.inline,
+                recursive.drop,
+                recursive.deferred,
+                recursive.post,
+                recursive.comment
+            ]
+            .concat()
+        ),
+        updated.get_alter_script_with_caps(&existing, true, PG17_CAPS)
+    );
+
+    // Drop + add (no SET EXPRESSION before PostgreSQL 17).
+    let parts = updated.alter_parts(&existing, true, GeneratedAlterCaps::default(), true);
+    assert_eq!(parts.inline, "");
+    assert_eq!(
+        parts.drop,
+        "alter table public.test_table drop column test_column;\n\n"
+    );
+    assert!(
+        parts
+            .deferred
+            .starts_with("alter table public.test_table add column test_column integer generated always as (id * 3) stored not null;"),
+        "{}",
+        parts.deferred
+    );
+
+    // Nothing generated changes: nothing is deferred.
+    let mut plain_change = existing.clone();
+    plain_change.is_nullable = false;
+    let parts = plain_change.alter_parts(&existing, true, PG19_CAPS, true);
+    assert!(!parts.is_deferred());
+    assert_eq!(
+        parts.inline,
+        "alter table public.test_table alter column test_column set not null;\n\n"
+    );
+}
+
+#[test]
+fn is_recreated_by_parent_add_compares_what_add_column_copies() {
+    let parent = generated_column("s", "(qty * 3)");
+    let mut child = parent.clone();
+    child.table = "child_table".to_string();
+    child.comment = Some("not copied, and not compared".to_string());
+    assert!(child.is_recreated_by_parent_add(&parent));
+
+    let mut own_expression = child.clone();
+    own_expression.generation_expression = Some("(qty * 5)".to_string());
+    let mut other_kind = child.clone();
+    other_kind.generation_type = Some("v".to_string());
+    let mut other_type = child.clone();
+    other_type.data_type = "bigint".to_string();
+    let mut not_null = child.clone();
+    not_null.is_nullable = false;
+    for differing in [own_expression, other_kind, other_type, not_null] {
+        assert!(
+            !differing.is_recreated_by_parent_add(&parent),
+            "{differing:?}"
+        );
+    }
+}
+
+#[test]
+fn equivalent_generation_expressions_are_not_a_generated_change() {
+    // Two deparse forms of the same IN-list (issue #226). `PartialEq` and the
+    // hash already treat them as equal; the alter path must too, or any other
+    // change to the column would drag a spurious drop + add (or, before,
+    // the invalid `add generated ... stored`) along with it.
+    let array_level = "((label)::text = ANY ((ARRAY['FOO'::character varying, 'BAR'::character varying])::text[]))";
+    let element_level = "((label)::text = ANY (ARRAY[('FOO'::character varying)::text, ('BAR'::character varying)::text]))";
+    for kind in ["s", "v"] {
+        let existing = generated_column(kind, array_level);
+        let mut updated = generated_column(kind, element_level);
+        updated.is_nullable = false;
+        for caps in [GeneratedAlterCaps::default(), PG19_CAPS] {
+            assert!(!updated.would_drop_and_re_add_with_caps(&existing, caps));
+            assert_eq!(
+                updated
+                    .get_alter_script_with_caps(&existing, true, caps)
+                    .as_deref(),
+                Some("alter table public.test_table alter column test_column set not null;\n\n"),
+                "kind {kind}"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_a_pair_enclosing_the_whole_expression_is_stripped() {
+    // PostgreSQL deparses `a * 2 + b * 3` as `((a * 2) + (b * 3))`. Only the
+    // outer pair is redundant; `(a * 2) + (b * 3)` starts with `(` and ends
+    // with `)` without being one group, and stripping it used to emit
+    // `AS (a * 2) + (b * 3)` — a syntax error — from CREATE TABLE, ADD COLUMN
+    // and SET EXPRESSION alike. Verified live on PostgreSQL 16 and 17.
+    let deparsed = "((a * 2) + (b * 3))";
+    let mut column = generated_column("s", deparsed);
+    assert_eq!(
+        column.get_script(),
+        "test_column integer generated always as ((a * 2) + (b * 3)) stored"
+    );
+    assert_eq!(
+        column.get_add_script(),
+        "alter table public.test_table add column test_column integer \
+         generated always as ((a * 2) + (b * 3)) stored;\n\n"
+    );
+    let existing = generated_column("s", "(a + b)");
+    assert_eq!(
+        column
+            .get_alter_script_with_caps(&existing, true, PG17_CAPS)
+            .as_deref(),
+        Some(
+            "alter table public.test_table alter column test_column \
+             set expression as ((a * 2) + (b * 3));\n\n"
+        )
+    );
+
+    // Redundant pairs still go, however many there are.
+    column.generation_expression = Some("(((a * 2)))".to_string());
+    assert_eq!(
+        column.get_script(),
+        "test_column integer generated always as (a * 2) stored"
+    );
+}
+
+#[test]
+fn is_enclosed_in_parens_matches_the_opening_pair() {
+    assert!(is_enclosed_in_parens("(a * 2)"));
+    assert!(is_enclosed_in_parens("((a * 2) + (b * 3))"));
+    assert!(!is_enclosed_in_parens("(a * 2) + (b * 3)"));
+    assert!(!is_enclosed_in_parens("(a) || (b)"));
+    assert!(!is_enclosed_in_parens("a * 2"));
+    assert!(!is_enclosed_in_parens("lower(a)"));
+    // Parentheses inside literals and quoted identifiers do not count,
+    // doubled quotes included.
+    assert!(is_enclosed_in_parens("('(' || a)"));
+    assert!(!is_enclosed_in_parens("(')' || a) || (b)"));
+    assert!(is_enclosed_in_parens("(\"we(ird\" || 'it''s)')"));
+    assert!(!is_enclosed_in_parens("(\"a)\") || (b)"));
+    // Unbalanced input is never treated as enclosed.
+    assert!(!is_enclosed_in_parens("(a"));
+    assert!(!is_enclosed_in_parens("('a)"));
+}
+
+// ==== pg19:statistics tests ====
+
+#[test]
+fn rebuilds_statistics_in_place_for_a_type_or_collation_change() {
+    // ALTER COLUMN ... TYPE re-creates the statistics on the column (and
+    // resets their target) on every supported version.
+    let existing = create_test_column();
+    let mut retyped = create_test_column();
+    retyped.data_type = "text".to_string();
+    retyped.character_maximum_length = None;
+    assert!(retyped.rebuilds_statistics_in_place(&existing, GeneratedAlterCaps::default(), true));
+    let mut collated = create_test_column();
+    collated.collation_name = Some("C".to_string());
+    assert!(collated.rebuilds_statistics_in_place(&existing, GeneratedAlterCaps::default(), true));
+
+    // Nullability, default, storage and a column statistics target do not.
+    let mut other = create_test_column();
+    other.is_nullable = false;
+    other.column_default = Some("'x'::character varying".to_string());
+    other.storage = Some("external".to_string());
+    other.statistics_target = Some(50);
+    other.comment = Some("c".to_string());
+    assert!(!other.rebuilds_statistics_in_place(&existing, PG19_CAPS, true));
+}
+
+#[test]
+fn rebuilds_statistics_in_place_for_set_expression_only() {
+    let stored = generated_column("s", "(id * 2)");
+    let stored_new = generated_column("s", "(id * 3)");
+    // SET EXPRESSION (PostgreSQL 17+) rebuilds; the drop + add before it
+    // does not — the statistics go with the column.
+    assert!(stored_new.rebuilds_statistics_in_place(&stored, PG17_CAPS, true));
+    assert!(!stored_new.rebuilds_statistics_in_place(&stored, GeneratedAlterCaps::default(), true));
+
+    let virt = generated_column("v", "(id * 2)");
+    let virt_new = generated_column("v", "(id * 3)");
+    assert!(virt_new.rebuilds_statistics_in_place(&virt, PG19_CAPS, true));
+    assert!(!virt_new.rebuilds_statistics_in_place(&virt, PG17_CAPS, true));
+
+    // STORED -> plain is DROP EXPRESSION, which keeps the statistics as
+    // they are.
+    let mut plain = create_test_column();
+    plain.data_type = "integer".to_string();
+    plain.character_maximum_length = None;
+    plain.character_octet_length = None;
+    assert!(!plain.rebuilds_statistics_in_place(&stored, PG19_CAPS, true));
+}
+
+#[test]
+fn rebuilds_statistics_in_place_when_a_commented_drop_add_leaves_the_type_change() {
+    // A plain column turning generated with a new type is a drop + add.
+    // Live, the type change is folded into it; with use_drop off the drop +
+    // add is commented out but the ALTER COLUMN ... TYPE ahead of it runs.
+    let mut existing = generated_column("s", "(id * 2)");
+    existing.is_generated = "NEVER".to_string();
+    existing.generation_expression = None;
+    existing.generation_type = None;
+    let mut updated = generated_column("s", "(id * 3)");
+    updated.data_type = "bigint".to_string();
+    assert!(updated.would_drop_and_re_add_with_caps(&existing, PG19_CAPS));
+    assert!(!updated.rebuilds_statistics_in_place(&existing, PG19_CAPS, true));
+    assert!(updated.rebuilds_statistics_in_place(&existing, PG19_CAPS, false));
+    let script = updated
+        .get_alter_script_with_caps(&existing, false, PG19_CAPS)
+        .unwrap();
+    assert!(
+        script.starts_with("alter table public.test_table alter column test_column type bigint;"),
+        "{script}"
+    );
+
+    // A generated column's type change is not run ahead of the commented
+    // drop + add (it would be computed from the old expression), so nothing
+    // is rebuilt in place.
+    let existing = generated_column("s", "(id * 2)");
+    assert!(updated.would_drop_and_re_add_with_caps(&existing, PG19_CAPS));
+    assert!(!updated.rebuilds_statistics_in_place(&existing, PG19_CAPS, false));
+    let script = updated
+        .get_alter_script_with_caps(&existing, false, PG19_CAPS)
+        .unwrap();
+    assert!(script.lines().all(|l| l.starts_with("--")), "{script}");
+}
+
+#[test]
+fn alters_type_in_place_is_the_type_half_of_rewrites_in_place() {
+    // The comparer asks which members of a family an ancestor's recursing
+    // statement rewrites: a partition's parent runs both ALTER COLUMN ...
+    // TYPE and SET EXPRESSION without ONLY, an inheritance parent only the
+    // first (its SET EXPRESSION says ONLY).
+    let existing = create_test_column();
+    let mut retyped = create_test_column();
+    retyped.data_type = "text".to_string();
+    retyped.character_maximum_length = None;
+    assert!(retyped.alters_type_in_place(&existing, PG19_CAPS, true));
+    assert!(retyped.rewrites_in_place(&existing, PG19_CAPS, true));
+
+    let stored = generated_column("s", "(id * 2)");
+    let stored_new = generated_column("s", "(id * 3)");
+    assert!(!stored_new.alters_type_in_place(&stored, PG17_CAPS, true));
+    assert!(stored_new.rewrites_in_place(&stored, PG17_CAPS, true));
+    // Without SET EXPRESSION it is a drop + add, which rewrites nothing in
+    // place: what read the old column went with it.
+    assert!(!stored_new.rewrites_in_place(&stored, GeneratedAlterCaps::default(), true));
+
+    // A type change folded into a live drop + add is not run. Commented out
+    // (use_drop off), it is not run either when the column is generated
+    // already: it would be computed from the old expression, and the drop +
+    // add supersedes it. A plain column's type change still runs.
+    let mut both = generated_column("s", "(id * 3)");
+    both.data_type = "bigint".to_string();
+    assert!(!both.alters_type_in_place(&stored, PG19_CAPS, true));
+    assert!(!both.alters_type_in_place(&stored, PG19_CAPS, false));
+    let mut plain = generated_column("s", "(id * 3)");
+    plain.is_generated = "NEVER".to_string();
+    plain.generation_expression = None;
+    plain.generation_type = None;
+    assert!(!both.alters_type_in_place(&plain, PG19_CAPS, true));
+    assert!(both.alters_type_in_place(&plain, PG19_CAPS, false));
+
+    // The statistics predicate is the same question.
+    for (new, old, caps, use_drop) in [
+        (&retyped, &existing, PG19_CAPS, true),
+        (&stored_new, &stored, PG17_CAPS, true),
+        (&stored_new, &stored, GeneratedAlterCaps::default(), true),
+        (&both, &stored, PG19_CAPS, true),
+        (&both, &stored, PG19_CAPS, false),
+        (&both, &plain, PG19_CAPS, false),
+    ] {
+        assert_eq!(
+            new.rebuilds_statistics_in_place(old, caps, use_drop),
+            new.rewrites_in_place(old, caps, use_drop)
+        );
+    }
+}
+
+#[test]
+fn pre_columns_generation_expression_reads_its_column_references() {
+    let reads = |expr: &str, column: &str| {
+        let mut column_def = generated_column("s", expr);
+        column_def.name = "g".to_string();
+        column_def.generation_expression_reads(column)
+    };
+    assert!(reads("(a * 2)", "a"));
+    assert!(reads("((a * 2) + b)", "b"));
+    assert!(reads("(\"Base Col\" * 2)", "\"Base Col\""));
+    assert!(reads("COALESCE(a, 0)", "a"));
+    assert!(reads("lower((a)::text)", "a"));
+    // Not a reference: a longer name, a literal, a function, a type, a
+    // qualified name.
+    assert!(!reads("(ab * 2)", "a"));
+    assert!(!reads("('a'::text || x)", "a"));
+    assert!(!reads("a(x)", "a"));
+    assert!(!reads("a (x)", "a"));
+    assert!(!reads("(x)::a", "a"));
+    assert!(!reads("s.a(x)", "a"));
+    assert!(!reads("('it''s a' || x)", "a"));
+    assert!(!reads("(\"Base Col\" * 2)", "Base"));
+    // A column that is not generated reads nothing.
+    let mut plain = generated_column("s", "(a * 2)");
+    plain.is_generated = "NEVER".to_string();
+    assert!(!plain.generation_expression_reads("a"));
+    assert!(!plain.is_generated_column());
+    assert!(generated_column("v", "(a * 2)").is_generated_column());
+}
+
+#[test]
+fn pre_columns_alter_parts_recreating_forces_the_drop_and_add() {
+    let existing = generated_column("s", "(id * 2)");
+    // Unchanged: nothing, unless forced.
+    assert_eq!(
+        existing.alter_parts(&existing, true, PG19_CAPS, true),
+        ColumnAlterParts::default()
+    );
+    let parts = existing.alter_parts_recreating(&existing, true, PG19_CAPS, true, true);
+    assert_eq!(
+        parts.drop,
+        "alter table public.test_table drop column test_column;\n\n"
+    );
+    assert!(
+        parts.deferred.starts_with(
+            "alter table public.test_table add column test_column integer generated always as (id * 2) stored"
+        ),
+        "{}",
+        parts.deferred
+    );
+    // Forced over a SET EXPRESSION the server could make.
+    let updated = generated_column("s", "(id * 3)");
+    let parts = updated.alter_parts_recreating(&existing, true, PG19_CAPS, true, true);
+    assert!(!parts.deferred.contains("set expression"), "{parts:?}");
+    assert!(!parts.drop.is_empty(), "{parts:?}");
+    // Ignored without use_drop, and for a column TO has plain.
+    assert_eq!(
+        existing.alter_parts_recreating(&existing, false, PG19_CAPS, true, true),
+        ColumnAlterParts::default()
+    );
+    let mut plain = existing.clone();
+    plain.is_generated = "NEVER".to_string();
+    plain.generation_expression = None;
+    plain.generation_type = None;
+    assert_eq!(
+        plain.alter_parts_recreating(&existing, true, PG19_CAPS, true, true),
+        plain.alter_parts(&existing, true, PG19_CAPS, true)
+    );
+}
+
+// ---- pre-columns review fixes ----------------------------------------------
+
+#[test]
+fn pre_columns_with_type_of_takes_the_type_and_nothing_else() {
+    let mut from = create_test_column();
+    from.data_type = "integer".to_string();
+    from.character_maximum_length = None;
+    from.collation_name = None;
+    from.udt_name = Some("int4".to_string());
+    let mut to = create_test_column();
+    to.data_type = "bigint".to_string();
+    to.character_maximum_length = None;
+    to.collation_name = None;
+    to.udt_name = Some("int8".to_string());
+    to.column_default = Some("7".to_string());
+    to.comment = Some("new".to_string());
+
+    let kept = to.with_type_of(&from);
+    assert!(!kept.type_differs(&from));
+    assert!(kept.type_differs(&to));
+    assert_eq!(kept.column_default.as_deref(), Some("7"));
+    assert_eq!(kept.comment.as_deref(), Some("new"));
+    // So an alter from `from` to it leaves the type alone.
+    let script = kept.get_alter_script(&from, true).unwrap_or_default();
+    assert!(!script.contains(" type "), "{script}");
+    assert!(script.contains("set default 7"), "{script}");
+}
+
+#[test]
+fn pre_columns_add_script_can_name_its_not_null() {
+    let mut column = create_test_column();
+    column.is_nullable = false;
+    let plain = column.get_add_script();
+    let named = column.get_add_script_with_not_null("constraint c_nn not null");
+    assert!(plain.contains(" not null;"), "{plain}");
+    assert_eq!(
+        named,
+        plain.replace(" not null;", " constraint c_nn not null;")
+    );
+    // A nullable column has none to name.
+    column.is_nullable = true;
+    assert_eq!(
+        column.get_add_script_with_not_null("constraint c_nn not null"),
+        column.get_add_script()
+    );
+}
+
+// ==== pre-clear tests ====
+
+#[test]
+fn use_drop_false_leaves_a_generated_columns_type_change_to_the_commented_drop_and_add() {
+    // FROM `stamp integer generated always as (id * 2)`, TO `stamp date
+    // generated always as ('2020-01-01'::date + id)`: a live
+    // `alter column stamp type date` recomputes the OLD expression as a date
+    // and fails ("cannot be cast automatically to type date"). With
+    // use_drop off the whole change is the commented drop + add.
+    for (kind, caps) in [
+        ("s", PG19_CAPS),
+        ("s", GeneratedAlterCaps::default()),
+        ("v", PG19_CAPS),
+    ] {
+        let existing = generated_column(kind, "(id * 2)");
+        let mut updated = generated_column(kind, "('2020-01-01'::date + id)");
+        updated.data_type = "date".to_string();
+        let script = updated
+            .get_alter_script_with_caps(&existing, false, caps)
+            .unwrap();
+        assert!(
+            script.lines().all(|l| l.starts_with("--")),
+            "kind {kind}: {script}"
+        );
+        if kind == "s" {
+            assert!(
+                script.starts_with(
+                    "-- use_drop=false: changing a stored generated column's type together with \
+                     its expression needs drop/add (SET EXPRESSION keeps the type); statements \
+                     commented out\n"
+                ),
+                "{script}"
+            );
+        }
+        assert!(
+            script.contains(
+                "-- alter table public.test_table add column test_column date generated always as"
+            ),
+            "kind {kind}: {script}"
+        );
+        assert!(!updated.alters_type_in_place(&existing, caps, false));
+    }
+}
+
+#[test]
+fn use_drop_false_keeps_the_other_in_place_changes_of_a_generated_column() {
+    // Only the type change goes: NOT NULL still runs in place.
+    let existing = generated_column("s", "(id * 2)");
+    let mut updated = generated_column("s", "(id * 3)");
+    updated.data_type = "bigint".to_string();
+    updated.is_nullable = false;
+    let script = updated
+        .get_alter_script_with_caps(&existing, false, GeneratedAlterCaps::default())
+        .unwrap();
+    assert!(
+        script.starts_with("alter table public.test_table alter column test_column set not null;"),
+        "{script}"
+    );
+    assert!(!script.contains("\nalter table public.test_table alter column test_column type"));
+    assert!(
+        script.contains("-- alter table public.test_table drop column test_column;"),
+        "{script}"
+    );
+}
+
+// ==== r3-gencol tests ====
+
+/// `public.t.g <data_type> GENERATED ALWAYS AS (app.f(v)) STORED`, with the
+/// PostgreSQL 14 flag as given.
+fn r3g_generated(data_type: &str, blocks_retype: bool) -> TableColumn {
+    let mut column = create_test_column();
+    column.table = "t".to_string();
+    column.name = "g".to_string();
+    column.data_type = data_type.to_string();
+    column.character_maximum_length = None;
+    column.character_octet_length = None;
+    column.is_generated = "ALWAYS".to_string();
+    column.generation_expression = Some("app.f(v)".to_string());
+    column.generation_type = Some("s".to_string());
+    column.generation_blocks_retype = blocks_retype;
+    column
+}
+
+#[test]
+fn r3g_pg14_retype_blocked_by_the_expression_is_a_drop_and_add() {
+    let from = r3g_generated("integer", true);
+    let to = r3g_generated("bigint", false);
+    assert!(to.retype_needs_drop_and_add(&from));
+    assert!(to.would_drop_and_re_add_with_caps(&from, GeneratedAlterCaps::default()));
+    assert!(!to.alters_type_in_place(&from, GeneratedAlterCaps::default(), true));
+    let script = to
+        .get_alter_script_with_caps(&from, true, GeneratedAlterCaps::default())
+        .unwrap();
+    assert_eq!(
+        script,
+        "alter table public.t drop column g;\n\nalter table public.t add column g bigint generated always as (app.f(v)) stored;\n\n"
+    );
+    assert!(!script.contains("alter column g type"), "{script}");
+}
+
+#[test]
+fn r3g_pg14_retype_blocked_by_the_expression_is_commented_out_without_use_drop() {
+    let from = r3g_generated("integer", true);
+    let to = r3g_generated("bigint", false);
+    let script = to
+        .get_alter_script_with_caps(&from, false, GeneratedAlterCaps::default())
+        .unwrap();
+    assert!(
+        script.starts_with(
+            "-- use_drop=false: PostgreSQL 14 cannot change the type of a generated column"
+        ),
+        "{script}"
+    );
+    assert!(
+        script.contains("-- alter table public.t drop column g;"),
+        "{script}"
+    );
+    assert!(!script.contains("\nalter table"), "{script}");
+}
+
+#[test]
+fn r3g_retype_stays_in_place_without_the_flag_or_the_type_change() {
+    // Not flagged: PostgreSQL 15+, or 14 with only built-ins in the expression.
+    let from = r3g_generated("integer", false);
+    let to = r3g_generated("bigint", false);
+    assert!(!to.retype_needs_drop_and_add(&from));
+    assert_eq!(
+        to.get_alter_script_with_caps(&from, true, GeneratedAlterCaps::default())
+            .unwrap(),
+        "alter table public.t alter column g type bigint;\n\n"
+    );
+    // Flagged but the type stays: nothing to do.
+    let flagged = r3g_generated("integer", true);
+    assert!(!r3g_generated("integer", false).retype_needs_drop_and_add(&flagged));
+    assert!(
+        r3g_generated("integer", false)
+            .get_alter_script_with_caps(&flagged, true, GeneratedAlterCaps::default())
+            .is_none()
+    );
+    // A column TO makes plain keeps its values: never a drop + add (see
+    // `plain_needs_rewrite` for the rewrite it may need instead).
+    let plain = r3g_plain("bigint");
+    assert!(!plain.retype_needs_drop_and_add(&flagged));
+}
+
+/// The plain TO side of `r3g_generated`.
+fn r3g_plain(data_type: &str) -> TableColumn {
+    let mut plain = r3g_generated(data_type, false);
+    plain.is_generated = "NEVER".to_string();
+    plain.generation_expression = None;
+    plain.generation_type = None;
+    plain
+}
+
+#[test]
+fn r3g_pg14_plain_with_a_new_type_is_rewritten_keeping_its_values() {
+    // PostgreSQL 14 keeps the column depending on `app.f` after DROP
+    // EXPRESSION: `alter column g type bigint` failed before and after it.
+    let from = r3g_generated("integer", true);
+    let mut to = r3g_plain("bigint");
+    to.column_default = Some("7".to_string());
+    to.is_nullable = false;
+    to.storage = Some("PLAIN".to_string());
+    to.statistics_target = Some(500);
+    to.comment = Some("it's g".to_string());
+    assert!(to.plain_needs_rewrite(&from));
+    assert!(!to.retype_needs_drop_and_add(&from));
+    assert!(to.would_drop_and_re_add_with_caps(&from, GeneratedAlterCaps::default()));
+    assert!(!to.alters_type_in_place(&from, GeneratedAlterCaps::default(), true));
+    let parts = to.alter_parts(&from, true, GeneratedAlterCaps::default(), false);
+    assert_eq!(parts.inline, "");
+    assert_eq!(
+        parts.drop,
+        "alter table public.t add column \"pgc_rewrite_g\" bigint;\n\n\
+         alter table public.t alter column \"pgc_rewrite_g\" type bigint using (g);\n\n\
+         alter table public.t drop column g;\n\n"
+    );
+    assert_eq!(
+        parts.deferred,
+        "alter table public.t rename column \"pgc_rewrite_g\" to g;\n\n\
+         alter table public.t alter column g set default 7;\n\n\
+         alter table public.t alter column g set not null;\n\n\
+         alter table public.t alter column g set storage PLAIN;\n\n\
+         alter table public.t alter column g set statistics 500;\n\n"
+    );
+    assert_eq!(parts.post, "");
+    assert_eq!(
+        parts.comment,
+        "comment on column public.t.g is 'it''s g';\n\n"
+    );
+    let script = to
+        .get_alter_script_with_caps(&from, true, GeneratedAlterCaps::default())
+        .unwrap();
+    assert!(!script.contains("drop expression"), "{script}");
+    assert!(!script.contains("alter column g type"), "{script}");
+}
+
+#[test]
+fn r3g_pg14_plain_rewrite_is_commented_out_without_use_drop() {
+    let from = r3g_generated("integer", true);
+    let to = r3g_plain("bigint");
+    let script = to
+        .get_alter_script_with_caps(&from, false, GeneratedAlterCaps::default())
+        .unwrap();
+    assert!(
+        script.starts_with("-- use_drop=false: PostgreSQL 14 keeps a generated column"),
+        "{script}"
+    );
+    assert!(
+        script.contains("-- alter table public.t rename column \"pgc_rewrite_g\" to g;"),
+        "{script}"
+    );
+    assert!(!script.contains("\nalter table"), "{script}");
+}
+
+#[test]
+fn r3g_pg14_plain_rewrite_only_when_it_is_needed() {
+    // The same type, and no routine of the expression dropped: DROP
+    // EXPRESSION, as always.
+    let flagged = r3g_generated("integer", true);
+    let same = r3g_plain("integer");
+    assert!(!same.plain_needs_rewrite(&flagged));
+    assert_eq!(
+        same.get_alter_script_with_caps(&flagged, true, GeneratedAlterCaps::default())
+            .unwrap(),
+        "alter table public.t alter column g drop expression;\n\n"
+    );
+    // The migration drops a routine the expression calls: rewritten.
+    let mut dropped = flagged.clone();
+    dropped.generation_routine_dropped = true;
+    assert!(same.plain_needs_rewrite(&dropped));
+    let parts = same.alter_parts(&dropped, true, GeneratedAlterCaps::default(), false);
+    assert!(
+        parts.drop.contains("type integer using (g);"),
+        "{}",
+        parts.drop
+    );
+    // Not flagged (PostgreSQL 15+, or 14 with built-ins only): ALTER TYPE
+    // and DROP EXPRESSION.
+    let unflagged = r3g_generated("integer", false);
+    let bigger = r3g_plain("bigint");
+    assert!(!bigger.plain_needs_rewrite(&unflagged));
+    assert_eq!(
+        bigger
+            .get_alter_script_with_caps(&unflagged, true, GeneratedAlterCaps::default())
+            .unwrap(),
+        "alter table public.t alter column g type bigint;\n\nalter table public.t alter column g drop expression;\n\n"
+    );
+    // Never for an identity column, nor for one that stays generated.
+    let mut identity = r3g_plain("bigint");
+    identity.is_identity = true;
+    assert!(!identity.plain_needs_rewrite(&flagged));
+    assert!(!r3g_generated("bigint", false).plain_needs_rewrite(&flagged));
+}
+
+#[test]
+fn r3g_rewrite_temp_name_is_quoted_and_fits_an_identifier() {
+    let mut column = r3g_plain("bigint");
+    column.name = "\"Mixed\"\"Case\"".to_string();
+    assert_eq!(column.rewrite_temp_name(), "\"pgc_rewrite_Mixed\"\"Case\"");
+    column.name = "c".repeat(63);
+    let temp = column.rewrite_temp_name();
+    assert_eq!(temp.len(), 63 + 2, "{temp}");
+    assert!(temp.starts_with("\"pgc_rewrite_ccc"), "{temp}");
+    column.name = "é".repeat(30);
+    let temp = column.rewrite_temp_name();
+    assert!(temp.len() <= 63 + 2, "{temp}");
+}
+
+#[test]
+fn r3g_generation_routine_dropped_is_not_part_of_the_column() {
+    let flagged = r3g_generated("integer", true);
+    let mut marked = flagged.clone();
+    marked.generation_routine_dropped = true;
+    assert_eq!(flagged, marked);
+    let digest = |column: &TableColumn| {
+        let mut hasher = Sha256::new();
+        column.add_to_hasher(&mut hasher);
+        format!("{:x}", hasher.finalize())
+    };
+    assert_eq!(digest(&flagged), digest(&marked));
+    let json = serde_json::to_string(&marked).unwrap();
+    assert!(!json.contains("generation_routine_dropped"), "{json}");
+    let back: TableColumn = serde_json::from_str(&json).unwrap();
+    assert!(!back.generation_routine_dropped);
+}
+
+#[test]
+fn r3g_generation_blocks_retype_is_not_part_of_the_column() {
+    // A fact about the dumped server: equality and the hash ignore it.
+    let flagged = r3g_generated("integer", true);
+    let plain = r3g_generated("integer", false);
+    assert_eq!(flagged, plain);
+    let digest = |column: &TableColumn| {
+        let mut hasher = Sha256::new();
+        column.add_to_hasher(&mut hasher);
+        format!("{:x}", hasher.finalize())
+    };
+    assert_eq!(digest(&flagged), digest(&plain));
+}
+
+// ==== r3-ddl: column collations ====
+
+fn collated_column(schema: Option<&str>, name: &str) -> TableColumn {
+    let mut column = create_test_column();
+    column.collation_catalog = Some("test_catalog".to_string());
+    column.collation_schema = schema.map(str::to_string);
+    column.collation_name = Some(name.to_string());
+    column
+}
+
+fn column_hash(column: &TableColumn) -> String {
+    let mut hasher = Sha256::new();
+    column.add_to_hasher(&mut hasher);
+    format!("{:x}", hasher.finalize())
+}
+
+/// A `pg_catalog` collation keeps the spelling every pgc version emitted:
+/// the bare name in double quotes. A collation schema the dump does not
+/// record is read the same way.
+#[test]
+fn a_pg_catalog_collation_keeps_its_unqualified_quoted_spelling() {
+    for schema in [Some("pg_catalog"), None, Some("")] {
+        for (name, clause) in [
+            ("C", " collate \"C\""),
+            ("en_US", " collate \"en_US\""),
+            ("ucs_basic", " collate \"ucs_basic\""),
+        ] {
+            let column = collated_column(schema, name);
+            assert_eq!(
+                column.get_script(),
+                format!("test_column varchar(255){clause}"),
+                "{schema:?}.{name}"
+            );
+            assert!(
+                column
+                    .get_add_script()
+                    .contains(&format!("varchar(255){clause};")),
+                "{}",
+                column.get_add_script()
+            );
+        }
+    }
+}
+
+/// Any other collation is qualified with its schema and both parts quoted as
+/// `quote_ident` would: the migrated database's `search_path` may not reach
+/// it, or may reach a same-named collation first.
+#[test]
+fn a_collation_outside_pg_catalog_is_schema_qualified() {
+    for (schema, name, clause) in [
+        ("app", "ci", " collate app.ci"),
+        ("public", "ci", " collate public.ci"),
+        ("My App", "Ci", " collate \"My App\".\"Ci\""),
+        ("app", "select", " collate app.\"select\""),
+        ("app", "en_US", " collate app.\"en_US\""),
+    ] {
+        let column = collated_column(Some(schema), name);
+        assert_eq!(
+            column.get_script(),
+            format!("test_column varchar(255){clause}")
+        );
+        assert_eq!(
+            column.get_add_script(),
+            format!(
+                "alter table public.test_table add column test_column varchar(255){clause};\n\n"
+            )
+        );
+    }
+}
+
+/// A `"` in a collation name is doubled, so the name cannot close the
+/// identifier and run the rest of itself when the migration is applied.
+#[test]
+fn a_collation_name_holding_a_quote_cannot_end_the_identifier() {
+    let hostile = "ci\"; create table public.pwned(x int); --";
+    let column = collated_column(Some("public"), hostile);
+    assert_eq!(
+        column.get_add_script(),
+        "alter table public.test_table add column test_column varchar(255) collate \
+         public.\"ci\"\"; create table public.pwned(x int); --\";\n\n"
+    );
+    let pg_catalog = collated_column(Some("pg_catalog"), "C\"; drop table t; --");
+    assert_eq!(
+        pg_catalog.get_script(),
+        "test_column varchar(255) collate \"C\"\"; drop table t; --\""
+    );
+}
+
+/// The collation's schema is part of the type: the same name in another
+/// schema is a different collation, and the column is retyped to it.
+#[test]
+fn a_collation_schema_change_alone_retypes_the_column() {
+    let existing = collated_column(Some("public"), "ci");
+    let updated = collated_column(Some("app"), "ci");
+    assert!(updated.type_differs(&existing));
+    let script = updated
+        .get_alter_script(&existing, true)
+        .expect("a collation change is migrated");
+    assert_eq!(
+        script,
+        "alter table public.test_table alter column test_column type varchar(255) collate app.ci;\n\n"
+    );
+}
+
+/// A column without a collation of its own hashes exactly as before (the
+/// pin of `test_known_sha256_hash`); one with a collation folds it in, so a
+/// change of collation — its name or its schema — changes the table hash.
+#[test]
+fn a_column_collation_is_hashed_only_when_the_column_has_one() {
+    let plain = create_test_column();
+    let pinned = "e71094fafb6a1f2d03c80ba04c8fea5dac0269f681cbe1c0e4afb1a8482b0db2";
+    assert_eq!(column_hash(&plain), pinned);
+    let mut empty = create_test_column();
+    empty.collation_name = Some(String::new());
+    empty.collation_schema = Some("pg_catalog".to_string());
+    assert_eq!(column_hash(&empty), pinned);
+
+    let c = collated_column(Some("pg_catalog"), "C");
+    let posix = collated_column(Some("pg_catalog"), "POSIX");
+    let public_ci = collated_column(Some("public"), "ci");
+    let app_ci = collated_column(Some("app"), "ci");
+    let hashes = [
+        column_hash(&c),
+        column_hash(&posix),
+        column_hash(&public_ci),
+        column_hash(&app_ci),
+    ];
+    for (i, a) in hashes.iter().enumerate() {
+        assert_ne!(a, pinned);
+        for b in &hashes[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    // The catalog stays out, as it always has.
+    let mut other_catalog = collated_column(Some("app"), "ci");
+    other_catalog.collation_catalog = Some("elsewhere".to_string());
+    assert_eq!(column_hash(&other_catalog), column_hash(&app_ci));
+    // A pin for the folded form.
+    assert_eq!(
+        column_hash(&c),
+        "28e7ce16ca820236e56cc1fc54c30a963b6e0c22818135efbad1421c2b9633d0"
+    );
+}
+
+// ==== r3-ddl review: a collation change alone ====
+
+/// `only_collation_differs` holds for a change of collation, schema
+/// included, and for gaining or losing one; not when anything else in the
+/// type changes too, nor for no change at all.
+#[test]
+fn only_collation_differs_tells_a_collation_change_from_a_type_change() {
+    let c = collated_column(Some("pg_catalog"), "C");
+    let posix = collated_column(Some("pg_catalog"), "POSIX");
+    let app_ci = collated_column(Some("app"), "ci");
+    let other_ci = collated_column(Some("other"), "ci");
+    let mut plain = create_test_column();
+    plain.collation_name = None;
+    assert!(c.only_collation_differs(&posix));
+    assert!(app_ci.only_collation_differs(&other_ci));
+    assert!(plain.only_collation_differs(&c));
+    assert!(c.only_collation_differs(&plain));
+    assert!(!c.only_collation_differs(&c.clone()));
+
+    let mut longer = posix.clone();
+    longer.character_maximum_length = Some(512);
+    assert!(longer.type_differs(&c));
+    assert!(!c.only_collation_differs(&longer));
+    let mut retyped = posix.clone();
+    retyped.data_type = "text".to_string();
+    retyped.character_maximum_length = None;
+    assert!(!c.only_collation_differs(&retyped));
 }

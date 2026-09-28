@@ -198,3 +198,351 @@ async fn production_header_mentions_commit_only_with_single_transaction() {
         "header must describe the trailing section accurately:\n{no_txn_script}"
     );
 }
+
+// ---- fix:replident: REPLICA IDENTITY USING INDEX under production output ----
+
+/// `public.ri (id, code)` with a unique index on `columns` named `ri_code_uk`
+/// and, when `using` is set, REPLICA IDENTITY USING INDEX on it.
+fn replica_identity_table(columns: &str, using: bool) -> Table {
+    let index = TableIndex {
+        schema: "public".to_string(),
+        table: "ri".to_string(),
+        name: "ri_code_uk".to_string(),
+        catalog: None,
+        indexdef: format!("CREATE UNIQUE INDEX ri_code_uk ON public.ri USING btree ({columns})"),
+        is_partition_index: false,
+        comment: None,
+    };
+    let mut table = Table::new(
+        "public".to_string(),
+        "ri".to_string(),
+        "public".to_string(),
+        "ri".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![],
+        vec![],
+        vec![index],
+        vec![],
+        None,
+    );
+    if using {
+        table.replica_identity = Some("i".to_string());
+        table.replica_identity_index = Some("ri_code_uk".to_string());
+    } else {
+        table.replica_identity = Some("d".to_string());
+    }
+    table.hash();
+    table
+}
+
+fn find(script: &str, needle: &str) -> usize {
+    script
+        .find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+}
+
+const USING_RI_CODE_UK: &str = "alter table public.ri replica identity using index ri_code_uk;";
+
+#[tokio::test]
+async fn production_new_table_sets_replica_identity_after_the_concurrent_build() {
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.tables.push(replica_identity_table("code", true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, true, true, GrantsMode::Ignore);
+    comparer.set_output_for_production(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    let commit = find(&script, "commit;");
+    let build = find(
+        &script,
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ri_code_uk ON public.ri",
+    );
+    let using = find(&script, USING_RI_CODE_UK);
+    assert!(commit < build && build < using, "{script}");
+    assert_eq!(script.matches("replica identity").count(), 1, "{script}");
+}
+
+#[tokio::test]
+async fn production_rebuild_leaves_replica_identity_in_txn_and_returns_post_commit() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(replica_identity_table("code", true));
+    to_dump
+        .tables
+        .push(replica_identity_table("code, id", true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, true, true, GrantsMode::Ignore);
+    comparer.set_output_for_production(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    // DEFAULT before COMMIT, so the table is never left on a missing index
+    // (which the server treats as NOTHING) while the index is rebuilt.
+    let reset = find(&script, "alter table public.ri replica identity default;");
+    let commit = find(&script, "commit;");
+    let drop = find(
+        &script,
+        "drop index concurrently if exists public.ri_code_uk;",
+    );
+    let build = find(
+        &script,
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ri_code_uk ON public.ri",
+    );
+    let using = find(&script, USING_RI_CODE_UK);
+    assert!(
+        reset < commit && commit < drop && drop < build && build < using,
+        "{script}"
+    );
+}
+
+#[tokio::test]
+async fn default_mode_keeps_replica_identity_inline_after_the_index() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(replica_identity_table("code", false));
+    to_dump
+        .tables
+        .push(replica_identity_table("code, id", true));
+
+    let mut comparer = Comparer::new(from_dump, to_dump, true, true, true, GrantsMode::Ignore);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    let build = find(&script, "CREATE UNIQUE INDEX ri_code_uk ON public.ri");
+    let using = find(&script, USING_RI_CODE_UK);
+    let commit = find(&script, "commit;");
+    assert!(build < using && using < commit, "{script}");
+    assert!(!script.contains("replica identity default"), "{script}");
+}
+
+/// `public.pp (id, k)`, partitioned by RANGE (id), with the unique index
+/// `pp_id_uk (id)` when `indexed`.
+fn replica_identity_parent(indexed: bool) -> Table {
+    let mut id = super::helpers::int_column("public", "pp", "id", 1);
+    id.is_nullable = false;
+    let indexes = if indexed {
+        vec![TableIndex {
+            schema: "public".to_string(),
+            table: "pp".to_string(),
+            name: "pp_id_uk".to_string(),
+            catalog: None,
+            indexdef: "CREATE UNIQUE INDEX pp_id_uk ON ONLY public.pp USING btree (id)".to_string(),
+            is_partition_index: false,
+            comment: None,
+        }]
+    } else {
+        vec![]
+    };
+    let mut table = Table::new(
+        "public".to_string(),
+        "pp".to_string(),
+        "public".to_string(),
+        "pp".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![id],
+        vec![],
+        indexes,
+        vec![],
+        None,
+    );
+    table.partition_key = Some("RANGE (id)".to_string());
+    table.hash();
+    table
+}
+
+/// Partition `public.<name>` of `public.pp`. With `indexed` it carries
+/// `<name>_id_idx`, the index PostgreSQL attaches to `pp_id_uk`, and is on
+/// REPLICA IDENTITY USING INDEX of it.
+fn replica_identity_partition(name: &str, bound: &str, indexed: bool) -> Table {
+    let mut id = super::helpers::int_column("public", name, "id", 1);
+    id.is_nullable = false;
+    let index_name = format!("{name}_id_idx");
+    let indexes = if indexed {
+        vec![TableIndex {
+            schema: "public".to_string(),
+            table: name.to_string(),
+            name: index_name.clone(),
+            catalog: None,
+            indexdef: format!("CREATE UNIQUE INDEX {index_name} ON public.{name} USING btree (id)"),
+            is_partition_index: true,
+            comment: None,
+        }]
+    } else {
+        vec![]
+    };
+    let mut table = Table::new(
+        "public".to_string(),
+        name.to_string(),
+        "public".to_string(),
+        name.to_string(),
+        "postgres".to_string(),
+        None,
+        vec![id],
+        vec![],
+        indexes,
+        vec![],
+        None,
+    );
+    table.partition_of = Some("public.pp".to_string());
+    table.partition_bound = Some(bound.to_string());
+    if indexed {
+        table.replica_identity = Some("i".to_string());
+        table.replica_identity_index = Some(index_name);
+        table.replica_identity_columns = vec!["id".to_string()];
+    } else {
+        table.replica_identity = Some("d".to_string());
+    }
+    table.hash();
+    table
+}
+
+/// FROM: `pp` with partition `p1`, no index. TO: `pp` gains `pp_id_uk`,
+/// and `p1` and a new partition `p2` use their partition of it as replica
+/// identity.
+fn replica_identity_partition_dumps() -> (Dump, Dump) {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(replica_identity_parent(false));
+    from_dump.tables.push(replica_identity_partition(
+        "p1",
+        "FOR VALUES FROM (0) TO (100)",
+        false,
+    ));
+    to_dump.tables.push(replica_identity_parent(true));
+    to_dump.tables.push(replica_identity_partition(
+        "p1",
+        "FOR VALUES FROM (0) TO (100)",
+        true,
+    ));
+    to_dump.tables.push(replica_identity_partition(
+        "p2",
+        "FOR VALUES FROM (100) TO (200)",
+        true,
+    ));
+    (from_dump, to_dump)
+}
+
+/// Review of fix:replident: a new partition is created before its parent
+/// is altered, so USING INDEX on the index PostgreSQL creates for it from a
+/// parent index added in the same migration used to run first and fail
+/// ("index ... does not exist"), aborting the migration.
+#[tokio::test]
+async fn partition_replica_identity_follows_the_parent_index_it_comes_from() {
+    let (from_dump, to_dump) = replica_identity_partition_dumps();
+    let mut comparer = Comparer::new(from_dump, to_dump, true, true, true, GrantsMode::Ignore);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    let create_p2 = find(&script, "create table public.p2 partition of public.pp");
+    let parent_index = find(&script, "CREATE UNIQUE INDEX pp_id_uk ON public.pp");
+    assert!(create_p2 < parent_index, "{script}");
+    for partition in ["p1", "p2"] {
+        let using = format!(
+            "alter table public.{partition} replica identity using index {partition}_id_idx;"
+        );
+        assert_eq!(script.matches(&using).count(), 1, "{script}");
+        let guard = find(
+            &script,
+            &format!("where indexrelid = to_regclass('public.{partition}_id_idx')"),
+        );
+        assert!(
+            parent_index < guard && guard < find(&script, &using),
+            "{script}"
+        );
+    }
+    assert!(!script.contains("replica identity default"), "{script}");
+}
+
+#[tokio::test]
+async fn production_partition_replica_identity_runs_after_the_attach() {
+    // The concurrent per-partition build names a new partition index
+    // `<partition>_<parent index>`, so USING INDEX on the name PostgreSQL
+    // chose in TO is guarded: it runs after the attach and only sets the
+    // replica identity when an index of that name is there.
+    let (from_dump, to_dump) = replica_identity_partition_dumps();
+    let mut comparer = Comparer::new(from_dump, to_dump, true, true, true, GrantsMode::Ignore);
+    comparer.set_output_for_production(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    let commit = find(&script, "commit;");
+    for partition in ["p1", "p2"] {
+        let attach = find(
+            &script,
+            &format!("alter index public.pp_id_uk attach partition public.{partition}_pp_id_uk;"),
+        );
+        let guard = find(
+            &script,
+            &format!("where indexrelid = to_regclass('public.{partition}_id_idx')"),
+        );
+        assert!(commit < attach && attach < guard, "{script}");
+    }
+}
+
+/// Review of fix:replident: a generated-column rewrite of a column the
+/// replica-identity index does not use left the table on DEFAULT from
+/// COMMIT until a post-commit USING INDEX, behind every other post-commit
+/// statement. The table now stays on its index.
+#[tokio::test]
+async fn production_rewrite_of_an_unrelated_column_keeps_the_replica_identity() {
+    let make = |generated: bool| {
+        let mut code = super::helpers::int_column("public", "zg", "code", 1);
+        code.is_nullable = false;
+        let mut g = super::helpers::int_column("public", "zg", "g", 2);
+        if generated {
+            g.is_generated = "ALWAYS".to_string();
+            g.generation_expression = Some("(code * 2)".to_string());
+            g.generation_type = Some("s".to_string());
+        }
+        let mut table = Table::new(
+            "public".to_string(),
+            "zg".to_string(),
+            "public".to_string(),
+            "zg".to_string(),
+            "postgres".to_string(),
+            None,
+            vec![code, g],
+            vec![],
+            vec![TableIndex {
+                schema: "public".to_string(),
+                table: "zg".to_string(),
+                name: "zg_uk".to_string(),
+                catalog: None,
+                indexdef: "CREATE UNIQUE INDEX zg_uk ON public.zg USING btree (code)".to_string(),
+                is_partition_index: false,
+                comment: None,
+            }],
+            vec![],
+            None,
+        );
+        table.replica_identity = Some("i".to_string());
+        table.replica_identity_index = Some("zg_uk".to_string());
+        table.replica_identity_columns = vec!["code".to_string()];
+        table.hash();
+        table
+    };
+    let mut from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    from_dump.tables.push(make(false));
+    to_dump.tables.push(make(true));
+
+    for production in [false, true] {
+        let mut comparer = Comparer::new(
+            from_dump.clone(),
+            to_dump.clone(),
+            true,
+            true,
+            true,
+            GrantsMode::Ignore,
+        );
+        comparer.set_output_for_production(production);
+        comparer.compare().await.unwrap();
+        let script = comparer.get_script();
+        find(&script, "alter table public.zg add column");
+        assert!(!script.contains("replica identity"), "{script}");
+    }
+}

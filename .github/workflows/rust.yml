@@ -69,17 +69,23 @@ jobs:
     #   3. Applies `data/test/schema_a.sql` to `a` and `schema_b.sql` to `b`.
     #      Uses ON_ERROR_STOP=0 because some statements use features specific
     #      to newer PG versions (NULLS NOT DISTINCT on PG15+, NOT ENFORCED on
-    #      PG18+); they fail to apply on older versions but the round-trip
-    #      property still holds because pgc emits SQL based on dumps, not on
-    #      the source schema files.
+    #      PG18+, FOR ALL SEQUENCES / SERVER subscriptions / aggregate SUPPORT
+    #      and more on PG19+); they fail to apply on older versions but the
+    #      round-trip property still holds because pgc emits SQL based on
+    #      dumps, not on the source schema files.
     #   4. Runs pgc compare to produce `output.sql`.
-    #   5. Applies `output.sql` to `a`.
+    #   5. Applies `output.sql` to `a`, then asserts from the catalogs that
+    #      `a` now matches `b` (.github/scripts/assert-*.sh).
     #   6. Re-runs pgc compare. The new diff must be empty — that's the
     #      idempotency contract pgc must satisfy.
     strategy:
       fail-fast: false
       matrix:
-        pg_version: ["14", "15", "16", "17", "18"]
+        # "19" is resolved to the newest published PostgreSQL 19 image: the
+        # GA `postgres:19` tag once it exists, a 19rcN / 19betaN tag until
+        # then (see "Resolve PostgreSQL image"), so the leg moves to the
+        # release without an edit here.
+        pg_version: ["14", "15", "16", "17", "18", "19"]
 
     steps:
     - uses: actions/checkout@v4
@@ -94,6 +100,59 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y postgresql-client
 
+    - name: Resolve PostgreSQL ${{ matrix.pg_version }} image
+      id: pgimage
+      run: |
+        # A major that is not released yet has no `postgres:<major>` tag on
+        # Docker Hub, only pre-release ones (19beta1..19betaN, then 19rc1..).
+        # Use the GA tag when Docker Hub has it, else the newest rc, else the
+        # newest beta, so a pre-release major is tested today and the job
+        # follows it to GA on its own. Pre-release tags are considered only
+        # when the GA tag is confirmed missing (HTTP 404): a released major
+        # still lists its old rc/beta tags, and a transient registry error
+        # must fail the step rather than quietly test an old candidate.
+        set -euo pipefail
+        v="${{ matrix.pg_version }}"
+        hub="https://hub.docker.com/v2/repositories/library/postgres/tags"
+        curl_opts=(-sS --retry 3 --retry-all-errors --max-time 30)
+        # The body goes to a regular file: curl 8.5 (ubuntu-24.04) cannot
+        # retry into /dev/null ("Failed to truncate file", exit 23).
+        probe="${RUNNER_TEMP:-/tmp}/pgc-pgtag-${v}.json"
+        code=$(curl "${curl_opts[@]}" -o "${probe}" -w '%{http_code}' "${hub}/${v}" || echo "curl-failed")
+        case "${code}" in
+          200)
+            tag="${v}"
+            ;;
+          404)
+            tags=$(curl "${curl_opts[@]}" -f "${hub}?page_size=100&name=${v}" | jq -r '.results[].name')
+            tag=$(grep -E "^${v}rc[0-9]+$" <<<"${tags}" | sort -V | tail -1 || true)
+            [ -n "${tag}" ] || tag=$(grep -E "^${v}beta[0-9]+$" <<<"${tags}" | sort -V | tail -1 || true)
+            if [ -z "${tag}" ]; then
+              echo "::error::no postgres image found for PostgreSQL ${v}"
+              exit 1
+            fi
+            echo "::notice::PostgreSQL ${v} is not released yet; testing pre-release postgres:${tag}"
+            ;;
+          *)
+            # The Hub API is down or rate-limited. A released major still
+            # pulls by its own tag; a pre-release one cannot be resolved.
+            if docker pull -q "postgres:${v}" > /dev/null 2>&1; then
+              echo "::warning::Docker Hub API answered ${code}; using postgres:${v}, which pulled"
+              tag="${v}"
+            else
+              echo "::error::Docker Hub API answered ${code} and postgres:${v} does not pull; not guessing an image"
+              exit 1
+            fi
+            ;;
+        esac
+        for attempt in 1 2 3; do
+          docker pull -q "postgres:${tag}" && break
+          [ "${attempt}" -lt 3 ] || { echo "::error::could not pull postgres:${tag}"; exit 1; }
+          sleep $((attempt * 10))
+        done
+        echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+        echo "Using postgres:${tag}"
+
     - name: Start PostgreSQL ${{ matrix.pg_version }}
       run: |
         # `services:` does not let us pass `command:` to the container, and
@@ -104,7 +163,7 @@ jobs:
           -e POSTGRES_PASSWORD=postgres \
           -e POSTGRES_USER=postgres \
           -p 5432:5432 \
-          postgres:${{ matrix.pg_version }} \
+          postgres:${{ steps.pgimage.outputs.tag }} \
           -c wal_level=logical
         # Wait for the server to accept connections.
         for i in $(seq 1 60); do
@@ -213,6 +272,31 @@ jobs:
         # empty) the test still validates idempotency.
         psql -h 127.0.0.1 -U postgres -d a -v ON_ERROR_STOP=0 \
           -f /tmp/output.sql
+
+    - name: Assert the migrated catalogs match (a == b)
+      env:
+        PGPASSWORD: postgres
+      run: |
+        # The round-2 compare below cannot catch a property that pgc loses on
+        # both sides (both dumps drop it, so they compare equal and the diff
+        # is empty) — for example a PG19 FOR ALL SEQUENCES flag or a SERVER
+        # subscription. Each script compares the relevant catalogs of `a`,
+        # after the migration, with `b` directly, and spot-checks that the
+        # fixture values really arrived. Version-specific checks are guarded
+        # on server_version_num inside the scripts. They read the round-1
+        # migration from /tmp/output.sql, so this must run before round 2.
+        fail=0
+        for script in .github/scripts/assert-*.sh; do
+          echo "::group::${script}"
+          if bash "${script}"; then
+            echo "::endgroup::"
+          else
+            echo "::endgroup::"
+            echo "::error::${script} failed on PG ${{ matrix.pg_version }}"
+            fail=1
+          fi
+        done
+        exit "${fail}"
 
     - name: Assert unread-column changes did not drag views along
       run: |

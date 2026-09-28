@@ -80,7 +80,9 @@ fn starts_with_ascii_ci(chars: &[char], at: usize, prefix: &str) -> bool {
 /// `simple_quote_literal`, verified live on PostgreSQL 16 in both modes). E-strings
 /// and dollar-quotes therefore never appear in catalog deparse output; handling them
 /// keeps the canonicalizer from mis-scanning literal content if hand-written SQL
-/// ever reaches it.
+/// ever reaches it. The doubled-backslash `off` rendering now only arrives in dumps
+/// written by pgc 1.0.x: pgc sets `standard_conforming_strings = on` on every dump
+/// connection (`dump::core::SESSION_SETUP_SQL`), and PostgreSQL 19 removed `off`.
 fn quoted_prefix_len(chars: &[char], at: usize) -> Option<usize> {
     let c = chars[at];
     // E-string: E'…' / e'…', only when the E stands alone (not the tail of an

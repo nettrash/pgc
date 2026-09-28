@@ -1,3 +1,1777 @@
+2026-09-28      v1.1.0
+
+                Adds support for PostgreSQL 19, which pgc now dumps,
+                compares and migrates alongside 14 through 18, and fixes
+                a long list of migration bugs that the work on it
+                uncovered, most of them present in every earlier
+                release. On PostgreSQL 19 the previous release could not
+                dump a database at all once any database in the cluster
+                held a subscription that takes its connection from a
+                foreign server. Beyond that crash, the new publication,
+                subscription, foreign-data wrapper, aggregate,
+                constraint, generated-column and statistics features are
+                now read, compared and written, in place wherever the
+                server allows it.
+
+                The fixes cover routines with SQL-standard bodies
+                (dumped empty until now), migrations that failed or
+                needed a second run (domain CHECK changes, rule changes,
+                aggregates, partition-key changes, grantor chains,
+                replica identity, owned sequences, publications,
+                statistics), migrations that silently lost objects a
+                DROP ... CASCADE took along, and a security issue: an
+                object or role name containing a line break or a comment
+                delimiter could end the comment pgc wrote it into and
+                run as SQL when the migration was applied.
+
+                Each dump now records the version of the server it was
+                taken from, a dump whose schema pattern matches no
+                schema (the source of a first deployment into an empty
+                database) included. The migration is applied to the FROM
+                database, so DDL that only a newer server accepts is
+                emitted only when FROM is new enough, and otherwise
+                falls back to a form every supported version accepts; a
+                dump written by an earlier pgc carries no version and
+                gets the fallback. pgc 1.1 reads every earlier dump, but
+                refuses to compare a FROM dump it wrote against a TO
+                dump written by pgc 1.0.x, whose missing information
+                would turn into destructive statements; re-dump both
+                sides after upgrading. Generated SQL changes for
+                PostgreSQL 14 to 18 only where it was wrong before; each
+                such change is listed below.
+
+                Features:
+                    - PostgreSQL 19 publications. FOR ALL SEQUENCES and
+                      FOR ALL TABLES EXCEPT (TABLE ...) are dumped,
+                      compared and created, the excluded tables written as
+                      TABLE ONLY per catalog row as pg_dump 19 does. When
+                      the migrated database is PostgreSQL 19 a
+                      publication moves between FOR ALL TABLES, FOR ALL
+                      SEQUENCES, both, a different EXCEPT list, and an
+                      empty or listed publication in place with ALTER
+                      PUBLICATION ... SET ALL ..., emptying a listed one
+                      first; only leaving the all-objects kind for a list
+                      or for nothing still needs a drop and recreate.
+                      Older servers and dumps without a recorded server
+                      version keep the drop and recreate.
+                    - PostgreSQL 19 subscriptions that take their
+                      connection from a foreign server: the server is
+                      dumped, CREATE SUBSCRIPTION ... SERVER is emitted,
+                      and a change of source becomes ALTER SUBSCRIPTION
+                      ... SERVER or ... CONNECTION, never a drop and
+                      recreate. When the owner changes as well, OWNER TO
+                      runs before the SERVER switch, because PostgreSQL
+                      checks the owner's user mapping, USAGE and
+                      password when the source changes.
+                    - The PostgreSQL 19 subscription options
+                      retain_dead_tuples, max_retention_duration and
+                      wal_receiver_timeout are dumped, created when not
+                      at their default, and changed with one ALTER
+                      SUBSCRIPTION ... SET. Turning retain_dead_tuples
+                      off runs before a connection change and turning
+                      it on runs after it, because PostgreSQL contacts
+                      the publisher for both. PostgreSQL accepts that
+                      change only once every worker of the subscription
+                      has exited, so an enabled subscription is disabled
+                      before anything else, the migration waits (at
+                      most 60 seconds) until its workers are gone, and
+                      every other change is made while it is disabled:
+                      SET PUBLICATION, a new connection or server and an
+                      owner change each restart a running worker, which
+                      made the change fail in almost every run. The new
+                      publication list is refreshed with REFRESH
+                      PUBLICATION once the subscription is enabled
+                      again. A subscription that ends disabled is enabled
+                      for that refresh and disabled again. With
+                      --use-single-transaction pgc warns that such a
+                      change cannot succeed while the apply worker runs,
+                      because the worker only sees the DISABLE once it
+                      is committed.
+                    - The PostgreSQL 19 foreign data wrapper CONNECTION
+                      function is dumped and emitted as CONNECTION f
+                      on CREATE, and as CONNECTION f or NO CONNECTION
+                      on ALTER.
+                    - All of the new values are hashed only when set,
+                      so subscriptions and wrappers without them keep
+                      their 1.0.x hashes, and older dumps load
+                      unchanged.
+                    - Added aggregate SUPPORT functions (PostgreSQL 19).
+                      CREATE AGGREGATE ... SUPPORT = was read and
+                      compared but never written, so the migration never
+                      converged; it is now emitted, and adding or
+                      removing one updates the aggregate in place.
+                      Setting it needs superuser, as it does for
+                      pg_dump; older servers ignore the option with a
+                      warning.
+                    - Added SET <list parameter> TO NULL (PostgreSQL
+                      19), the empty list, which is stored as a bare
+                      search_path=. It is emitted when the migrated
+                      database is PostgreSQL 19 or later; for an older
+                      server, or a FROM dump that does not record the
+                      version, the portable SET search_path = '' is kept
+                      as before.
+                    - PostgreSQL 19: a CHECK constraint whose only
+                      change is its enforceability is altered in place
+                      with ALTER CONSTRAINT ... [NOT] ENFORCED instead
+                      of being dropped and re-added. The statement
+                      recurses to inheritance children and partitions,
+                      and a parent's is emitted before its children's.
+                      A table that drops and re-adds a column in the
+                      same migration, or whose child keeps an enforced
+                      copy of a constraint going NOT ENFORCED, keeps
+                      the drop and re-add. PostgreSQL 18 rejects the
+                      statement for CHECK constraints, so older servers
+                      keep the drop and re-add too.
+                    - PostgreSQL 19: a VIRTUAL generated column's
+                      expression is changed with ALTER COLUMN ... SET
+                      EXPRESSION, which keeps the column's position,
+                      grants, dependent views, indexes and statistics.
+                      On PostgreSQL 18 this is done only when no table
+                      of the inheritance or partition family has a
+                      CHECK constraint, counting tables the migration
+                      creates. It is never done for a table that is an
+                      explicit member of a publication, which
+                      PostgreSQL rejects. SET EXPRESSION applies to the
+                      table ONLY unless it is partitioned, so an
+                      inheritance child keeps an expression of its own.
+                      These choices follow the server version recorded
+                      in the FROM dump. A dump that does not record one
+                      gets the form every supported server accepts.
+                    - Added support for PostgreSQL 19 extended
+                      statistics on virtual generated columns. PostgreSQL
+                      19 stores such a column as an expression, so every
+                      statistics object that named one came out of pgc as
+                      a CREATE STATISTICS the server rejects. They are now
+                      created the way PostgreSQL deparses them, for
+                      example ON a, (v), and restored when pgc drops and
+                      re-adds the column they name.
+                    - Added round-trip fixtures for PostgreSQL 19
+                      syntax pgc already handles: the oid8 type in
+                      columns, arrays, defaults, CHECK constraints, hash
+                      indexes, domains, ranges, functions and views;
+                      window IGNORE NULLS and RESPECT NULLS; JSON_ARRAY
+                      over a subquery; the new heap storage parameters
+                      autovacuum_parallel_workers and
+                      log_autoanalyze_min_duration; the Polish stemmer,
+                      the Esperanto configuration and the
+                      pg_stash_advice extension. The dump gains two
+                      optional fields, available_extensions and
+                      standard_conforming_strings_off, which older
+                      dumps may omit.
+
+                Bug fixes: - A publication that switched from FOR ALL
+                TABLES to a table list got ALTER PUBLICATION ... SET
+                TABLE, which PostgreSQL rejects on every version ("is
+                defined as FOR ALL TABLES"), so the migration failed and
+                every later compare emitted it again. No ALTER leaves
+                FOR ALL TABLES, so the publication is now dropped and
+                recreated (commented out without --use-drop), as it
+                already was in the other direction. FOR ALL TABLES to an
+                empty publication, and a table list to an empty one,
+                emitted nothing at all: the first is now recreated too,
+                and the second emits ALTER PUBLICATION ... DROP TABLE
+                ONLY for the members that are still there. - A table
+                that the migration drops and recreates (a partition key
+                change, for example) silently lost its publication
+                membership, and the next compare reported it. With
+                --use-drop, publications that list such a table now have
+                their membership re-emitted even when nothing else about
+                them changed, and tables the migration already dropped
+                are left out of DROP TABLE lists, which would fail on
+                them. - A publication member that is an inheritance
+                parent was written without ONLY, so SET TABLE added its
+                children as members too and every later compare emitted
+                the same SET TABLE again, and a publication created on a
+                parent with a row filter could not be recreated
+                ("conflicting or redundant WHERE clauses"). Such members
+                are now written TABLE ONLY, one per catalog row; other
+                tables are written as before. - Publication row filters
+                and column lists, FOR TABLES IN SCHEMA members
+                (PostgreSQL 15+), publish_via_partition_root and
+                publish_generated_columns (PostgreSQL 18+) were not
+                dumped, so changes to them went unnoticed and a
+                recreated publication came back without them. They are
+                now dumped, compared and emitted: SET TABLE with the
+                column list and WHERE clause, SET / DROP TABLES IN
+                SCHEMA, and one SET (...) for the options, placed before
+                the member change when it turns
+                publish_via_partition_root on and after it otherwise. -
+                Resolved a dump crash on PostgreSQL 19: a subscription
+                created with SERVER has a NULL subconninfo, which the
+                dump decoded into a string and panicked on. Because the
+                subscription query also lacked a database filter, one
+                such subscription anywhere in the cluster crashed every
+                dump. The connection is now read NULL-safe. - Resolved
+                subscriptions leaking between databases. pg_subscription
+                is a shared catalog and the dump read all of it, so
+                every database's subscriptions appeared in every dump,
+                and two databases with same-named subscriptions produced
+                arbitrary ALTERs. The query is now restricted to the
+                current database, as pg_dump restricts it. - A failing
+                subscription query is no longer mistaken for missing
+                privileges. Only insufficient_privilege (SQLSTATE 42501)
+                still degrades to an empty list with a warning; any
+                other error fails the dump instead of silently dropping
+                every subscription in the next compare. - FROM-only
+                subscriptions are now dropped before every other
+                statement, and FROM-only foreign servers and then
+                foreign data wrappers after the subscriptions have been
+                dropped or moved. On PostgreSQL 19 a subscription blocks
+                DROP SERVER and DROP FOREIGN DATA WRAPPER even with
+                CASCADE. Both sections appear only when something is
+                dropped, so other output is unchanged. - Resolved
+                changed aggregates failing to migrate. Every aggregate
+                was written as a plain CREATE AGGREGATE, so any change
+                that kept its signature - an INITCOND, a state size, a
+                combine function - failed with "function already exists
+                with same argument types" and was re-emitted on every
+                later compare. Aggregates are now written as CREATE OR
+                REPLACE AGGREGATE (PostgreSQL 12+), which updates them
+                in place and keeps every view that uses them. - Resolved
+                aggregates with a sort operator never being created.
+                SORTOP was written as the stored operator name, SORTOP =
+                pg_catalog.>, which does not parse; it is now written
+                SORTOP = OPERATOR(pg_catalog.>), as pg_dump writes it. -
+                Resolved routine and aggregate kind changes failing to
+                migrate. A function replaced by an aggregate or a
+                procedure of the same signature, or an ordered-set
+                aggregate replaced by a hypothetical-set one, was sent
+                to CREATE OR REPLACE, which PostgreSQL refuses ("cannot
+                change routine kind"). Those changes, and a changed
+                number of direct arguments, now drop the old routine
+                first - with DROP ROUTINE when the kind changes, so a
+                replayed migration still runs - and recreate the
+                dependents the CASCADE removed. - Resolved the
+                privileges of a dropped and recreated routine being
+                lost. When a return type or routine kind change drops a
+                routine and creates it again, its grants were compared
+                with the ones the drop had already removed: explicit
+                grants came back only on the next run, and a REVOKE
+                EXECUTE FROM PUBLIC was silently lost, leaving the
+                routine executable by everyone. They are now compared
+                with the new routine's default privileges, so every
+                grant and revoke is applied in the same migration. -
+                Resolved an aggregate's PARALLEL SAFE or RESTRICTED
+                marking never being migrated. It was compared but not
+                written, so the aggregate was created PARALLEL UNSAFE
+                and re-emitted on every compare. - Resolved a negative
+                SSPACE or MSSPACE being silently dropped. PostgreSQL 19
+                reads a negative state size as a state that can grow
+                without bound (its own array_agg and string_agg use -1),
+                and every supported version stores one, but pgc wrote
+                only positive values and left negative ones out of the
+                aggregate's hash, so the value was lost on creation and
+                a change to or from it went undetected. Only such
+                aggregates hash differently from pgc 1.0.x dumps, and
+                are rewritten once. - Resolved routines with SET
+                search_path = '' failing to migrate. The value is stored
+                as search_path="" and was pasted back as SET search_path
+                = "", which every PostgreSQL version rejects as a
+                zero-length delimited identifier, so the routine was
+                never created or updated. A list parameter (search_path,
+                temp_tablespaces, ...) with an empty element, or with a
+                name longer than 63 bytes, which was silently truncated,
+                is now written element by element as string literals,
+                the way pg_get_functiondef prints it (SET search_path TO
+                '', 'public'), with numbers kept as numbers. Every other
+                list is written exactly as before. - Resolved
+                output_plugin_libraries lists being collapsed into one
+                element. The parameter was not known to be a quoted
+                list, so SET output_plugin_libraries = pgoutput,
+                test_decoding was stored back as the single entry
+                "pgoutput, test_decoding" and re-emitted on every
+                compare. output_plugin_libraries and
+                oauth_validator_libraries are now handled like
+                search_path. - A change to a STORED generated column's
+                expression produced a migration PostgreSQL could not
+                run. pgc emitted DROP EXPRESSION followed by ALTER
+                COLUMN ... ADD GENERATED ALWAYS AS (...) STORED, a
+                statement no PostgreSQL version accepts, so the column
+                was silently left as a plain column. The change is now
+                ALTER COLUMN ... SET EXPRESSION when the migrated server
+                is PostgreSQL 17 or newer, and a DROP COLUMN plus ADD
+                COLUMN otherwise, with the column's indexes, constraints
+                and policies restored afterwards. - A generated column
+                that had to be dropped and re-added could not be while a
+                view read it: PostgreSQL refused the DROP COLUMN and the
+                migration never converged. Such views are now dropped
+                first and recreated with the others. - A generated
+                column that is dropped and re-added no longer starts
+                with ALTER COLUMN statements the re-added column makes
+                redundant. A type change among them failed outright,
+                because PostgreSQL casts the old generation expression
+                to the new type. A type change made together with an
+                expression change is now always a drop and re-add. - A
+                generated column whose new expression reads a column
+                added in the same migration was changed before that
+                column existed. Generated-column changes now come after
+                the table's ADD COLUMNs and before its DROP COLUMNs. -
+                An expression PostgreSQL deparses as ((a * 2) + (b * 3))
+                lost both pairs of parentheses and came out as a syntax
+                error, in CREATE TABLE and ADD COLUMN alike. Only a pair
+                enclosing the whole expression is removed now. - A
+                generated column changed across a classical inheritance
+                family was dropped and re-added by every member, which
+                PostgreSQL refused for the children ("cannot drop
+                inherited column") and which left merged child copies
+                with the old expression. The parent now drops and
+                re-adds it once, removing the copies of the children
+                that follow it in between. On a partition or such a
+                child, a constraint on the column that the parent's drop
+                already removed is dropped with IF EXISTS. - Classical
+                inheritance was not part of the table order. A new child
+                that sorted before its parent was created before the
+                parent existed, and a removed parent that sorted before
+                its child was dropped while the child still depended on
+                it. Parents now come before their children on create and
+                after them on drop. Tables already in a valid order keep
+                their position. - A generated column whose expression
+                differed from the other side only in how PostgreSQL
+                deparsed an IN list was treated as changed whenever
+                anything else about the column changed, and dragged a
+                spurious drop and re-add along. - Removed the ALTER
+                CONSTRAINT ... [NO] INHERIT that the CHECK constraint
+                alter path could emit. PostgreSQL accepts it only for
+                NOT NULL constraints, so a CHECK NO INHERIT change is
+                always a drop and re-add. - Resolved CREATE STATISTICS
+                failing for statistics on expressions (PostgreSQL 14 and
+                later). The kind list always named "expressions", which
+                is not a kind CREATE STATISTICS accepts, and univariate
+                statistics - a single expression - were given a kind
+                list at all, which PostgreSQL rejects. The kind list now
+                leaves "expressions" out and is omitted for univariate
+                statistics. - Resolved the ON list of extended
+                statistics being rebuilt by splitting the definition on
+                commas. A comma inside a literal changed the literal,
+                and the FROM of EXTRACT(year FROM d) cut the list short,
+                leaving a parenthesis open that made psql swallow every
+                later statement of the migration into one syntax error.
+                The ON list now comes from
+                pg_get_statisticsobjdef_columns, and for dumps written
+                by earlier versions it is cut out of the stored
+                definition with a scan that respects quotes and
+                parentheses. A change inside such an expression, which
+                the split saw as no change at all, now drops and
+                recreates the statistics. - Resolved extended statistics
+                lost when PostgreSQL dropped them together with
+                something pgc changed: a column pgc rewrites as DROP
+                COLUMN + ADD COLUMN (a plain column becoming generated,
+                a generated column whose change SET EXPRESSION cannot
+                make), a generated column removed by DROP FUNCTION ...
+                CASCADE - including statistics on the partitions of its
+                table and statistics that are new in the target - a
+                table dropped and recreated for a partition-key change,
+                or a materialized view that is dropped and rebuilt. The
+                dump now records which statistics depend on which
+                columns, and the migration recreates them afterwards. -
+                Resolved CREATE STATISTICS on a new materialized view
+                running before the view was created. - Resolved
+                statistics targets lost when a column the statistics
+                read changes type or, on PostgreSQL 17 and later, its
+                generation expression in place (ALTER COLUMN ... TYPE,
+                SET EXPRESSION). PostgreSQL rebuilds the statistics
+                object from its definition and resets its target; the
+                migration now sets the target again. - Resolved explicit
+                statistics targets (ALTER STATISTICS ... SET STATISTICS)
+                being ignored on PostgreSQL 17 and later, where
+                stxstattarget became a nullable smallint that pgc failed
+                to read. - Resolved the drops of statistics that exist
+                only in the source database coming out in a different
+                order on every run. - Resolved a text search dictionary
+                whose options changed being dropped with CASCADE and
+                recreated. The CASCADE silently dropped every text
+                search configuration that mapped the dictionary and,
+                through them, every stored generated tsvector column and
+                expression index built on them, and the next compare
+                could not even put them back, because configurations are
+                compared after tables. A change to options only is now
+                one ALTER TEXT SEARCH DICTIONARY. It removes the options
+                the target no longer has and lists every target option
+                in target order, which leaves the stored options exactly
+                equal to the target's. It runs before the tables, so a
+                generated column or index added by the same migration is
+                computed with the new options. The ALTER does not
+                re-process values already stored, which the migration
+                says in a comment and pgc repeats on stderr. A template
+                change is still a drop and recreate, because PostgreSQL
+                cannot alter it. PostgreSQL 19 made the options-only
+                change common: it rewrote the Dutch stemmer, so keeping
+                the old stems means moving a dictionary from language
+                'dutch' to 'dutch_porter'. - Resolved a server, database
+                or role set to standard_conforming_strings = off
+                (possible up to PostgreSQL 18) being dumped with every
+                backslash in defaults, CHECK constraints, index
+                predicates and view bodies doubled. The doubled form
+                produced spurious differences against every other dump,
+                and stored an extra backslash when applied to a server
+                with the setting on, which PostgreSQL 19 always is.
+                Every pgc connection now sets it on, as pg_dump does.
+                Each dump also records whether its server's clients
+                default to off, and a migration for such a server starts
+                with set standard_conforming_strings = on;, again as a
+                pg_dump script does, so psql no longer reads 'C:\temp'
+                as an escape string and stores a tab. Servers at the
+                default see no change. - Resolved CREATE EXTENSION ...
+                VERSION and ALTER EXTENSION ... UPDATE TO naming a
+                version the migrated server cannot install. PostgreSQL
+                19 ships btree_gist 1.9 as its only installable version,
+                so pinning 1.8 from an older server failed, and so did
+                every GiST index and exclusion constraint that needs it.
+                Each dump now records the versions its server can
+                install. When the FROM server cannot install the target
+                version, a new extension is created at the server
+                default and an impossible update is left out, each with
+                a comment saying why. Dumps without the list, and every
+                installable version, give the same SQL as before. -
+                Resolved routines with a SQL-standard body (BEGIN ATOMIC
+                ... END, or RETURN expr; PostgreSQL 14 and later) being
+                dumped, compared and migrated with an empty body.
+                PostgreSQL parses such a body when the routine is
+                created and keeps it as a query tree in
+                pg_proc.prosqlbody, leaving prosrc empty, and prosrc was
+                all pgc read. Every one of them was replayed as AS $$$$:
+                a function failed to create ("return type mismatch"), a
+                procedure became an empty no-op without any error, and a
+                change to the body was never detected, because the empty
+                text hashed the same on both sides. The body is now read
+                with pg_get_function_sqlbody under an empty search_path,
+                as pg_dump reads it, so every name in it outside
+                pg_catalog stays schema-qualified, public ones included,
+                whatever search_path the dump session or the database
+                has. It is emitted verbatim after every option with no
+                AS. A changed body is replaced in place with CREATE OR
+                REPLACE, which also converts between a quoted body and a
+                SQL-standard one. A carriage return inside such a body
+                belongs to a literal and is kept as it is. The dump
+                marks these routines with a new optional is_sql_body
+                field, which older dumps may omit. The hash and the
+                emitted SQL of every other routine are unchanged; a
+                SQL-standard routine compared from a pgc 1.0.x dump is
+                re-created once with its real body. This also makes a
+                routine body using PostgreSQL 19's INSERT ... ON
+                CONFLICT DO SELECT migratable. - Resolved migrations
+                failing, needing a second run or never converging around
+                a routine with a SQL-standard body. Unlike a quoted
+                body, such a body is a hard dependent of every relation,
+                column, routine and operator it uses, and PostgreSQL
+                resolves it when the routine is created, even with
+                --guard-sql-routine-bodies. As a result a table,
+                sequence or view it read could not be dropped or
+                rebuilt, and a column it read could not be dropped or
+                retyped. Dropping and re-creating a routine or operator
+                it called silently took it along, and it could be
+                created before a public routine or view it named, or
+                before an operator or cast it applied. pgc now records
+                these dependencies (a new optional sql_body_dependencies
+                dump field) and drops such a routine, with the views and
+                aggregates built on it, before any of those changes. It
+                re-creates them afterwards with their grants and with
+                the constraints, indexes, defaults and policies the drop
+                took along. It orders them after the routines and views
+                they use, and creates the ones that need a new operator
+                or cast after it. - Resolved the clear script failing on
+                routines with a SQL-standard body. One that reads a
+                relation is now dropped together with the views, before
+                that relation. A routine is dropped before the routines
+                it calls, and an aggregate before its SQL-standard
+                support function. - Resolved domain CHECK constraints
+                and enum labels that changed on their own never reaching
+                the migration. A type was hashed as soon as its pg_type
+                row was read, before its domain constraints and enum
+                labels were loaded, so the hash covered neither, and the
+                comparer only looks at a type whose hash differs. A
+                domain whose only change was a CHECK body, an added or
+                dropped CHECK, or NOT VALID against validated - and an
+                enum whose only change was a new label - produced no SQL
+                at all, and the round-trip check could not notice,
+                because the change was lost on both sides. Types are now
+                hashed once both are loaded, and reading a dump file
+                rehashes every type, so dumps written by pgc 1.0.x
+                compare correctly with each other and with new ones; an
+                old dump compared with a new one no longer reports
+                constrained domains as "requires no supported changes".
+                Such migrations now carry ALTER DOMAIN ... DROP/ADD
+                CONSTRAINT and ALTER TYPE ... ADD VALUE statements that
+                1.0.x silently left out. - Resolved domain CHECK
+                constraints being added or validated too early. ADD
+                CONSTRAINT and VALIDATE CONSTRAINT on a domain check
+                every stored value of it, and they ran with the types,
+                before the tables, so a table or column the same
+                migration drops - still holding values only the old
+                CHECK allowed - failed the migration, and a CHECK that
+                calls a routine, operator or cast the migration creates
+                failed because it did not exist yet. They now run in
+                their own section after the tables, routines, operators
+                and casts; dropping the old CHECK still happens first,
+                with the types. - Resolved --use-single-transaction
+                migrations that add an enum value and use it. PostgreSQL
+                refuses a value added by ALTER TYPE ... ADD VALUE inside
+                an open transaction ("unsafe use of new value"), so a
+                column default or CHECK naming the new label failed the
+                whole migration. The ADD VALUE statements, which carry
+                IF NOT EXISTS and replay safely, now run before BEGIN; a
+                label added there stays if the rest of the migration
+                rolls back. Without --use-single-transaction nothing
+                moves. - A domain CHECK that is NOT VALID in the
+                migrated database and validated in the target is now
+                validated in place with ALTER DOMAIN ... VALIDATE
+                CONSTRAINT instead of being dropped and re-added, so it
+                is no longer commented out under --use-drop false. With
+                --use-drop false a commented-out domain statement is
+                commented out on every line, so a CHECK whose body holds
+                a line break no longer leaves the rest of the statement
+                live. With --output-for-production, ALTER DOMAIN ...
+                DROP CONSTRAINT is guarded with IF EXISTS, as ALTER
+                TABLE already was, so a migration that re-creates a
+                domain CHECK can be replayed after a partial run. - An
+                enum whose shared labels are in a different order is now
+                reported as such - PostgreSQL cannot reorder enum values
+                - instead of as "requires no changes". A domain's
+                constraints are hashed in name order, as the set they
+                are, so the same constraints stored in a different order
+                no longer read as a change; enum label order stays part
+                of the hash. No hash in an existing dump changes because
+                of this: every dump stores them in name order. -
+                Resolved full grants mode never converging on privileges
+                granted by a role other than the object's owner.
+                PostgreSQL records who granted each privilege, and a
+                REVOKE removes only the entries recorded under the role
+                it runs as - the owner, when the owner or a superuser
+                runs it. An entry a delegate granted (a role holding
+                WITH GRANT OPTION; since PostgreSQL 19 also the role
+                named by GRANT ... GRANTED BY) therefore survived the
+                migration's plain REVOKE without an error, and the next
+                compare emitted the same REVOKE again. Revoking a grant
+                option such entries were granted under failed outright
+                with "dependent privileges exist". pgc now revokes these
+                entries in the grantor's name: REVOKE ... GRANTED BY on
+                PostgreSQL 19 and later, and SET ROLE grantor / REVOKE /
+                RESET ROLE on older servers or dumps that do not record
+                a version. Entries granted under a grant option the
+                migration takes away are revoked first, deepest in the
+                chain first, and granted back by the owner when the
+                target still wants them. These statements run at the top
+                of the grants section, while each grantor still holds
+                its grant option. The migrating role must be a
+                superuser, or able to act as the grantor, and for SET
+                ROLE the grantor needs USAGE on the object's schema.
+                With --output-for-production each of them is wrapped in
+                a DO block that runs it only while the entry is still
+                recorded: once the grantor holds no privilege on the
+                object any more, repeating the statement fails with
+                "permission denied", which would have broken the promise
+                that a production migration can be replayed. pgc reports
+                on stderr, instead of emitting a statement bound to
+                fail, any entry whose grantor no longer holds the grant
+                option (PostgreSQL keeps such orphans and no REVOKE can
+                reach them). On PostgreSQL 14 to 18 an entry whose
+                grantor has since become a superuser still cannot be
+                removed: a superuser's REVOKE acts as the object's
+                owner, so the SET ROLE form removes nothing and the next
+                compare emits it again. The GRANT side still ignores
+                grantors, and migrations whose grants were all made by
+                owners are unchanged byte for byte. - Resolved column
+                privileges lost, or a table REVOKE rejected, in full
+                grants mode when a table-level privilege is revoked.
+                PostgreSQL applies a table-level REVOKE to every column
+                as well, removing the column entries the same grantor
+                gave the same grantee, but pgc compared the columns as
+                if they were untouched. A column grant the target keeps
+                - a reader keeping SELECT (note) while losing SELECT on
+                the table - was gone after the migration and came back
+                only on the next compare. Taking a table-level grant
+                option away failed with "dependent privileges exist"
+                when the column-level option it also removes had been
+                used to grant the column to someone else. The columns
+                are now planned against what the table statements leave:
+                the column grants the target keeps are granted back in
+                the same run, and the dependent column entries are
+                revoked, in their grantor's name, before the table
+                statement runs. - Resolved REPLICA IDENTITY USING INDEX
+                not being supported at all. pgc dumped only
+                relreplident, so it never knew which index a table used.
+                A switch to USING INDEX emitted replica identity
+                default, a no-op that came back on every run; a switch
+                between two indexes was not detected; a table created by
+                the migration, or an index rebuilt under the same name,
+                silently lost it; and moving off it ran after a DROP NOT
+                NULL on the key column, which PostgreSQL refuses (column
+                is in index used as replica identity). The dump now
+                records the index from pg_index.indisreplident, and its
+                columns, in optional replica_identity_index and
+                replica_identity_columns fields. Only the index name is
+                hashed, and only when present, so every other table
+                keeps its hash and older dumps still load. A table
+                leaves USING INDEX first in its ALTER only when the
+                migration drops or rebuilds that index, or drops,
+                re-creates or clears the NOT NULL of one of its columns
+                (and only with --use-drop). It returns last, once the
+                index exists and those NOT NULLs are added and
+                validated, which PostgreSQL 19 and 18.7 now require.
+                Under --output-for-production the statement follows a
+                CREATE INDEX CONCURRENTLY after commit. A partition on
+                an index PostgreSQL creates from its parent is set after
+                every table statement, in a block that warns instead of
+                failing when no index of that name exists. A table left
+                on USING INDEX after its index was dropped, which the
+                server treats as NOTHING, is dumped as NOTHING. -
+                Resolved rule changes that could not be applied. A
+                changed rule was emitted exactly as pg_get_ruledef
+                prints it, CREATE RULE ...;, with a second semicolon
+                appended, and PostgreSQL rejected it with rule ...
+                already exists. The change was never applied and every
+                later compare emitted it again. A changed rule is now
+                emitted as CREATE OR REPLACE RULE, which keeps the rule
+                and its comment and can change the event, the condition,
+                INSTEAD or ALSO and every action, including PostgreSQL
+                19's ON CONFLICT DO SELECT. Every rule statement now
+                ends in a single semicolon. - Resolved rules that were
+                created too early or dropped too late. Rules were
+                compared right after the tables, so a new rule on a new
+                view, or one calling a new function, failed because
+                neither existed yet. A removed rule was dropped after
+                the tables, so a rule writing to a removed table blocked
+                that table's DROP TABLE. Rules are now created after
+                routines, views, operators and casts. Removed rules are
+                dropped, in dump order, before any view or table DDL. -
+                Resolved rules that were silently lost, or that stood in
+                the way of other changes. A rule was never put back when
+                its table was dropped or recreated (a partition key
+                change, or a table turned into a view of the same name),
+                when its view was rebuilt, or when a routine's DROP
+                FUNCTION ... CASCADE took the rule itself, its view, or
+                a view it reads. A rule reading a column or
+                foreign-table column being retyped made ALTER COLUMN ...
+                TYPE fail. A rule reading a table, foreign table or
+                sequence being dropped blocked the drop. Dumps now
+                record which relations, columns and routines each rule
+                depends on. Such a rule is dropped before the change and
+                recreated with CREATE OR REPLACE RULE after it, and a
+                comment the target no longer has is cleared. A rule
+                whose own table or view goes away is put back even when
+                the dump was written by an older pgc. - Resolved DROP
+                RULE and COMMENT ON RULE for names that need quoting.
+                The dump stores these names already quoted, and pgc
+                quoted them again, so "My Rule" became """My Rule""".
+                That is another name: the drop did nothing and was
+                emitted again on every run, and the comment failed. - In
+                production mode new rules are emitted as CREATE OR
+                REPLACE RULE, so the migration can be run again. Each
+                rule in the dump gains an optional depends_on field,
+                which older dumps may omit. Rule hashes are unchanged. -
+                Resolved serial detection turning any column with an
+                owned sequence and a nextval default into a serial
+                column. The type fell back to serial for every column
+                that was not an integer, so a numeric, domain or
+                PostgreSQL 19 oid8 column was created as integer with an
+                integer sequence, and every later compare failed on
+                MAXVALUE out of range. The same shortcut was taken for a
+                sequence of another type than its column, a custom or
+                renamed sequence name, a nullable column, changed
+                sequence options, a sequence comment or a changed
+                sequence persistence. None of these converged or kept
+                the second compare empty. A column of a table that
+                already existed, a partition or a typed table also took
+                it: the sequence was skipped as created by the column,
+                but ADD COLUMN, SET DEFAULT, PARTITION OF and OF type
+                never create it, so it was missing or the migration
+                failed. A serial whose sequence another new table used
+                in its default failed when that table was created first.
+                The serial pseudo-types are now used only when they
+                recreate the sequence exactly in a new plain table, and
+                genuine serial, bigserial and smallserial columns are
+                emitted as before. Every other owned sequence is created
+                with its own options before the tables and linked to its
+                column with ALTER SEQUENCE ... OWNED BY after them. -
+                Resolved a new sequence owned by a column losing its
+                ownership. When it was created on its own, no OWNED BY
+                was ever emitted, and the second compare could not
+                notice because the sequence hash does not include
+                ownership. - Resolved a sequence owned by an identity
+                column that is not its identity sequence being treated
+                as the identity sequence. A new one was skipped as
+                created by the column and never created, and one removed
+                from the target was never dropped. - Resolved an SQL
+                injection through the names pgc writes into the comments
+                of a migration. Object and role names went verbatim into
+                the /* Table: ... */ headers, into the -- use_drop=false
+                notes and into the statements commented out for review,
+                and PostgreSQL allows any character in a name: a line
+                feed or a bare carriage return ends a -- comment, */
+                ends a block comment and /* opens a nested one. A view
+                named v<newline>drop table t; -- whose columns changed
+                made the applied migration drop t. A table named x*/
+                create table y(); /* created y. An extension owned by a
+                role with such a name ran its payload even with
+                --use-comments false. A name containing /* swallowed the
+                rest of the script. Names written into a -- comment now
+                have their line breaks replaced by spaces, as pg_dump
+                does. Names written into a block comment have */ and /*
+                split apart. A commented-out statement carries -- in
+                front of every physical line, the ones after a bare
+                carriage return included. The comment stripper behind
+                --use-comments false and the production rewriter now end
+                a -- comment at a bare carriage return, as PostgreSQL's
+                lexer does. Dump hashes are unchanged, and the output
+                for ordinary names is byte-for-byte the same. - Resolved
+                materialized views being named without quote_ident. pgc
+                read their schema, name and owner raw from pg_matviews,
+                so every statement it wrote for one (CREATE, ALTER ...
+                OWNER TO, DROP, the clear script) used the bare catalog
+                name. A mixed-case view "MyMv" was created as mymv and
+                never converged, its column comments were lost from the
+                dump, and a name holding SQL ran it. They are now read
+                through quote_ident like every other object. A dump
+                written by pgc 1.0.x has its materialized-view names
+                quoted on load, so it still matches a current dump of
+                the same view; names that need no quotes keep their
+                hashes. - Resolved the guarded REPLICA IDENTITY block
+                for a partition always being dollar-quoted as $pgc$. A
+                partition or index name containing $pgc$ ended the quote
+                and ran the rest of itself as SQL. The block now uses a
+                tag its body does not contain ($pgc$, else $pgc1$, ...).
+                - Resolved foreign-table option changes never applying.
+                pgc sent the whole new option list as OPTIONS (k 'v',
+                ...), which means ADD, so changing an option's value or
+                adding one next to an existing option failed with option
+                "k" provided more than once. Options are now changed key
+                by key: SET for a changed value, DROP for a removed key
+                and ADD for a new one. A change of order alone emits
+                nothing. - Resolved the silent loss of objects a
+                routine's DROP ... CASCADE takes along. pgc drops a
+                routine with CASCADE ahead of the table changes when its
+                SQL-standard body reads a column being retyped, and in
+                the routine phase when its return type, arguments or
+                kind change. PostgreSQL then removes everything that
+                depends on it, and pgc used to put back only table
+                constraints, indexes, column defaults, generated
+                columns, policies, views and rules. The migration
+                applied cleanly and lost the domain CHECKs, the triggers
+                whose WHEN clause calls the routine (and the enabled
+                state and comment of their partition clones), the
+                extended statistics and the indexes on materialized
+                views calling it, the defaults of foreign-table columns
+                calling it, and the routines whose argument defaults or
+                SQL-standard bodies call it. Worse, a domain whose
+                DEFAULT calls the routine was dropped whole, together
+                with every table column of that type and the data in it.
+                All of these are now put back after the routines, from
+                the TO dump, and a domain default is detached right
+                before the drop and set again afterwards. - Resolved
+                migrations that failed because the table changes created
+                objects calling a routine pgc had dropped ahead of them.
+                Constraints, indexes, policies and column defaults
+                calling such a routine are now left out of the table
+                changes and created once the routine is back, and a
+                routine the routine phase's CASCADE takes along through
+                an argument default is re-created there instead of being
+                dropped before the tables. - Added safeguards for a DROP
+                ... CASCADE that pgc could not undo. A routine whose
+                CASCADE would take a partitioned table through its
+                partition key, a range or base type (and every column of
+                it), a foreign-data wrapper, or an operator or cast is
+                no longer dropped ahead of the change it is in the way
+                of. The routine phase drops such a routine without
+                CASCADE. Neither is a routine that a new column's
+                default, a new column's domain default or a generated
+                column needs while the tables change dropped ahead of
+                them. The migration says so in a comment and on stderr,
+                and fails on PostgreSQL's dependency check, as it did in
+                1.0.27, instead of silently losing the table or the
+                data. - Resolved a CHECK constraint that the migration
+                relaxes or drops still being checked by the rewrite of
+                the column it reads, which failed with "check constraint
+                ... is violated by some row" - usually the very reason
+                the CHECK was changing. A partition's or an inheritance
+                child's own CHECK was relaxed or dropped in that table's
+                alter, after the parent's recursing ALTER COLUMN ...
+                TYPE (or a partitioned parent's SET EXPRESSION) had
+                already rewritten its rows; such relaxes and drops now
+                run ahead of every table alter (on PostgreSQL 19 an
+                in-place ALTER CONSTRAINT ... NOT ENFORCED as well), and
+                the re-added or tightened CHECK still follows the
+                rewrite. - Resolved grants mode revoking column
+                privileges that the migration's own table DDL had
+                already removed, and losing the ones the target still
+                wanted. A generated column that is dropped and re-added,
+                and every column of a table that is dropped and
+                recreated, start with no privileges, but they were
+                diffed against the source column's ACL: the target's
+                column grants were not issued again until the next run,
+                and an entry a delegate had granted was revoked in the
+                delegate's name, which failed with "permission denied
+                for column" (and, with --use-single-transaction, rolled
+                back the whole migration on every run). These columns
+                are now planned from an empty ACL, including a
+                partition's or an inheritance child's copy that the
+                parent's drop and add re-creates. In addonly mode a
+                dropped and recreated table's own grants are now issued
+                again as well, where before they were taken for present
+                and lost until the next run. A partition whose column
+                type changes through its parent is not dropped, and
+                neither is a table whose DROP TABLE --use-drop leaves
+                commented out: their table privileges are diffed against
+                their real ACL instead of the default privileges, and
+                entries a delegate granted on such a partition are
+                revoked in the delegate's name, where before a plain
+                REVOKE left them in place. - Resolved a compare of a
+                FROM dump written by this version with a TO dump written
+                by pgc 1.0.x producing a destructive migration, even
+                when both dumps were taken from the same, unchanged
+                database. pgc 1.0.x leaves out, or holds wrongly, what
+                it could not read, and the gaps were taken as the state
+                to reach: tables whose names start with pg but not pg_
+                (pgbench_accounts) were dropped, SQL-standard routines
+                were replaced with an empty body, so a procedure
+                silently became a no-op, publication row filters, column
+                lists, TABLES IN SCHEMA members and options were
+                stripped, which published columns the list had kept out,
+                and the subscriptions of the cluster's other databases,
+                which pgc 1.0.x wrote into every dump, were created,
+                connecting to their publishers. No safe migration can be
+                derived from such a pair, so compare now refuses it: pgc
+                exits non-zero, writes no script and says to re-dump TO
+                with this version. The --config chain dumps both sides
+                itself and never mixes versions. - Resolved a FROM dump
+                written by pgc 1.0.x of a PostgreSQL 14 to 18 database
+                whose clients default to standard_conforming_strings =
+                off silently corrupting backslash literals. Such a dump
+                holds every backslash doubled and does not record the
+                setting, so against a TO dump written by this version
+                every default, CHECK constraint and view holding a
+                backslash looked changed and was rewritten in standard
+                form without set standard_conforming_strings = on;, and
+                psql stored 'C:\temp' as C:, a tab and emp. Such a
+                migration now starts with the SET whatever the FROM
+                server's default; on a server at the default it changes
+                nothing, and it is still left out of an otherwise empty
+                migration. - Resolved a FROM dump written by pgc 1.0.x
+                silently leaving a TO subscription out of the migration.
+                pgc 1.0.x wrote the subscriptions of every database in
+                the cluster into each dump, so a subscription of the
+                same name in another database counted as already present
+                and was never created, and one that differed was altered
+                from the other database's definition. Against a TO dump
+                written by this version every TO subscription is now
+                created, which fails with subscription already exists,
+                before the publisher is contacted, where FROM has it;
+                subscriptions only FROM lists are dropped once each with
+                DROP SUBSCRIPTION IF EXISTS. - A FROM dump written by
+                pgc 1.0.x compared with a TO dump written by this
+                version is compared as before, with a warning on stderr
+                and a comment at the top of the script: the migration
+                re-applies what pgc 1.0.x could not read, re-creating
+                SQL-standard routines and setting publications and
+                replica identities again, and it creates the tables pgc
+                1.0.x could not see and every subscription, which stderr
+                lists and which fail with already exists where FROM has
+                them. Production output skips such a table's CREATE
+                TABLE, but the constraints added to it separately still
+                fail and any other difference in that table is not
+                applied. Re-dump FROM to avoid all of this. Two dumps
+                written by pgc 1.0.x compare exactly as before. -
+                Resolved the partitions of a recreated table going
+                missing. A partition-key change, or a type change on a
+                partition-key column, drops the partitioned table, and
+                DROP TABLE takes every partition with it, but pgc only
+                created again the partitions whose own definition had
+                changed. One that kept its bound - the DEFAULT
+                partition, or every partition when a HASH or RANGE key
+                moves to another column - was gone until a second run,
+                together with its indexes, grants, statistics, triggers,
+                rules and publication membership, and until then every
+                insert into its range failed. Every partition the drop
+                takes, at any depth, is now created again in the same
+                migration; a partition only 'to' has waits until its
+                recreated parent is back, also when its name needs
+                quoting; and the views, SQL-body routines and rules
+                reading such a partition are dropped first and recreated
+                after. The parent's row triggers, which PostgreSQL 15
+                and later lists on every partition, are no longer
+                created a second time on a recreated partition, where
+                they failed with "already exists"; a partition's own
+                trigger that only shares its name with one of the
+                parent's is still created. - Resolved a table that 'to'
+                attaches to, or moves under, a recreated partitioned
+                table going with it. Taken in name order, a table that
+                came before its new parent was attached to the old one,
+                and the DROP TABLE that followed took it along, rows and
+                all, without an error. It is now attached once its new
+                parent is back, and so is a recreated table that moves
+                under another one, after which its own partitions are
+                created again. - Resolved a recreated table with a
+                serial column not being created at all. DROP TABLE also
+                dropped the sequence the column owns, the CREATE TABLE
+                that followed named it in its nextval default and failed
+                with "relation ... does not exist", and the migration
+                left neither the table, its partitions nor the sequence
+                behind. The sequence is now detached with ALTER SEQUENCE
+                ... OWNED BY NONE right before the DROP TABLE and owned
+                by its column again once the tables are back, which also
+                keeps its current value, owner and privileges. Identity
+                columns were not affected. - Resolved a recreated table
+                that another table's foreign key references failing the
+                whole migration. DROP TABLE refused to run ("other
+                objects depend on it"), every CREATE after it failed
+                with "already exists", the views and routines dropped
+                ahead of it came back on the old table, and the
+                migration never converged. Foreign keys referencing a
+                recreated table or one of its partitions are now dropped
+                before the table changes and added back after them, NOT
+                VALID and then validated under --output-for-production;
+                one the referencing table changes or drops in the same
+                migration is dropped only once. This covers a key that
+                names a public table without its schema, as PostgreSQL
+                writes it when the search path reaches it, and a key
+                referencing a partitioned table one of whose
+                sub-partitions is recreated, which PostgreSQL copies
+                onto that sub-partition. The recreated table's own
+                foreign keys, which CREATE TABLE leaves out and which
+                were silently lost until a second run, are added back
+                too. Rows still pointing at the lost rows of the
+                recreated table make adding a key back fail, as for any
+                foreign key to an empty table. A foreign table that is a
+                partition of a recreated table is still only created
+                again by a second run, and then as a standalone foreign
+                table: pgc does not know foreign tables as partitions. -
+                Resolved ALTER TABLE ... ADD CONSTRAINT lowercasing
+                quoted identifiers. A constraint whose definition names
+                a mixed-case schema, table or column, such as a foreign
+                key referencing "Sales"."Orders"("Id"), was emitted as
+                "sales"."orders"("id") and failed with "does not exist".
+                Quoted identifiers now keep their case; everything
+                outside them and string literals is lowercased as
+                before. - Resolved --output-for-production adding a
+                foreign key to a partitioned table NOT VALID on a server
+                older than PostgreSQL 18, which refuses it ("cannot add
+                NOT VALID foreign key on partitioned table") and so
+                aborted a single-transaction migration. Such a foreign
+                key is now added in one statement there, and when the
+                'from' dump does not record its server version. -
+                Resolved the objects a routine's DROP ... CASCADE took
+                through a view. When a routine is dropped, or its return
+                type, arguments or kind change, the routine phase drops
+                it with CASCADE. PostgreSQL then removes every view
+                calling it and, with each view, everything reading that
+                view: other views, materialized views with their data,
+                indexes and statistics, routines with a SQL-standard
+                body, and rules. pgc put back only the views calling the
+                routine, so the rest was missing until the next compare,
+                and a rule on a lost view failed to be re-created. A
+                view calling such a routine that something reads is now
+                dropped ahead of the table changes together with its
+                readers. All of them are re-created after the routine in
+                dependency order, with their owners, comments, indexes,
+                statistics, rules and privileges. The dump now records,
+                per view, the routines its definition depends on, and
+                the call is matched on those: a view calling an
+                unchanged overload, or a built-in of the same name, is
+                left in place. A view that a plain DROP VIEW could not
+                remove (a routine with its row type in its signature, a
+                policy reading it, a column of its row type) is left to
+                the CASCADE as before, and so is every view of a FROM
+                dump written by pgc 1.0.x. - Resolved the privileges of
+                a view re-created after a routine's DROP ... CASCADE
+                took it. They were compared with the view's FROM
+                privileges, which the CASCADE had removed. Its grants
+                came back only on the next compare, and a role the
+                schema's default privileges let in kept its access
+                although the view revoked it. Such a view is now planned
+                like a dropped one, from the default privileges. A view
+                matched only by the routine's name, which the CASCADE
+                does not take, keeps its privileges and its
+                grantor-named revokes. - Resolved the privileges of a
+                routine the migration creates - new, or dropped and
+                re-created - ignoring the default privileges for
+                functions (ALTER DEFAULT PRIVILEGES ... ON FUNCTIONS).
+                What a schema's defaults granted and the routine revokes
+                stayed granted. A routine granting EXECUTE to PUBLIC
+                under a database-wide REVOKE ... FROM PUBLIC default
+                lost that grant. Each lasted until the next compare. The
+                routine's privileges are now planned from every ACL the
+                default privileges can give it, for each role that may
+                create it. - Resolved a routine with no explicit
+                privileges in TO losing PUBLIC's EXECUTE. Compared with
+                an explicit FROM ACL, the NULL ACL was read as no
+                privileges at all. The migration therefore revoked
+                EXECUTE from PUBLIC whenever the FROM routine had other
+                grants or had its default spelled out, and never granted
+                it back where FROM had revoked it. The next compare saw
+                nothing to do. The NULL ACL is now read as the default
+                it stands for. - Resolved role names that need quotes
+                being written bare in GRANT and REVOKE. aclitem text
+                leaves a mixed-case or reserved-word role unquoted, so
+                the statement named a different, lower-case role, or did
+                not parse. Object, column and default-privilege grants
+                now quote every such grantee, as the grantor-named
+                revokes already did, and a mixed-case owner is
+                recognised in its own ACL. - Resolved subscription
+                publication names being written unquoted in CREATE
+                SUBSCRIPTION and ALTER SUBSCRIPTION ... SET PUBLICATION.
+                The dump keeps the names as the catalog holds them, so
+                subscription hashes are unchanged. - Resolved REVOKE
+                EXECUTE / USAGE ... FROM PUBLIC never being migrated for
+                routines and types whose source ACL is NULL, the default
+                privileges. A NULL ACL was compared as "no privileges"
+                instead of as the PUBLIC EXECUTE or USAGE it grants, and
+                the reverse change took PUBLIC's privilege away. An ACL
+                with everything revoked is now told apart from NULL. -
+                Resolved new and recreated routines and types being
+                given the wrong privileges when the source database has
+                default privileges (ALTER DEFAULT PRIVILEGES FOR ROLE
+                ...). Only the creating role's defaults apply, and the
+                role running the migration is not known, so the
+                migration now revokes whatever the target lacks and
+                grants whatever it holds. A range type the migration
+                drops and recreates gets its privileges back the same
+                way. A multirange type gets no GRANT or REVOKE, which
+                PostgreSQL refuses. - Resolved a range type whose
+                privileges alone changed being dropped with CASCADE and
+                recreated, taking every column of that type with it. A
+                type whose only difference is its ACL is now left to the
+                GRANT and REVOKE statements. - Resolved ALTER
+                SUBSCRIPTION ... SET PUBLICATION failing on a disabled
+                subscription, or inside --use-single-transaction. The
+                refresh is now skipped there and run with REFRESH
+                PUBLICATION after the subscription is enabled, or after
+                commit. - Resolved column drops, column type changes,
+                SET UNLOGGED and, on PostgreSQL 19, ATTACH PARTITION
+                failing on tables a publication row depends on through a
+                column list, a row filter or an EXCEPT entry. Those rows
+                are now taken out before the tables are changed and put
+                back afterwards, including in a publication the
+                migration keeps unchanged. A row that cannot come back,
+                such as a table made UNLOGGED, gets a note and a
+                warning. - Resolved a migration that failed on every run
+                when a column read by a generated column changed type.
+                PostgreSQL refuses ALTER COLUMN ... TYPE while a
+                generated column (STORED or VIRTUAL) reads the column,
+                on every version, even when the generated column itself
+                does not change. The generated column is now dropped
+                before the retype and re-added from its target
+                definition after it, and what the drop takes along is
+                restored: its indexes, CHECK constraints, extended
+                statistics, the views reading it and its column
+                privileges. A generated column that becomes a plain
+                column drops its expression first and keeps its values;
+                one the target no longer has is dropped first. When both
+                a column and a generated column reading it are dropped,
+                the generated column now goes first; the old order
+                failed on PostgreSQL 15 and later, and on 14 the second
+                drop found no column. - Resolved type changes in
+                classical inheritance (INHERITS) families. A child
+                re-emitted ALTER COLUMN ... TYPE for the column it
+                inherits, which PostgreSQL refuses ("cannot alter
+                inherited column"); the parent's statement already
+                recurses to it. A generated column of the child reading
+                that column made the parent's statement fail as well.
+                The child now leaves the retype to its parent, and its
+                generated columns are dropped ahead of every table alter
+                and re-added in its own alter. - Resolved column drop +
+                add migrations that PostgreSQL refused because other
+                objects depend on the column: a policy using it, a
+                trigger naming it in UPDATE OF or its WHEN clause, or
+                another table's foreign key referencing a key on it.
+                This covers a generated column re-created around a
+                retype and one whose expression change needs a drop +
+                add. These objects are now dropped ahead of the table
+                changes and put back afterwards, triggers in their
+                enabled state. On PostgreSQL 18 and later a named NOT
+                NULL constraint on such a column is re-added under its
+                name; the auto-named one the plain NOT NULL created made
+                the restore fail. Constraint definitions also keep the
+                case of quoted identifiers: a unique key or foreign key
+                on a column such as "Code" was written as "code" and
+                failed. - Resolved extended statistics that were dropped
+                and created again on every compare. PostgreSQL prints
+                the plain columns of a statistics object in physical
+                column order, so the same object printed differently on
+                two tables whose columns sat in another order - for
+                instance after a column was dropped and re-added. Each
+                re-create threw away the collected statistics until the
+                next ANALYZE. The plain columns are now compared as a
+                set and the expressions in order. Stored hashes are
+                unchanged. - Resolved CHECK constraint changes in
+                classical inheritance families that PostgreSQL refused.
+                When a child's copy of a CHECK is both its own and
+                inherited, and it has to be dropped and re-added (an
+                enforceability change before PostgreSQL 19 or against a
+                FROM dump without a version, or an expression change on
+                any version) or becomes only inherited, the migration
+                failed with "cannot drop inherited constraint", "already
+                exists" or "conflicts with NOT ENFORCED constraint", and
+                the tightening case could leave the parent without its
+                CHECK. Every copy in the family is now dropped, parents
+                first, before any is re-added. An ancestor whose copy
+                does not change drops and re-adds it as it is. -
+                Resolved partitioned tables with a row trigger whose
+                migration failed. PostgreSQL clones such a trigger onto
+                every partition and creates and drops the clones with
+                it, but the clones were dumped as the partitions' own
+                triggers: every new or re-created partitioned table got
+                a CREATE TRIGGER per partition that failed with "already
+                exists", and dropping the table or changing the trigger
+                emitted a DROP TRIGGER on a clone that PostgreSQL
+                refuses. A clone is now never created or dropped. Only
+                an enabled state or comment of its own is kept, and set
+                once the parent's trigger is in place. On PostgreSQL 14,
+                where clones are internal, those states were lost and
+                are now migrated. A partition whose parent lies outside
+                the dumped schemas keeps every clone in the dump,
+                compared with the other side's, and a new such partition
+                gets its clones' states set. Dumps written by pgc 1.0.x
+                are read the same way. - Resolved ATTACH PARTITION
+                failing with "trigger already exists" when the table had
+                a trigger of its own named like a row trigger of its new
+                parent. That trigger is now dropped before the attach,
+                which clones the parent's. - Resolved the clear command
+                dropping objects in an order PostgreSQL refuses, so the
+                round-trip fixture databases could not be cleared
+                without --use-cascade. The script kept fixed sections -
+                views, tables, routines, sequences, types, extensions,
+                schemas - with only a few orderings of its own. An
+                aggregate went before its state function only when that
+                function had a SQL-standard body. A domain came after
+                the function its CHECK calls, and domains, classic
+                INHERITS children and tables whose rules read a view
+                kept their dump order. Operators, casts, collations and
+                text search objects were never dropped, which left the
+                schema non-empty, and neither was anything that depended
+                on a dropped extension, such as a foreign-data wrapper
+                using the postgres_fdw handler. The clear command now
+                reads the dependencies PostgreSQL records (pg_depend)
+                once, after it has read the schema, and moves a drop
+                only as far as one of them requires, so a schema without
+                such dependencies gets the script it always had. A
+                dependency cycle - a table whose CHECK, default,
+                trigger, rule, policy or index calls a function whose
+                SQL-standard body reads that same table - is broken by
+                dropping that part of the table first; a stored
+                generated column loses only its expression (DROP
+                EXPRESSION), so a view reading the column does not block
+                it. On PostgreSQL 14, where dropping the function drops
+                the generated column with it, whatever reads the column
+                goes first. Event triggers are dropped before anything
+                else, so one that logs DDL into a table of the schema no
+                longer fails every drop after that table is gone.
+                Operators, casts, collations and text search
+                configurations and dictionaries are dropped with their
+                schema. A foreign-data wrapper, server, user mapping,
+                subscription or event trigger, which belongs to no
+                schema, is dropped only when it depends on something the
+                script drops inside the selected schemas and nothing
+                outside them depends on it: an extension in public that
+                is read although public is not selected pulls in
+                nothing, and a server that a foreign table in another
+                schema uses is left in place, with a warning, together
+                with its user mappings. A SQL-standard routine that
+                reads only relations the script leaves alone is again
+                dropped after the tables whose defaults call it, as in
+                1.0.27. - Resolved an aggregate's SUPPORT clause being
+                sent to a FROM server older than PostgreSQL 19, which
+                accepts it with a WARNING and stores nothing, so every
+                later compare re-created the aggregate. When the FROM
+                dump records an older server, the clause is left out
+                with a comment in the script and a warning on stderr,
+                and an aggregate that differs only in its support
+                function gets just the comment. A FROM dump without a
+                version, one written by pgc 1.0.x, gets the clause as
+                before. - Resolved a generated column whose type and
+                expression both change emitting, with --use-drop off, a
+                live ALTER COLUMN ... TYPE ahead of the commented-out
+                drop and re-add. PostgreSQL computes that type change
+                from the old expression, so it failed ("cannot be cast
+                automatically") or did work the re-add redoes. It is now
+                part of the commented-out drop and re-add. - Removed the
+                probe of pg_constraint.connullsnotdistinct, a column no
+                PostgreSQL version has (UNIQUE NULLS NOT DISTINCT is
+                pg_index.indnullsnotdistinct, PostgreSQL 15+, which
+                pg_get_constraintdef already renders), together with the
+                dead select behind it. - Documented exactly what
+                --use-drop off does and does not guarantee: no DROP
+                statement and no ALTER ... DROP column, constraint,
+                default, NOT NULL, identity or expression clause runs,
+                but comment removals, REVOKE under --grants-mode full,
+                taking tables out of a publication, DROP MAPPING,
+                OPTIONS (DROP ...) and DISABLE ROW LEVEL SECURITY still
+                do, and the statements that depend on a suppressed drop
+                still run and fail. - Resolved tables whose name starts
+                with pg followed by any character other than an
+                underscore (pgbench_accounts, pg1_orders) being left out
+                of every dump. The tables query filtered tablename not
+                like 'pg_%', and _ is a LIKE wildcard, so such a table
+                was never compared, never created and never dropped,
+                silently. The filter now matches a literal underscore. -
+                Resolved a column whose quoted name contains a space
+                breaking every migration that created its table. CREATE
+                TABLE removed each column's name by cutting its
+                definition at the first space, so "Col X" integer came
+                out as "Col X" X" integer: an unterminated quoted
+                identifier, which made psql read the rest of the
+                migration into it and fail it as one syntax error. The
+                name is now removed by its exact length.
+                    - Resolved the objects a routine's DROP ... CASCADE
+                      took along with a stored generated column calling
+                      it, for instance when the routine's return type or
+                      parameter names changed, or when it had a
+                      SQL-standard body dropped ahead of the tables. The
+                      generated column was re-added, but not the views
+                      reading it (or the views over those), the
+                      SQL-standard routines and rules reading it, its
+                      column privileges, the triggers naming it in UPDATE
+                      OF or reading it in WHEN, the publication rows whose
+                      column list or row filter used it, the objects only
+                      the target schema had on it, or a partition's own
+                      objects on its copy. A table could silently drop out
+                      of a publication. When the same migration also
+                      dropped such a view for a type change, the view was
+                      re-created before the column was back and the
+                      migration failed with "column does not exist". All
+                      of these are now dropped ahead where needed and put
+                      back after the column is re-added. The table phase
+                      also no longer runs ALTER COLUMN ... TYPE on such a
+                      column first: that was redundant on every version,
+                      and PostgreSQL 14 refused it ("found unexpected
+                      dependency for column"), which aborted a
+                      --use-single-transaction migration.
+                    - Resolved column defaults, CHECK constraints and
+                      policies calling a routine that reads such a
+                      re-added generated column being put back before that
+                      routine was created again: the migration failed with
+                      "function does not exist", or the routine's own
+                      DROP ... CASCADE silently took them again. They are
+                      now put back after it.
+                    - Resolved extended statistics on a materialized view
+                      being created before the view when the view was
+                      created together with routines held back until after
+                      the operators and casts.
+                    - Resolved a migration that failed on every run when
+                      a publication's column list or row filter used a
+                      generated column dropped and re-added because a
+                      column it reads changed type. Those publication rows
+                      are now released before the tables and restored
+                      after them, on partitions too.
+                    - Resolved a partition's own index, CHECK, UNIQUE key
+                      (with the foreign keys referencing it), extended
+                      statistics and RLS policy on a generated column
+                      being lost when its partitioned parent dropped and
+                      re-added the column around a type change. They are
+                      now restored after the table changes.
+                    - Resolved a type change of a stored generated column
+                      that never applied on PostgreSQL 14 when its
+                      expression used a user-defined function or operator:
+                      PostgreSQL 14 records that use on the column itself
+                      and refuses ALTER COLUMN ... TYPE. The dump of a
+                      PostgreSQL 14 server now marks such columns, and
+                      the migration drops and re-adds them, restoring
+                      what depends on them. Other versions and pgc 1.0.x
+                      dumps are unchanged.
+                    - Resolved two PostgreSQL 14 failures when such a
+                      generated column is made a plain column. With a type
+                      change as well, the migration never applied. When
+                      the migration also dropped the function the
+                      expression called, the column and its data were
+                      silently deleted, since PostgreSQL 14 keeps the
+                      column depending on the function after DROP
+                      EXPRESSION. Such a column is now rewritten with its
+                      values kept, and what depends on it is restored.
+                    - Resolved a type change of a column used by an RLS
+                      policy, by a trigger's UPDATE OF list or by its
+                      WHEN clause, which failed on every run ("cannot
+                      alter type of a column used in a policy/trigger
+                      definition"). This includes another table's policy
+                      reading the column through a subquery. Such
+                      policies and triggers are now dropped ahead of the
+                      table changes, or created only after them.
+                    - Resolved an SQL injection through column
+                      collation names. pgc wrote a column's collation
+                      as collate "<name>" from the raw catalog name, so
+                      a " in the name closed the identifier and the
+                      rest of the name ran as SQL when the migration
+                      was applied, even inside a single transaction.
+                      The collation was also written without its
+                      schema: a collation outside search_path failed
+                      with "does not exist", and a same-named one
+                      earlier on the path was bound silently. A
+                      collation outside pg_catalog is now qualified and
+                      quoted as quote_ident does (collate app.ci);
+                      pg_catalog collations keep collate "C".
+                    - Resolved a change of a column's collation alone
+                      never being migrated: the collation was not part
+                      of the table hash. It is now, for columns that
+                      have one, and the change is applied with ALTER
+                      COLUMN ... TYPE ... COLLATE; on a partition-key
+                      column, which PostgreSQL cannot retype, the table
+                      is dropped and recreated as for a type change
+                      there, and the script says it is the collation.
+                      Tables without a collated column keep their
+                      hashes, and a pgc 1.0.x dump has its collated
+                      tables rehashed on load so it still matches a
+                      current dump.
+                    - Resolved collations the target adds being created
+                      after the tables: a column moved to a new
+                      collation, a new table, a new column or a domain
+                      using one failed with "collation ... does not
+                      exist", and a single-transaction migration never
+                      applied. They are now created before the types
+                      and tables.
+                    - Resolved ALTER COLUMN ... TYPE failing on a column
+                      a row-level security policy or a trigger (WHEN, or
+                      UPDATE OF) depends on, for a real type change as
+                      for a collation change: PostgreSQL refuses it
+                      while they exist, so the migration failed on every
+                      run. Such policies and triggers, including another
+                      table's policy whose subquery reads the column,
+                      are now dropped ahead of the table changes and
+                      created again from the target afterwards (with
+                      --use-drop, from the dependencies the FROM dump
+                      recorded).
+                    - Resolved event triggers whose names need quotes
+                      (mixed case, spaces) being quoted a second time:
+                      the migration created a trigger literally named
+                      "AuditTrg" with the quotes, and every drop,
+                      enable/disable, owner change and comment missed
+                      the real one, run after run.
+                    - Resolved CREATE TABLE failing for a primary key
+                      over a column whose quoted name holds ) or ,
+                      ("Code (x)", "a,b"): the key's column list was
+                      cut at the first ) and split at every ,. The
+                      key's INCLUDE (...) and DEFERRABLE clauses, which
+                      were left out so the next compare dropped and
+                      re-added the key, are now kept too.
+                    - Resolved dropping a table also dropping
+                      unrelated foreign keys whose definition merely
+                      contained its name (s.account in references
+                      s.accounts(id), log in catalog_id). An unchanged
+                      key was never added back; a changed one was
+                      dropped twice, which failed with "does not exist"
+                      and aborted a single-transaction migration. Only
+                      a key that references the dropped table, or a
+                      partitioned table the dropped partition belongs
+                      to, is now dropped ahead of it, once, and the
+                      ones the target keeps are added back. That
+                      includes a key to the parent of a dropped
+                      partition, which used to be lost.
+                    - Resolved a pgc 1.0.x dump of a materialized view
+                      named after a column-name or type/function-name
+                      keyword (left, int, position, and from PostgreSQL
+                      16 or 17 on json_object, json, merge_action)
+                      failing to match a current dump of the same view,
+                      which was then dropped and recreated with its
+                      indexes, dependent views and grants. Such names
+                      are now quoted as quote_ident does on the server
+                      of the dump they are compared with.
+                    - Resolved the routine language and a materialized
+                      view's tablespace being written from the raw
+                      catalog name; both are now quoted as quote_ident
+                      does, and unchanged for the usual names.
+                    - Resolved composite type changes never being
+                      migrated. A type whose attributes changed got only
+                      an "Alter script not implemented" comment, which
+                      USE_COMMENTS=false strips, so the migration was
+                      silently empty and the next compare looked
+                      converged. Attributes are now dropped, retyped
+                      (ALTER ATTRIBUTE ... SET DATA TYPE) and added in
+                      place, with CASCADE when typed tables use the type,
+                      after the views that read a changed column are
+                      dropped. A renamed attribute is a drop and an add.
+                      To reach the target order, attributes are dropped
+                      and re-added only when nothing stores the type. A
+                      retype PostgreSQL refuses because a column stores
+                      the type is left out with a note. A drop with
+                      CASCADE says, in a note and on stderr, that it also
+                      drops what depends on the column. The dump records
+                      the typed tables and storing columns of each
+                      composite type; neither is hashed, and the query
+                      that finds them stays fast with thousands of types.
+                    - Resolved ALTER TABLE ... ADD / DROP COLUMN and
+                      ALTER COLUMN ... TYPE being emitted for typed
+                      tables, which PostgreSQL refuses. Their columns now
+                      follow their type's ALTER TYPE ... CASCADE, and only
+                      what the table adds itself (default, NOT NULL,
+                      comment) is set on it. A column the type adds is
+                      filled with its default before NOT NULL, as ADD
+                      COLUMN ... DEFAULT would fill it. A typed table
+                      whose type is outside the compared schemas gets a
+                      note and a warning.
+                    - Resolved sequence data type changes. ALTER SEQUENCE
+                      had no AS clause, so serial -> bigserial (or an
+                      integer -> bigint sequence or identity column)
+                      failed on every run with MAXVALUE out of range, and
+                      the reverse silently kept bigint. The new type is
+                      now set first.
+                    - Resolved owner changes of sequences linked to a
+                      table failing on every run. pgc changed the owner of
+                      a serial or identity sequence directly and first,
+                      which PostgreSQL refuses for a sequence linked to a
+                      table; the table's OWNER TO now carries it. A
+                      sequence that moves to another table, or to none,
+                      while its owner changes is unlinked first, and a
+                      sequence that becomes OWNED BY a column while its
+                      owner changes is linked after the tables.
+                    - Resolved range types creating their multirange in
+                      the migration role's search_path schema (usually
+                      public) instead of the range's own. An unqualified
+                      multirange_type_name was written, so every column,
+                      routine or view using schema.name_multirange failed,
+                      and two ranges of the same name in different schemas
+                      collided. The name is now schema-qualified, and a
+                      multirange an earlier pgc misplaced is moved with
+                      ALTER TYPE ... SET SCHEMA.
+                    - Resolved a routine with SET search_path TO NULL in
+                      a PostgreSQL 19 TO being re-created by every
+                      compare against an older FROM server, which can
+                      only store the '' fallback. The routine is now
+                      compared in that form, behind a note and a warning.
+                    - Every type, enum or extension difference pgc leaves
+                      in place now also prints a warning on stderr,
+                      since USE_COMMENTS=false strips the comment that
+                      said so. These are an enum value it cannot remove
+                      or reorder, a domain base type, collation or kind
+                      change, a type it cannot create, a composite retype
+                      or reorder it cannot make, and an extension owner
+                      change.
+
+                Known limitations (add):
+                    - A composite attribute retype, or a reorder, is not
+                      migrated while columns or typed tables hold values
+                      of the type. That includes columns the same
+                      migration drops later; the next run makes the
+                      change.
+                    - ALTER TYPE ... DROP ATTRIBUTE ... CASCADE on a type
+                      with typed tables also drops the objects depending
+                      on the dropped column that pgc does not compare,
+                      such as views in other schemas. PostgreSQL has no
+                      way to reach the typed tables without it; pgc
+                      warns.
+                    - A domain's collation cannot be changed in place
+                      (PostgreSQL has no ALTER DOMAIN ... COLLATE); pgc
+                      warns.
+Bullets for the v1.1.0 "Bug fixes" list, in the existing style:
+
+                    - Resolved the enforceability of CHECK constraint
+                      copies a table only inherits being ignored.
+                      PostgreSQL 19 lets such a copy stay ENFORCED under
+                      a NOT ENFORCED parent (18 reaches that state by
+                      attaching a table), but pgc dumped only local
+                      copies, so a parent's in-place NOT ENFORCED silently
+                      stopped checking the child's rows. The dump now
+                      records such a copy (an optional field, hashed only
+                      when present). After every table alter, the
+                      migration sets each copy that differs from the
+                      target, parents first, with ALTER TABLE ... ALTER
+                      CONSTRAINT ... [NOT] ENFORCED on PostgreSQL 19,
+                      including a merged copy that a recursing NOT
+                      ENFORCED reached. On older servers it writes a
+                      comment and a warning instead.
+                    - Resolved attaching a table as a partition. The
+                      migration ran ATTACH PARTITION before the table's
+                      own SET NOT NULL, ADD COLUMN and DROP COLUMN, so the
+                      attach failed. It also dropped the table's copy of
+                      the parent's CHECK after the attach had merged it
+                      ("cannot drop inherited constraint"), and failed
+                      the attach when the table lacked that CHECK or held
+                      it with another definition. The attach now follows
+                      the table's column changes. The parents' CHECKs are
+                      added, re-added or given the target's
+                      enforceability before it and never dropped after
+                      it. The table, and its own partitions, are altered
+                      after their new parents. The CHECK copies a DETACH
+                      PARTITION leaves behind are dropped or kept in the
+                      same migration.
+                    - Resolved changes to a table's INHERITS parents never
+                      being migrated. The table's copy of the parent's
+                      CHECK was silently dropped, and the table never
+                      joined its new parent. The migration now emits
+                      ALTER TABLE ... NO INHERIT and INHERIT, with the
+                      column changes and CHECKs the INHERIT needs. A CHECK
+                      the target has the table only inherit is dropped by
+                      its holders before the INHERIT and added back after
+                      it, so the table's copy ends up inherited, as in the
+                      target.
+                    - Resolved a NOT NULL constraint (PostgreSQL 18 and
+                      later) whose name no longer followed
+                      {table}_{column}_not_null being dropped. That
+                      happens after a column or table rename, on a
+                      detached partition, or when a name moves to another
+                      column. The column became nullable until the next
+                      run, and on a primary-key or identity column the
+                      drop failed on every run. NOT NULL constraints are
+                      now paired by column. A name PostgreSQL generated is
+                      left alone, and one the target chose, moved or
+                      swapped is renamed, through a temporary name for a
+                      swap. Each rename is guarded, so a partly applied
+                      migration can run again.
+                    - Resolved a foreign server whose foreign-data
+                      wrapper changes being dropped with CASCADE, which
+                      silently took its user mappings, every foreign
+                      table on it with their privileges and comments, the
+                      views over them, the server's own USAGE grants, and
+                      a foreign table's place as a partition. The
+                      migration now drops those foreign tables and views
+                      and the server's user mappings itself, drops the
+                      server without CASCADE, and creates it again with
+                      its user mappings, grants and foreign tables,
+                      column grants and partition attaches included,
+                      followed by the views. On PostgreSQL 19 a server
+                      that a SERVER subscription the migration keeps
+                      still uses is left as it is, with a warning. A
+                      foreign table the migration creates is now attached
+                      to its partitioned table and given the target's
+                      column grants, and a server it creates gets the
+                      target's USAGE grants.
+                    - Resolved a text search dictionary whose template
+                      changes being dropped with CASCADE, which took the
+                      configurations mapping it and the generated
+                      tsvector columns and indexes built through them,
+                      and needed three runs. The migration now creates the
+                      new dictionary under a temporary name before the
+                      tables, moves the configurations to it, drops the
+                      old one without CASCADE and renames the new one,
+                      all in one DO block. A drop that another object
+                      blocks fails loudly and leaves nothing behind.
+
+Known limitations (for the existing "Known limitations" list):
+
+                    - A NOT NULL constraint that INHERIT needs the table
+                      to have already stays local afterwards (PostgreSQL
+                      cannot turn it into an inherited one), where a
+                      table created under INHERITS only inherits it. It
+                      matters only if the parent later drops its NOT
+                      NULL.
+                    - ATTACH PARTITION, DETACH PARTITION, INHERIT and NO
+                      INHERIT are not guarded against re-running a partly
+                      applied --output-for-production migration.
+                    - With --grants-mode ignore, a foreign server that is
+                      created again because its wrapper changes, and the
+                      foreign tables on it, are not given their
+                      privileges back (a warning says so).
+                    - Resolved a dump whose schema pattern matches no
+                      accessible schema holding none of the objects
+                      that do not live in a schema: event triggers,
+                      publications, subscriptions, foreign-data
+                      wrappers, foreign servers, user mappings and the
+                      extensions installed in public, which a dump of
+                      any schema of the same database always holds.
+                      Compared against such a dump, a migration dropped
+                      every one of them, a subscription's replication
+                      slot on the publisher included, even when the
+                      target database held them too; from such a dump,
+                      the first deployment into a database that already
+                      held some created them again and failed. Such a
+                      dump now reads them like any other. The clear
+                      command still reads nothing for a pattern that
+                      matches no schema, so its script drops nothing.
+                    - Resolved an identity column's sequence going
+                      unmigrated after the column was renamed.
+                      PostgreSQL keeps the sequence's old name when its
+                      column is renamed, so the source and target dumps
+                      held it under two different names and any change
+                      to it - options, privileges - was never compared.
+                      The sequence is now renamed to its target name
+                      first and then compared as usual.
+                    - Resolved a composite type's attribute type change
+                      failing when a policy or trigger depends on the
+                      corresponding column of a table typed by it: ALTER
+                      TYPE ... ALTER ATTRIBUTE ... CASCADE runs before
+                      the tables are changed, and PostgreSQL refuses it
+                      while such a dependent exists. Those policies and
+                      triggers are now dropped just before the type is
+                      altered and created again afterwards.
+                    - Resolved a composite type's attribute retype
+                      (ALTER TYPE ... ALTER ATTRIBUTE ... TYPE ...
+                      CASCADE) failing when what blocks it sat on a
+                      partition or INHERITS descendant of a typed table,
+                      on a typed table the migration drops or recreates
+                      later, or on another table whose policy reads the
+                      column: the statement reaches all of them, but only
+                      the kept typed tables' own policies and triggers
+                      were dropped ahead of it. They are now all dropped
+                      just before the composite section and created from
+                      the target once, after every table alter (nothing
+                      on a dropped table; a recreated one brings its own
+                      back). A policy reading a recreated typed table was
+                      dropped and never created again. Attributes whose
+                      names need quoting (mixed case, reserved words) are
+                      matched to their typed tables' columns as well.
+                    - Resolved the same retype failing with "cannot alter
+                      type of a column used by a generated column" when an
+                      inheritance descendant of a typed table has a
+                      generated column reading the retyped column: the
+                      column was only dropped in the table phase, after
+                      the type. It is now dropped (or loses its
+                      expression) before the type's ALTER, after the
+                      policies, triggers and foreign keys on it, and added
+                      back in its table's alter. On a descendant the
+                      migration drops, a copy inherited from an ancestor
+                      that is handled the same way is left to that
+                      ancestor.
+                    - Resolved a change of a composite type attribute's
+                      collation never being migrated, and a new composite
+                      type losing an attribute's COLLATE. The dump now
+                      records an attribute's own collation (left out of
+                      the dump and of the hash when it is the data type's
+                      default, so every other type keeps its hash), CREATE
+                      TYPE and ADD ATTRIBUTE write it, and a change is an
+                      ALTER ATTRIBUTE ... SET DATA TYPE ... COLLATE ...
+                      CASCADE. A FROM dump written by pgc 1.0.x takes the
+                      target's collations, as it recorded none.
+                    - Resolved the policies, triggers, views, rules,
+                      SQL-standard routine bodies and publication column
+                      lists or row filters over a typed table's column
+                      being dropped and created again on every run when
+                      the column differs but its type does not retype it
+                      (the type is outside the compared schemas, or a
+                      column stores it): the migration counted the column
+                      as retyped by the table, which ALTER TABLE cannot
+                      do. A table that leaves the typed table's family
+                      still retypes its own column, with what blocks it
+                      out of the way.
+                    - Resolved a policy that reads both a column one table
+                      drops and re-adds and a column another table retypes
+                      in place being created again right after the first
+                      table's alter, where it blocked the second table's
+                      ALTER COLUMN ... TYPE. It is now created once, after
+                      every table alter.
+                    - Resolved a new or recreated typed table being
+                      created as CREATE TABLE ... OF type followed by full
+                      column definitions, a syntax error on every version
+                      (a partitioned typed table whose partition key
+                      changed was dropped and never created again). It is
+                      now created as CREATE TABLE ... OF type with only
+                      what it adds: column WITH OPTIONS defaults and NOT
+                      NULL constraints and the primary key, or no list at
+                      all.
+                    - Resolved CREATE SUBSCRIPTION contacting the
+                      publisher for a subscription only TO has. A
+                      disabled subscription, or one without a
+                      replication slot, was written WITH (enabled =
+                      false), so PostgreSQL connected to its publisher:
+                      the migration failed when the publisher was
+                      unreachable, and on a reachable one it created a
+                      replication slot that the disabled subscription
+                      never consumed and that kept retaining WAL there.
+                      The dump now records the slot
+                      (pg_subscription.subslotname), and such a
+                      subscription is created WITH (connect = false,
+                      slot_name = NONE or '...', enabled = false), as
+                      pg_dump writes it; only an enabled subscription is
+                      still created connected, naming its slot when the
+                      slot is not named after the subscription. A slot
+                      that differs between FROM and TO, which no compare
+                      could see before, becomes ALTER SUBSCRIPTION ...
+                      SET (slot_name = ...), with an enabled
+                      subscription disabled first for slot_name = NONE;
+                      the statement neither drops the old slot nor
+                      creates the new one on the publisher, which a
+                      comment in the script says. A subscription on a
+                      slot named after it keeps its pgc 1.0.x hash, and
+                      a pgc 1.0.x dump, which lacks the slot, reads as
+                      one.
+                    - Resolved migrations that wrote a replication slot
+                      name PostgreSQL refuses as slot_name. CREATE
+                      SUBSCRIPTION ... WITH (connect = false) records
+                      the subscription's own name as its slot unchecked,
+                      so a slot can be named "My Sub", x"y or none. SET
+                      (slot_name = 'x"y') then failed on every run, and
+                      slot_name = 'none' silently cleared the slot. Such
+                      a slot name, anything but 1 to 63 lower-case
+                      letters, digits and underscores, none, and
+                      pg_conflict_detection on PostgreSQL 19, is now
+                      left out, with a comment in the script and a
+                      warning on stderr, so the migration applies and
+                      the next compare is empty. An enabled subscription
+                      whose own name is no valid slot name is created
+                      with connect = false, since the publisher would
+                      refuse to create that slot.
+
+                Internals:
+                    - The new publication fields are left out of the dump
+                      at their default and folded into the hash only when
+                      set, so dumps written by pgc 1.0.x load unchanged
+                      and publications that use none of the new
+                      properties keep their 1.0.x hashes and SQL.
+
+                Tests:
+                    - PostgreSQL 19 fixtures for SERVER subscriptions,
+                      an owner change together with a server switch,
+                      the three subscription options and FDW CONNECTION
+                      functions, all built from subscriptions created
+                      with connect = false present on both sides; unit
+                      tests for both query versions, the ALTER
+                      orderings, the drop ordering, the single
+                      transaction warning and the hash and dump format
+                      compatibility.
+                    - Added fixtures for changed, PARALLEL, SORTOP and
+                      unbounded-state aggregates, routine and aggregate
+                      kind changes, the privileges of recreated
+                      routines, aggregate SUPPORT and the list-parameter
+                      SET forms, a SplitGUCList-equivalent splitter and
+                      numeric-constant scanner with their own tests, and
+                      hash pins showing that only aggregates with a
+                      negative state size hash differently from 1.0.x.
+                    - `cargo test` now runs 2363 tests, up from 1106 in
+                      v1.0.27, and 12 more that need a live server stay
+                      `#[ignore]`d (run them with `cargo test --
+                      --ignored` and the standard `PG*` environment
+                      variables). Every fixture case the CI round trip
+                      covers is also checked directly against the
+                      catalogs after the migration, by the
+                      `.github/scripts/assert-*.sh` steps.
+
+                Tooling:
+                    - CI tests PostgreSQL 19. The integration matrix
+                      gained a 19 leg that resolves its image at run
+                      time: the GA postgres:19 tag once it is published,
+                      the newest 19rcN or 19betaN tag until then, so the
+                      job follows the release without an edit.
+                    - CI checks the migrated catalogs directly. After
+                      round 1 is applied, .github/scripts/assert-*.sh
+                      compare the relevant catalogs of the migrated
+                      database with the target and spot-check that the
+                      fixture values arrived. The round-2 compare cannot
+                      see a property pgc loses on both sides, since both
+                      dumps then agree; these steps can. Each is guarded
+                      by server_version_num where the catalogs differ
+                      between majors.
+
+                Documentation:
+                    - README gained a Supported PostgreSQL versions
+                      section: 14 through 19, how the FROM server's
+                      version selects the DDL pgc emits, and the caveats
+                      of comparing across majors, among them PostgreSQL
+                      19's change of the default GiST operator class for
+                      inet and cidr.
+                    - data/test/README.md documents every new fixture
+                      case, and fills the missing section 45.
+
+                Known limitations:
+                    - A partition or INHERITS child that the target
+                      takes out of its family while keeping the old
+                      column type gets the new type from the ancestor's
+                      recursing retype, for ordinary and typed tables
+                      alike; the next run retypes it back.
+                    - An INHERITS descendant's generated column over a
+                      typed column that no statement retypes is dropped
+                      and re-added on every run.
+                    - pgc 1.0.x cannot read a dump written by this
+                      version of a schema that has extended statistics,
+                      or a trigger declared with UPDATE OF columns or
+                      with a WHEN clause: the dump now records which
+                      columns these objects depend on, in a form 1.0.x
+                      does not know. Dumps written by 1.0.x still load,
+                      but they carry neither the deparsed statistics ON
+                      list nor those dependencies, so statistics and
+                      triggers taken along with a rewritten column are
+                      only restored once the source database is dumped
+                      again with this version.
+                    - pgc 1.0.x could not read statistics targets from
+                      PostgreSQL 17 and later. Comparing a source dump
+                      written by 1.0.x of such a server with a target
+                      dump written by this version emits one ALTER
+                      STATISTICS ... SET STATISTICS per statistics
+                      object with an explicit target.
+
 2026-09-06      v1.0.27
 
                 Fixes four migrations that did not do what they said -

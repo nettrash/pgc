@@ -433,3 +433,43 @@ fn leaves_a_body_with_nothing_to_blank_untouched() {
     let src = "\n\tselect regexp_replace(s.util_a(v), 1, 2);\n";
     assert_eq!(blank_comments_and_literals(src), src);
 }
+
+// ---- A bare carriage return ends a line comment ---------------------------
+//
+// PostgreSQL's lexer defines a line comment as `--` followed by `[^\n\r]*`,
+// and psql splits statements the same way, so whatever follows a bare `\r`
+// runs as SQL. Stripping it along with the comment would drop a statement
+// PostgreSQL executes; leaving it in a routine body unscanned would hide a
+// real reference.
+
+#[test]
+fn line_comment_ends_at_a_bare_carriage_return() {
+    assert_eq!(
+        strip_comments_and_collapse("-- hidden\rselect 42;\n"),
+        "\rselect 42;\n"
+    );
+    assert_eq!(
+        strip_comments_and_collapse("select 1; -- a\r\nselect 2;\n"),
+        "select 1; \r\nselect 2;\n"
+    );
+    // Nothing after the comment on that line: unchanged behaviour.
+    assert_eq!(strip_comments_and_collapse("-- only\n"), "\n");
+}
+
+#[test]
+fn is_line_end_matches_the_postgresql_lexer() {
+    assert!(is_line_end(b'\n'));
+    assert!(is_line_end(b'\r'));
+    assert!(!is_line_end(b' '));
+    assert!(!is_line_end(b'\t'));
+    assert!(!is_line_end(0x0b)); // vertical tab
+    assert!(!is_line_end(0x0c)); // form feed
+}
+
+#[test]
+fn blanking_ends_a_line_comment_at_a_bare_carriage_return() {
+    let sql = "-- note\rperform public.audit();";
+    let blanked = blank_comments_and_literals(sql);
+    assert_eq!(blanked.len(), sql.len());
+    assert_eq!(blanked, "       \rperform public.audit();");
+}

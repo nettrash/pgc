@@ -294,10 +294,10 @@ async fn a_dump_without_column_dependencies_keeps_the_table_level_answer() {
 
 #[tokio::test]
 async fn a_collation_change_on_a_read_column_still_drops_the_views() {
-    // The collation alone is invisible to the table hash, so this pairs it
-    // with a default change — which is what makes the comparer produce an
-    // alter script for the table at all, and therefore what makes the
-    // collation reach `ALTER COLUMN ... TYPE`.
+    // Written when the collation alone was invisible to the table hash, so
+    // it pairs it with a default change, which made the comparer produce an
+    // alter script for the table at all. The collation is part of the hash
+    // now (r3-ddl); the default change stays, and does no harm.
     let mut from_status = text_column("orders", "status", 2);
     from_status.collation_name = Some("C".to_string());
     from_status.column_default = Some("'x'::text".to_string());

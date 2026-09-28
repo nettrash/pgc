@@ -986,6 +986,61 @@ fn test_lowercase_outside_literals_adjacent_literals() {
     );
 }
 
+#[test]
+fn test_lowercase_outside_literals_preserves_quoted_identifiers() {
+    // Lowercased, `"My Schema"` and `"Id"` would name other objects.
+    assert_eq!(
+        TableConstraint::lowercase_outside_literals(
+            "FOREIGN KEY (\"OrderId\", K) REFERENCES \"My Schema\".\"Orders\"(\"Id\", k)"
+        ),
+        "foreign key (\"OrderId\", k) references \"My Schema\".\"Orders\"(\"Id\", k)"
+    );
+    // A doubled quote inside stays inside, and a quote in a literal opens
+    // nothing.
+    assert_eq!(
+        TableConstraint::lowercase_outside_literals("CHECK (\"A\"\"B\" <> 'X\"Y' AND Z > 0)"),
+        "check (\"A\"\"B\" <> 'X\"Y' and z > 0)"
+    );
+}
+
+#[test]
+fn test_get_script_keeps_the_case_of_quoted_identifiers() {
+    let constraint = TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "\"My Schema\"".to_string(),
+        name: "\"Lines_Order_FK\"".to_string(),
+        table_name: "\"Lines\"".to_string(),
+        constraint_type: "FOREIGN KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some(
+            "FOREIGN KEY (\"OrderId\", \"K\") REFERENCES \"My Schema\".\"Orders\"(\"Id\", \"K\") ON DELETE CASCADE"
+                .to_string(),
+        ),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+    assert_eq!(
+        constraint.get_script(),
+        "alter table \"My Schema\".\"Lines\" add constraint \"Lines_Order_FK\" foreign key (\"OrderId\", \"K\") references \"My Schema\".\"Orders\"(\"Id\", \"K\") on delete cascade ;\n\n"
+    );
+}
+
+#[test]
+fn test_not_enforced_in_a_quoted_identifier_is_not_the_keyword() {
+    assert!(!TableConstraint::lowercased_contains_outside_literals(
+        "check ((\"NOT ENFORCED\" > 0))",
+        "not enforced"
+    ));
+    assert!(TableConstraint::lowercased_contains_outside_literals(
+        "check ((\"A\" > 0)) NOT ENFORCED",
+        "not enforced"
+    ));
+}
+
 // --- normalize_definition: array cast distribution equivalence ---
 
 #[test]
@@ -1401,26 +1456,22 @@ fn test_add_to_hasher_is_enforced_affects_hash() {
 
 #[test]
 fn test_can_be_altered_to_check_enforced_change() {
-    let a = TableConstraint {
-        catalog: "test".to_string(),
-        schema: "public".to_string(),
-        name: "chk_val".to_string(),
-        table_name: "t".to_string(),
-        constraint_type: "CHECK".to_string(),
-        is_deferrable: false,
-        initially_deferred: false,
-        definition: Some("CHECK (val > 0)".to_string()),
-        coninhcount: 0,
-        is_enforced: true,
-        no_inherit: false,
-        nulls_not_distinct: false,
-        comment: None,
-    };
-    let mut b = a.clone();
-    b.is_enforced = false;
+    // Real `pg_get_constraintdef` output: the NOT ENFORCED side carries the
+    // suffix in its definition. In place only where the migrated server
+    // accepts ALTER CONSTRAINT ... [NOT] ENFORCED on a CHECK (PostgreSQL 19).
+    let a = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let b = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
     assert!(
-        a.can_be_altered_to(&b),
-        "CHECK constraint should be alterable when only is_enforced differs"
+        a.can_be_altered_to_with_caps(&b, PG19_CAPS),
+        "CHECK enforceability flip must be alterable in place on PG19"
+    );
+    assert!(
+        b.can_be_altered_to_with_caps(&a, PG19_CAPS),
+        "the reverse flip must be alterable in place on PG19"
+    );
+    assert!(
+        !a.can_be_altered_to(&b) && !b.can_be_altered_to(&a),
+        "without the capability (PG14-18, unknown version) it is a drop + re-add"
     );
 }
 
@@ -1513,64 +1564,36 @@ fn test_get_alter_script_fk_not_enforced_to_enforced() {
 
 #[test]
 fn test_get_alter_script_check_enforced_change() {
-    let old = TableConstraint {
-        catalog: "test".to_string(),
-        schema: "public".to_string(),
-        name: "chk_val".to_string(),
-        table_name: "t".to_string(),
-        constraint_type: "CHECK".to_string(),
-        is_deferrable: false,
-        initially_deferred: false,
-        definition: Some("CHECK (val > 0)".to_string()),
-        coninhcount: 0,
-        is_enforced: true,
-        no_inherit: false,
-        nulls_not_distinct: false,
-        comment: None,
-    };
-    let mut new_c = old.clone();
-    new_c.is_enforced = false;
+    let old = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let new_c = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
 
     let script = old
-        .get_alter_script(&new_c)
-        .expect("should produce alter script");
-    assert!(
-        script.contains("alter table public.t alter constraint chk_val not enforced"),
-        "expected NOT ENFORCED for CHECK alter: {script}"
+        .get_alter_script_with_caps(&new_c, PG19_CAPS)
+        .expect("PG19: should produce an in-place alter script");
+    assert_eq!(
+        script, "alter table public.t alter constraint chk_val not enforced;\n\n",
+        "expected exactly the recursing NOT ENFORCED alter (no ONLY): {script}"
+    );
+    assert_eq!(
+        old.get_alter_script(&new_c),
+        None,
+        "without the capability the flip must fall back to drop + re-add"
     );
 }
 
 #[test]
 fn test_get_alter_script_check_not_enforced_to_enforced() {
-    let old = TableConstraint {
-        catalog: "test".to_string(),
-        schema: "public".to_string(),
-        name: "chk_val".to_string(),
-        table_name: "t".to_string(),
-        constraint_type: "CHECK".to_string(),
-        is_deferrable: false,
-        initially_deferred: false,
-        definition: Some("CHECK (val > 0)".to_string()),
-        coninhcount: 0,
-        is_enforced: false,
-        no_inherit: false,
-        nulls_not_distinct: false,
-        comment: None,
-    };
-    let mut new_c = old.clone();
-    new_c.is_enforced = true;
+    let old = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
+    let new_c = check_on_t("chk_val", "CHECK (val > 0)", true);
 
     let script = old
-        .get_alter_script(&new_c)
-        .expect("should produce alter script");
-    assert!(
-        script.contains("alter table public.t alter constraint chk_val enforced"),
-        "expected ENFORCED for CHECK alter: {script}"
+        .get_alter_script_with_caps(&new_c, PG19_CAPS)
+        .expect("PG19: should produce an in-place alter script");
+    assert_eq!(
+        script, "alter table public.t alter constraint chk_val enforced;\n\n",
+        "expected exactly the ENFORCED alter: {script}"
     );
-    assert!(
-        !script.contains("not enforced"),
-        "should not contain 'not enforced': {script}"
-    );
+    assert_eq!(old.get_alter_script(&new_c), None);
 }
 
 #[test]
@@ -1801,5 +1824,322 @@ fn test_auto_not_null_column_reclips_when_base_fits_but_suffix_overflows() {
         c.auto_not_null_column(&table),
         Some(column),
         "base.len() == 63 with a 2-digit suffix must be recognized as auto-named"
+    );
+}
+
+// ---- PG19: CHECK ALTER CONSTRAINT [NOT] ENFORCED ----
+
+const PG19_CAPS: ConstraintAlterCaps = ConstraintAlterCaps {
+    check_enforceability: true,
+};
+
+/// A CHECK constraint on `public.t` as a live dump records it.
+fn check_on_t(name: &str, definition: &str, is_enforced: bool) -> TableConstraint {
+    TableConstraint {
+        catalog: "test".to_string(),
+        schema: "public".to_string(),
+        name: name.to_string(),
+        table_name: "t".to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some(definition.to_string()),
+        coninhcount: 0,
+        is_enforced,
+        no_inherit: definition.contains("NO INHERIT"),
+        nulls_not_distinct: false,
+        comment: None,
+    }
+}
+
+#[test]
+fn pg19_check_caps_default_is_conservative() {
+    assert!(!ConstraintAlterCaps::default().check_enforceability);
+}
+
+#[test]
+fn pg19_check_not_enforced_to_not_valid_is_drop_and_re_add() {
+    // ALTER CONSTRAINT ... ENFORCED always validates existing rows, so the
+    // "enforced but NOT VALID" state cannot be reached in place. Emitting the
+    // ALTER would leave a validated constraint and loop on every compare.
+    let old = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
+    let new_c = check_on_t("chk_val", "CHECK (val > 0) NOT VALID", true);
+    assert!(!old.can_be_altered_to_with_caps(&new_c, PG19_CAPS));
+    assert_eq!(old.get_alter_script_with_caps(&new_c, PG19_CAPS), None);
+}
+
+#[test]
+fn pg19_check_not_valid_to_not_enforced_is_in_place() {
+    // Verified on 19beta4: a NOT VALID constraint can go NOT ENFORCED with
+    // ALTER CONSTRAINT, and deparses as plain `... NOT ENFORCED` afterwards.
+    let old = check_on_t("chk_val", "CHECK (val > 0) NOT VALID", true);
+    let new_c = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
+    assert_eq!(
+        old.get_alter_script_with_caps(&new_c, PG19_CAPS).as_deref(),
+        Some("alter table public.t alter constraint chk_val not enforced;\n\n")
+    );
+}
+
+#[test]
+fn pg19_check_expression_change_with_enforcement_flip_is_drop_and_re_add() {
+    let old = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let new_c = check_on_t("chk_val", "CHECK (val > 1) NOT ENFORCED", false);
+    assert_eq!(old.get_alter_script_with_caps(&new_c, PG19_CAPS), None);
+}
+
+#[test]
+fn pg19_check_no_inherit_change_is_never_altered_in_place() {
+    // `ALTER CONSTRAINT ... [NO] INHERIT` applies only to NOT NULL
+    // constraints ("is not a not-null constraint" on 18 and 19; a syntax
+    // error before), so a CHECK NO INHERIT change is always drop + re-add —
+    // even with an identical expression, even with the PG19 capability.
+    let old = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let mut new_c = old.clone();
+    new_c.no_inherit = true;
+    for caps in [ConstraintAlterCaps::default(), PG19_CAPS] {
+        assert!(!old.can_be_altered_to_with_caps(&new_c, caps));
+        assert_eq!(old.get_alter_script_with_caps(&new_c, caps), None);
+    }
+    // Combined with an enforceability flip, likewise.
+    let flipped = check_on_t("chk_val", "CHECK (val > 0) NO INHERIT NOT ENFORCED", false);
+    assert_eq!(old.get_alter_script_with_caps(&flipped, PG19_CAPS), None);
+}
+
+#[test]
+fn pg19_check_no_inherit_constraint_flips_in_place() {
+    // NOT ENFORCED is deparsed after NO INHERIT; both sides NO INHERIT.
+    let old = check_on_t("chk_val", "CHECK (val > 0) NO INHERIT", true);
+    let new_c = check_on_t("chk_val", "CHECK (val > 0) NO INHERIT NOT ENFORCED", false);
+    let script = old
+        .get_alter_script_with_caps(&new_c, PG19_CAPS)
+        .expect("NO INHERIT constraint flips in place on PG19");
+    assert!(
+        !script.contains("inherit"),
+        "must not touch NO INHERIT: {script}"
+    );
+    assert!(script.contains("alter constraint chk_val not enforced;"));
+}
+
+#[test]
+fn pg19_check_enforcement_suffix_strip_ignores_literals() {
+    // The suffix test is anchored at the end: a literal containing the words
+    // is inside the parentheses, and a CHECK expression always ends in `)`.
+    let literal = "CHECK (s <> 'x NOT ENFORCED'::text)";
+    assert_eq!(strip_not_enforced(literal), literal);
+    assert_eq!(
+        strip_not_enforced("CHECK (s <> 'x NOT ENFORCED'::text) NOT ENFORCED"),
+        literal
+    );
+    assert_eq!(
+        strip_not_enforced("check (a > 0) not enforced"),
+        "check (a > 0)"
+    );
+    assert_eq!(strip_not_valid("CHECK (a > 0) NOT VALID"), "CHECK (a > 0)");
+    assert_eq!(strip_not_valid("CHECK (a > 0)"), "CHECK (a > 0)");
+
+    let old = check_on_t("chk_s", literal, true);
+    let new_c = check_on_t(
+        "chk_s",
+        "CHECK (s <> 'x NOT ENFORCED'::text) NOT ENFORCED",
+        false,
+    );
+    assert!(old.can_be_altered_to_with_caps(&new_c, PG19_CAPS));
+    // A different literal is a real expression change.
+    let other = check_on_t("chk_s", "CHECK (s <> 'x'::text) NOT ENFORCED", false);
+    assert!(!old.can_be_altered_to_with_caps(&other, PG19_CAPS));
+}
+
+#[test]
+fn pg19_check_flip_with_comment_change_emits_both() {
+    let old = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let mut new_c = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
+    new_c.comment = Some("relaxed".to_string());
+    let script = old
+        .get_alter_script_with_caps(&new_c, PG19_CAPS)
+        .expect("flip plus comment is in place on PG19");
+    assert_eq!(
+        script,
+        "alter table public.t alter constraint chk_val not enforced;\n\n\
+         comment on constraint chk_val on public.t is 'relaxed';\n\n"
+    );
+}
+
+#[test]
+fn pg19_check_comment_only_change_is_unaffected_by_caps() {
+    let old = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let mut new_c = old.clone();
+    new_c.comment = Some("note".to_string());
+    let expected = Some("comment on constraint chk_val on public.t is 'note';\n\n".to_string());
+    assert_eq!(old.get_alter_script(&new_c), expected);
+    assert_eq!(old.get_alter_script_with_caps(&new_c, PG19_CAPS), expected);
+}
+
+#[test]
+fn pg19_check_caps_do_not_change_foreign_key_decisions() {
+    // The capability is CHECK-only; FK enforceability has its own branch.
+    let old = TableConstraint {
+        catalog: "test".to_string(),
+        schema: "public".to_string(),
+        name: "fk_ref".to_string(),
+        table_name: "t".to_string(),
+        constraint_type: "FOREIGN KEY".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some("FOREIGN KEY (x) REFERENCES public.y(id)".to_string()),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: true,
+        nulls_not_distinct: false,
+        comment: None,
+    };
+    let mut live = old.clone();
+    live.definition = Some("FOREIGN KEY (x) REFERENCES public.y(id) NOT ENFORCED".to_string());
+    live.is_enforced = false;
+    let mut identical_def = old.clone();
+    identical_def.is_enforced = false;
+    for target in [&live, &identical_def] {
+        assert_eq!(
+            old.can_be_altered_to_with_caps(target, PG19_CAPS),
+            old.can_be_altered_to(target)
+        );
+        assert_eq!(
+            old.get_alter_script_with_caps(target, PG19_CAPS),
+            old.get_alter_script(target)
+        );
+    }
+}
+
+#[test]
+fn pg19_check_flip_across_databases_is_in_place() {
+    // FROM and TO are dumped from different databases, so `catalog`
+    // (current_database()) always differs in a real compare.
+    let old = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let mut new_c = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
+    new_c.catalog = "other_db".to_string();
+    assert_eq!(
+        old.get_alter_script_with_caps(&new_c, PG19_CAPS).as_deref(),
+        Some("alter table public.t alter constraint chk_val not enforced;\n\n")
+    );
+}
+
+#[test]
+fn pg19_check_hash_is_unchanged_by_the_alter_caps() {
+    // The capability only changes how a difference is migrated, never what
+    // counts as one: a CHECK constraint hashes exactly as pgc 1.0.x hashed it
+    // (pinned), so dumps written by older versions compare cleanly.
+    let hash = |c: &TableConstraint| {
+        let mut hasher = Sha256::new();
+        c.add_to_hasher(&mut hasher);
+        format!("{:x}", hasher.finalize())
+    };
+    assert_eq!(
+        hash(&check_on_t(
+            "chk_val",
+            "CHECK (val > 0) NOT ENFORCED",
+            false
+        )),
+        "e72a87d50e2df281cb6db94ee05310161e9fe15640ae3f03fb6c12877d7cfd00"
+    );
+    assert_eq!(
+        hash(&check_on_t("chk_val", "CHECK (val > 0)", true)),
+        "43712e9438b25a69aeba244905b4887da51f3913c63b83df5617957f5e4926c3"
+    );
+}
+
+#[test]
+fn pg19_relaxes_enforcement_only_from_enforced_to_not_enforced_check() {
+    let enforced = check_on_t("chk_val", "CHECK (val > 0)", true);
+    let relaxed = check_on_t("chk_val", "CHECK (val > 0) NOT ENFORCED", false);
+    assert!(enforced.relaxes_enforcement_to(&relaxed));
+    assert!(!relaxed.relaxes_enforcement_to(&enforced));
+    assert!(!enforced.relaxes_enforcement_to(&enforced));
+    assert!(!relaxed.relaxes_enforcement_to(&relaxed));
+    // A foreign key's in-place alters belong to the foreign-key section.
+    let mut fk = create_foreign_key_constraint();
+    fk.is_enforced = true;
+    let mut fk_relaxed = fk.clone();
+    fk_relaxed.is_enforced = false;
+    assert!(!fk.relaxes_enforcement_to(&fk_relaxed));
+}
+
+// ---- pre-columns review fixes ----------------------------------------------
+
+#[test]
+fn pre_columns_lowercase_outside_literals_keeps_quoted_identifiers() {
+    // A quoted identifier is case-sensitive: lowercased, `"G x"` named a
+    // column the statement did not find.
+    assert_eq!(
+        TableConstraint::lowercase_outside_literals(
+            "UNIQUE (\"G x\") REFERENCES S.\"Mixed\"\"Name\"(\"Col\")"
+        ),
+        "unique (\"G x\") references s.\"Mixed\"\"Name\"(\"Col\")"
+    );
+    // Literals as before, next to a quoted identifier.
+    assert_eq!(
+        TableConstraint::lowercase_outside_literals("CHECK (\"Code\" <> 'ABC')"),
+        "check (\"Code\" <> 'ABC')"
+    );
+    // An unterminated quoted identifier is copied to the end.
+    assert_eq!(
+        TableConstraint::lowercase_outside_literals("UNIQUE (\"Ab"),
+        "unique (\"Ab"
+    );
+}
+
+#[test]
+fn pre_columns_constraint_script_keeps_a_mixed_case_column() {
+    let mut unique = create_unique_constraint();
+    unique.name = "\"t_G x_key\"".to_string();
+    unique.definition = Some("UNIQUE (\"G x\")".to_string());
+    assert_eq!(
+        unique.get_script(),
+        "alter table analytics.products add constraint \"t_G x_key\" unique (\"G x\") ;\n\n"
+    );
+    let mut fk = create_foreign_key_constraint();
+    fk.definition = Some("FOREIGN KEY (gx) REFERENCES rvs.t4(\"G x\")".to_string());
+    assert!(
+        fk.get_script()
+            .contains("foreign key (gx) references rvs.t4(\"G x\")"),
+        "{}",
+        fk.get_script()
+    );
+}
+
+// ==== r3-constraints tests ====
+
+#[test]
+fn r3c_inherited_copy_moves_the_constraint_to_the_inheriting_table() {
+    let mut parent = create_check_constraint();
+    parent.definition = Some("CHECK ((age > 0))".to_string());
+    parent.comment = Some("the parent's".to_string());
+    let copy = parent.inherited_copy("\"App\"", "orders_1", false);
+    assert_eq!(copy.schema, "\"App\"");
+    assert_eq!(copy.table_name, "orders_1");
+    assert_eq!(copy.name, parent.name);
+    assert_eq!(copy.coninhcount, 1);
+    assert_eq!(copy.comment, None);
+    assert_eq!(copy.definition, parent.definition);
+    assert!(copy.is_enforced);
+}
+
+#[test]
+fn r3c_inherited_copy_is_enforced_only_when_asked() {
+    let mut parent = create_check_constraint();
+    parent.is_enforced = false;
+    parent.definition = Some("CHECK ((age > 0)) NOT ENFORCED".to_string());
+    let follows = parent.inherited_copy("public", "c", false);
+    assert!(!follows.is_enforced);
+    assert_eq!(follows.definition, parent.definition);
+    let enforced = parent.inherited_copy("public", "c", true);
+    assert!(enforced.is_enforced);
+    assert_eq!(enforced.definition.as_deref(), Some("CHECK ((age > 0))"));
+    // A literal that reads like the keyword is left alone.
+    parent.definition = Some("CHECK ((note <> ' not enforced'::text)) NOT ENFORCED".to_string());
+    assert_eq!(
+        parent
+            .inherited_copy("public", "c", true)
+            .definition
+            .as_deref(),
+        Some("CHECK ((note <> ' not enforced'::text))")
     );
 }

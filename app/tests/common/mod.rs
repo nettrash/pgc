@@ -210,6 +210,8 @@ pub fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableC
         statistics_target: None,
         acl: vec![],
         serial_type: None,
+        generation_blocks_retype: false,
+        generation_routine_dropped: false,
     }
 }
 

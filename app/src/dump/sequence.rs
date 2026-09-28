@@ -4,11 +4,55 @@
 //! they are created and dropped with their column, and emitting them separately
 //! would produce a migration that fails to apply. The comparer detects them and
 //! routes the rest through its `sequence_post_script` buffer.
+//!
+//! A `serial` column is only shorthand, so the comparer takes it only when it
+//! reproduces the sequence exactly (see [`Sequence::serial_pseudo_type`]). Any
+//! other sequence owned by a column is created on its own before the tables, and
+//! its `OWNED BY` is set once the owning table exists.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::dump::table_column::TableColumn;
+use crate::utils::string_extensions::{StringExt, unquote_ident};
+
+/// `NAMEDATALEN - 1`: the longest identifier PostgreSQL stores, in bytes.
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// The first `server_version_num` with unlogged sequences (PostgreSQL 15).
+/// From then on the sequence of a `serial` column takes the persistence of
+/// its table, so an unlogged table gets an unlogged sequence.
+pub const UNLOGGED_SEQUENCE_MIN_VERSION: i32 = 150_000;
+
+/// The name PostgreSQL gives the sequence of `serial` column `column` in
+/// `table`, as `makeObjectName(table, column, "seq")` builds it: the longer of
+/// the two names is shortened, one byte at a time, until `<table>_<column>_seq`
+/// fits in 63 bytes. Both arguments are raw (unquoted) names.
+///
+/// `None` when a non-ASCII name would have to be shortened: PostgreSQL counts
+/// the bytes in the server encoding, which a dump does not record. An ASCII
+/// name has the same length in every server encoding.
+fn serial_sequence_name(table: &str, column: &str) -> Option<String> {
+    const LABEL: &str = "seq";
+    // Two separating underscores plus the label.
+    let available = MAX_IDENTIFIER_BYTES - LABEL.len() - 2;
+    let (mut table_len, mut column_len) = (table.len(), column.len());
+    if table_len + column_len > available && !(table.is_ascii() && column.is_ascii()) {
+        return None;
+    }
+    while table_len + column_len > available {
+        if table_len > column_len {
+            table_len -= 1;
+        } else {
+            column_len -= 1;
+        }
+    }
+    Some(format!(
+        "{}_{}_{LABEL}",
+        &table[..table_len],
+        &column[..column_len]
+    ))
+}
 
 /// This is an information about a PostgreSQL sequence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,8 +344,60 @@ impl Sequence {
             && self.owned_by_column == from.owned_by_column
     }
 
+    /// Whether PostgreSQL links this sequence to a table column — `OWNED BY`
+    /// (a `serial` column) or an identity column — which ties its owner to
+    /// the table's: a linked sequence's owner cannot be changed on its own
+    /// ("cannot change owner of sequence … linked to table"), and `ALTER
+    /// TABLE … OWNER TO` changes it together with the table's.
+    fn is_linked(&self) -> bool {
+        self.is_identity || self.owned_by_table.is_some()
+    }
+
+    /// Whether altering `from` into this sequence links it to a table column
+    /// it was not linked to (`OWNED BY`, a first link or one to another
+    /// table) while its owner changes. `OWNED BY` needs the sequence and the
+    /// table to have one owner, and the table's new owner is only set in the
+    /// table section, so the alter leaves the clause out and the comparer
+    /// runs [`Sequence::get_owned_by_script`] after the tables instead.
+    pub fn owned_by_waits_for_tables(&self, from: &Sequence) -> bool {
+        self.owner != from.owner
+            && self.render_owned_by_clause().is_some()
+            && !self.links_like(from)
+    }
+
+    /// Whether altering `from` into this sequence has to unlink it (`OWNED
+    /// BY NONE`) before its new owner is set: `from` is `OWNED BY` a column
+    /// of a table this sequence is not linked to (another table, or none)
+    /// and the owner changes. PostgreSQL refuses a direct owner change of a
+    /// linked sequence ("cannot change owner of sequence … linked to table"),
+    /// and the table it is linked to in FROM is not the one whose `ALTER
+    /// TABLE … OWNER TO` would carry it. Its new link, if any, follows after
+    /// the tables ([`Sequence::owned_by_waits_for_tables`]). An identity
+    /// sequence cannot be unlinked, and never moves to another table.
+    fn unlinks_before_owner_change(&self, from: &Sequence) -> bool {
+        self.owner != from.owner
+            && from.render_owned_by_clause().is_some()
+            && !self.links_like(from)
+    }
+
+    /// Whether both sequences are linked, to the same table.
+    fn links_like(&self, from: &Sequence) -> bool {
+        self.is_linked()
+            && from.is_linked()
+            && self.owned_by_schema == from.owned_by_schema
+            && self.owned_by_table == from.owned_by_table
+    }
+
     fn build_alter_script(&self, from: &Sequence, include_persistence: bool) -> String {
         let mut clauses = Vec::new();
+
+        // `AS type` first: PostgreSQL checks the bounds that follow against
+        // the new type, and without it a serial -> bigserial change is
+        // refused (MAXVALUE out of range for integer), while bigint ->
+        // integer silently keeps the sequence bigint.
+        if self.data_type != from.data_type && !self.data_type.is_empty() {
+            clauses.push(format!("as {}", self.data_type));
+        }
 
         // Handle logged/unlogged change
         let mut logging_script = String::new();
@@ -351,9 +447,26 @@ impl Sequence {
             "no cycle".to_string()
         });
 
-        if let Some(owned_by) = self.render_owned_by_clause() {
+        if self.unlinks_before_owner_change(from) {
+            clauses.push("owned by none".to_string());
+        } else if let Some(owned_by) = self.render_owned_by_clause()
+            && !self.owned_by_waits_for_tables(from)
+        {
             clauses.push(owned_by);
         }
+
+        // A new owner of a sequence linked to a table column that stays
+        // linked to the same table: that table's `ALTER TABLE … OWNER TO` (in
+        // the table section, after this one) carries it, and a direct `OWNER
+        // TO` here is refused. (One that becomes linked here, or moves to
+        // another table, is unlinked first, takes its new owner here and its
+        // `OWNED BY` after the tables; see `unlinks_before_owner_change` and
+        // `owned_by_waits_for_tables`.)
+        let owner_script = if self.owner != from.owner && self.links_like(from) {
+            String::new()
+        } else {
+            self.get_owner_script()
+        };
 
         let mut script = logging_script;
         script.push_str(&format!("alter sequence {}.{}", self.schema, self.name));
@@ -365,7 +478,7 @@ impl Sequence {
 
         script.append_block(";");
 
-        script.push_str(&self.get_owner_script());
+        script.push_str(&owner_script);
 
         if let Some(comment) = &self.comment {
             script.append_block(&format!(
@@ -389,6 +502,104 @@ impl Sequence {
             self.schema, self.name, self.owner
         )
         .with_empty_lines()
+    }
+
+    /// `ALTER SEQUENCE ... OWNED BY` for the column recorded in `owned_by_*`,
+    /// or `None` when the sequence has no owning column or is an identity
+    /// sequence (PostgreSQL manages that link itself and refuses to change it).
+    ///
+    /// [`Sequence::get_script`] never sets ownership, because the owning table
+    /// does not exist yet when sequences are created, so the comparer emits
+    /// this once the tables are in place.
+    pub fn get_owned_by_script(&self) -> Option<String> {
+        self.render_owned_by_clause().map(|owned_by| {
+            format!("alter sequence {}.{} {owned_by};", self.schema, self.name).with_empty_lines()
+        })
+    }
+
+    /// The pseudo-type (`serial`, `bigserial` or `smallserial`) that makes
+    /// `CREATE TABLE` recreate this sequence as it is, together with `column`,
+    /// the column it is owned by; `None` when the sequence must be created on
+    /// its own instead.
+    ///
+    /// A `serial` column is shorthand for exactly this: a `NOT NULL` column of
+    /// the matching integer type whose default is `nextval` of a sequence
+    /// PostgreSQL creates alongside it, of the same type, named
+    /// `<table>_<column>_seq` and with every option at its default. Anything
+    /// the shorthand does not reproduce yields `None`:
+    ///
+    /// - a column type other than `smallint`, `integer` or `bigint`, such as
+    ///   `numeric`, a domain, or PostgreSQL 19's `oid8` (which cannot be an
+    ///   identity column, so an owned sequence is its only way to auto-number);
+    /// - a sequence whose type differs from the column's;
+    /// - a sequence named anything other than the generated name, including a
+    ///   collision-suffixed `..._seq1`;
+    /// - a default other than plain `nextval('<sequence>'::regclass)`;
+    /// - a nullable column;
+    /// - a changed start, increment, bounds, cache or cycle option, or a
+    ///   comment on the sequence;
+    /// - a persistence other than `serial_unlogged`.
+    ///
+    /// `serial_unlogged` is whether the pseudo-type gives the sequence an
+    /// unlogged table's persistence on the migrated server (see
+    /// [`UNLOGGED_SEQUENCE_MIN_VERSION`]), or `None` when that is not known,
+    /// in which case persistence is not compared.
+    ///
+    /// The default is accepted schema-qualified or bare, since `pg_get_expr`
+    /// leaves the schema out when it is on the dumping session's `search_path`.
+    pub fn serial_pseudo_type(
+        &self,
+        column: &TableColumn,
+        serial_unlogged: Option<bool>,
+    ) -> Option<&'static str> {
+        let (Some(schema), Some(table), Some(owned_column)) = (
+            self.owned_by_schema.as_deref(),
+            self.owned_by_table.as_deref(),
+            self.owned_by_column.as_deref(),
+        ) else {
+            return None;
+        };
+        if self.is_identity
+            || column.is_identity
+            || column.is_nullable
+            || column.name != owned_column
+            || self.schema != schema
+        {
+            return None;
+        }
+
+        let column_type = column.data_type.to_lowercase();
+        let (pseudo_type, max_value) = match column_type.as_str() {
+            "smallint" => ("smallserial", i64::from(i16::MAX)),
+            "integer" => ("serial", i64::from(i32::MAX)),
+            "bigint" => ("bigserial", i64::MAX),
+            _ => return None,
+        };
+        let as_serial_creates_it = self.data_type.to_lowercase() == column_type
+            && self.start_value == Some(1)
+            && self.min_value == Some(1)
+            && self.max_value == Some(max_value)
+            && self.increment_by == Some(1)
+            && self.cache_size == Some(1)
+            && !self.cycle
+            && self.comment.is_none()
+            && serial_unlogged.is_none_or(|unlogged| unlogged == self.is_unlogged);
+        if !as_serial_creates_it {
+            return None;
+        }
+
+        let generated_name =
+            serial_sequence_name(&unquote_ident(table), &unquote_ident(owned_column))?;
+        if unquote_ident(&self.name) != generated_name {
+            return None;
+        }
+
+        let qualified = format!("nextval('{}.{}'::regclass)", self.schema, self.name);
+        let bare = format!("nextval('{}'::regclass)", self.name);
+        match column.column_default.as_deref() {
+            Some(default) if default == qualified || default == bare => Some(pseudo_type),
+            _ => None,
+        }
     }
 }
 

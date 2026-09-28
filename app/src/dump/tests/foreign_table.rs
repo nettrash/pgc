@@ -7,6 +7,7 @@ fn make_column(name: &str, data_type: &str) -> ForeignTableColumn {
         is_nullable: true,
         column_default: None,
         options: Vec::new(),
+        acl: Vec::new(),
     }
 }
 
@@ -200,4 +201,106 @@ fn get_alter_script_server_change_use_drop_false_comments_out() {
     assert!(script.contains("-- drop foreign table"));
     assert!(script.contains("-- create foreign table"));
     assert!(!script.contains("\ndrop foreign table"));
+}
+
+fn with_options(options: &[&str]) -> ForeignTable {
+    let mut ft = make_foreign_table();
+    ft.options = options.iter().map(|o| o.to_string()).collect();
+    ft.hash();
+    ft
+}
+
+// A bare option in `OPTIONS (...)` means ADD, and ADD of a key the table
+// already has fails with `option "table_name" provided more than once`. The
+// whole TO list used to go out bare, so changing one option value, or adding
+// one next to an existing option, never applied.
+#[test]
+fn get_alter_script_sets_a_changed_option_value() {
+    let from = with_options(&["table_name 'a'", "schema_name 'x'"]);
+    let to = with_options(&["table_name 'b'", "schema_name 'x'"]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter foreign table public.ft_test options (set table_name 'b');\n\n"
+    );
+}
+
+#[test]
+fn get_alter_script_adds_only_the_new_option() {
+    let from = with_options(&["table_name 'a'"]);
+    let to = with_options(&["table_name 'a'", "schema_name 'y'"]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter foreign table public.ft_test options (schema_name 'y');\n\n"
+    );
+}
+
+#[test]
+fn get_alter_script_drops_sets_and_adds_in_one_statement() {
+    let from = with_options(&["table_name 'a'", "schema_name 'x'"]);
+    let to = with_options(&["schema_name 'z'", "updatable 'false'"]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter foreign table public.ft_test options (drop table_name, set schema_name 'z', updatable 'false');\n\n"
+    );
+}
+
+#[test]
+fn get_alter_script_options_on_a_table_that_had_none_are_unchanged() {
+    // Every key is new, so the list is the TO list, bare, as it always was.
+    let from = with_options(&[]);
+    let to = with_options(&["schema_name 'remote_schema'", "table_name 'remote_table'"]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter foreign table public.ft_test options (schema_name 'remote_schema', table_name 'remote_table');\n\n"
+    );
+}
+
+#[test]
+fn get_alter_script_removing_every_option_still_drops_each() {
+    let from = with_options(&["table_name 'a'", "schema_name 'x'"]);
+    let to = with_options(&[]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter foreign table public.ft_test options (drop table_name);\n\n\
+         alter foreign table public.ft_test options (drop schema_name);\n\n"
+    );
+}
+
+#[test]
+fn get_alter_script_ignores_a_change_of_option_order_alone() {
+    // PostgreSQL has no statement that reorders options, and the values are
+    // all in place already.
+    let from = with_options(&["table_name 'a'", "schema_name 'x'"]);
+    let to = with_options(&["schema_name 'x'", "table_name 'a'"]);
+    assert_eq!(from.get_alter_script(&to, true), "");
+}
+
+#[test]
+fn option_changes_keeps_escaped_values_whole() {
+    assert_eq!(
+        ForeignTable::option_changes(
+            &["table_name E'a\\\\b'".to_string()],
+            &["table_name 'it''s'".to_string()],
+        ),
+        vec!["set table_name 'it''s'".to_string()]
+    );
+}
+
+#[test]
+fn r3c_foreign_partition_is_attached_after_it_is_created() {
+    let mut ft = make_foreign_table();
+    let standalone = ft.get_script();
+    ft.partition_of = Some("public.\"Parent\"".to_string());
+    ft.partition_bound = Some("FOR VALUES FROM (0) TO (100)".to_string());
+    let script = ft.get_script();
+    assert!(script.starts_with(&standalone), "{script}");
+    assert_eq!(
+        &script[standalone.len()..],
+        "alter table public.\"Parent\" attach partition public.ft_test FOR VALUES FROM (0) TO (100);\n\n"
+    );
+    // Neither the partition nor column privileges are hashed.
+    let before = make_foreign_table().hash;
+    ft.columns[0].acl = vec!["reader=w/postgres".to_string()];
+    ft.hash();
+    assert_eq!(ft.hash, before);
 }

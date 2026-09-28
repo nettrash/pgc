@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, comment_out};
 
 /// Represents a PostgreSQL collation (from pg_collation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,12 +147,7 @@ impl Collation {
                 script.append_block(&self.get_drop_script());
             } else {
                 let drop = self.get_drop_script();
-                script.push_str(
-                    &drop
-                        .lines()
-                        .map(|l| format!("-- {}\n", l))
-                        .collect::<String>(),
-                );
+                script.push_str(&comment_out(&drop));
             }
             script.push_str(&target.get_script());
             return script;

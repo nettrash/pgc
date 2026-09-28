@@ -249,6 +249,34 @@ FROM clear_shared.audit_log
 GROUP BY table_name, operation;
 
 -- ============================================================
+-- 10b. Routines with a SQL-standard body (PostgreSQL 14+)
+-- ============================================================
+-- Unlike a string body, a BEGIN ATOMIC / RETURN body is a hard dependent of
+-- what it uses (pg_depend), so PostgreSQL refuses to drop a view, table or
+-- routine under it. The clear script drops these together with the views,
+-- before the relations they read, and a caller before its callee.
+
+-- Reads a view (dropped before that view)
+CREATE FUNCTION clear_app.top_customer_count()
+RETURNS BIGINT
+LANGUAGE sql STABLE
+RETURN (SELECT count(*) FROM clear_app.v_top_customers);
+
+-- Reads a table (dropped before the tables)
+CREATE FUNCTION clear_app.order_total_atomic(p_customer_id INTEGER)
+RETURNS NUMERIC
+LANGUAGE sql STABLE
+BEGIN ATOMIC
+    SELECT COALESCE(SUM(amount), 0) FROM clear_app.orders WHERE customer_id = p_customer_id;
+END;
+
+-- Calls the one above (dropped before it)
+CREATE FUNCTION clear_app.order_total_doubled(p_customer_id INTEGER)
+RETURNS NUMERIC
+LANGUAGE sql STABLE
+RETURN clear_app.order_total_atomic(p_customer_id) * 2;
+
+-- ============================================================
 -- 11. Comments
 -- ============================================================
 COMMENT ON SCHEMA clear_app IS 'Application schema for clear command testing';

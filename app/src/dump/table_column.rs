@@ -5,12 +5,85 @@
 //! plus `ADD COLUMN`. That distinction matters beyond this module:
 //! [`TableColumn::would_drop_and_re_add`] is what tells the comparer that
 //! PostgreSQL will CASCADE away the column's indexes, constraints and policies,
-//! which then have to be re-emitted.
+//! which then have to be re-emitted. On PostgreSQL 14 a generated column made
+//! plain can need the same treatment with its values kept — a new column
+//! filled from the old one, which is dropped (`TableColumn::plain_needs_rewrite`).
+//!
+//! A generated column's expression can change in place with
+//! `ALTER COLUMN ... SET EXPRESSION AS (...)` where the migrated server accepts
+//! it — STORED columns on PostgreSQL 17+, VIRTUAL ones on PostgreSQL 19+ (and
+//! on 18 in a table without CHECK constraints) unless the table is an explicit
+//! publication member. The comparer works that out per table and passes it in
+//! as a [`GeneratedAlterCaps`]; without it the change is a `DROP COLUMN` +
+//! `ADD COLUMN`.
+//!
+//! Either form can depend on columns the same migration adds — a new
+//! expression may read a new column — so the table alter path takes them from
+//! `TableColumn::alter_parts` separately and emits them after the table's
+//! `ADD COLUMN`s.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{
+    StringExt, comment_out, line_comment_safe, quote_identifier,
+};
+
+/// One column's alter statements, split by where the table alter path has to
+/// emit them (see `TableColumn::alter_parts`). Concatenated in field order
+/// they are exactly what [`TableColumn::get_alter_script_with_caps`] returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ColumnAlterParts {
+    /// Statements that run in column order, among the table's
+    /// `ADD COLUMN`s: everything, unless the generated part is deferred.
+    pub(crate) inline: String,
+    /// The `DROP COLUMN` of a live drop + add; empty otherwise.
+    pub(crate) drop: String,
+    /// The deferred generated part — `SET EXPRESSION`, or the `ADD COLUMN`
+    /// of a live drop + add. It may read a column the migration adds, so it
+    /// runs after every `ADD COLUMN` of the table. Empty when nothing is
+    /// deferred.
+    pub(crate) deferred: String,
+    /// Storage, compression and statistics changes that follow a deferred
+    /// part (they must reach the re-added column, not the dropped one).
+    pub(crate) post: String,
+    /// The column comment change that follows a deferred part.
+    pub(crate) comment: String,
+}
+
+impl ColumnAlterParts {
+    /// Whether the generated part is deferred past the table's `ADD COLUMN`s.
+    pub(crate) fn is_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    fn concat(self) -> Option<String> {
+        let joined = [
+            self.inline,
+            self.drop,
+            self.deferred,
+            self.post,
+            self.comment,
+        ]
+        .concat();
+        (!joined.is_empty()).then_some(joined)
+    }
+}
+
+/// Where the migrated server (the FROM database) accepts
+/// `ALTER TABLE ... ALTER COLUMN c SET EXPRESSION AS (expr)` for the table
+/// being altered. The [`Default`] — both flags off — is the conservative
+/// answer for a server of unknown version: every expression change becomes a
+/// `DROP COLUMN` + `ADD COLUMN`, which every supported server accepts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GeneratedAlterCaps {
+    /// SET EXPRESSION on a STORED generated column (PostgreSQL 17+).
+    pub stored_set_expression: bool,
+    /// SET EXPRESSION on a VIRTUAL generated column: PostgreSQL 19+, or 18
+    /// when the table has no CHECK constraints; never while the table (or a
+    /// child it recurses to) is an explicit `FOR TABLE` publication member.
+    pub virtual_set_expression: bool,
+}
 
 /// Whether two optional generated-column expressions are equivalent, ignoring the
 /// non-idempotent ways PostgreSQL deparses an `IN`-list expression (issue #226).
@@ -24,6 +97,48 @@ fn generation_expressions_equivalent(a: &Option<String>, b: &Option<String>) -> 
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Whether the `(` that starts `expr` is closed by the `)` that ends it, so
+/// one pair of parentheses encloses the whole expression. Parentheses inside
+/// string literals and quoted identifiers (with their doubled-quote escapes)
+/// do not count. Only ASCII bytes are matched, so walking bytes is safe for
+/// any UTF-8 input.
+fn is_enclosed_in_parens(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+        return false;
+    }
+    let last = bytes.len() - 1;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => {
+                if bytes.get(i + 1) == Some(&q) {
+                    i += 1; // A doubled quote stays inside the literal.
+                } else {
+                    quote = None;
+                }
+            }
+            Some(_) => {}
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && i != last {
+                        return false; // The opening pair closed early.
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    depth == 0 && quote.is_none()
 }
 
 /// This is an information about a PostgreSQL table.
@@ -137,6 +252,29 @@ pub struct TableColumn {
     /// Column-level ACL entries (attacl)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acl: Vec<String>,
+    /// PostgreSQL 14 only: this generated column's expression uses an object
+    /// — a function, an operator, a type or collation other than the
+    /// column's own — that PostgreSQL 14 records as a dependency of the
+    /// column itself (15 and later record it on the column's default,
+    /// `pg_attrdef`). PostgreSQL 14 then refuses `ALTER COLUMN ... TYPE` on
+    /// it ("found unexpected dependency for column"), so the comparer drops
+    /// and re-adds such a column to change its type (see
+    /// `TableColumn::retype_needs_drop_and_add`).
+    ///
+    /// A fact about the dumped server, not about the schema: left out of
+    /// `PartialEq` and the hash, and only read on the FROM side. Always
+    /// `false` in a dump of PostgreSQL 15+ and in one written by pgc 1.0.x,
+    /// and then left out of the dump.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generation_blocks_retype: bool,
+    /// Transient, set by the comparer on a FROM column whose
+    /// [`TableColumn::generation_blocks_retype`] is set: the migration drops
+    /// a routine this column's expression calls with `DROP ... CASCADE`,
+    /// which on PostgreSQL 14 takes the column along even once `DROP
+    /// EXPRESSION` has made it plain (see `TableColumn::plain_needs_rewrite`).
+    /// Never written to a dump, and left out of `PartialEq` and the hash.
+    #[serde(skip)]
+    pub generation_routine_dropped: bool,
     /// Transient: set at comparison time to "serial", "bigserial", or "smallserial"
     #[serde(skip)]
     pub serial_type: Option<String>,
@@ -144,7 +282,14 @@ pub struct TableColumn {
 
 impl TableColumn {
     /// Render the type clause for alter statements (data type, length, collation, interval)
-    fn render_type_clause(&self) -> String {
+    pub(crate) fn render_type_clause(&self) -> String {
+        let mut clause = self.render_type_clause_without_collation();
+        clause.push_str(&self.collate_clause());
+        clause
+    }
+
+    /// [`TableColumn::render_type_clause`] without the `collate` clause.
+    fn render_type_clause_without_collation(&self) -> String {
         let mut clause = String::new();
         clause.push_str(&self.data_type);
 
@@ -170,13 +315,40 @@ impl TableColumn {
             clause.push_str(interval_type);
         }
 
-        if let Some(collation) = &self.collation_name
-            && !collation.is_empty()
-        {
-            clause.push_str(&format!(" collate \"{collation}\""));
-        }
-
         clause
+    }
+
+    /// The column's ` collate <name>` clause, with its leading space, or an
+    /// empty string when the column has no collation of its own.
+    ///
+    /// The dump stores the collation's schema and name raw (`nspname`,
+    /// `collname`), so both are quoted here. A `pg_catalog` collation (`"C"`,
+    /// `"POSIX"`, `"en_US"`, `"ucs_basic"`) keeps the spelling every pgc
+    /// version has emitted — the bare name, always in double quotes, which
+    /// resolves because `pg_catalog` is always searched first. Any other
+    /// collation is qualified with its schema, since it may not be on the
+    /// migrated database's `search_path` (or a same-named collation earlier
+    /// on it would silently take its place). A collation schema the dump does
+    /// not record — a hand-built fixture — is treated as `pg_catalog`.
+    ///
+    /// A name holding a `"` has it doubled, so it cannot end the identifier
+    /// early and run the rest of itself as SQL.
+    fn collate_clause(&self) -> String {
+        let Some(name) = self.collation_name.as_deref().filter(|n| !n.is_empty()) else {
+            return String::new();
+        };
+        match self
+            .collation_schema
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "pg_catalog")
+        {
+            None => format!(" collate \"{}\"", name.replace('"', "\"\"")),
+            Some(schema) => format!(
+                " collate {}.{}",
+                quote_identifier(schema),
+                quote_identifier(name)
+            ),
+        }
     }
 
     fn type_clause_differs(&self, other: &TableColumn) -> bool {
@@ -232,37 +404,407 @@ impl TableColumn {
     /// `get_alter_script` calls this method to gate the actual
     /// drop+add emission, so the predicate body and the SQL emission
     /// share a single source of truth — they cannot drift apart.
+    ///
+    /// Assumes a migrated server that cannot `SET EXPRESSION`; see
+    /// [`TableColumn::would_drop_and_re_add_with_caps`].
     pub fn would_drop_and_re_add(&self, existing: &TableColumn) -> bool {
-        let new_generated = Self::normalized_generated(&self.is_generated);
-        let old_generated = Self::normalized_generated(&existing.is_generated);
-
-        let generation_type_changed = new_generated == "ALWAYS"
-            && old_generated == "ALWAYS"
-            && self.effective_generation_type() != existing.effective_generation_type();
-        let generated_changed = new_generated != old_generated
-            || (new_generated == "ALWAYS"
-                && self.generation_expression != existing.generation_expression)
-            || generation_type_changed;
-
-        if !generated_changed {
-            return false;
-        }
-
-        let new_is_generated = new_generated == "ALWAYS";
-        let old_is_generated = old_generated != "NEVER";
-
-        (!old_is_generated && new_is_generated)
-            || (old_is_generated
-                && (existing.effective_generation_type() == "v"
-                    || self.effective_generation_type() == "v"))
+        self.would_drop_and_re_add_with_caps(existing, GeneratedAlterCaps::default())
     }
 
+    /// Like [`TableColumn::would_drop_and_re_add`], for a migrated server with
+    /// the `SET EXPRESSION` capabilities in `caps`.
+    ///
+    /// Every generated-column change is a drop + add except two: a STORED
+    /// column losing its expression (`DROP EXPRESSION`), and an expression
+    /// change the server can apply with `SET EXPRESSION`. In particular a
+    /// STORED expression change without `caps.stored_set_expression` is a
+    /// drop + add — PostgreSQL has no `ALTER COLUMN ... ADD GENERATED ALWAYS
+    /// AS (...) STORED`.
+    pub fn would_drop_and_re_add_with_caps(
+        &self,
+        existing: &TableColumn,
+        caps: GeneratedAlterCaps,
+    ) -> bool {
+        if self.retype_needs_drop_and_add(existing) || self.plain_needs_rewrite(existing) {
+            return true;
+        }
+        if !self.generated_changed(existing) || self.can_set_expression(existing, caps) {
+            return false;
+        }
+        let new_is_generated = Self::normalized_generated(&self.is_generated) == "ALWAYS";
+        let old_is_virtual = Self::normalized_generated(&existing.is_generated) == "ALWAYS"
+            && existing.effective_generation_type() == "v";
+        // Anything that ends up generated (plain -> generated, a STORED <->
+        // VIRTUAL flip, an expression change SET EXPRESSION cannot make),
+        // plus VIRTUAL -> plain (DROP EXPRESSION is STORED-only).
+        new_is_generated || old_is_virtual
+    }
+
+    /// Whether changing `existing` (the FROM column) into `self` changes the
+    /// type of a column that stays generated while the migrated server,
+    /// PostgreSQL 14, refuses `ALTER COLUMN ... TYPE` on it
+    /// ([`TableColumn::generation_blocks_retype`]). Such a column is dropped
+    /// and re-added instead, like a generated-column change `ALTER COLUMN`
+    /// cannot make: [`TableColumn::would_drop_and_re_add_with_caps`] answers
+    /// true for it, so the comparer restores what the drop takes along.
+    pub(crate) fn retype_needs_drop_and_add(&self, existing: &TableColumn) -> bool {
+        existing.generation_blocks_retype
+            && self.is_generated_column()
+            && existing.is_generated_column()
+            && self.type_clause_differs(existing)
+    }
+
+    /// Whether turning the generated column `existing` (FROM) into the plain
+    /// column `self` has to rewrite it, keeping its values, rather than run
+    /// `ALTER COLUMN ... DROP EXPRESSION`. On PostgreSQL 14
+    /// ([`TableColumn::generation_blocks_retype`]) the column keeps
+    /// depending on what its expression used after `DROP EXPRESSION`, so an
+    /// `ALTER COLUMN ... TYPE` still fails ("found unexpected dependency for
+    /// column"), and a `DROP ... CASCADE` of a routine it called takes the
+    /// column, data and all. The rewrite is needed when the type changes
+    /// too, or when the migration drops such a routine
+    /// ([`TableColumn::generation_routine_dropped`]); otherwise `DROP
+    /// EXPRESSION` stays. Never for an identity column.
+    ///
+    /// The rewrite adds the TO column under a temporary name, fills it from
+    /// the old one with `ALTER COLUMN ... TYPE ... USING`, which rewrites the
+    /// table without firing its triggers, drops the old column and renames
+    /// the new one (see `TableColumn::plain_rewrite_parts`), so
+    /// [`TableColumn::would_drop_and_re_add_with_caps`] answers true for it
+    /// and the comparer restores what the drop takes along.
+    pub(crate) fn plain_needs_rewrite(&self, existing: &TableColumn) -> bool {
+        existing.generation_blocks_retype
+            && existing.is_generated_column()
+            && !self.is_generated_column()
+            && !self.is_identity
+            && (self.type_clause_differs(existing) || existing.generation_routine_dropped)
+    }
+
+    /// The name `TableColumn::plain_rewrite_parts` gives the new column until
+    /// it replaces this one: `pgc_rewrite_` and this column's name, quoted,
+    /// cut to PostgreSQL's 63-byte identifier limit.
+    fn rewrite_temp_name(&self) -> String {
+        let raw = match self
+            .name
+            .strip_prefix('"')
+            .and_then(|n| n.strip_suffix('"'))
+        {
+            Some(quoted) => quoted.replace("\"\"", "\""),
+            None => self.name.clone(),
+        };
+        let mut temp = format!("pgc_rewrite_{raw}");
+        if temp.len() > 63 {
+            let mut end = 63;
+            while !temp.is_char_boundary(end) {
+                end -= 1;
+            }
+            temp.truncate(end);
+        }
+        format!("\"{}\"", temp.replace('"', "\"\""))
+    }
+
+    /// The statements of the rewrite `TableColumn::plain_needs_rewrite`
+    /// calls for, as `(drop part, deferred part)` of a [`ColumnAlterParts`]:
+    /// the new column is added under a temporary name, filled from the old
+    /// one and the old one dropped where a drop + add drops; it takes the
+    /// old name, with the TO default, `NOT NULL`, storage, compression and
+    /// statistics target, where a drop + add adds.
+    fn plain_rewrite_parts(&self) -> (String, String) {
+        let temp = self.rewrite_temp_name();
+        let table = format!("{}.{}", self.schema, self.table);
+        let type_clause = self.render_type_clause();
+        let mut drop = String::new();
+        drop.push_str(
+            &format!("alter table {table} add column {temp} {type_clause};").with_empty_lines(),
+        );
+        drop.push_str(
+            &format!(
+                "alter table {table} alter column {temp} type {type_clause} using ({});",
+                self.name
+            )
+            .with_empty_lines(),
+        );
+        drop.push_str(&self.get_drop_script());
+        let mut deferred = format!("alter table {table} rename column {temp} to {};", self.name)
+            .with_empty_lines();
+        if let Some(default) = &self.column_default {
+            deferred.push_str(
+                &format!(
+                    "alter table {table} alter column {} set default {default};",
+                    self.name
+                )
+                .with_empty_lines(),
+            );
+        }
+        if !self.is_nullable {
+            deferred.push_str(
+                &format!(
+                    "alter table {table} alter column {} set not null;",
+                    self.name
+                )
+                .with_empty_lines(),
+            );
+        }
+        if let Some(storage) = &self.storage {
+            deferred.push_str(
+                &format!(
+                    "alter table {table} alter column {} set storage {storage};",
+                    self.name
+                )
+                .with_empty_lines(),
+            );
+        }
+        if let Some(compression) = &self.compression {
+            deferred.push_str(
+                &format!(
+                    "alter table {table} alter column {} set compression {compression};",
+                    self.name
+                )
+                .with_empty_lines(),
+            );
+        }
+        if let Some(target) = self.statistics_target.filter(|target| *target >= 0) {
+            deferred.push_str(
+                &format!(
+                    "alter table {table} alter column {} set statistics {target};",
+                    self.name
+                )
+                .with_empty_lines(),
+            );
+        }
+        (drop, deferred)
+    }
+
+    /// Whether this is a generated column, STORED or VIRTUAL.
+    pub(crate) fn is_generated_column(&self) -> bool {
+        Self::normalized_generated(&self.is_generated) == "ALWAYS"
+    }
+
+    /// Whether this generated column's expression reads the column named
+    /// `column` (in the `quote_ident` form the dump stores names in).
+    ///
+    /// `pg_get_expr` prints a generated column's expression with its column
+    /// references unqualified and in that same form, so they are found as
+    /// identifier tokens outside string literals — skipping one that names
+    /// a function (followed by `(`), a type (after `::`) or part of a
+    /// qualified name (next to a `.`). A token that is none of these but
+    /// happens to spell the name is still counted: the caller then does
+    /// more than it had to, never less. `false` for a column that is not
+    /// generated.
+    pub(crate) fn generation_expression_reads(&self, column: &str) -> bool {
+        if !self.is_generated_column() {
+            return false;
+        }
+        let Some(expr) = self.generation_expression.as_deref() else {
+            return false;
+        };
+        let bytes = expr.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            let start = i;
+            if b == b'\'' {
+                // A literal; a doubled quote stays inside it.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if bytes.get(i + 1) == Some(&b'"') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+            } else if b.is_ascii_alphabetic() || b == b'_' || !b.is_ascii() {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || bytes[i] == b'_'
+                        || bytes[i] == b'$'
+                        || !bytes[i].is_ascii())
+                {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+                continue;
+            }
+            let token = &expr[start..i];
+            let before = expr[..start].trim_end();
+            let after = expr[i..].trim_start();
+            let qualified = before.ends_with('.') || after.starts_with('.');
+            let is_type = before.ends_with("::");
+            let is_call = after.starts_with('(');
+            if token == column && !qualified && !is_type && !is_call {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the generated part of the column — generated or not, its
+    /// expression, STORED vs VIRTUAL — differs. Expressions are compared with
+    /// [`generation_expressions_equivalent`], the same test `PartialEq` and
+    /// the hash use, so a non-idempotent deparse alone is not a change.
+    fn generated_changed(&self, existing: &TableColumn) -> bool {
+        let new_generated = Self::normalized_generated(&self.is_generated);
+        let old_generated = Self::normalized_generated(&existing.is_generated);
+        // Issue #181: a `generation_type` (`s`/`v`) flip with the same
+        // expression counts as a change too.
+        new_generated != old_generated
+            || (new_generated == "ALWAYS"
+                && (!generation_expressions_equivalent(
+                    &self.generation_expression,
+                    &existing.generation_expression,
+                ) || self.effective_generation_type() != existing.effective_generation_type()))
+    }
+
+    /// True when the change is an expression change of a generated column
+    /// that stays generated of the same kind and type, and the migrated server
+    /// can apply it with `ALTER COLUMN ... SET EXPRESSION AS (...)`.
+    ///
+    /// A type change rules it out. `ALTER COLUMN ... TYPE` would have to run
+    /// first, and on a generated column it casts the *old* expression to the
+    /// new type (`USING` is not allowed there), which fails whenever that cast
+    /// is not automatic — `SET EXPRESSION` then fails too, because the column
+    /// still has the old type. A drop + add changes both at once.
+    fn can_set_expression(&self, existing: &TableColumn, caps: GeneratedAlterCaps) -> bool {
+        let both_generated = Self::normalized_generated(&self.is_generated) == "ALWAYS"
+            && Self::normalized_generated(&existing.is_generated) == "ALWAYS";
+        let allowed = match self.effective_generation_type() {
+            "v" => caps.virtual_set_expression,
+            _ => caps.stored_set_expression,
+        };
+        both_generated
+            && allowed
+            && self.effective_generation_type() == existing.effective_generation_type()
+            && !self.type_differs(existing)
+            && self.generation_expression.is_some()
+            && !generation_expressions_equivalent(
+                &self.generation_expression,
+                &existing.generation_expression,
+            )
+    }
+
+    /// Whether altering `existing` into `self` changes the column in place in
+    /// a way that makes PostgreSQL rebuild the extended statistics on it:
+    /// `ALTER COLUMN ... TYPE` (a collation change included) or `SET
+    /// EXPRESSION`, whether this table's own alter runs it or a parent's
+    /// recurses to it. The rebuild re-creates each statistics object from its
+    /// definition, which keeps the owner and the comment but resets an explicit
+    /// statistics target to the default (verified live on PostgreSQL 14, 17,
+    /// 18 and 19), so the comparer has to set the target again.
+    ///
+    /// A live drop + add is not a rebuild: the statistics go with the column
+    /// and are restored whole. With `use_drop` off that drop + add is only
+    /// commented out, and a type change ahead of it still runs — unless the
+    /// column is generated already (see [`TableColumn::alters_type_in_place`]).
+    pub(crate) fn rebuilds_statistics_in_place(
+        &self,
+        existing: &TableColumn,
+        caps: GeneratedAlterCaps,
+        use_drop: bool,
+    ) -> bool {
+        self.rewrites_in_place(existing, caps, use_drop)
+    }
+
+    /// Whether altering `existing` into `self` runs `ALTER COLUMN ... TYPE`
+    /// or `SET EXPRESSION`, the in-place changes that recompute the column
+    /// for every row. PostgreSQL rebuilds what depends on the column along
+    /// the way: the extended statistics on it (see
+    /// [`TableColumn::rebuilds_statistics_in_place`]), and the CHECK
+    /// constraints that read it, each checked against every row while it is
+    /// still enforced. Run on a partitioned table, either statement recurses
+    /// to the partitions (see [`TableColumn::alters_type_in_place`] for an
+    /// inheritance parent).
+    ///
+    /// A live drop + add is neither: it replaces the column, and what
+    /// depended on it goes with the old one. With `use_drop` off that drop +
+    /// add is only commented out, and a type change ahead of it still runs —
+    /// unless the column is generated already (see
+    /// [`TableColumn::alters_type_in_place`]).
+    pub(crate) fn rewrites_in_place(
+        &self,
+        existing: &TableColumn,
+        caps: GeneratedAlterCaps,
+        use_drop: bool,
+    ) -> bool {
+        self.alters_type_in_place(existing, caps, use_drop)
+            || (self.generated_changed(existing) && self.can_set_expression(existing, caps))
+    }
+
+    /// The `ALTER COLUMN ... TYPE` half of [`TableColumn::rewrites_in_place`]
+    /// (a collation change included): the only one of the two that also
+    /// recurses from an inheritance parent to its children, since the
+    /// comparer writes a non-partitioned table's `SET EXPRESSION` with
+    /// `ONLY`.
+    ///
+    /// Not when the column is dropped and re-added: live, the add carries the
+    /// new type. Commented out (`use_drop` off), a plain column's type change
+    /// still runs ahead of it, but a generated column's does not: PostgreSQL
+    /// would recompute it from the old expression cast to the new type,
+    /// which fails when no such cast exists and is superseded by the drop +
+    /// add when it does.
+    pub(crate) fn alters_type_in_place(
+        &self,
+        existing: &TableColumn,
+        caps: GeneratedAlterCaps,
+        use_drop: bool,
+    ) -> bool {
+        self.type_clause_differs(existing)
+            && !(self.would_drop_and_re_add_with_caps(existing, caps)
+                && (use_drop || Self::normalized_generated(&existing.is_generated) != "NEVER"))
+    }
+
+    /// Whether an `ADD COLUMN` of `other` on an inheritance parent gives a
+    /// child exactly this column: the same type, nullability, default and
+    /// generation. PostgreSQL copies those to the children an `ADD COLUMN`
+    /// recurses to; it does not copy a comment, and a child cannot receive an
+    /// identity column that way, so an identity column never qualifies.
+    pub(crate) fn is_recreated_by_parent_add(&self, other: &TableColumn) -> bool {
+        !self.is_identity
+            && !other.is_identity
+            && self.name == other.name
+            && !self.type_differs(other)
+            && self.is_nullable == other.is_nullable
+            && self.column_default == other.column_default
+            && Self::normalized_generated(&self.is_generated)
+                == Self::normalized_generated(&other.is_generated)
+            && self.effective_generation_type() == other.effective_generation_type()
+            && generation_expressions_equivalent(
+                &self.generation_expression,
+                &other.generation_expression,
+            )
+    }
+
+    /// The generation expression with its redundant enclosing parentheses
+    /// removed, ready to be wrapped in exactly one pair (`AS (expr)`).
+    ///
+    /// Only a pair that encloses the *whole* expression is redundant.
+    /// PostgreSQL deparses `a * 2 + b * 3` as `((a * 2) + (b * 3))`; peeling
+    /// the outer pair leaves `(a * 2) + (b * 3)`, which still starts with `(`
+    /// and ends with `)` without being one group — stripping those too used
+    /// to emit `AS (a * 2) + (b * 3)`, a syntax error.
     fn normalized_generation_expression(expr: &str) -> String {
         let mut trimmed = expr.trim();
-        // Strip redundant outer parentheses to avoid emitted ((expr)) which some servers reject
-        while trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() > 2 {
-            let candidate = trimmed[1..trimmed.len() - 1].trim();
-            trimmed = candidate;
+        while trimmed.len() > 2 && is_enclosed_in_parens(trimmed) {
+            trimmed = trimmed[1..trimmed.len() - 1].trim();
         }
         trimmed.to_string()
     }
@@ -412,6 +954,53 @@ impl TableColumn {
     /// least as eager as either caller was on its own — and for both callers,
     /// eager is the safe direction: an unnecessary drop or recreate costs time,
     /// a missing one produces SQL PostgreSQL will not run.
+    /// This column with the type of `other` — its data type, length,
+    /// precision, scale, interval, collation, domain and UDT — in place of
+    /// its own, so an alter from `other` to it leaves the type alone. The
+    /// table alter path uses it for a column an inheritance ancestor's
+    /// recursing `ALTER COLUMN ... TYPE` retypes (see
+    /// `InheritedRecreates::retyped_by_ancestor`).
+    pub(crate) fn with_type_of(&self, other: &TableColumn) -> TableColumn {
+        TableColumn {
+            data_type: other.data_type.clone(),
+            character_maximum_length: other.character_maximum_length,
+            character_octet_length: other.character_octet_length,
+            numeric_precision: other.numeric_precision,
+            numeric_precision_radix: other.numeric_precision_radix,
+            numeric_scale: other.numeric_scale,
+            datetime_precision: other.datetime_precision,
+            interval_type: other.interval_type.clone(),
+            interval_precision: other.interval_precision,
+            character_set_catalog: other.character_set_catalog.clone(),
+            character_set_schema: other.character_set_schema.clone(),
+            character_set_name: other.character_set_name.clone(),
+            collation_catalog: other.collation_catalog.clone(),
+            collation_schema: other.collation_schema.clone(),
+            collation_name: other.collation_name.clone(),
+            domain_catalog: other.domain_catalog.clone(),
+            domain_schema: other.domain_schema.clone(),
+            domain_name: other.domain_name.clone(),
+            udt_catalog: other.udt_catalog.clone(),
+            udt_schema: other.udt_schema.clone(),
+            udt_name: other.udt_name.clone(),
+            maximum_cardinality: other.maximum_cardinality,
+            ..self.clone()
+        }
+    }
+
+    /// Whether the collation is all that [`TableColumn::type_differs`]
+    /// finds different: the same type, length, precision and interval
+    /// qualifier, another `collate` clause.
+    pub(crate) fn only_collation_differs(&self, other: &TableColumn) -> bool {
+        self.collate_clause() != other.collate_clause()
+            && self.render_type_clause_without_collation()
+                == other.render_type_clause_without_collation()
+            && self.udt_name == other.udt_name
+            && self.numeric_precision == other.numeric_precision
+            && self.numeric_scale == other.numeric_scale
+            && self.character_maximum_length == other.character_maximum_length
+    }
+
     pub fn type_differs(&self, other: &TableColumn) -> bool {
         self.type_clause_differs(other)
             || self.udt_name != other.udt_name
@@ -460,6 +1049,17 @@ impl TableColumn {
         }
         if let Some(stats) = self.statistics_target {
             hasher.update(stats.to_string().as_bytes());
+        }
+        // The column's own collation, when it has one: without it a change
+        // of collation alone left the table's hash as it was, and nothing was
+        // migrated. A column without one hashes as it always has.
+        if let Some(collation) = self.collation_name.as_deref().filter(|c| !c.is_empty()) {
+            hasher.update(b"collate");
+            let schema = self.collation_schema.as_deref().unwrap_or_default();
+            hasher.update((schema.len() as u32).to_be_bytes());
+            hasher.update(schema.as_bytes());
+            hasher.update((collation.len() as u32).to_be_bytes());
+            hasher.update(collation.as_bytes());
         }
         // skip catalog/charset/related_views and other descriptive-only fields
     }
@@ -531,11 +1131,7 @@ impl TableColumn {
         }
 
         // Collation
-        if let Some(collation) = &self.collation_name
-            && !collation.is_empty()
-        {
-            script.push_str(&format!(" collate \"{collation}\""));
-        }
+        script.push_str(&self.collate_clause());
 
         // Identity
         if self.is_identity {
@@ -594,7 +1190,71 @@ impl TableColumn {
         script.trim_end().to_string()
     }
 
+    /// The statements that turn `existing` (the FROM-side column) into
+    /// `self` (the TO-side column), or `None` when nothing differs.
+    ///
+    /// Assumes a migrated server that cannot `SET EXPRESSION`; see
+    /// [`TableColumn::get_alter_script_with_caps`].
     pub fn get_alter_script(&self, existing: &TableColumn, use_drop: bool) -> Option<String> {
+        self.get_alter_script_with_caps(existing, use_drop, GeneratedAlterCaps::default())
+    }
+
+    /// Like [`TableColumn::get_alter_script`], for a migrated server with the
+    /// `SET EXPRESSION` capabilities in `caps`.
+    ///
+    /// `SET EXPRESSION` is emitted without `ONLY` here, so it recurses to
+    /// inheritance children and partitions. The table alter path uses the
+    /// `ONLY` form for a table that is not partitioned, so that each
+    /// inheritance child keeps an expression of its own.
+    pub fn get_alter_script_with_caps(
+        &self,
+        existing: &TableColumn,
+        use_drop: bool,
+        caps: GeneratedAlterCaps,
+    ) -> Option<String> {
+        self.alter_parts(existing, use_drop, caps, false).concat()
+    }
+
+    /// The statements of [`TableColumn::get_alter_script_with_caps`], split by
+    /// where the table alter path emits them (see [`ColumnAlterParts`]).
+    ///
+    /// With `set_expression_only`, `SET EXPRESSION` is emitted as
+    /// `ALTER TABLE ONLY ...`: the inheritance children keep their own
+    /// expressions and are altered by their own diff. PostgreSQL 17+ accepts
+    /// that form for inheritance parents and partitioned tables alike (verified
+    /// live on 17, 18 and 19), so the caller decides; a partitioned table has
+    /// to recurse, because partitions are never diffed on their own.
+    ///
+    /// A live drop + add re-creates the column from its TO definition, so the
+    /// type, default, nullability and identity changes that would otherwise
+    /// precede it are left out. They are redundant, and on a generated column
+    /// a type change can fail outright ("generation expression ... cannot be
+    /// cast automatically").
+    pub(crate) fn alter_parts(
+        &self,
+        existing: &TableColumn,
+        use_drop: bool,
+        caps: GeneratedAlterCaps,
+        set_expression_only: bool,
+    ) -> ColumnAlterParts {
+        self.alter_parts_recreating(existing, use_drop, caps, set_expression_only, false)
+    }
+
+    /// [`TableColumn::alter_parts`], with `recreate` forcing the drop + add
+    /// of a column that is generated in TO even when nothing about it would
+    /// otherwise need one — not even a change. The table alter path forces
+    /// it for a generated column that stands in the way of retyping a column
+    /// it reads (see `Table::columns_recreated_for_retype`). Ignored without
+    /// `use_drop`, and for a column that is not generated in TO.
+    pub(crate) fn alter_parts_recreating(
+        &self,
+        existing: &TableColumn,
+        use_drop: bool,
+        caps: GeneratedAlterCaps,
+        set_expression_only: bool,
+        recreate: bool,
+    ) -> ColumnAlterParts {
+        let recreate = recreate && use_drop && self.is_generated_column();
         let mut statements = Vec::new();
 
         let new_generated = Self::normalized_generated(&self.is_generated);
@@ -637,16 +1297,14 @@ impl TableColumn {
             if use_drop {
                 statements.push(drop_cmd);
             } else {
-                statements.push(
-                    drop_cmd
-                        .lines()
-                        .map(|l| format!("-- {}\n", l))
-                        .collect::<String>(),
-                );
+                statements.push(comment_out(&drop_cmd));
             }
         }
 
-        if self.type_clause_differs(existing) {
+        let type_statement = self
+            .type_clause_differs(existing)
+            .then_some(statements.len());
+        if type_statement.is_some() {
             statements.push(
                 format!(
                     "alter table {}.{} alter column {} type {};",
@@ -677,12 +1335,7 @@ impl TableColumn {
                     if use_drop {
                         statements.push(drop_cmd);
                     } else {
-                        statements.push(
-                            drop_cmd
-                                .lines()
-                                .map(|l| format!("-- {}\n", l))
-                                .collect::<String>(),
-                        );
+                        statements.push(comment_out(&drop_cmd));
                     }
                 }
             }
@@ -701,7 +1354,9 @@ impl TableColumn {
                 } else {
                     let commented = format!(
                         "-- use_drop=false: would drop NOT NULL\n-- alter table {}.{} alter column {} drop not null;\n",
-                        self.schema, self.table, self.name
+                        line_comment_safe(&self.schema),
+                        line_comment_safe(&self.table),
+                        line_comment_safe(&self.name)
                     );
                     statements.push(commented);
                 }
@@ -727,110 +1382,115 @@ impl TableColumn {
             self.build_identity_update_statements(existing, &mut statements);
         }
 
-        // Issue #181: `generation_type` (`s`/`v`) flips must also count
-        // as a change. PG18 introduced VIRTUAL generated columns and
-        // they CANNOT be ALTERed in place — neither
-        // `ALTER COLUMN DROP EXPRESSION` (which only works for
-        // STORED) nor `ALTER COLUMN ADD GENERATED ALWAYS AS (...)
-        // VIRTUAL` (invalid syntax) is valid. Without this check a
-        // STORED ↔ VIRTUAL flip with the same expression would be
-        // silently skipped.
-        let generation_type_changed = new_generated == "ALWAYS"
-            && old_generated == "ALWAYS"
-            && self.effective_generation_type() != existing.effective_generation_type();
-        let generated_changed = new_generated != old_generated
-            || (new_generated == "ALWAYS"
-                && self.generation_expression != existing.generation_expression)
-            || generation_type_changed;
+        let mut parts = ColumnAlterParts::default();
+        // Whether the column is rewritten (`plain_needs_rewrite`): its new
+        // copy starts with no storage, compression, statistics target or
+        // comment of its own.
+        let mut rewrite = false;
 
-        if generated_changed {
+        // Issue #181: `generation_type` (`s`/`v`) flips count as a change
+        // too; see `generated_changed`. So does a type change PostgreSQL 14
+        // cannot make in place (see `retype_needs_drop_and_add`).
+        if recreate || self.generated_changed(existing) || self.retype_needs_drop_and_add(existing)
+        {
             let new_is_generated = new_generated == "ALWAYS";
             let old_is_generated = old_generated != "NEVER";
 
-            // The drop+add gate lives in `would_drop_and_re_add` so the
-            // comparer's Path B detection (issue #188) cannot drift
-            // from this emission site. The predicate inlines the same
-            // `generated_changed` short-circuit above, so calling it
-            // here is redundant but safe — and it keeps the invariant
-            // enforced by code, not by a comment. Rationale: PG18+
-            // VIRTUAL generated columns reject in-place ALTER
-            // (`DROP EXPRESSION` only works for STORED; the
-            // `ADD GENERATED ... VIRTUAL` form is invalid syntax), so
-            // any participant that is VIRTUAL on either side — plus
-            // the non-generated→GENERATED transition — has no choice
-            // but the full DROP COLUMN + ADD COLUMN round-trip.
-            // (Issue #181)
-            let needs_full_recreate = self.would_drop_and_re_add(existing);
-
-            if needs_full_recreate {
+            if !recreate && self.can_set_expression(existing, caps) {
+                // Same kind and type, new expression, and the migrated server
+                // accepts the in-place form. It keeps the column's attnum,
+                // grants, comment and every dependent (PostgreSQL rebuilds
+                // indexes, constraints and statistics itself), and a generated
+                // value is derived data, so it is emitted even with
+                // use_drop=false. Deferred: the new expression may read a
+                // column this migration adds.
+                if let Some(expr) = &self.generation_expression {
+                    parts.deferred = format!(
+                        "alter table {}{}.{} alter column {} set expression as ({});",
+                        if set_expression_only { "only " } else { "" },
+                        self.schema,
+                        self.table,
+                        self.name,
+                        Self::normalized_generation_expression(expr)
+                    )
+                    .with_empty_lines();
+                }
+            } else if recreate || self.would_drop_and_re_add_with_caps(existing, caps) {
+                // The drop+add gate lives in `would_drop_and_re_add_with_caps`
+                // so the comparer's Path B detection (issue #188) cannot
+                // drift from this emission site. Everything but
+                // STORED -> plain and a SET EXPRESSION change lands here:
+                // VIRTUAL columns reject `DROP EXPRESSION`, and PostgreSQL has
+                // no `ALTER COLUMN ... ADD GENERATED ALWAYS AS (...)` for
+                // either kind (issue #181).
                 if use_drop {
-                    statements.push(self.get_drop_script());
-                    statements.push(self.get_add_script());
-                } else {
-                    let header = if !old_is_generated && new_is_generated {
-                        "-- use_drop=false: converting column to generated requires drop/add; statements commented out\n"
+                    // The re-added column carries the whole TO definition.
+                    statements.clear();
+                    if self.plain_needs_rewrite(existing) {
+                        (parts.drop, parts.deferred) = self.plain_rewrite_parts();
+                        rewrite = true;
                     } else {
+                        parts.drop = self.get_drop_script();
+                        parts.deferred = self.get_add_script();
+                    }
+                } else {
+                    // The in-place statements stay live, all but a type change
+                    // of a column that is generated now: PostgreSQL recomputes
+                    // it from the OLD expression cast to the new type, which
+                    // fails when no such cast exists (`integer` -> `date`:
+                    // "cannot be cast automatically") and is superseded by the
+                    // drop + add below when it does not.
+                    if old_is_generated && let Some(index) = type_statement {
+                        statements.remove(index);
+                    }
+                    let header = if self.plain_needs_rewrite(existing) {
+                        "-- use_drop=false: PostgreSQL 14 keeps a generated column depending on the functions and operators its expression used after DROP EXPRESSION, so making it plain with a new type needs a rewrite that drops the column; statements commented out\n"
+                    } else if !old_is_generated && new_is_generated {
+                        "-- use_drop=false: converting column to generated requires drop/add; statements commented out\n"
+                    } else if self.retype_needs_drop_and_add(existing)
+                        && !self.generated_changed(existing)
+                    {
+                        "-- use_drop=false: PostgreSQL 14 cannot change the type of a generated column whose expression uses a function or operator; drop/add required and statements commented out\n"
+                    } else if existing.effective_generation_type() == "v"
+                        || self.effective_generation_type() == "v"
+                    {
                         "-- use_drop=false: virtual generated column cannot be ALTERed in place (PG18+); drop/add required and statements commented out\n"
+                    } else if self.type_differs(existing) {
+                        "-- use_drop=false: changing a stored generated column's type together with its expression needs drop/add (SET EXPRESSION keeps the type); statements commented out\n"
+                    } else {
+                        "-- use_drop=false: changing a stored generated column's expression needs drop/add on this server (SET EXPRESSION requires PostgreSQL 17+); statements commented out\n"
                     };
                     let mut commented = String::from(header);
-                    for line in self.get_drop_script().lines() {
-                        commented.push_str(&format!("-- {line}\n"));
-                    }
-                    for line in self.get_add_script().lines() {
-                        commented.push_str(&format!("-- {line}\n"));
+                    if self.plain_needs_rewrite(existing) {
+                        let (drop, rename) = self.plain_rewrite_parts();
+                        commented.push_str(&comment_out(&drop));
+                        commented.push_str(&comment_out(&rename));
+                    } else {
+                        commented.push_str(&comment_out(&self.get_drop_script()));
+                        commented.push_str(&comment_out(&self.get_add_script()));
                     }
                     statements.push(commented);
                 }
-            } else {
-                if old_is_generated {
-                    let drop_cmd = format!(
-                        "alter table {}.{} alter column {} drop expression;",
-                        self.schema, self.table, self.name
-                    )
-                    .with_empty_lines();
-                    if use_drop {
-                        statements.push(drop_cmd);
-                    } else {
-                        statements.push(
-                            drop_cmd
-                                .lines()
-                                .map(|l| format!("-- {}\n", l))
-                                .collect::<String>(),
-                        );
-                    }
-                }
-
-                if new_is_generated && let Some(expr) = &self.generation_expression {
-                    let norm_expr = Self::normalized_generation_expression(expr);
-                    let wrapped = format!("({norm_expr})");
-                    // We only reach this branch for STORED-side
-                    // additions — `needs_full_recreate` already
-                    // routed any VIRTUAL participant through the
-                    // drop+add path above.
-                    let add_cmd = format!(
-                        "alter table {}.{} alter column {} add generated always as {wrapped} stored;",
-                        self.schema, self.table, self.name
-                    ).with_empty_lines();
-                    if use_drop || !old_is_generated {
-                        statements.push(add_cmd);
-                    } else {
-                        // Drop was commented out, so add would fail; comment it out too
-                        statements.push("-- use_drop=false: drop expression + add generated requires drop; statements commented out (manual intervention needed)\n".to_string());
-                        statements.push(
-                            add_cmd
-                                .lines()
-                                .map(|l| format!("-- {}\n", l))
-                                .collect::<String>(),
-                        );
-                    }
+            } else if old_is_generated {
+                // STORED -> plain: the column keeps its values.
+                let drop_cmd = format!(
+                    "alter table {}.{} alter column {} drop expression;",
+                    self.schema, self.table, self.name
+                )
+                .with_empty_lines();
+                if use_drop {
+                    statements.push(drop_cmd);
+                } else {
+                    statements.push(comment_out(&drop_cmd));
                 }
             }
         }
 
+        let mut post = Vec::new();
         if self.storage != existing.storage
             && let Some(storage) = &self.storage
         {
-            statements.push(
+            post.push(
                 format!(
                     "alter table {}.{} alter column {} set storage {};",
                     self.schema, self.table, self.name, storage
@@ -841,7 +1501,7 @@ impl TableColumn {
 
         if self.compression != existing.compression {
             if let Some(compression) = &self.compression {
-                statements.push(
+                post.push(
                     format!(
                         "alter table {}.{} alter column {} set compression {};",
                         self.schema, self.table, self.name, compression
@@ -849,7 +1509,7 @@ impl TableColumn {
                     .with_empty_lines(),
                 );
             } else {
-                statements.push(
+                post.push(
                     format!(
                         "alter table {}.{} alter column {} set compression default;",
                         self.schema, self.table, self.name
@@ -863,7 +1523,7 @@ impl TableColumn {
             if let Some(stats) = self.statistics_target
                 && stats >= 0
             {
-                statements.push(
+                post.push(
                     format!(
                         "alter table {}.{} alter column {} set statistics {};",
                         self.schema, self.table, self.name, stats
@@ -871,7 +1531,7 @@ impl TableColumn {
                     .with_empty_lines(),
                 );
             } else {
-                statements.push(
+                post.push(
                     format!(
                         "alter table {}.{} alter column {} set statistics -1;",
                         self.schema, self.table, self.name
@@ -881,32 +1541,56 @@ impl TableColumn {
             }
         }
 
-        if statements.is_empty() {
-            None
-        } else {
-            let mut joined = statements.join("");
-            if self.comment != existing.comment {
-                let comment_stmt = if let Some(cmt) = &self.comment {
-                    format!(
-                        "comment on column {}.{}.{} is '{}';",
-                        self.schema,
-                        self.table,
-                        self.name,
-                        cmt.replace('\'', "''")
-                    )
-                } else {
-                    format!(
-                        "comment on column {}.{}.{} is null;",
-                        self.schema, self.table, self.name
-                    )
-                };
-                joined.append_block(&comment_stmt);
-            }
-            Some(joined)
+        // The rewrite's own statements carry the rest.
+        if rewrite {
+            post.clear();
         }
+
+        // A comment change rides along with the other statements, as it
+        // always has; a rewritten column gets its comment back.
+        let comment = if (rewrite && self.comment.is_some())
+            || (self.comment != existing.comment
+                && (parts.is_deferred() || !statements.is_empty() || !post.is_empty()))
+        {
+            let comment_stmt = if let Some(cmt) = &self.comment {
+                format!(
+                    "comment on column {}.{}.{} is '{}';",
+                    self.schema,
+                    self.table,
+                    self.name,
+                    cmt.replace('\'', "''")
+                )
+            } else {
+                format!(
+                    "comment on column {}.{}.{} is null;",
+                    self.schema, self.table, self.name
+                )
+            };
+            let mut block = String::new();
+            block.append_block(&comment_stmt);
+            block
+        } else {
+            String::new()
+        };
+
+        if parts.is_deferred() {
+            parts.inline = statements.concat();
+            parts.post = post.concat();
+            parts.comment = comment;
+        } else {
+            parts.inline = [statements.concat(), post.concat(), comment].concat();
+        }
+        parts
     }
 
     pub fn get_add_script(&self) -> String {
+        self.get_add_script_with_not_null("not null")
+    }
+
+    /// [`TableColumn::get_add_script`] with `not_null` — such as
+    /// `constraint c_nn not null` — in place of its plain `not null` when
+    /// the column is not nullable.
+    pub(crate) fn get_add_script_with_not_null(&self, not_null: &str) -> String {
         let mut statement = format!(
             "alter table {}.{} add column {} {}",
             self.schema,
@@ -969,7 +1653,8 @@ impl TableColumn {
         }
 
         if !self.is_nullable {
-            statement.push_str(" not null");
+            statement.push(' ');
+            statement.push_str(not_null);
         }
 
         statement.append_block(";");
