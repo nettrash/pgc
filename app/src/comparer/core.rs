@@ -306,6 +306,28 @@ struct MoveChecks {
     readds: Vec<TableConstraint>,
 }
 
+/// The per-table answer of `Comparer::table_alter_caps`, keyed by FROM table
+/// `(schema, name)`.
+type TableAlterCapsMap = HashMap<(String, String), TableAlterCaps>;
+
+/// What `Comparer::set_expression_check_hazards` plans: the CHECK
+/// constraints that have to be out of the way of an `ALTER TABLE ONLY ...
+/// SET EXPRESSION`. All three are keyed by FROM table `(schema, name)`.
+#[derive(Debug, Default)]
+pub(crate) struct SetExpressionHazards {
+    /// The tables whose `SET EXPRESSION` is at risk. Without `use_drop`
+    /// nothing can be dropped ahead, so `Comparer::table_alter_caps` turns
+    /// the in-place form off for them: the expression change becomes a
+    /// drop + add, commented out like every other drop.
+    pub(crate) tables: HashSet<(String, String)>,
+    /// The CHECKs each holder drops ahead of the table alters, parents
+    /// first: added to [`InheritedRecreates::family_checks`].
+    pub(crate) drops: HashMap<(String, String), HashSet<String>>,
+    /// The CHECKs, as TO has them on each table, whose add waits for every
+    /// table alter: [`InheritedRecreates::checks_after_alters`].
+    pub(crate) deferred: HashMap<(String, String), HashSet<String>>,
+}
+
 /// The statement `--guard-sql-routine-bodies` emits. `SET`, not `SET LOCAL`,
 /// so it also covers the post-commit section (see
 /// `Comparer::set_guard_sql_routine_bodies`).
@@ -2525,6 +2547,33 @@ impl Comparer {
     /// Path B dependent restoration, and the view pre-drop in
     /// `dependent_view_keys`) sees the same answer.
     pub(crate) fn table_alter_caps(&self) -> HashMap<(String, String), TableAlterCaps> {
+        self.table_alter_caps_and_left_out().0
+    }
+
+    /// [`Comparer::table_alter_caps`], and the FROM tables, sorted, whose
+    /// `SET EXPRESSION` it turns off because `use_drop` is off and the
+    /// statement would corrupt an inherited CHECK constraint (see
+    /// `Comparer::set_expression_check_hazards`). Empty with `use_drop`.
+    fn table_alter_caps_and_left_out(&self) -> (TableAlterCapsMap, Vec<(String, String)>) {
+        let mut caps = self.base_table_alter_caps();
+        let mut left_out = Vec::new();
+        // Without `use_drop` no CHECK can be dropped out of the way, so such
+        // a table gets the drop + add, which `use_drop` off leaves out too.
+        if !self.use_drop {
+            left_out.extend(self.set_expression_check_hazards(&caps).tables);
+            left_out.sort();
+            for key in &left_out {
+                if let Some(table_caps) = caps.get_mut(key) {
+                    table_caps.generated.stored_set_expression = false;
+                    table_caps.generated.virtual_set_expression = false;
+                }
+            }
+        }
+        (caps, left_out)
+    }
+
+    /// [`Comparer::table_alter_caps`] before the `use_drop` adjustment.
+    fn base_table_alter_caps(&self) -> HashMap<(String, String), TableAlterCaps> {
         if !self.migrated_server_at_least(170000) {
             return HashMap::new();
         }
@@ -3628,6 +3677,197 @@ impl Comparer {
             }
         }
         plans
+    }
+
+    /// The inherited CHECK constraints an `ALTER TABLE ONLY ... SET
+    /// EXPRESSION` would corrupt, and how the migration keeps them out of
+    /// its way (see [`SetExpressionHazards`]).
+    ///
+    /// PostgreSQL 17+ rebuilds the CHECK constraints that read the column,
+    /// and gets inheritance wrong when the statement says `ONLY` (verified
+    /// live on 17, 18 and 19rc1, STORED and VIRTUAL alike). On a child it
+    /// drops a copy the table only inherits and never adds it back, and it
+    /// turns a merged copy into a plain local one; on a parent the re-add
+    /// recurses into children whose copies were never dropped, so each one
+    /// ends up counting its parent twice (`coninhcount` 2), which no later
+    /// statement undoes. A partitioned table's statement recurses (no
+    /// `ONLY`) and is not affected.
+    ///
+    /// So for each FROM table whose alter writes `SET EXPRESSION` with
+    /// `ONLY` (a table that is neither partitioned nor a partition, altered
+    /// in place, see [`TableColumn::sets_expression_in_place`]), every
+    /// inheritable CHECK that reads one of those columns has to be gone when
+    /// it runs: its own when it has `INHERITS` children (in either dump: a
+    /// TO-only child is created before the alters), and those of every
+    /// `INHERITS` ancestor the table keeps, which the table inherits. Each
+    /// such CHECK in FROM joins its holder's
+    /// [`InheritedRecreates::family_checks`], so it is dropped ahead of the
+    /// table alters, parents first; and the add of every CHECK of those
+    /// names that TO holds on the table or a kept ancestor waits for every
+    /// table alter ([`InheritedRecreates::checks_after_alters`]), as an add
+    /// recurses into children whose own `SET EXPRESSION` runs later. A CHECK
+    /// that reads none of the columns is left alone: PostgreSQL does not
+    /// touch it.
+    ///
+    /// A holder the migration drops, or drops and re-creates, takes its
+    /// copies with it and is left out, as is an ancestor outside the dumps.
+    pub(crate) fn set_expression_check_hazards(
+        &self,
+        alter_caps: &HashMap<(String, String), TableAlterCaps>,
+    ) -> SetExpressionHazards {
+        let mut hazards = SetExpressionHazards::default();
+        let from = &self.from.tables;
+        let to = &self.to.tables;
+        if from.iter().all(|t| t.inherits_from.is_empty())
+            && to.iter().all(|t| t.inherits_from.is_empty())
+        {
+            return hazards;
+        }
+        let from_index = Self::relation_index(from.iter());
+        let to_index = Self::relation_index(to.iter());
+        let from_children = Self::relation_children(from);
+        let to_children = Self::relation_children(to);
+        let to_of = |table: &Table| {
+            Self::lookup_relation(&to_index, &Self::table_key(&table.schema, &table.name))
+                .map(|i| &to[i])
+        };
+        // `INHERITS` ancestors, nearest first, walking only the parents
+        // `kept` keeps.
+        let ancestors = |tables: &[Table],
+                         index: &HashMap<String, usize>,
+                         start: usize,
+                         kept: &dyn Fn(&str) -> bool|
+         -> Vec<usize> {
+            let mut seen = vec![false; tables.len()];
+            seen[start] = true;
+            let mut out = Vec::new();
+            let mut queue: VecDeque<usize> = tables[start]
+                .inherits_from
+                .iter()
+                .filter(|r| kept(r))
+                .filter_map(|r| Self::lookup_relation(index, r))
+                .collect();
+            while let Some(a) = queue.pop_front() {
+                if std::mem::replace(&mut seen[a], true) {
+                    continue;
+                }
+                out.push(a);
+                queue.extend(
+                    tables[a]
+                        .inherits_from
+                        .iter()
+                        .filter_map(|r| Self::lookup_relation(index, r)),
+                );
+            }
+            out
+        };
+
+        for (i, table) in from.iter().enumerate() {
+            let Some(to_table) = to_of(table) else {
+                continue;
+            };
+            if table.hash.is_none()
+                || !Self::hashes_differ(&table.hash, &to_table.hash)
+                || table.partition_of.is_some()
+                || to_table.partition_of.is_some()
+                || to_table.partition_key.is_some()
+                || Self::alter_drops_table(table, to_table)
+            {
+                continue;
+            }
+            let caps = Self::caps_for(alter_caps, table).generated;
+            let columns: Vec<&str> = to_table
+                .columns
+                .iter()
+                .filter(|to_col| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|c| c.name == to_col.name)
+                        .is_some_and(|from_col| to_col.sets_expression_in_place(from_col, caps))
+                })
+                .map(|c| c.name.as_str())
+                .collect();
+            if columns.is_empty() {
+                continue;
+            }
+            let reads = |c: &TableConstraint| {
+                !c.no_inherit && columns.iter().any(|column| c.check_reads_column(column))
+            };
+            let mut names: HashSet<String> = HashSet::new();
+            let mut drop_ahead = |holder: &Table, name: &str, names: &mut HashSet<String>| {
+                hazards
+                    .drops
+                    .entry((holder.schema.clone(), holder.name.clone()))
+                    .or_default()
+                    .insert(name.to_string());
+                names.insert(name.to_string());
+            };
+
+            // Its own CHECKs, which the parent's re-add would double up in
+            // its children.
+            let to_i = to_index
+                .get(&Self::table_key(&to_table.schema, &to_table.name))
+                .copied();
+            let has_children =
+                !from_children[i].is_empty() || to_i.is_some_and(|t| !to_children[t].is_empty());
+            if has_children {
+                for check in table.constraints.iter().filter(|c| reads(c)) {
+                    drop_ahead(table, &check.name, &mut names);
+                }
+            }
+
+            // The CHECKs it inherits from the ancestors it keeps.
+            let kept = |r: &str| to_table.inherits_from.iter().any(|t| t == r);
+            for a in ancestors(from, &from_index, i, &kept) {
+                let ancestor = &from[a];
+                let Some(to_ancestor) = to_of(ancestor) else {
+                    continue;
+                };
+                if ancestor.hash.is_none() || Self::alter_drops_table(ancestor, to_ancestor) {
+                    continue;
+                }
+                // A merged copy here stays, a plain local one once the
+                // ancestors' copies are gone, which the statement leaves be.
+                for check in ancestor.constraints.iter().filter(|c| reads(c)) {
+                    drop_ahead(ancestor, &check.name, &mut names);
+                }
+            }
+            // A CHECK TO's ancestors add, which the add would hand down.
+            let mut to_holders: Vec<&Table> = vec![to_table];
+            if let Some(to_i) = to_i {
+                let kept_from = |r: &str| table.inherits_from.iter().any(|f| f == r);
+                to_holders.extend(
+                    ancestors(to, &to_index, to_i, &kept_from)
+                        .into_iter()
+                        .map(|a| &to[a]),
+                );
+            }
+            for holder in &to_holders[1..] {
+                for check in holder.constraints.iter().filter(|c| reads(c)) {
+                    names.insert(check.name.clone());
+                }
+            }
+            if names.is_empty() {
+                continue;
+            }
+            hazards
+                .tables
+                .insert((table.schema.clone(), table.name.clone()));
+            // Every add of those names on the table and the ancestors waits.
+            for holder in to_holders {
+                for check in holder.constraints.iter().filter(|c| {
+                    c.constraint_type.eq_ignore_ascii_case("check") && names.contains(&c.name)
+                }) {
+                    hazards
+                        .deferred
+                        .entry((holder.schema.clone(), holder.name.clone()))
+                        .or_default()
+                        .insert(check.name.clone());
+                }
+            }
+        }
+        hazards
     }
 
     /// The columns, keyed by FROM table `(schema, name)`, that each table's
@@ -5055,15 +5295,31 @@ impl Comparer {
                 let family = inherited_recreates
                     .get(&(from_parent.schema.clone(), from_parent.name.clone()))
                     .is_some_and(|plan| plan.family_checks.contains(&check.name));
+                let caps = Self::caps_for(alter_caps, from_parent).generated;
                 let rewrites_columns = !from_parent
-                    .rewrite_column_drops(
-                        parent,
-                        self.use_drop,
-                        Self::caps_for(alter_caps, from_parent).generated,
-                    )
+                    .rewrite_column_drops(parent, self.use_drop, caps)
                     .is_empty();
+                // A recursing in-place rewrite of a column the CHECK reads —
+                // `ALTER COLUMN ... TYPE` (a collation change included), or
+                // a partitioned table's `SET EXPRESSION` — rebuilds every
+                // copy beneath from the parent's, and so resets a copy kept
+                // ENFORCED under a `NOT ENFORCED` parent (verified live on
+                // PostgreSQL 19rc1).
+                let rebuilds_check = parent.columns.iter().any(|to_col| {
+                    check.check_reads_column(&to_col.name)
+                        && from_parent
+                            .columns
+                            .iter()
+                            .find(|c| c.name == to_col.name)
+                            .is_some_and(|from_col| {
+                                to_col.alters_type_in_place(from_col, caps, self.use_drop)
+                                    || (parent.partition_key.is_some()
+                                        && to_col.sets_expression_in_place(from_col, caps))
+                            })
+                });
                 family
                     || rewrites_columns
+                    || rebuilds_check
                     || readded.contains(&(
                         parent.schema.clone(),
                         parent.name.clone(),
@@ -7855,6 +8111,26 @@ impl Comparer {
         for (key, checks) in self.inherited_check_recreates(alter_caps) {
             inherited_recreates.entry(key).or_default().family_checks = checks;
         }
+        // The CHECKs in the way of an `ALTER TABLE ONLY ... SET EXPRESSION`
+        // (see `Comparer::set_expression_check_hazards`). Without `use_drop`
+        // `table_alter_caps` has turned that form off for them instead.
+        if self.use_drop {
+            let hazards = self.set_expression_check_hazards(alter_caps);
+            for (key, checks) in hazards.drops {
+                inherited_recreates
+                    .entry(key)
+                    .or_default()
+                    .family_checks
+                    .extend(checks);
+            }
+            for (key, checks) in hazards.deferred {
+                inherited_recreates
+                    .entry(key)
+                    .or_default()
+                    .checks_after_alters
+                    .extend(checks);
+            }
+        }
         for (key, columns) in self.inherited_retypes(alter_caps) {
             inherited_recreates
                 .entry(key)
@@ -7900,7 +8176,18 @@ impl Comparer {
 
         // In-place ALTER forms the FROM server accepts, per table. Shared by
         // the alter call and the Path B gate below so they cannot disagree.
-        let alter_caps = self.table_alter_caps();
+        let (alter_caps, set_expression_left_out) = self.table_alter_caps_and_left_out();
+        for (schema, name) in &set_expression_left_out {
+            let warning = format!(
+                "Warning: the generated-column expression changes of table {schema}.{name} are \
+                 left out: ALTER TABLE ONLY ... SET EXPRESSION would corrupt the inherited CHECK \
+                 constraints that read them (PostgreSQL 17+), and with use_drop off they cannot \
+                 be dropped and re-added around it."
+            );
+            self.script
+                .push_str(&format!("/* {} */\n", block_comment_safe(&warning)));
+            eprintln!("{warning}");
+        }
         let mut inherited_recreates = self.plan_inherited_recreates(&alter_caps);
         let blockers = self.column_drop_blockers(&alter_caps);
         // The policies in the way of an in-place retype, by table key: those
@@ -8795,6 +9082,41 @@ impl Comparer {
             } else {
                 continue; // Table is present in both dumps, we already processed it
             }
+        }
+
+        // The CHECK adds that wait for every table alter (see
+        // `InheritedRecreates::checks_after_alters`), parents first.
+        let mut after_alters_script = String::new();
+        for table in ordered_from.iter() {
+            let Some(inherited) = inherited_recreates
+                .get(&(table.schema.clone(), table.name.clone()))
+                .filter(|inherited| !inherited.checks_after_alters.is_empty())
+            else {
+                continue;
+            };
+            if self
+                .dropped_and_recreated_tables
+                .contains(&Self::table_key(&table.schema, &table.name))
+            {
+                continue;
+            }
+            if let Some(&tidx) = to_table_map.get(&(table.schema.as_str(), table.name.as_str())) {
+                after_alters_script.push_str(&table.after_alters_script(
+                    &self.to.tables[tidx],
+                    self.use_drop,
+                    Self::caps_for(&alter_caps, table),
+                    inherited,
+                ));
+            }
+        }
+        if !after_alters_script.is_empty() {
+            self.script.append_block(
+                "\n/* ---> CHECK constraints added after the table alters: Start ---- */",
+            );
+            self.script.push_str(&after_alters_script);
+            self.script.append_block(
+                "/* ---> CHECK constraints added after the table alters: End ------ */",
+            );
         }
 
         // The policies in the way of an in-place retype (see

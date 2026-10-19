@@ -5620,3 +5620,166 @@ CREATE FOREIGN TABLE test_schema.pg19_comments_ft (id integer)
     SERVER test_foreign_server OPTIONS (schema_name 'public', table_name 'b', updatable 'false');
 
 -- ==== END fix:comments ====
+
+-- ==== BEGIN fix:inhcheck — inherited CHECK constraints around SET EXPRESSION and parent retypes ====
+-- PostgreSQL 17+ corrupts the inherited CHECKs that read a generated column
+-- whose expression `ALTER TABLE ONLY ... SET EXPRESSION` changes: a child's
+-- copy it only inherits is dropped and never re-added, a merged copy loses
+-- its inheritance, and a parent's re-add counts its children twice
+-- (coninhcount 2). pgc drops those CHECKs ahead of the table alters and adds
+-- them back after every one (README section 80). TO changes the expressions
+-- (a * 2) -> (a * 3), and some children's own (a * 5) -> (a * 7).
+
+-- Every version (PG14-16 drop and re-add the column).
+CREATE TABLE test_schema.inhck_a (
+    id integer,
+    a  integer,
+    v  integer GENERATED ALWAYS AS (a * 3) STORED,
+    CONSTRAINT inhck_a_v CHECK (v > -1000)
+);
+CREATE TABLE test_schema.inhck_a_child () INHERITS (test_schema.inhck_a);
+INSERT INTO test_schema.inhck_a_child (id, a) VALUES (1, 5), (2, 6);
+CREATE TABLE test_schema.inhck_e (
+    a integer,
+    v integer GENERATED ALWAYS AS (a * 3) STORED,
+    CONSTRAINT inhck_e_v CHECK (v > -1000)
+);
+CREATE TABLE test_schema.inhck_e_child () INHERITS (test_schema.inhck_e);
+CREATE TABLE test_schema.inhck_e_grandchild () INHERITS (test_schema.inhck_e_child);
+INSERT INTO test_schema.inhck_e_grandchild (a) VALUES (7);
+-- The CHECK changes too.
+CREATE TABLE test_schema.inhck_h (
+    a integer,
+    v integer GENERATED ALWAYS AS (a * 3) STORED,
+    CONSTRAINT inhck_h_v CHECK (v > -2000)
+);
+CREATE TABLE test_schema.inhck_h_child () INHERITS (test_schema.inhck_h);
+-- A CHECK that does not read the column is left alone.
+CREATE TABLE test_schema.inhck_i (
+    a integer,
+    b integer,
+    v integer GENERATED ALWAYS AS (a * 3) STORED,
+    CONSTRAINT inhck_i_b CHECK (b > -1000)
+);
+CREATE TABLE test_schema.inhck_i_child () INHERITS (test_schema.inhck_i);
+
+-- PG17+ only: on older servers these need a drop + add of an inherited
+-- column, which pgc cannot make yet.
+DO $inhck$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 170000 THEN
+        -- The child keeps an expression of its own; the parent's changes.
+        CREATE TABLE test_schema.inhck_b (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 3) STORED,
+            CONSTRAINT inhck_b_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_b_child (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 5) STORED
+        ) INHERITS (test_schema.inhck_b);
+        -- Only the child's own expression changes.
+        CREATE TABLE test_schema.inhck_c (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 2) STORED,
+            CONSTRAINT inhck_c_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_c_child (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 7) STORED
+        ) INHERITS (test_schema.inhck_c);
+        INSERT INTO test_schema.inhck_c_child (a) VALUES (3);
+        -- A merged child copy.
+        CREATE TABLE test_schema.inhck_d (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 3) STORED,
+            CONSTRAINT inhck_d_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_d_child (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 3) STORED,
+            CONSTRAINT inhck_d_v CHECK (v > -1000)
+        ) INHERITS (test_schema.inhck_d);
+        -- Two parents with the same CHECK.
+        CREATE TABLE test_schema.inhck_f_x (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 3) STORED,
+            CONSTRAINT inhck_f_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_f_y (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 3) STORED,
+            CONSTRAINT inhck_f_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_f_m () INHERITS (test_schema.inhck_f_x, test_schema.inhck_f_y);
+        -- TO adds the CHECK to the parent; the child's own expression changes.
+        CREATE TABLE test_schema.inhck_g (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 2) STORED,
+            CONSTRAINT inhck_g_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_g_child (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 7) STORED
+        ) INHERITS (test_schema.inhck_g);
+    END IF;
+END
+$inhck$;
+
+-- VIRTUAL, PG19+ (18 has no SET EXPRESSION with CHECK constraints). A block
+-- of its own: PL/pgSQL parses the whole block first, and VIRTUAL is a syntax
+-- error before PG18.
+DO $inhck$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        CREATE TABLE test_schema.inhck_va (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 3) VIRTUAL,
+            CONSTRAINT inhck_va_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_va_child () INHERITS (test_schema.inhck_va);
+        INSERT INTO test_schema.inhck_va_child (a) VALUES (4);
+        CREATE TABLE test_schema.inhck_vc (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 2) VIRTUAL,
+            CONSTRAINT inhck_vc_v CHECK (v > -1000)
+        );
+        CREATE TABLE test_schema.inhck_vc_child (
+            a integer,
+            v integer GENERATED ALWAYS AS (a * 7) VIRTUAL
+        ) INHERITS (test_schema.inhck_vc);
+    END IF;
+END
+$inhck$;
+
+-- A copy kept ENFORCED under a NOT ENFORCED parent, which a recursing
+-- rebuild of the CHECK resets (every version; the enforceability needs
+-- PG19, and its ALTER CONSTRAINT fails harmlessly before). TO retypes the
+-- column the CHECK reads: integer -> bigint, a new collation, and on a
+-- partitioned parent a column that is not its key.
+CREATE TABLE test_schema.inhck_en (
+    a bigint,
+    CONSTRAINT inhck_en_a CHECK (a > -1000)
+);
+CREATE TABLE test_schema.inhck_en_child () INHERITS (test_schema.inhck_en);
+ALTER TABLE test_schema.inhck_en ALTER CONSTRAINT inhck_en_a NOT ENFORCED;
+ALTER TABLE test_schema.inhck_en_child ALTER CONSTRAINT inhck_en_a ENFORCED;
+CREATE TABLE test_schema.inhck_enc (
+    t text COLLATE "C",
+    CONSTRAINT inhck_enc_t CHECK (t <> 'x')
+);
+CREATE TABLE test_schema.inhck_enc_child () INHERITS (test_schema.inhck_enc);
+ALTER TABLE test_schema.inhck_enc ALTER CONSTRAINT inhck_enc_t NOT ENFORCED;
+ALTER TABLE test_schema.inhck_enc_child ALTER CONSTRAINT inhck_enc_t ENFORCED;
+CREATE TABLE test_schema.inhck_enp (
+    k integer NOT NULL,
+    a bigint,
+    CONSTRAINT inhck_enp_a CHECK (a > -1000)
+) PARTITION BY RANGE (k);
+CREATE TABLE test_schema.inhck_enp_1
+    PARTITION OF test_schema.inhck_enp FOR VALUES FROM (0) TO (100);
+ALTER TABLE test_schema.inhck_enp ALTER CONSTRAINT inhck_enp_a NOT ENFORCED;
+ALTER TABLE test_schema.inhck_enp_1 ALTER CONSTRAINT inhck_enp_a ENFORCED;
+INSERT INTO test_schema.inhck_enp (k, a) VALUES (1, 1);
+
+-- ==== END fix:inhcheck ====

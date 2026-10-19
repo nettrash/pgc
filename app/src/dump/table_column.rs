@@ -99,6 +99,75 @@ fn generation_expressions_equivalent(a: &Option<String>, b: &Option<String>) -> 
     }
 }
 
+/// Whether the deparsed expression `expr` reads the column named `column`
+/// (in the `quote_ident` form the dump stores names in): an identifier
+/// token outside string literals that is not a function (followed by `(`),
+/// a type (after `::`) or part of a qualified name (next to a `.`). A token
+/// that is none of these but happens to spell the name is still counted, so
+/// a caller that acts on `true` does more than it had to, never less.
+/// `pg_get_expr` and `pg_get_constraintdef` print column references
+/// unqualified and in that same form.
+pub(crate) fn expression_reads_identifier(expr: &str, column: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let start = i;
+        if b == b'\'' {
+            // A literal; a doubled quote stays inside it.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len());
+        } else if b.is_ascii_alphabetic() || b == b'_' || !b.is_ascii() {
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] == b'_'
+                    || bytes[i] == b'$'
+                    || !bytes[i].is_ascii())
+            {
+                i += 1;
+            }
+        } else {
+            i += 1;
+            continue;
+        }
+        let token = &expr[start..i];
+        let before = expr[..start].trim_end();
+        let after = expr[i..].trim_start();
+        let qualified = before.ends_with('.') || after.starts_with('.');
+        let is_type = before.ends_with("::");
+        let is_call = after.starts_with('(');
+        if token == column && !qualified && !is_type && !is_call {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether the `(` that starts `expr` is closed by the `)` that ends it, so
 /// one pair of parentheses encloses the whole expression. Parentheses inside
 /// string literals and quoted identifiers (with their doubled-quote escapes)
@@ -581,81 +650,16 @@ impl TableColumn {
     }
 
     /// Whether this generated column's expression reads the column named
-    /// `column` (in the `quote_ident` form the dump stores names in).
-    ///
-    /// `pg_get_expr` prints a generated column's expression with its column
-    /// references unqualified and in that same form, so they are found as
-    /// identifier tokens outside string literals — skipping one that names
-    /// a function (followed by `(`), a type (after `::`) or part of a
-    /// qualified name (next to a `.`). A token that is none of these but
-    /// happens to spell the name is still counted: the caller then does
-    /// more than it had to, never less. `false` for a column that is not
-    /// generated.
+    /// `column` (in the `quote_ident` form the dump stores names in), as
+    /// [`expression_reads_identifier`] finds it. `false` for a column that
+    /// is not generated.
     pub(crate) fn generation_expression_reads(&self, column: &str) -> bool {
         if !self.is_generated_column() {
             return false;
         }
-        let Some(expr) = self.generation_expression.as_deref() else {
-            return false;
-        };
-        let bytes = expr.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let b = bytes[i];
-            let start = i;
-            if b == b'\'' {
-                // A literal; a doubled quote stays inside it.
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if bytes.get(i + 1) == Some(&b'\'') {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-                i += 1;
-                continue;
-            }
-            if b == b'"' {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        if bytes.get(i + 1) == Some(&b'"') {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-                i = (i + 1).min(bytes.len());
-            } else if b.is_ascii_alphabetic() || b == b'_' || !b.is_ascii() {
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric()
-                        || bytes[i] == b'_'
-                        || bytes[i] == b'$'
-                        || !bytes[i].is_ascii())
-                {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-                continue;
-            }
-            let token = &expr[start..i];
-            let before = expr[..start].trim_end();
-            let after = expr[i..].trim_start();
-            let qualified = before.ends_with('.') || after.starts_with('.');
-            let is_type = before.ends_with("::");
-            let is_call = after.starts_with('(');
-            if token == column && !qualified && !is_type && !is_call {
-                return true;
-            }
-        }
-        false
+        self.generation_expression
+            .as_deref()
+            .is_some_and(|expr| expression_reads_identifier(expr, column))
     }
 
     /// Whether the generated part of the column — generated or not, its
@@ -746,7 +750,21 @@ impl TableColumn {
         use_drop: bool,
     ) -> bool {
         self.alters_type_in_place(existing, caps, use_drop)
-            || (self.generated_changed(existing) && self.can_set_expression(existing, caps))
+            || self.sets_expression_in_place(existing, caps)
+    }
+
+    /// Whether altering `existing` into `self` is an `ALTER COLUMN ... SET
+    /// EXPRESSION AS (...)`: the expression of a column that stays generated
+    /// changes, and the migrated server applies that in place (`caps`). On
+    /// a table that is not partitioned the comparer writes it `ALTER TABLE
+    /// ONLY`, which PostgreSQL 17+ gets wrong around inherited CHECK
+    /// constraints (see `Comparer::set_expression_check_hazards`).
+    pub(crate) fn sets_expression_in_place(
+        &self,
+        existing: &TableColumn,
+        caps: GeneratedAlterCaps,
+    ) -> bool {
+        self.generated_changed(existing) && self.can_set_expression(existing, caps)
     }
 
     /// The `ALTER COLUMN ... TYPE` half of [`TableColumn::rewrites_in_place`]

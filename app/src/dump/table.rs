@@ -342,6 +342,13 @@ pub(crate) struct InheritedRecreates {
     /// whose copy does not change included; the order of the re-adds does
     /// not matter. Never an in-place `ALTER CONSTRAINT`.
     pub(crate) family_checks: HashSet<String>,
+    /// CHECK constraints of this table, by name, whose add or re-add the
+    /// alter leaves to the comparer, which runs it once every table alter
+    /// has (see [`Table::after_alters_script`]). An add recurses to the
+    /// inheritance children, and a child's own `ALTER TABLE ONLY ... SET
+    /// EXPRESSION` later in the loop drops a copy it only inherits
+    /// (PostgreSQL 17+; see `Comparer::set_expression_check_hazards`).
+    pub(crate) checks_after_alters: HashSet<String>,
     /// Columns this table inherits (`INHERITS`) from an ancestor whose own
     /// alter retypes them in place: that `ALTER COLUMN ... TYPE` recurses to
     /// this table, which PostgreSQL forbids to retype an inherited column
@@ -427,6 +434,9 @@ struct AlterScriptParts {
     /// left to the comparer's pass after it (see
     /// `InheritedRecreates::retyped_by_ancestor`).
     ancestor_retype_pre_script: String,
+    /// The CHECK adds left to the comparer's pass after every table alter
+    /// (see `InheritedRecreates::checks_after_alters`).
+    after_alters_script: String,
 }
 
 /// This is an information about a PostgreSQL table.
@@ -2833,6 +2843,7 @@ impl Table {
                 replica_identity_after: None,
                 ancestor_pre_script: String::new(),
                 ancestor_retype_pre_script: String::new(),
+                after_alters_script: String::new(),
             };
         }
 
@@ -2855,6 +2866,8 @@ impl Table {
         let mut generated_script = String::new();
         let mut column_drop_script = String::new();
         let mut constraint_post_script = String::new();
+        // See `InheritedRecreates::checks_after_alters`.
+        let mut after_alters_script = String::new();
         let mut index_script = String::new();
         let mut index_drop_script = String::new();
         let mut detach_script = String::new();
@@ -2984,6 +2997,12 @@ impl Table {
             constraint.constraint_type.eq_ignore_ascii_case("check")
                 && inherited.family_checks.contains(&constraint.name)
         };
+        // A CHECK whose add waits for every table alter (see
+        // `InheritedRecreates::checks_after_alters`).
+        let defers_add = |constraint: &TableConstraint| {
+            constraint.constraint_type.eq_ignore_ascii_case("check")
+                && inherited.checks_after_alters.contains(&constraint.name)
+        };
         // A copy the detach leaves behind (see
         // `InheritedRecreates::detached_checks`) is still inherited before
         // the detach, so nothing about it can run ahead of it.
@@ -3093,6 +3112,7 @@ impl Table {
                             replica_identity_after: None,
                             ancestor_pre_script: String::new(),
                             ancestor_retype_pre_script: String::new(),
+                            after_alters_script: String::new(),
                         };
                     }
 
@@ -3543,7 +3563,11 @@ impl Table {
                         }
 
                         if !is_fk {
-                            constraint_post_script.push_str(&new_constraint.get_script());
+                            if defers_add(new_constraint) {
+                                after_alters_script.push_str(&new_constraint.get_script());
+                            } else {
+                                constraint_post_script.push_str(&new_constraint.get_script());
+                            }
                         }
                     }
                 }
@@ -3552,7 +3576,11 @@ impl Table {
                     .auto_not_null_column(&to_table.name)
                     .is_none()
             {
-                constraint_post_script.push_str(&new_constraint.get_script());
+                if defers_add(new_constraint) {
+                    after_alters_script.push_str(&new_constraint.get_script());
+                } else {
+                    constraint_post_script.push_str(&new_constraint.get_script());
+                }
             }
             // An auto-named NOT NULL constraint present only on the TO side is not a
             // real object to ADD. PG18 surfaces a column's NOT NULL in pg_constraint as
@@ -3949,6 +3977,7 @@ impl Table {
             replica_identity_after,
             ancestor_pre_script,
             ancestor_retype_pre_script,
+            after_alters_script,
         }
     }
 
@@ -4111,6 +4140,25 @@ impl Table {
     ) -> String {
         self.build_alter_script_parts(to_table, use_drop, false, false, caps, inherited)
             .ancestor_retype_pre_script
+    }
+
+    /// The CHECK adds and re-adds [`Table::get_alter_script_in_family`]
+    /// leaves out because `inherited` names them in
+    /// [`InheritedRecreates::checks_after_alters`]. The comparer runs them
+    /// once every table alter has, parents first. Empty otherwise, and for a
+    /// table the alter drops and recreates.
+    pub(crate) fn after_alters_script(
+        &self,
+        to_table: &Table,
+        use_drop: bool,
+        caps: TableAlterCaps,
+        inherited: &InheritedRecreates,
+    ) -> String {
+        if inherited.checks_after_alters.is_empty() {
+            return String::new();
+        }
+        self.build_alter_script_parts(to_table, use_drop, false, false, caps, inherited)
+            .after_alters_script
     }
 
     /// The columns a table typed by the same type in FROM (`self`) and TO

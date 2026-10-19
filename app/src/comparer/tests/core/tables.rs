@@ -4552,3 +4552,243 @@ async fn r3c_no_inherit_drops_a_merged_copy_without_its_parents() {
     assert!(!script.contains("alter table public.ih_p"), "{script}");
     assert!(!script.contains("alter table public.ih_g"), "{script}");
 }
+
+// ==== fix:inhcheck tests ====
+
+/// CHECK `ck_<column>` (`<column> > 0`) on `table`.
+fn check_on(table: &str, column: &str) -> TableConstraint {
+    TableConstraint {
+        catalog: "postgres".to_string(),
+        schema: "public".to_string(),
+        name: format!("ck_{column}"),
+        table_name: table.to_string(),
+        constraint_type: "CHECK".to_string(),
+        is_deferrable: false,
+        initially_deferred: false,
+        definition: Some(format!("CHECK ({column} > 0)")),
+        coninhcount: 0,
+        is_enforced: true,
+        no_inherit: false,
+        nulls_not_distinct: false,
+        comment: None,
+    }
+}
+
+/// `public.ih_parent (qty, doubled GENERATED ALWAYS AS (<parent>) STORED)`,
+/// holding `ck_<check>` when `check` names a column, and `ih_child`, which
+/// inherits both columns — with an expression of its own, `child` — and
+/// only inherits the CHECK, so the dump does not list it there.
+fn inhcheck_dump(parent: &str, child: &str, check: Option<&str>, version: Option<i32>) -> Dump {
+    let mut dump = Dump::new(DumpConfig::default());
+    dump.server_version_num = version;
+    for (name, expr, inherits) in [
+        ("ih_parent", parent, &[][..]),
+        ("ih_child", child, &["public.ih_parent"][..]),
+    ] {
+        let qty = int_column("public", name, "qty", 1);
+        let mut doubled = int_column("public", name, "doubled", 2);
+        doubled.is_generated = "ALWAYS".to_string();
+        doubled.generation_expression = Some(expr.to_string());
+        doubled.generation_type = Some("s".to_string());
+        let mut table = plain_table(name, vec![qty, doubled], inherits);
+        if name == "ih_parent"
+            && let Some(column) = check
+        {
+            table.constraints = vec![check_on(name, column)];
+        }
+        table.hash();
+        dump.tables.push(table);
+    }
+    dump
+}
+
+const IH_DROP: &str = "alter table public.ih_parent drop constraint ck_doubled;";
+const IH_PARENT_SET: &str =
+    "alter table only public.ih_parent alter column doubled set expression as (qty * 3);";
+const IH_AFTER: &str = "/* ---> CHECK constraints added after the table alters: Start ---- */";
+const IH_ADD: &str = "alter table public.ih_parent add constraint ck_doubled check (doubled > 0) ;";
+
+#[tokio::test]
+async fn inhcheck_set_expression_family_check_is_dropped_ahead_and_added_after() {
+    // PostgreSQL 17+ drops the copy the child only inherits when the
+    // child's `ONLY ... SET EXPRESSION` rebuilds it, and the parent's
+    // re-add counts the child twice: the CHECK has to be gone for both.
+    for version in [170000, 180000, 190000] {
+        let script = tables_script(
+            inhcheck_dump("(qty * 2)", "(qty * 2)", Some("doubled"), Some(version)),
+            inhcheck_dump("(qty * 3)", "(qty * 3)", Some("doubled"), None),
+        )
+        .await;
+        let drop = position(&script, IH_DROP);
+        let parent = position(&script, IH_PARENT_SET);
+        let child = position(
+            &script,
+            "alter table only public.ih_child alter column doubled set expression as (qty * 3);",
+        );
+        let after = position(&script, IH_AFTER);
+        let add = position(&script, IH_ADD);
+        assert!(
+            drop < parent && parent < child && child < after && after < add,
+            "{script}"
+        );
+        assert_eq!(
+            script.matches("add constraint ck_doubled").count(),
+            1,
+            "{script}"
+        );
+        assert!(!script.contains("drop column"), "{script}");
+    }
+}
+
+#[tokio::test]
+async fn inhcheck_child_only_set_expression_takes_the_parents_check_out_of_the_way() {
+    // The parent is unchanged; it is altered only to let go of its CHECK
+    // and take it back.
+    let script = tables_script(
+        inhcheck_dump("(qty * 2)", "(qty * 5)", Some("doubled"), Some(190000)),
+        inhcheck_dump("(qty * 2)", "(qty * 7)", Some("doubled"), None),
+    )
+    .await;
+    let drop = position(&script, IH_DROP);
+    let child = position(
+        &script,
+        "alter table only public.ih_child alter column doubled set expression as (qty * 7);",
+    );
+    let add = position(&script, IH_ADD);
+    assert!(drop < child && child < add, "{script}");
+    assert!(!script.contains(IH_PARENT_SET), "{script}");
+}
+
+#[tokio::test]
+async fn inhcheck_check_not_reading_the_column_is_left_alone() {
+    let script = tables_script(
+        inhcheck_dump("(qty * 2)", "(qty * 2)", Some("qty"), Some(190000)),
+        inhcheck_dump("(qty * 3)", "(qty * 3)", Some("qty"), None),
+    )
+    .await;
+    assert!(script.contains(IH_PARENT_SET), "{script}");
+    assert!(!script.contains("constraint ck_qty"), "{script}");
+    assert!(!script.contains(IH_AFTER), "{script}");
+}
+
+#[tokio::test]
+async fn inhcheck_to_only_check_on_the_parent_waits_for_the_childs_set_expression() {
+    // The add recurses into the child, whose own SET EXPRESSION would then
+    // drop the copy.
+    let script = tables_script(
+        inhcheck_dump("(qty * 2)", "(qty * 5)", None, Some(190000)),
+        inhcheck_dump("(qty * 2)", "(qty * 7)", Some("doubled"), None),
+    )
+    .await;
+    let child = position(
+        &script,
+        "alter table only public.ih_child alter column doubled set expression as (qty * 7);",
+    );
+    let add = position(&script, IH_ADD);
+    assert!(child < add, "{script}");
+    assert!(!script.contains("drop constraint"), "{script}");
+}
+
+#[tokio::test]
+async fn inhcheck_without_use_drop_leaves_the_expression_change_out() {
+    let mut comparer = Comparer::new(
+        inhcheck_dump("(qty * 2)", "(qty * 2)", Some("doubled"), Some(190000)),
+        inhcheck_dump("(qty * 3)", "(qty * 3)", Some("doubled"), None),
+        false,
+        false,
+        true,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+    assert!(!script.contains("set expression"), "{script}");
+    assert!(!script.contains(IH_AFTER), "{script}");
+    for table in ["ih_child", "ih_parent"] {
+        assert!(
+            script.contains(&format!(
+                "Warning: the generated-column expression changes of table public.{table} are left out"
+            )),
+            "{script}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inhcheck_before_pg17_is_unchanged() {
+    // No SET EXPRESSION: the column is dropped and re-added as before.
+    for version in [None, Some(160000)] {
+        let script = tables_script(
+            inhcheck_dump("(qty * 2)", "(qty * 2)", Some("doubled"), version),
+            inhcheck_dump("(qty * 3)", "(qty * 3)", Some("doubled"), None),
+        )
+        .await;
+        assert!(!script.contains("set expression"), "{script}");
+        assert!(!script.contains(IH_AFTER), "{script}");
+        assert!(
+            script.contains("alter table public.ih_parent drop column doubled;"),
+            "{script}"
+        );
+    }
+}
+
+/// [`inherited_enforcement_dump`] with `amount` of every table retyped to
+/// `bigint` when `retyped` is set, and a second column `other` that only
+/// `other_retyped` retypes.
+fn retyped_enforcement_dump(
+    recorded: &[&str],
+    retyped: bool,
+    other_retyped: bool,
+    version: Option<i32>,
+) -> Dump {
+    let mut dump = inherited_enforcement_dump(false, recorded, version);
+    for table in &mut dump.tables {
+        let mut other = int_column("public", &table.name, "other", 2);
+        if other_retyped {
+            other.data_type = "bigint".to_string();
+        }
+        table.columns.push(other);
+        if retyped {
+            table.columns[0].data_type = "bigint".to_string();
+        }
+        table.hash();
+    }
+    dump
+}
+
+#[tokio::test]
+async fn inhcheck_pg19_parent_retype_restores_the_childs_enforced_copy() {
+    // The recursing ALTER COLUMN ... TYPE rebuilds the copy from the NOT
+    // ENFORCED parent's CHECK, which the child keeps ENFORCED.
+    let script = tables_script(
+        retyped_enforcement_dump(&["ie_child"], false, false, Some(190000)),
+        retyped_enforcement_dump(&["ie_child"], true, false, None),
+    )
+    .await;
+    let retype = position(
+        &script,
+        "alter table public.ie_parent alter column amount type bigint;",
+    );
+    let enforce = position(
+        &script,
+        "alter table public.ie_child alter constraint ck_amount enforced;",
+    );
+    assert!(retype < enforce, "{script}");
+    assert!(
+        !script.contains("public.ie_grandchild alter constraint"),
+        "{script}"
+    );
+}
+
+#[tokio::test]
+async fn inhcheck_retype_of_a_column_the_check_does_not_read_restores_nothing() {
+    let script = tables_script(
+        retyped_enforcement_dump(&["ie_child"], false, false, Some(190000)),
+        retyped_enforcement_dump(&["ie_child"], false, true, None),
+    )
+    .await;
+    assert!(
+        script.contains("alter table public.ie_parent alter column other type bigint;"),
+        "{script}"
+    );
+    assert!(!script.contains("alter constraint"), "{script}");
+}

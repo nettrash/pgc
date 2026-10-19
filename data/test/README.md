@@ -1909,6 +1909,44 @@ Section 45 (line 503): replace "Every subscription is created `WITH (connect = f
 
 ---
 
+### 80. Inherited CHECK Constraints Around SET EXPRESSION and Parent Retypes (all versions; the in-place forms PG17+, enforceability PG19+)
+
+The fixtures are the `inhck_*` tables of the fix:inhcheck block at the end of both schema files. Every CHECK reads the generated column `v` (or the retyped column), except `inhck_i_b`.
+
+**The problem (PG17+).** `ALTER TABLE ONLY ... SET EXPRESSION` rebuilds the CHECK constraints that read the column and gets inheritance wrong; this is a server bug, verified on 17, 18 and 19rc1, STORED and VIRTUAL alike:
+- on a child, a copy the table only inherits is dropped and never added back;
+- on a child, a merged copy (local and inherited) loses its inheritance;
+- on a parent, the re-add recurses into children whose copies were never dropped, so each counts its parent twice (`coninhcount` 2).
+
+The migrated child then accepted rows its CHECK refuses. Round 2 was empty, because a dump holds only local constraints.
+
+**What happens now.** For each table whose alter writes `ALTER TABLE ONLY ... SET EXPRESSION`, every inheritable CHECK that reads one of those columns — its own when it has `INHERITS` children, and its kept ancestors' — is dropped ahead of the table alters, parents first (`InheritedRecreates::family_checks`). It is added back in the section `CHECK constraints added after the table alters`, once every table alter has run, together with any CHECK of the same name that TO adds to those tables (`InheritedRecreates::checks_after_alters`). A partitioned table's statement recurses (no `ONLY`) and is not affected. Without `USE_DROP` nothing can be dropped, so the expression change is left out with a warning.
+
+**The problem (PG19).** A copy kept ENFORCED under a NOT ENFORCED parent is rebuilt from the parent's CHECK by a recursing `ALTER COLUMN ... TYPE` (a collation change included) or a partitioned parent's `SET EXPRESSION`, and comes out NOT ENFORCED. Round 2 caught it, so the migration needed a second run. Such a copy now gets `ALTER CONSTRAINT ... ENFORCED` in the `Enforceability of inherited CHECK constraint copies` section.
+
+#### Tables (fix:inhcheck block)
+- **Modified (every version)**: `inhck_a` / `inhck_a_child`: both expressions `(a * 2)` → `(a * 3)`, the CHECK only inherited by the child.
+- **Modified (every version)**: `inhck_e` / `inhck_e_child` / `inhck_e_grandchild`: the same over three levels.
+- **Modified (every version)**: `inhck_h` / `inhck_h_child`: the CHECK changes too (`v > -1000` → `v > -2000`).
+- **Modified (every version)**: `inhck_i` / `inhck_i_child`: `inhck_i_b` reads `b`, not `v`, and is never dropped.
+- **Modified (PG17+, created by a `DO` block)**: `inhck_b` / `inhck_b_child`: the child keeps its own `(a * 5)`; the parent's changes.
+- **Modified (PG17+)**: `inhck_c` / `inhck_c_child`: only the child's own expression changes, `(a * 5)` → `(a * 7)`.
+- **Modified (PG17+)**: `inhck_d` / `inhck_d_child`: the child holds a merged copy.
+- **Modified (PG17+)**: `inhck_f_x` / `inhck_f_y` / `inhck_f_m`: two parents with the same CHECK.
+- **Modified (PG17+)**: `inhck_g` / `inhck_g_child`: TO adds `inhck_g_v` to the parent; the child's own expression changes.
+- **Modified (PG19+)**: `inhck_va` / `inhck_va_child` and `inhck_vc` / `inhck_vc_child`: shapes A and C with VIRTUAL columns.
+- **Modified (every version; enforceability PG19+)**: `inhck_en` / `inhck_en_child` (`integer` → `bigint`), `inhck_enc` / `inhck_enc_child` (`COLLATE "C"`), `inhck_enp` / `inhck_enp_1` (a partitioned parent, a column that is not its key): the parent's CHECK NOT ENFORCED, the child's copy ENFORCED.
+
+The `DO`-gated cases need a drop and re-add of an inherited column on PostgreSQL 14 to 16 (and for VIRTUAL on 18), which pgc cannot make yet (see the CHANGELOG's known limitations).
+
+**CI assertion** (`.github/scripts/assert-inhcheck.sh`), run after round 1:
+- every CHECK of the `inhck_*` tables, inherited copies included, matches `b`: enforced, validated, local, `coninhcount`, definition; so do the columns and the inheritance;
+- a row each child's CHECK must refuse is refused in `a`;
+- on PG17+ the CHECK is dropped before the family's first `SET EXPRESSION` and added after its last, `inhck_g_v` is added after the child's `SET EXPRESSION`, and `inhck_i_b` is never dropped;
+- on PG19 `ALTER CONSTRAINT ... ENFORCED` follows each parent's retype for `inhck_en_child`, `inhck_enc_child` and `inhck_enp_1`.
+
+---
+
 ## Clear Command Test (`clear_test.sql`)
 
 The `clear_test.sql` file creates a self-contained set of database objects across two schemas (`clear_app` and `clear_shared`) to verify the `pgc --command clear` drop-all script generation.

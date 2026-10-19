@@ -2143,3 +2143,22 @@ fn r3c_inherited_copy_is_enforced_only_when_asked() {
         Some("CHECK ((note <> ' not enforced'::text))")
     );
 }
+
+#[test]
+fn check_reads_column_finds_unquoted_and_quoted_references() {
+    let mut check = create_check_constraint();
+    check.definition = Some("CHECK ((total > 0) AND (\"Mixed\" <> 'total'::text))".to_string());
+    assert!(check.check_reads_column("total"));
+    assert!(check.check_reads_column("\"Mixed\""));
+    // A string literal, a function name and a qualified name do not count.
+    assert!(!check.check_reads_column("other"));
+    check.definition = Some("CHECK ((lower(name) <> 'total'::text))".to_string());
+    assert!(!check.check_reads_column("total"));
+    assert!(!check.check_reads_column("lower"));
+    check.definition = Some("CHECK ((s.total > 0))".to_string());
+    assert!(!check.check_reads_column("total"));
+    // Only a CHECK reads columns this way.
+    let mut unique = create_unique_constraint();
+    unique.definition = Some("UNIQUE (total)".to_string());
+    assert!(!unique.check_reads_column("total"));
+}

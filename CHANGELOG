@@ -1684,6 +1684,38 @@ Known limitations (for the existing "Known limitations" list):
                       whose own name is no valid slot name is created
                       with connect = false, since the publisher would
                       refuse to create that slot.
+                    - Resolved a silent loss of CHECK constraints in
+                      INHERITS families on PostgreSQL 17 and later.
+                      ALTER TABLE ONLY ... SET EXPRESSION, which pgc
+                      writes for a changed generated-column expression
+                      (STORED on 17+, VIRTUAL on 19), rebuilds the CHECK
+                      constraints reading the column and gets
+                      inheritance wrong (a server bug, verified on 17,
+                      18 and 19rc1): a child drops a copy it only
+                      inherits and never adds it back, a merged copy
+                      loses its inheritance, and a parent's re-add
+                      counts every child twice (coninhcount 2). The
+                      child then accepted rows its CHECK refuses, and
+                      the next compare was empty, since a dump holds
+                      only local constraints. Every inheritable CHECK
+                      reading such a column is now dropped ahead of the
+                      table alters, parents first, and added back once
+                      every table alter has run, together with any CHECK
+                      the target adds to those tables. A CHECK reading
+                      no changed column is left alone, and partitioned
+                      tables, whose statement recurses, are not
+                      affected. Without --use-drop the expression change
+                      is left out with a warning instead.
+                    - Resolved an inherited CHECK copy kept ENFORCED
+                      under a NOT ENFORCED parent (PostgreSQL 19) that
+                      the migration turned NOT ENFORCED. A parent's
+                      ALTER COLUMN ... TYPE, a collation change included,
+                      or a partitioned parent's SET EXPRESSION rebuilds
+                      the copies below from the parent's CHECK; the
+                      copies whose CHECK reads that column now get ALTER
+                      CONSTRAINT ... ENFORCED again after every table
+                      alter, as for the other statements that reset
+                      them. Before, a second run was needed.
 
                 Internals:
                     - The new publication fields are left out of the dump
@@ -1710,7 +1742,7 @@ Known limitations (for the existing "Known limitations" list):
                       numeric-constant scanner with their own tests, and
                       hash pins showing that only aggregates with a
                       negative state size hash differently from 1.0.x.
-                    - `cargo test` now runs 2363 tests, up from 1106 in
+                    - `cargo test` now runs 2372 tests, up from 1106 in
                       v1.0.27, and 12 more that need a live server stay
                       `#[ignore]`d (run them with `cargo test --
                       --ignored` and the standard `PG*` environment
@@ -1746,6 +1778,15 @@ Known limitations (for the existing "Known limitations" list):
                       case, and fills the missing section 45.
 
                 Known limitations:
+                    - Where the server has no usable SET EXPRESSION
+                      (PostgreSQL 14 to 16, and VIRTUAL columns of a
+                      family with CHECK constraints on 18), a changed
+                      expression is a drop and re-add of the column,
+                      which still fails or needs a second run in an
+                      INHERITS family whose CHECK reads the column when a
+                      child keeps or changes an expression of its own,
+                      has a merged copy of the CHECK, or inherits from
+                      two parents.
                     - A partition or INHERITS child that the target
                       takes out of its family while keeping the old
                       column type gets the new type from the ancestor's

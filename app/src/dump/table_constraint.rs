@@ -108,6 +108,18 @@ impl TableConstraint {
         true
     }
 
+    /// Whether this is a CHECK constraint whose expression reads the column
+    /// named `column` (in the dump's `quote_ident` form), as
+    /// `expression_reads_identifier` finds it in the deparsed definition.
+    /// A false positive is possible, a false negative is not: callers use it
+    /// to decide what has to be dropped and re-added around a column change.
+    pub(crate) fn check_reads_column(&self, column: &str) -> bool {
+        self.constraint_type.eq_ignore_ascii_case("check")
+            && self.definition.as_deref().is_some_and(|def| {
+                crate::dump::table_column::expression_reads_identifier(def, column)
+            })
+    }
+
     /// Hash
     pub fn add_to_hasher(&self, hasher: &mut Sha256) {
         hasher.update(self.schema.as_bytes());
