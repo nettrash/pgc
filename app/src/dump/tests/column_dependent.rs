@@ -38,6 +38,8 @@ fn test_kind_round_trips_through_serde_json() {
         ColumnDependentKind::Index,
         ColumnDependentKind::Constraint,
         ColumnDependentKind::Policy,
+        ColumnDependentKind::Statistic,
+        ColumnDependentKind::Trigger,
     ] {
         let json = serde_json::to_string(&variant).expect("serialization should succeed");
         let deserialized: ColumnDependentKind =
@@ -64,7 +66,7 @@ fn test_kind_serializes_as_variant_name() {
 
 #[test]
 fn test_kind_deserialize_unknown_variant_fails() {
-    let result: Result<ColumnDependentKind, _> = serde_json::from_str("\"Trigger\"");
+    let result: Result<ColumnDependentKind, _> = serde_json::from_str("\"Rule\"");
     assert!(result.is_err(), "unknown variant must fail to deserialize");
 }
 
@@ -150,4 +152,35 @@ fn test_dependent_clone_preserves_fields() {
     assert_eq!(cloned.dep_schema, original.dep_schema);
     assert_eq!(cloned.dep_table, original.dep_table);
     assert_eq!(cloned.dep_name, original.dep_name);
+}
+
+#[test]
+fn test_statistic_kind_serializes_as_variant_name_and_round_trips() {
+    let json = serde_json::to_string(&ColumnDependentKind::Statistic).unwrap();
+    assert_eq!(json, "\"Statistic\"");
+    let back: ColumnDependentKind = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ColumnDependentKind::Statistic);
+    assert_ne!(ColumnDependentKind::Statistic, ColumnDependentKind::Index);
+}
+
+#[test]
+fn test_statistic_dependent_keeps_its_own_schema() {
+    // A statistics object may live in another schema than its table.
+    let mut value = sample(ColumnDependentKind::Statistic);
+    value.dep_schema = "stats".to_string();
+    value.dep_name = "st_orders_status".to_string();
+    let json = serde_json::to_string(&value).unwrap();
+    let back: ColumnDependent = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.kind, ColumnDependentKind::Statistic);
+    assert_eq!(back.schema, "public");
+    assert_eq!(back.dep_schema, "stats");
+    assert_eq!(back.dep_table, "orders");
+}
+
+#[test]
+fn pre_columns_trigger_kind_serializes_as_its_variant_name() {
+    assert_eq!(
+        serde_json::to_string(&ColumnDependentKind::Trigger).unwrap(),
+        "\"Trigger\""
+    );
 }

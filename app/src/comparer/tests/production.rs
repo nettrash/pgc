@@ -504,6 +504,32 @@ fn add_constraint_is_left_unguarded() {
 }
 
 #[test]
+fn alter_domain_drop_constraint_gets_if_exists() {
+    // A changed domain CHECK is a drop + re-add pair; guarding the drop makes
+    // a replay drop the re-added constraint and add it again.
+    let s = "alter domain public.d drop constraint \"d_chk\";\n\nalter domain public.d add constraint \"d_chk\" CHECK ((VALUE > 5));";
+    assert_eq!(
+        make_idempotent(s),
+        "alter domain public.d drop constraint if exists \"d_chk\";\n\nalter domain public.d add constraint \"d_chk\" CHECK ((VALUE > 5));"
+    );
+}
+
+#[test]
+fn alter_domain_other_operations_are_left_untouched() {
+    for s in [
+        "alter domain public.d drop constraint if exists \"d_chk\";",
+        "alter domain public.d validate constraint \"d_chk\";",
+        "alter domain public.d drop default;",
+        "alter domain public.d drop not null;",
+        "alter domain public.d owner to app_owner;",
+        "alter domain public.d add constraint \"c\" CHECK ((VALUE <> 'drop constraint x'::text));",
+        "-- alter domain public.d drop constraint \"d_chk\";",
+    ] {
+        assert_eq!(make_idempotent(s), s);
+    }
+}
+
+#[test]
 fn alter_guards_not_doubled() {
     let s = "alter table public.t add column if not exists c int;";
     assert_eq!(make_idempotent(s), s);
@@ -570,6 +596,24 @@ fn dollar_quoted_body_is_left_untouched() {
 }
 
 #[test]
+fn sql_standard_body_passes_through_and_later_statements_are_still_guarded() {
+    // A BEGIN ATOMIC body is not quoted, so each `;` inside it restarts the
+    // statement scan. That is harmless: PostgreSQL rejects DDL in such a body,
+    // so the statements that follow each `;` (DML, SELECT, END) match no guard.
+    // Nor is `$$` inside one of its literals a dollar quote to skip over.
+    let atomic = "create or replace function test_schema.f(p integer) returns SETOF test_schema.w language sql VOLATILE PARALLEL UNSAFE ROWS 1000 BEGIN ATOMIC\n INSERT INTO test_schema.w (id, a)\n   VALUES (f.p, '$$ x;') ON CONFLICT(id) DO SELECT FOR UPDATE\n   RETURNING w.id,\n     w.a;\n SELECT 1;\n DELETE FROM test_schema.w\n  WHERE (w.id = f.p);\nEND;\n\n";
+    assert_eq!(make_idempotent(atomic), atomic);
+    let ret = "create or replace procedure test_schema.p(p integer) language sql BEGIN ATOMIC\nEND;\n\ncreate or replace function test_schema.g(p integer) returns integer language sql IMMUTABLE RETURN (p + 1);\n\n";
+    assert_eq!(make_idempotent(ret), ret);
+
+    let followed = format!("{atomic}create table public.t (id int);");
+    assert_eq!(
+        make_idempotent(&followed),
+        format!("{atomic}create table if not exists public.t (id int);")
+    );
+}
+
+#[test]
 fn multiple_statements_each_guarded_independently() {
     let s = "create table public.a (id int);\n\nalter table public.a add column b int;\n\nalter table public.a drop constraint old;";
     assert_eq!(
@@ -596,4 +640,40 @@ fn alter_column_set_default_is_not_mistaken_for_op() {
 #[test]
 fn empty_input_is_empty() {
     assert_eq!(make_idempotent(""), "");
+}
+
+#[test]
+fn line_comment_ends_at_a_bare_carriage_return() {
+    // psql runs what follows a bare CR, so it is a statement to guard like
+    // any other, not part of the comment.
+    let s = "-- note\rcreate table public.u (id int);";
+    assert_eq!(
+        make_idempotent(s),
+        "-- note\rcreate table if not exists public.u (id int);"
+    );
+}
+
+#[test]
+fn partitioned_index_fallback_header_neutralises_comment_delimiters() {
+    let mut parents = HashSet::new();
+    parents.insert("public.orders".to_string());
+    let children = HashMap::new();
+    let part_idx = HashSet::new();
+    let ctx = PartitionContext {
+        partitioned_parents: &parents,
+        children: &children,
+        partitioned_indexes: &part_idx,
+    };
+    let idx = index(
+        "public",
+        "orders",
+        "\"i*/ drop table public.victim; /*\"",
+        "CREATE INDEX \"i*/ drop table public.victim; /*\" ON public.orders USING btree (total)",
+    );
+    let split = index_create_split(&idx, &ctx, false);
+    let header = split.in_txn.lines().next().unwrap();
+    assert_eq!(
+        header,
+        "/* partitioned index public.\"i* / drop table public.victim; / *\": no partitions found — created non-concurrently */"
+    );
 }

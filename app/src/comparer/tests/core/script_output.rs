@@ -1071,6 +1071,192 @@ fn guard_comparer(use_single_transaction: bool) -> Comparer {
     )
 }
 
+// ── standard_conforming_strings on a migrated server set to off ────────
+// pgc 1.1 dumps every literal in standard form. Applied to a PostgreSQL
+// 14–18 database whose clients default to `standard_conforming_strings =
+// off`, `'C:\temp'` would be read as an escape string and store a tab, so
+// such a migration starts with a session SET, as a pg_dump script does.
+
+const SCS_GUARD: &str = "set standard_conforming_strings = on;";
+
+/// [`guard_comparer`]'s one-table migration, with the FROM server's default
+/// and whether the TO dump was written by pgc 1.1+ (it then records its
+/// `server_version_num`).
+fn scs_comparer(
+    from_scs_off: bool,
+    to_written_by_1_1: bool,
+    use_single_transaction: bool,
+) -> Comparer {
+    let mut comparer = guard_comparer(use_single_transaction);
+    comparer.from.standard_conforming_strings_off = from_scs_off;
+    comparer.from.server_version_num = Some(180000);
+    comparer.to.server_version_num = to_written_by_1_1.then_some(180000);
+    comparer
+}
+
+#[tokio::test]
+async fn scs_guard_leads_a_migration_for_a_server_defaulting_to_off() {
+    let mut comparer = scs_comparer(true, true, true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.starts_with(&format!("{SCS_GUARD}\n\nbegin;\n\n")),
+        "first, and outside the transaction as in a pg_dump script:\n{script}"
+    );
+    assert_eq!(script.matches(SCS_GUARD).count(), 1, "{script}");
+}
+
+#[tokio::test]
+async fn scs_guard_leads_a_migration_without_a_transaction_too() {
+    let mut comparer = scs_comparer(true, true, false);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(script.starts_with(&format!("{SCS_GUARD}\n\n")), "{script}");
+    let guard = script.find(SCS_GUARD).expect("guard missing");
+    let create = script.find("create table").expect("no table create");
+    assert!(guard < create, "{script}");
+}
+
+/// The default, and every CI compare: nothing changes.
+#[tokio::test]
+async fn scs_guard_is_absent_when_the_migrated_server_defaults_to_on() {
+    for use_single_transaction in [false, true] {
+        let mut plain = guard_comparer(use_single_transaction);
+        plain.compare().await.unwrap();
+        let mut comparer = scs_comparer(false, true, use_single_transaction);
+        comparer.compare().await.unwrap();
+
+        assert!(
+            !comparer
+                .get_script()
+                .contains("standard_conforming_strings")
+        );
+        assert_eq!(comparer.get_script(), plain.get_script());
+    }
+}
+
+/// A pgc 1.0.x TO dump holds its literals in whatever form its server's
+/// setting produced; unknown, so the output stays what pgc 1.0.x wrote.
+#[tokio::test]
+async fn scs_guard_is_absent_for_a_to_dump_written_by_pgc_1_0() {
+    let mut plain = guard_comparer(true);
+    plain.compare().await.unwrap();
+    let mut comparer = scs_comparer(true, false, true);
+    comparer.compare().await.unwrap();
+
+    assert_eq!(comparer.get_script(), plain.get_script());
+}
+
+#[tokio::test]
+async fn scs_guard_is_withdrawn_from_an_empty_migration() {
+    for use_single_transaction in [false, true] {
+        let mut plain = Comparer::new(
+            Dump::new(DumpConfig::default()),
+            Dump::new(DumpConfig::default()),
+            false,
+            use_single_transaction,
+            false,
+            GrantsMode::Ignore,
+        );
+        plain.compare().await.unwrap();
+
+        let mut guarded = Comparer::new(
+            Dump::new(DumpConfig::default()),
+            Dump::new(DumpConfig::default()),
+            false,
+            use_single_transaction,
+            false,
+            GrantsMode::Ignore,
+        );
+        guarded.from.standard_conforming_strings_off = true;
+        guarded.to.server_version_num = Some(180000);
+        // Both guards at once must also come out, together.
+        guarded.set_guard_sql_routine_bodies(true);
+        guarded.compare().await.unwrap();
+
+        assert_eq!(guarded.get_script(), plain.get_script());
+    }
+    let mut empty = Comparer::new(
+        Dump::new(DumpConfig::default()),
+        Dump::new(DumpConfig::default()),
+        false,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    empty.from.standard_conforming_strings_off = true;
+    empty.to.server_version_num = Some(180000);
+    empty.compare().await.unwrap();
+    assert_eq!(empty.get_script(), "", "an empty migration must stay empty");
+}
+
+#[tokio::test]
+async fn scs_guard_precedes_the_function_body_guard() {
+    let mut comparer = scs_comparer(true, true, true);
+    comparer.set_guard_sql_routine_bodies(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(
+        script.starts_with(&format!("{SCS_GUARD}\n\nbegin;\n\n{GUARD}\n\n")),
+        "{script}"
+    );
+}
+
+/// The production rewrite leaves the SET alone, and it still precedes the
+/// transaction and so the post-commit section too.
+#[tokio::test]
+async fn scs_guard_survives_production_output() {
+    let mut comparer = scs_comparer(true, true, true);
+    comparer.set_output_for_production(true);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    assert!(script.lines().any(|l| l == SCS_GUARD), "{script}");
+    let guard = script.find(SCS_GUARD).expect("guard missing");
+    let begin = script.find("begin;").expect("begin; missing");
+    assert!(guard < begin, "{script}");
+}
+
+/// The literal the guard protects comes through verbatim after it.
+#[tokio::test]
+async fn scs_guard_precedes_a_backslash_literal() {
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    let mut path = int_column("public", "files", "path", 1);
+    path.data_type = "text".to_string();
+    path.numeric_precision = None;
+    path.numeric_precision_radix = None;
+    path.numeric_scale = None;
+    path.column_default = Some(r"'C:\temp'::text".to_string());
+    let mut table = Table::new(
+        "public".to_string(),
+        "files".to_string(),
+        "public".to_string(),
+        "files".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![path],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.hash();
+    to_dump.tables.push(table);
+    let mut comparer = Comparer::new(from_dump, to_dump, false, false, false, GrantsMode::Ignore);
+    comparer.from.standard_conforming_strings_off = true;
+    comparer.to.server_version_num = Some(180000);
+    comparer.compare().await.unwrap();
+    let script = comparer.get_script();
+
+    let guard = script.find(SCS_GUARD).expect("guard missing");
+    let literal = script.find(r"'C:\temp'::text").expect("literal verbatim");
+    assert!(guard < literal, "{script}");
+}
+
 #[tokio::test]
 async fn guard_is_absent_by_default() {
     let mut comparer = guard_comparer(true);
@@ -1167,4 +1353,123 @@ async fn guard_is_withdrawn_from_an_empty_migration_inside_a_transaction_too() {
     guarded.compare().await.unwrap();
 
     assert_eq!(guarded.get_script(), plain.get_script());
+}
+
+// ── drops of FROM-only objects follow the dump ──────────────────────────
+// `compare_event_triggers`, `compare_foreign_tables` and `compare_collations`
+// walked a `HashMap` of the FROM objects to find the ones TO lacks, so their
+// drops came out in a different order on every run of the same compare.
+// They now follow the FROM dump, which its queries sort by name. Eight
+// objects make a chance match of the dump order 1 in 40320.
+
+const ORDER_NAMES: [&str; 8] = ["a1", "b2", "c3", "d4", "e5", "f6", "g7", "h8"];
+
+/// The byte offset of each name in `script`, which must be increasing.
+fn assert_in_dump_order(script: &str, needle: impl Fn(&str) -> String) {
+    let positions: Vec<usize> = ORDER_NAMES
+        .iter()
+        .map(|n| {
+            script
+                .find(&needle(n))
+                .unwrap_or_else(|| panic!("no drop of {n}:\n{script}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "drops out of dump order:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn event_trigger_drops_follow_the_dump_order() {
+    use crate::dump::event_trigger::EventTrigger;
+    let mut from_dump = Dump::new(DumpConfig::default());
+    for name in ORDER_NAMES {
+        from_dump.event_triggers.push(EventTrigger::new(
+            name.to_string(),
+            "ddl_command_start".to_string(),
+            "public.f".to_string(),
+            vec![],
+            "O".to_string(),
+            "postgres".to_string(),
+            None,
+        ));
+    }
+    let mut comparer = Comparer::new(
+        from_dump,
+        Dump::new(DumpConfig::default()),
+        true,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_event_triggers().await.unwrap();
+    let script = comparer.get_script();
+    assert_in_dump_order(&script, |n| {
+        format!("drop event trigger if exists \"{n}\";")
+    });
+}
+
+#[tokio::test]
+async fn foreign_table_drops_follow_the_dump_order() {
+    use crate::dump::foreign_table::ForeignTable;
+    let mut from_dump = Dump::new(DumpConfig::default());
+    for name in ORDER_NAMES {
+        from_dump.foreign_tables.push(ForeignTable::new(
+            "public".to_string(),
+            name.to_string(),
+            "srv".to_string(),
+            "postgres".to_string(),
+            vec![],
+            vec![],
+        ));
+    }
+    let mut comparer = Comparer::new(
+        from_dump,
+        Dump::new(DumpConfig::default()),
+        true,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_foreign_tables().await.unwrap();
+    let script = comparer.get_script();
+    assert_in_dump_order(&script, |n| {
+        format!("drop foreign table if exists public.{n};")
+    });
+}
+
+#[tokio::test]
+async fn collation_drops_follow_the_dump_order() {
+    use crate::dump::collation::Collation;
+    let mut from_dump = Dump::new(DumpConfig::default());
+    for name in ORDER_NAMES {
+        let mut collation = Collation {
+            schema: "public".to_string(),
+            name: name.to_string(),
+            owner: "postgres".to_string(),
+            provider: "i".to_string(),
+            locale: None,
+            lc_collate: None,
+            lc_ctype: None,
+            icu_locale: Some("und".to_string()),
+            icu_rules: None,
+            deterministic: true,
+            comment: None,
+            hash: None,
+        };
+        collation.hash();
+        from_dump.collations.push(collation);
+    }
+    let mut comparer = Comparer::new(
+        from_dump,
+        Dump::new(DumpConfig::default()),
+        true,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_collations().await.unwrap();
+    let script = comparer.get_script();
+    assert_in_dump_order(&script, |n| format!("DROP COLLATION IF EXISTS public.{n} "));
 }

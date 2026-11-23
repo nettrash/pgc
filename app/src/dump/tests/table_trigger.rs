@@ -552,3 +552,160 @@ fn test_alter_script_definition_change_includes_enabled_and_comment() {
         "must not duplicate disable statement, got {disable_count} in: {script}"
     );
 }
+
+#[test]
+fn recreate_script_guards_the_drop_and_keeps_state_and_comment() {
+    let trigger = TableTrigger {
+        oid: Oid(1),
+        name: "orders_chk".to_string(),
+        definition: "CREATE TRIGGER orders_chk BEFORE INSERT ON s1.orders FOR EACH ROW WHEN ((NOT s1.is_valid(new.code))) EXECUTE FUNCTION s1.trg()".to_string(),
+        enabled: "D".to_string(),
+        comment: Some("it's checked".to_string()),
+    };
+    assert_eq!(
+        trigger.get_recreate_script("s1", "orders"),
+        "drop trigger if exists orders_chk on s1.orders;\n\n\
+         CREATE TRIGGER orders_chk BEFORE INSERT ON s1.orders FOR EACH ROW WHEN ((NOT s1.is_valid(new.code))) EXECUTE FUNCTION s1.trg();\n\n\
+         alter table s1.orders disable trigger orders_chk;\n\n\
+         comment on trigger orders_chk on s1.orders is 'it''s checked';\n\n"
+    );
+}
+
+#[test]
+fn clone_state_script_sets_what_the_parent_does_not_hand_down() {
+    let clone = |enabled: &str, comment: Option<&str>| {
+        TableTrigger {
+        oid: Oid(2),
+        name: "\"Pt Chk\"".to_string(),
+        definition: "CREATE TRIGGER \"Pt Chk\" AFTER INSERT ON s1.pt_1 FOR EACH ROW EXECUTE FUNCTION s1.trg()".to_string(),
+        enabled: enabled.to_string(),
+        comment: comment.map(str::to_string),
+    }
+    };
+    // In the parent's state, without a comment: nothing to do.
+    assert_eq!(
+        clone("O", None).get_clone_state_script("s1", "pt_1", "O"),
+        ""
+    );
+    assert_eq!(
+        clone("D", None).get_clone_state_script("s1", "pt_1", "D"),
+        ""
+    );
+    // Its own state, and back to the default one.
+    assert_eq!(
+        clone("D", None).get_clone_state_script("s1", "pt_1", "O"),
+        "alter table s1.pt_1 disable trigger \"Pt Chk\";\n\n"
+    );
+    assert_eq!(
+        clone("A", None).get_clone_state_script("s1", "pt_1", "D"),
+        "alter table s1.pt_1 enable always trigger \"Pt Chk\";\n\n"
+    );
+    assert_eq!(
+        clone("R", None).get_clone_state_script("s1", "pt_1", "O"),
+        "alter table s1.pt_1 enable replica trigger \"Pt Chk\";\n\n"
+    );
+    assert_eq!(
+        clone("O", None).get_clone_state_script("s1", "pt_1", "D"),
+        "alter table s1.pt_1 enable trigger \"Pt Chk\";\n\n"
+    );
+    // A comment is never handed down.
+    assert_eq!(
+        clone("O", Some("it's mine")).get_clone_state_script("s1", "pt_1", "O"),
+        "comment on trigger \"Pt Chk\" on s1.pt_1 is 'it''s mine';\n\n"
+    );
+}
+
+fn defined(name: &str, definition: &str) -> TableTrigger {
+    TableTrigger {
+        oid: Oid(3),
+        name: name.to_string(),
+        definition: definition.to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    }
+}
+
+#[test]
+fn is_row_level_reads_the_level_clause_only() {
+    let row = defined(
+        "t",
+        "CREATE TRIGGER t AFTER INSERT ON s1.pt FOR EACH ROW EXECUTE FUNCTION s1.trg()",
+    );
+    assert!(row.is_row_level());
+    let statement = defined(
+        "t",
+        "CREATE TRIGGER t AFTER INSERT ON s1.pt FOR EACH STATEMENT EXECUTE FUNCTION s1.trg()",
+    );
+    assert!(!statement.is_row_level());
+    // A quoted name or a literal argument spelling the other level does not
+    // count.
+    let quoted = defined(
+        "\"a FOR EACH ROW b\"",
+        "CREATE TRIGGER \"a FOR EACH ROW b\" AFTER INSERT ON \"S\".\"FOR EACH ROW x\" FOR EACH STATEMENT EXECUTE FUNCTION s1.trg(' FOR EACH ROW ')",
+    );
+    assert!(!quoted.is_row_level());
+    let constraint = defined(
+        "ct",
+        "CREATE CONSTRAINT TRIGGER ct AFTER INSERT ON s1.pt DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION s1.trg()",
+    );
+    assert!(constraint.is_row_level());
+}
+
+#[test]
+fn pre_columns_is_row_level_reads_the_for_each_clause() {
+    let with = |definition: &str| TableTrigger {
+        oid: Oid(3),
+        name: "t".to_string(),
+        definition: definition.to_string(),
+        enabled: "O".to_string(),
+        comment: None,
+    };
+    assert!(
+        with("CREATE TRIGGER t BEFORE INSERT ON s1.pt FOR EACH ROW EXECUTE FUNCTION s1.trg()")
+            .is_row_level()
+    );
+    assert!(
+        with("CREATE TRIGGER t AFTER UPDATE ON s1.pt FOR EACH ROW WHEN ((new.a > 0)) EXECUTE FUNCTION s1.trg()")
+            .is_row_level()
+    );
+    assert!(
+        with("CREATE CONSTRAINT TRIGGER t AFTER INSERT ON s1.pt DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION s1.trg()")
+            .is_row_level()
+    );
+    assert!(
+        !with(
+            "CREATE TRIGGER t BEFORE INSERT ON s1.pt FOR EACH STATEMENT EXECUTE FUNCTION s1.trg()"
+        )
+        .is_row_level()
+    );
+    // Neither a quoted name nor an argument that spells the words counts.
+    assert!(
+        !with("CREATE TRIGGER \"x FOR EACH ROW\" BEFORE INSERT ON s1.\"a FOR EACH ROW b\" FOR EACH STATEMENT EXECUTE FUNCTION s1.trg(' FOR EACH ROW')")
+            .is_row_level()
+    );
+    assert!(
+        with("CREATE TRIGGER \"x FOR EACH STATEMENT\" BEFORE INSERT ON s1.pt FOR EACH ROW EXECUTE FUNCTION s1.trg()")
+            .is_row_level()
+    );
+    assert!(!with("").is_row_level());
+}
+
+#[test]
+fn pre_columns_enabled_state_statement_recurses_without_only() {
+    let mut trigger = create_simple_trigger();
+    for (enabled, expected) in [
+        ("O", "alter table s1.pt enable trigger simple_trigger;"),
+        ("D", "alter table s1.pt disable trigger simple_trigger;"),
+        (
+            "R",
+            "alter table s1.pt enable replica trigger simple_trigger;",
+        ),
+        (
+            "A",
+            "alter table s1.pt enable always trigger simple_trigger;",
+        ),
+    ] {
+        trigger.enabled = enabled.to_string();
+        assert_eq!(trigger.enabled_state_statement("s1", "pt"), expected);
+    }
+}

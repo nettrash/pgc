@@ -26,6 +26,7 @@ pub mod collation;
 pub mod column_dependent;
 pub mod core;
 pub mod default_privilege;
+pub mod drop_order;
 pub mod event_trigger;
 pub mod extension;
 pub mod fdw;

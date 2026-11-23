@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, comment_out};
 
 /// A PostgreSQL operator (pg_operator).
 /// Operators are schema-scoped.
@@ -152,10 +152,25 @@ impl Operator {
         .with_empty_lines()
     }
 
-    pub fn get_alter_script(&self, target: &Operator, use_drop: bool) -> String {
-        let mut script = String::new();
+    /// `schema.name(left, right)`, `NONE` for a missing operand: the key the
+    /// comparer matches operators by, and the form in which
+    /// [`SqlBodyDependencies::operators`](super::routine::SqlBodyDependencies::operators)
+    /// names them.
+    pub fn key(&self) -> String {
+        format!(
+            "{}.{}({})",
+            self.schema,
+            self.name,
+            self.operand_signature()
+        )
+    }
 
-        let definition_changed = self.left_type != target.left_type
+    /// Whether turning `self` into `target` changes the operator's definition,
+    /// which [`Operator::get_alter_script`] can only apply by `DROP OPERATOR …
+    /// CASCADE` and a new `CREATE OPERATOR` (owner and comment are altered in
+    /// place).
+    pub fn definition_differs(&self, target: &Operator) -> bool {
+        self.left_type != target.left_type
             || self.right_type != target.right_type
             || self.result_type != target.result_type
             || self.procedure != target.procedure
@@ -164,19 +179,18 @@ impl Operator {
             || self.restrict != target.restrict
             || self.join != target.join
             || self.is_hashes != target.is_hashes
-            || self.is_merges != target.is_merges;
+            || self.is_merges != target.is_merges
+    }
 
-        if definition_changed {
+    pub fn get_alter_script(&self, target: &Operator, use_drop: bool) -> String {
+        let mut script = String::new();
+
+        if self.definition_differs(target) {
             if use_drop {
                 script.append_block(&self.get_drop_script());
             } else {
                 let drop = self.get_drop_script();
-                script.push_str(
-                    &drop
-                        .lines()
-                        .map(|l| format!("-- {}\n", l))
-                        .collect::<String>(),
-                );
+                script.push_str(&comment_out(&drop));
             }
             script.push_str(&target.get_script());
             return script;

@@ -683,3 +683,62 @@ fn matview_index_alter_plan_ignores_an_unchanged_index() {
     assert!(plan.create.is_empty());
     assert!(plan.comment_changes.is_empty());
 }
+
+#[test]
+fn pre_cascade_routine_dependencies_do_not_affect_the_hash_or_the_script() {
+    // They only decide what a routine's DROP ... CASCADE takes: hashing them
+    // would make every view look changed against a dump that predates them.
+    let legacy = create_view("select public.f(id) from public.users");
+    let mut current = legacy.clone();
+    current.routine_dependencies = Some(vec!["public.f(x integer)".to_string()]);
+    current.hash();
+    assert_eq!(legacy.hash, current.hash);
+    assert_eq!(legacy.get_script(), current.get_script());
+}
+
+#[test]
+fn pre_cascade_routine_dependencies_serde() {
+    // Absent in a pgc 1.0.x dump: unknown, not "calls nothing".
+    let json = r#"{
+        "schema": "analytics",
+        "name": "active_users",
+        "definition": "select id from public.users",
+        "table_relation": []
+    }"#;
+    let view: View = serde_json::from_str(json).expect("older dumps must stay readable");
+    assert_eq!(view.routine_dependencies, None);
+
+    // Written only when known; an empty list is kept apart from unknown.
+    let mut view = create_view("select 1");
+    let written = serde_json::to_value(&view).unwrap();
+    assert!(written.get("routine_dependencies").is_none(), "{written}");
+    view.routine_dependencies = Some(Vec::new());
+    let written = serde_json::to_value(&view).unwrap();
+    assert_eq!(written["routine_dependencies"], serde_json::json!([]));
+    let reread: View = serde_json::from_value(written).unwrap();
+    assert_eq!(reread.routine_dependencies, Some(Vec::new()));
+}
+
+// ==== r3-ddl: materialized view tablespace ====
+
+/// The dump stores `pg_tablespace.spcname` raw; it goes into `SET TABLESPACE`
+/// spelled as `quote_ident` would, so `pg_default` and any other plain name
+/// are unchanged and one that needs quoting cannot break the statement.
+#[test]
+fn a_materialized_view_tablespace_is_quoted_only_when_it_needs_it() {
+    for (space, spelled) in [
+        ("fast_ssd", "fast_ssd"),
+        ("Fast SSD", "\"Fast SSD\""),
+        ("ts\"; drop table t; --", "\"ts\"\"; drop table t; --\""),
+    ] {
+        let mut view = create_materialized_view("select 1");
+        view.tablespace = Some(space.to_string());
+        assert!(
+            view.get_script().contains(&format!(
+                "alter materialized view analytics.active_users set tablespace {spelled};"
+            )),
+            "{}",
+            view.get_script()
+        );
+    }
+}

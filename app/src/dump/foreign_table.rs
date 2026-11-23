@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, comment_out, line_comment_safe};
 
 /// A column in a foreign table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +16,12 @@ pub struct ForeignTableColumn {
     pub column_default: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// Column-level privileges (`pg_attribute.attacl`). Empty in a dump
+    /// written before pgc 1.1.0. Not hashed, and not compared: the comparer
+    /// uses them only to give a foreign table it drops and creates again
+    /// the column privileges TO has (see `Comparer::compare_grants`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
 }
 
 /// Information about a PostgreSQL foreign table.
@@ -33,6 +39,17 @@ pub struct ForeignTable {
     pub hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acl: Vec<String>,
+    /// The partitioned table this foreign table is a partition of
+    /// (`quote_ident(schema).quote_ident(name)`), with its bound
+    /// (`pg_get_expr(relpartbound)`) in `partition_bound`. Both `None` for
+    /// a standalone foreign table and in a dump written before pgc 1.1.0.
+    /// Not hashed, so every foreign table keeps the hash pgc 1.0.x gave
+    /// it: [`ForeignTable::get_script`] attaches the table it creates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_of: Option<String>,
+    /// See [`ForeignTable::partition_of`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_bound: Option<String>,
 }
 
 impl ForeignTable {
@@ -54,6 +71,8 @@ impl ForeignTable {
             comment: None,
             hash: None,
             acl: Vec::new(),
+            partition_of: None,
+            partition_bound: None,
         };
         ft.hash();
         ft
@@ -93,7 +112,10 @@ impl ForeignTable {
         self.hash = Some(format!("{:x}", hasher.finalize()));
     }
 
-    /// Returns a CREATE FOREIGN TABLE script.
+    /// Returns a CREATE FOREIGN TABLE script, with the owner and comment,
+    /// and — for a partition (see [`ForeignTable::partition_of`]) — the
+    /// `ATTACH PARTITION` that puts it under its partitioned table, which
+    /// the columns listed here have to match.
     pub fn get_script(&self) -> String {
         let mut script = format!("create foreign table {}.{} (\n", self.schema, self.name);
 
@@ -145,6 +167,16 @@ impl ForeignTable {
             );
         }
 
+        if let (Some(parent), Some(bound)) = (&self.partition_of, &self.partition_bound) {
+            result.push_str(
+                &format!(
+                    "alter table {} attach partition {}.{} {};",
+                    parent, self.schema, self.name, bound
+                )
+                .with_empty_lines(),
+            );
+        }
+
         result
     }
 
@@ -155,6 +187,38 @@ impl ForeignTable {
             self.schema, self.name
         )
         .with_empty_lines()
+    }
+
+    /// The items of an `OPTIONS (...)` clause that turn the `from` options into
+    /// `to`, each option being `key 'value'` as the dump stores it.
+    ///
+    /// A bare item means `ADD`, which fails with `option "key" provided more
+    /// than once` for a key the table already has, so a key on both sides
+    /// whose value changes is `SET`, a key only `from` has is dropped and a key
+    /// only `to` has is added (bare, as the whole list used to be). A key whose
+    /// value is unchanged is left out; so is a change of order alone, which
+    /// PostgreSQL gives no way to make.
+    fn option_changes(from: &[String], to: &[String]) -> Vec<String> {
+        fn key(option: &str) -> &str {
+            option.split_whitespace().next().unwrap_or(option)
+        }
+        let to_keys: std::collections::HashSet<&str> = to.iter().map(|o| key(o)).collect();
+        let from_by_key: std::collections::HashMap<&str, &str> =
+            from.iter().map(|o| (key(o), o.as_str())).collect();
+        let mut changes: Vec<String> = from
+            .iter()
+            .map(|o| key(o))
+            .filter(|k| !to_keys.contains(k))
+            .map(|k| format!("drop {k}"))
+            .collect();
+        for option in to {
+            match from_by_key.get(key(option)) {
+                Some(existing) if *existing == option.as_str() => {}
+                Some(_) => changes.push(format!("set {option}")),
+                None => changes.push(option.clone()),
+            }
+        }
+        changes
     }
 
     /// Returns an ALTER script to transform self into target.
@@ -179,17 +243,14 @@ impl ForeignTable {
             if use_drop {
                 return format!("{}{}", drop, create);
             } else {
-                let commented_drop = drop
-                    .lines()
-                    .map(|l| format!("-- {}\n", l))
-                    .collect::<String>();
-                let commented_create = create
-                    .lines()
-                    .map(|l| format!("-- {}\n", l))
-                    .collect::<String>();
+                let commented_drop = comment_out(&drop);
+                let commented_create = comment_out(&create);
                 return format!(
                     "-- use_drop=false: foreign table {}.{} requires drop+recreate; statements commented out\n{}{}",
-                    self.schema, self.name, commented_drop, commented_create
+                    line_comment_safe(&self.schema),
+                    line_comment_safe(&self.name),
+                    commented_drop,
+                    commented_create
                 );
             }
         }
@@ -210,16 +271,18 @@ impl ForeignTable {
                     }
                 }
             } else {
-                // Use SET for simplicity — drop all old, add all new
-                statements.push(
-                    format!(
-                        "alter foreign table {}.{} options ({});",
-                        target.schema,
-                        target.name,
-                        target.options.join(", ")
-                    )
-                    .with_empty_lines(),
-                );
+                let changes = Self::option_changes(&self.options, &target.options);
+                if !changes.is_empty() {
+                    statements.push(
+                        format!(
+                            "alter foreign table {}.{} options ({});",
+                            target.schema,
+                            target.name,
+                            changes.join(", ")
+                        )
+                        .with_empty_lines(),
+                    );
+                }
             }
         }
 

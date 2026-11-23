@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, comment_out};
 
 /// Parse a `key=value` option string into `(key, value)`. The catalog stores
 /// options in `key=value` form; PostgreSQL DDL requires `key 'value'`.
@@ -62,6 +62,13 @@ pub struct ForeignDataWrapper {
     pub handler_func: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_func: Option<String>,
+    /// Connection function (`pg_foreign_data_wrapper.fdwconnection`, PG19+)
+    /// that `CREATE SUBSCRIPTION ... SERVER` calls to build a conninfo, as a
+    /// schema-qualified `nsp.proname`. `None` when unset, and always before
+    /// PG19. Only ever emitted as `CONNECTION f` / `NO CONNECTION` when set
+    /// or changed, since neither clause parses on PG14–18.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_func: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +86,13 @@ impl ForeignDataWrapper {
         }
         if let Some(v) = &self.validator_func {
             hasher.update(v.as_bytes());
+        }
+        // PG19: folded in only when set, tagged and length-prefixed, so a
+        // wrapper without one keeps its pgc 1.0.x hash.
+        if let Some(c) = &self.connection_func {
+            hasher.update(b"connection:");
+            hasher.update((c.len() as u32).to_be_bytes());
+            hasher.update(c.as_bytes());
         }
         hasher.update((self.options.len() as u32).to_be_bytes());
         for o in &self.options {
@@ -102,6 +116,10 @@ impl ForeignDataWrapper {
             parts.push(format!("VALIDATOR {}", v));
         } else {
             parts.push("NO VALIDATOR".to_string());
+        }
+        // Never `NO CONNECTION`: it is the default, and a syntax error before PG19.
+        if let Some(c) = &self.connection_func {
+            parts.push(format!("CONNECTION {c}"));
         }
         if !self.options.is_empty() {
             parts.push(format!("OPTIONS ({})", format_options(&self.options)));
@@ -142,18 +160,32 @@ impl ForeignDataWrapper {
         let definition_changed = self.handler_func != target.handler_func
             || self.validator_func != target.validator_func
             || self.options != target.options;
+        // Kept out of `definition_changed` so a connection-only change emits
+        // just the `CONNECTION` clause, while every other diff renders exactly
+        // as it did before PG19.
+        let connection_changed = self.connection_func != target.connection_func;
 
-        if definition_changed {
+        if definition_changed || connection_changed {
             let mut parts: Vec<String> = Vec::new();
-            if let Some(h) = &target.handler_func {
-                parts.push(format!("HANDLER {}", h));
-            } else if self.handler_func.is_some() {
-                parts.push("NO HANDLER".to_string());
+            if definition_changed {
+                if let Some(h) = &target.handler_func {
+                    parts.push(format!("HANDLER {}", h));
+                } else if self.handler_func.is_some() {
+                    parts.push("NO HANDLER".to_string());
+                }
+                if let Some(v) = &target.validator_func {
+                    parts.push(format!("VALIDATOR {}", v));
+                } else if self.validator_func.is_some() {
+                    parts.push("NO VALIDATOR".to_string());
+                }
             }
-            if let Some(v) = &target.validator_func {
-                parts.push(format!("VALIDATOR {}", v));
-            } else if self.validator_func.is_some() {
-                parts.push("NO VALIDATOR".to_string());
+            // `NO CONNECTION` needs a FROM wrapper with a connection function,
+            // so it only ever reaches a PG19 server.
+            if connection_changed {
+                match &target.connection_func {
+                    Some(c) => parts.push(format!("CONNECTION {c}")),
+                    None => parts.push("NO CONNECTION".to_string()),
+                }
             }
             if !parts.is_empty() {
                 script.append_block(&format!(
@@ -226,6 +258,13 @@ pub struct ForeignServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub hash: Option<String>,
+    /// The server's privileges (`pg_foreign_server.srvacl`): `USAGE`.
+    /// Empty for the default (owner only), and in a dump written before
+    /// pgc 1.1.0. Not hashed, and not compared: the comparer uses them only
+    /// to give a server it drops and creates again the privileges TO has
+    /// (see `Comparer::compare_grants`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
 }
 
 impl ForeignServer {
@@ -296,23 +335,38 @@ impl ForeignServer {
         format!("DROP SERVER IF EXISTS {} CASCADE;", self.name).with_empty_lines()
     }
 
+    /// `DROP SERVER IF EXISTS` without `CASCADE`: it fails while anything
+    /// still uses the server, rather than taking it along.
+    pub fn get_restrict_drop_script(&self) -> String {
+        format!("DROP SERVER IF EXISTS {};", self.name).with_empty_lines()
+    }
+
+    /// Whether `target` is this server on another foreign-data wrapper,
+    /// which `ALTER SERVER` cannot make: the server has to be dropped and
+    /// created again.
+    pub fn changes_wrapper(&self, target: &ForeignServer) -> bool {
+        self.fdw_name != target.fdw_name
+    }
+
+    /// Returns a script that turns this server into `target`.
+    ///
+    /// A wrapper change (see [`ForeignServer::changes_wrapper`]) is a drop
+    /// with `CASCADE` and a create here, the drop commented out without
+    /// `use_drop`. With `use_drop` the comparer never asks for it: it drops
+    /// the server's user mappings and foreign tables itself, the server
+    /// without `CASCADE`, and creates them all again — or, when a PG19
+    /// subscription uses the server, leaves it alone.
     pub fn get_alter_script(&self, target: &ForeignServer, use_drop: bool) -> String {
         let mut script = String::new();
 
-        let definition_changed = self.fdw_name != target.fdw_name;
+        let definition_changed = self.changes_wrapper(target);
 
         if definition_changed {
-            // FDW name can't be changed; drop+recreate
             if use_drop {
                 script.append_block(&self.get_drop_script());
             } else {
                 let drop = self.get_drop_script();
-                script.push_str(
-                    &drop
-                        .lines()
-                        .map(|l| format!("-- {}\n", l))
-                        .collect::<String>(),
-                );
+                script.push_str(&comment_out(&drop));
             }
             script.push_str(&target.get_script());
             return script;

@@ -13,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   # Keep in sync with the toolchain used by the integration job in rust.yml
   # and the version pinned in Dockerfile.
-  RUST_TOOLCHAIN: "1.95.0"
+  RUST_TOOLCHAIN: "1.100.0"
   # nfpm produces .deb/.rpm/.apk/.pkg.tar.zst from a single config.
   NFPM_VERSION: "2.40.0"
 

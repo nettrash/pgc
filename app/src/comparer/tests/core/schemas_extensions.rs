@@ -3,7 +3,7 @@
 use crate::comparer::core::*;
 use crate::config::dump_config::DumpConfig;
 use crate::config::grants_mode::GrantsMode;
-use crate::dump::extension::Extension;
+use crate::dump::extension::{AvailableExtension, Extension};
 use crate::dump::schema::Schema;
 
 #[tokio::test]
@@ -209,4 +209,406 @@ async fn compare_extensions_leaves_an_unmoved_extension_alone() {
     assert!(!script.contains("alter extension"), "{script}");
     assert!(!script.contains("drop extension"), "{script}");
     assert!(!script.contains("create extension"), "{script}");
+}
+
+// ── PG19: extension versions the migrated server cannot install ────────
+// PostgreSQL 19 ships btree_gist 1.9 as the only installable version (the
+// 1.2 base script is gone), so `version '1.8'` — from an older major, or from
+// a pg_upgrade'd 19 cluster still at 1.8 — fails, and so does every GiST
+// index and exclusion constraint that needs btree_gist. The FROM dump records
+// what its server can install; the output only changes when the requested
+// version is not in that list.
+
+fn avail(name: &str, default_version: &str, versions: &[&str]) -> AvailableExtension {
+    AvailableExtension {
+        name: name.to_string(),
+        default_version: default_version.to_string(),
+        versions: versions.iter().map(|v| v.to_string()).collect(),
+    }
+}
+
+async fn compare_ext(from_dump: Dump, to_dump: Dump, use_comments: bool) -> String {
+    let mut comparer = Comparer::new(
+        from_dump,
+        to_dump,
+        true,
+        false,
+        use_comments,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_extensions().await.unwrap();
+    comparer.get_script()
+}
+
+#[tokio::test]
+async fn create_of_an_uninstallable_version_uses_the_server_default() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+
+    let script = compare_ext(from_dump, to_dump, true).await;
+
+    assert!(
+        script.contains(
+            "-- Extension btree_gist version '1.8' is not installable on the migrated server \
+             (installable: 1.9); creating its default version '1.9' instead.\n\
+             create extension if not exists btree_gist with schema public;\n"
+        ),
+        "{script}"
+    );
+    assert!(!script.contains("version '1.8';"), "{script}");
+}
+
+#[tokio::test]
+async fn default_version_create_note_is_stripped_without_comments() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+
+    assert_eq!(
+        script,
+        "create extension if not exists btree_gist with schema public;\n"
+    );
+}
+
+#[tokio::test]
+async fn impossible_downgrade_is_skipped_with_a_note() {
+    // FROM: a PG19 server at btree_gist 1.9; TO: a PG18 database at 1.8.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("btree_gist", "1.9", "public"));
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+
+    let script = compare_ext(from_dump.clone(), to_dump.clone(), true).await;
+    assert!(
+        script.contains(
+            "-- Extension btree_gist version '1.8' is not available on the migrated server \
+             (installed: '1.9'; installable: 1.9); version left unchanged.\n"
+        ),
+        "{script}"
+    );
+    assert!(!script.contains("alter extension"), "{script}");
+
+    // With comments off nothing executable is left, so a re-run is empty.
+    assert_eq!(compare_ext(from_dump, to_dump, false).await, "");
+}
+
+#[tokio::test]
+async fn skipped_update_still_relocates() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("btree_gist", "1.9", "public"));
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump
+        .extensions
+        .push(ext("btree_gist", "1.8", "shared_schema"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(
+        script,
+        "alter extension btree_gist set schema shared_schema;\n"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_from_a_pg_upgraded_version_is_still_emitted() {
+    // pg_upgrade to 19 keeps btree_gist at 1.8, which 19 cannot install
+    // from scratch but can update from (btree_gist--1.8--1.9.sql).
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("btree_gist", "1.8", "public"));
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.9", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(script, "alter extension btree_gist update to '1.9';\n");
+}
+
+#[tokio::test]
+async fn update_between_uninstallable_versions_is_still_attempted() {
+    // Installed 1.7 is not installable on 19 either; an update script from
+    // it (1.7--1.8) may exist, and the list cannot tell, so emit as before.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("btree_gist", "1.7", "public"));
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(script, "alter extension btree_gist update to '1.8';\n");
+}
+
+#[tokio::test]
+async fn installable_versions_are_emitted_exactly_as_before() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("postgres_fdw", "1.2", "public"));
+    from_dump.available_extensions.extend([
+        avail("postgres_fdw", "1.3", &["1.0", "1.1", "1.2", "1.3"]),
+        avail("hstore", "1.8", &["1.4", "1.5", "1.6", "1.7", "1.8"]),
+    ]);
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump
+        .extensions
+        .push(ext("postgres_fdw", "1.3", "public"));
+    to_dump.extensions.push(ext("hstore", "1.7", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(
+        script,
+        "alter extension postgres_fdw update to '1.3';\n\n\
+         create extension if not exists hstore with schema public version '1.7';\n"
+    );
+}
+
+#[tokio::test]
+async fn unknown_availability_is_byte_identical_to_before() {
+    // A FROM dump written by pgc 1.0.x has no availability list.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("btree_gist", "1.9", "public"));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+    to_dump.extensions.push(ext("btree_gin", "1.3", "public"));
+
+    // The TO dump's own list is never consulted.
+    to_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.8", &["1.8"]));
+
+    let script = compare_ext(from_dump, to_dump, true).await;
+    assert!(
+        script.contains("alter extension btree_gist update to '1.8';"),
+        "{script}"
+    );
+    assert!(
+        script
+            .contains("create extension if not exists btree_gin with schema public version '1.3';"),
+        "{script}"
+    );
+    assert!(!script.contains("migrated server"), "{script}");
+}
+
+#[tokio::test]
+async fn extension_missing_from_the_list_keeps_the_pinned_create() {
+    // pg_stash_advice (new in 19) going to an 18 server: not available at
+    // all, which no spelling fixes, so the statement stays as it was.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.8", &["1.8"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump
+        .extensions
+        .push(ext("pg_stash_advice", "1.0", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(
+        script,
+        "create extension if not exists pg_stash_advice with schema public version '1.0';\n"
+    );
+}
+
+#[tokio::test]
+async fn extension_without_a_default_keeps_the_pinned_create() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .available_extensions
+        .push(avail("custom_ext", "", &["2.0"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("custom_ext", "1.0", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(
+        script,
+        "create extension if not exists custom_ext with schema public version '1.0';\n"
+    );
+}
+
+// ── extension updates with no update path ─────────────────────────────
+// A version the FROM server can install is not one it can update to: contrib
+// ships no downgrade scripts, so FROM on PostgreSQL 19 at postgres_fdw 1.3
+// against TO on 18 at 1.2 used to get `alter extension postgres_fdw update
+// to '1.2'`, which fails with "no update path". Dumps now record, per
+// installed extension, the versions `pg_extension_update_paths` reaches.
+
+fn ext_reaching(name: &str, version: &str, targets: &[&str]) -> Extension {
+    let mut e = ext(name, version, "public");
+    e.update_targets = Some(targets.iter().map(|v| v.to_string()).collect());
+    e
+}
+
+#[tokio::test]
+async fn downgrade_between_installable_versions_is_skipped_with_a_note() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext_reaching("postgres_fdw", "1.3", &[]));
+    from_dump.available_extensions.push(avail(
+        "postgres_fdw",
+        "1.3",
+        &["1.0", "1.1", "1.2", "1.3"],
+    ));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump
+        .extensions
+        .push(ext("postgres_fdw", "1.2", "public"));
+
+    let script = compare_ext(from_dump.clone(), to_dump.clone(), true).await;
+    assert!(
+        script.contains(
+            "-- Extension postgres_fdw has no update path from version '1.3' to '1.2' on the \
+             migrated server (reachable: none); version left unchanged.\n"
+        ),
+        "{script}"
+    );
+    assert!(!script.contains("alter extension"), "{script}");
+
+    // With comments off nothing executable is left, so a re-run is empty.
+    assert_eq!(compare_ext(from_dump, to_dump, false).await, "");
+}
+
+#[tokio::test]
+async fn skipped_downgrade_note_names_the_reachable_versions() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext_reaching("cube", "1.4", &["1.5"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("cube", "1.2", "public"));
+
+    let script = compare_ext(from_dump, to_dump, true).await;
+    assert!(
+        script.contains(
+            "-- Extension cube has no update path from version '1.4' to '1.2' on the \
+             migrated server (reachable: 1.5); version left unchanged.\n"
+        ),
+        "{script}"
+    );
+}
+
+#[tokio::test]
+async fn reachable_update_is_still_emitted() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext_reaching("cube", "1.4", &["1.5"]));
+    from_dump
+        .available_extensions
+        .push(avail("cube", "1.5", &["1.2", "1.3", "1.4", "1.5"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("cube", "1.5", "public"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(script, "alter extension cube update to '1.5';\n");
+}
+
+#[tokio::test]
+async fn skipped_downgrade_still_relocates() {
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump.extensions.push(ext_reaching("seg", "1.4", &[]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("seg", "1.3", "shared_schema"));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(script, "alter extension seg set schema shared_schema;\n");
+}
+
+#[tokio::test]
+async fn uninstallable_target_keeps_its_own_note_when_targets_are_known() {
+    // Both reasons hold; the installable list is the more useful one to show.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext_reaching("btree_gist", "1.9", &[]));
+    from_dump
+        .available_extensions
+        .push(avail("btree_gist", "1.9", &["1.9"]));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+
+    let script = compare_ext(from_dump, to_dump, true).await;
+    assert!(
+        script.contains(
+            "-- Extension btree_gist version '1.8' is not available on the migrated server \
+             (installed: '1.9'; installable: 1.9); version left unchanged.\n"
+        ),
+        "{script}"
+    );
+    assert!(!script.contains("no update path"), "{script}");
+}
+
+#[tokio::test]
+async fn known_targets_decide_an_update_between_uninstallable_versions() {
+    // A pg_upgrade'd 19 cluster at btree_gist 1.7, which 19 cannot install:
+    // the installable list cannot tell whether 1.7 reaches 1.8, the recorded
+    // update paths can.
+    let from = |targets: &[&str]| {
+        let mut from_dump = Dump::new(DumpConfig::default());
+        from_dump
+            .extensions
+            .push(ext_reaching("btree_gist", "1.7", targets));
+        from_dump
+            .available_extensions
+            .push(avail("btree_gist", "1.9", &["1.9"]));
+        from_dump
+    };
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump.extensions.push(ext("btree_gist", "1.8", "public"));
+
+    let reachable = compare_ext(from(&["1.8", "1.9"]), to_dump.clone(), false).await;
+    assert_eq!(reachable, "alter extension btree_gist update to '1.8';\n");
+
+    let unreachable = compare_ext(from(&["1.9"]), to_dump, true).await;
+    assert!(
+        unreachable.contains(
+            "-- Extension btree_gist has no update path from version '1.7' to '1.8' on the \
+             migrated server (reachable: 1.9); version left unchanged.\n"
+        ),
+        "{unreachable}"
+    );
+    assert!(!unreachable.contains("alter extension"), "{unreachable}");
+}
+
+#[tokio::test]
+async fn targets_recorded_on_the_to_dump_are_never_consulted() {
+    // The migration runs on FROM; TO's update paths say nothing about it.
+    let mut from_dump = Dump::new(DumpConfig::default());
+    from_dump
+        .extensions
+        .push(ext("postgres_fdw", "1.3", "public"));
+    let mut to_dump = Dump::new(DumpConfig::default());
+    to_dump
+        .extensions
+        .push(ext_reaching("postgres_fdw", "1.2", &[]));
+
+    let script = compare_ext(from_dump, to_dump, false).await;
+    assert_eq!(script, "alter extension postgres_fdw update to '1.2';\n");
 }

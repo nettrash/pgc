@@ -3,10 +3,25 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, line_comment_safe};
 
 fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// The event trigger's name as it goes into a statement. The dump stores it
+/// `quote_ident`-ed (`fetch_event_triggers_standalone`), so a name that needed
+/// quoting already carries its quotes and is used as it is — wrapping it
+/// again turned `"AuditTrg"` into `"""AuditTrg"""`, a different name, so the
+/// create made a misnamed trigger and every drop, alter and comment missed
+/// the real one. A name that did not need quoting is quoted here, which is
+/// how these statements have always spelled it.
+fn quoted(name: &str) -> String {
+    if name.starts_with('"') {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 /// Represents a PostgreSQL event trigger (from pg_event_trigger).
@@ -73,8 +88,8 @@ impl EventTrigger {
 
     pub fn get_script(&self) -> String {
         let mut script = format!(
-            "create event trigger \"{}\" on {}",
-            self.name.replace('"', "\"\""),
+            "create event trigger {} on {}",
+            quoted(&self.name),
             self.event
         );
 
@@ -99,24 +114,24 @@ impl EventTrigger {
                 _ => "enable",
             };
             result.append_block(&format!(
-                "alter event trigger \"{}\" {};",
-                self.name.replace('"', "\"\""),
+                "alter event trigger {} {};",
+                quoted(&self.name),
                 state
             ));
         }
 
         if !self.owner.is_empty() {
             result.append_block(&format!(
-                "alter event trigger \"{}\" owner to {};",
-                self.name.replace('"', "\"\""),
+                "alter event trigger {} owner to {};",
+                quoted(&self.name),
                 self.owner
             ));
         }
 
         if let Some(comment) = &self.comment {
             result.append_block(&format!(
-                "comment on event trigger \"{}\" is '{}';",
-                self.name.replace('"', "\"\""),
+                "comment on event trigger {} is '{}';",
+                quoted(&self.name),
                 escape_single_quotes(comment)
             ));
         }
@@ -125,11 +140,7 @@ impl EventTrigger {
     }
 
     pub fn get_drop_script(&self) -> String {
-        format!(
-            "drop event trigger if exists \"{}\";",
-            self.name.replace('"', "\"\"")
-        )
-        .with_empty_lines()
+        format!("drop event trigger if exists {};", quoted(&self.name)).with_empty_lines()
     }
 
     pub fn get_alter_script(&self, target: &EventTrigger, use_drop: bool) -> String {
@@ -145,8 +156,8 @@ impl EventTrigger {
                 script.push_str(&target.get_script());
             } else {
                 script.push_str(&format!(
-                    "-- Event trigger \"{}\" requires drop+recreate (definition changed); use_drop=false\n",
-                    self.name
+                    "-- Event trigger {} requires drop+recreate (definition changed); use_drop=false\n",
+                    line_comment_safe(&quoted(&self.name))
                 ));
             }
             return script;
@@ -160,16 +171,16 @@ impl EventTrigger {
                 _ => "enable",
             };
             script.append_block(&format!(
-                "alter event trigger \"{}\" {};",
-                target.name.replace('"', "\"\""),
+                "alter event trigger {} {};",
+                quoted(&target.name),
                 state
             ));
         }
 
         if self.owner != target.owner && !target.owner.is_empty() {
             script.append_block(&format!(
-                "alter event trigger \"{}\" owner to {};",
-                target.name.replace('"', "\"\""),
+                "alter event trigger {} owner to {};",
+                quoted(&target.name),
                 target.owner
             ));
         }
@@ -177,14 +188,14 @@ impl EventTrigger {
         if self.comment != target.comment {
             if let Some(cmt) = &target.comment {
                 script.append_block(&format!(
-                    "comment on event trigger \"{}\" is '{}';",
-                    target.name.replace('"', "\"\""),
+                    "comment on event trigger {} is '{}';",
+                    quoted(&target.name),
                     escape_single_quotes(cmt)
                 ));
             } else if use_drop {
                 script.append_block(&format!(
-                    "comment on event trigger \"{}\" is null;",
-                    target.name.replace('"', "\"\"")
+                    "comment on event trigger {} is null;",
+                    quoted(&target.name)
                 ));
             }
         }
