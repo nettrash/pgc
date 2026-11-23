@@ -36,6 +36,13 @@ CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA public;
 -- extname), so the diff must relocate it with ALTER EXTENSION ... SET SCHEMA
 -- rather than treat the move as an unrelated create plus drop.
 CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch" WITH SCHEMA shared_schema;
+-- Extension versions (every version): seg goes DOWN from 1.4 to 1.3, which no
+-- update script reaches (contrib ships no downgrades), so the diff must leave
+-- it at 1.4 with a note instead of an `alter extension ... update to` that
+-- fails. cube goes UP from 1.4 to 1.5 along cube--1.4--1.5.sql and must still
+-- be updated. Both versions of each are installable on PG14-19.
+CREATE EXTENSION IF NOT EXISTS seg WITH SCHEMA public VERSION '1.4';
+CREATE EXTENSION IF NOT EXISTS cube WITH SCHEMA public VERSION '1.4';
 
 -- Custom types
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending');

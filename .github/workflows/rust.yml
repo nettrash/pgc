@@ -81,10 +81,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # "19" is resolved to the newest published PostgreSQL 19 image: the
-        # GA `postgres:19` tag once it exists, a 19rcN / 19betaN tag until
-        # then (see "Resolve PostgreSQL image"), so the leg moves to the
-        # release without an edit here.
+        # Each entry runs on its GA `postgres:<major>` tag; 19 has been GA
+        # since 2026-11-19. A major with no GA tag yet resolves to its newest
+        # rcN / betaN tag instead (see "Resolve PostgreSQL image"), so the
+        # next major can be added here while it is in beta and moves to its
+        # release without another edit.
         pg_version: ["14", "15", "16", "17", "18", "19"]
 
     steps:
@@ -104,7 +105,7 @@ jobs:
       id: pgimage
       run: |
         # A major that is not released yet has no `postgres:<major>` tag on
-        # Docker Hub, only pre-release ones (19beta1..19betaN, then 19rc1..).
+        # Docker Hub, only pre-release ones (<major>beta1.., then <major>rc1..).
         # Use the GA tag when Docker Hub has it, else the newest rc, else the
         # newest beta, so a pre-release major is tested today and the job
         # follows it to GA on its own. Pre-release tags are considered only

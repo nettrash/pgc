@@ -22,6 +22,8 @@ These schemas are designed to test comparison capabilities for the following Pos
 - **Added**: `hstore` extension in Schema B
 - **Removed**: `pgcrypto` extension in Schema B
 - **Unchanged**: `uuid-ossp`, `pg_trgm`, `btree_gist`, `postgres_fdw`
+- **Version down, no update path (every version)**: `seg` 1.4 → 1.3. Expected: no `alter extension seg ...`; the version is left at 1.4 with a comment (see "Extension Update With No Update Path" below).
+- **Version up (every version)**: `cube` 1.4 → 1.5. Expected: `alter extension cube update to '1.5';`
 
 ### 3. Custom Types
 
@@ -660,7 +662,13 @@ Requires PostgreSQL 19+ (`postgres_fdw` 1.3 supplies `postgres_fdw_connection`).
   - an update is replaced by a comment only when the installed version is installable and the target is not. A `pg_upgrade`d version the server can no longer install still gets its update attempted.
   - Dumps without the list, and every installable version, produce the same SQL as before.
 - The single-server CI cannot exercise this, because `a` and `b` get the same versions. It is covered by unit tests in `comparer/tests/core/schemas_extensions.rs`, and was verified live: from an empty PG19 database to a PG18 one, btree_gist was created at 1.9 and the exclusion constraint applied.
-- **Not covered:** a downgrade between two installable versions (e.g. btree_gin 1.4 → 1.3 on PG19) still emits an `alter extension ... update to` that fails, as before.
+
+#### Extension Update With No Update Path (every version)
+- A version the server can install is not necessarily one the installed extension can be updated to. `alter extension ... update to` needs a chain of update scripts from the installed version, and contrib ships none that go down: from `seg` 1.4, `update to '1.3'` fails with `no update path`, although `create extension seg version '1.3'` works. Across majors this is FROM on PostgreSQL 19 at `postgres_fdw` 1.3 (also `btree_gin` 1.4, `pg_buffercache` 1.7, `pg_stat_statements` 1.13) against TO on 18 one version lower.
+- Each dump records, per installed extension, the versions `pg_extension_update_paths` reaches from its installed version (`Extension::update_targets`; `None` in older dumps, and for an extension whose control file the server no longer has). The comparer reads the FROM dump's and replaces an update to a version not in that list with a comment, `-- Extension seg has no update path from version '1.4' to '1.3' on the migrated server (reachable: none); version left unchanged.`, and a warning on stderr. A schema move is still made. When the target is not installable at all, the comment of the previous section is used instead. With the paths known, an update from a `pg_upgrade`d version the server can no longer install is decided by them, not attempted blindly.
+- **Fixtures**: `seg` 1.4 in Schema A, 1.3 in Schema B (no path), and `cube` 1.4 → 1.5 (a path: `cube--1.4--1.5.sql`). Both versions of each are installable on PG14–19.
+- **CI assertion** (`.github/scripts/assert-misc.sh`): after round 1, `a` still has `seg` 1.4 and `b` 1.3, the round-1 SQL holds no `alter extension seg`, and it holds `alter extension cube update to '1.5';`. The generic extension check leaves `seg` out, since `a` and `b` differ there on purpose. Round 2 is empty: the comment is all that is emitted, and `USE_COMMENTS=false` strips it.
+- Also covered by unit tests in `comparer/tests/core/schemas_extensions.rs` and `dump/tests/extension.rs`, a dump-format test in `tests/dump_file_format.rs`, and the live test `a_dump_records_extension_update_paths_and_skips_a_downgrade`.
 
 #### standard_conforming_strings = off on a PostgreSQL 14–18 Server
 - Every pgc connection runs `set standard_conforming_strings = on`, as pg_dump does, so literals are always dumped in standard form. A server, database or role set to `off` used to make pgc dump every backslash in defaults, CHECK constraints, index predicates and view bodies doubled.
@@ -1913,7 +1921,7 @@ Section 45 (line 503): replace "Every subscription is created `WITH (connect = f
 
 The fixtures are the `inhck_*` tables of the fix:inhcheck block at the end of both schema files. Every CHECK reads the generated column `v` (or the retyped column), except `inhck_i_b`.
 
-**The problem (PG17+).** `ALTER TABLE ONLY ... SET EXPRESSION` rebuilds the CHECK constraints that read the column and gets inheritance wrong; this is a server bug, verified on 17, 18 and 19rc1, STORED and VIRTUAL alike:
+**The problem (PG17+).** `ALTER TABLE ONLY ... SET EXPRESSION` rebuilds the CHECK constraints that read the column and gets inheritance wrong; this is a server bug, verified on 17, 18 and 19.0, STORED and VIRTUAL alike:
 - on a child, a copy the table only inherits is dropped and never added back;
 - on a child, a merged copy (local and inherited) loses its inheritance;
 - on a parent, the re-add recurses into children whose copies were never dropped, so each counts its parent twice (`coninhcount` 2).
@@ -2156,6 +2164,7 @@ The comparison should detect and generate SQL for:
 - Detecting the move from the pre-19 `JSON_ARRAYAGG` rewrite to PG19's `JSON_ARRAY(query)` (PG19; no diff on PG16–18)
 - Detecting the heap reloptions `autovacuum_parallel_workers` and `log_autoanalyze_min_duration` on tables, partitions and materialized views (PG19+)
 - Never pinning an extension `VERSION` the migrated (FROM) server cannot install: the extension is created at the server default, or the version is left unchanged, each with an explanatory comment (PG19 btree_gist 1.9)
+- Leaving out an extension update the FROM server has no update path for, a downgrade such as `seg` 1.4 → 1.3 or PG19's `postgres_fdw` 1.3 against PG18's 1.2, with an explanatory comment, while updates that have a path are still made
 - Starting the migration with `set standard_conforming_strings = on;` when the migrated server's clients default to `off` (PG14–18), so backslashes in literals are stored as written
 - Dumping tables whose names start with `pg` followed by any character other than `_` (`pgbench_accounts`)
 - Dumping SQL-standard routine bodies (`BEGIN ATOMIC ... END`, `RETURN expr`) under an empty `search_path` and emitting them verbatim after every option (PG14+). This includes body changes, switches between a quoted body and a SQL-standard one, and `INSERT ... ON CONFLICT DO SELECT` bodies (PG19+).

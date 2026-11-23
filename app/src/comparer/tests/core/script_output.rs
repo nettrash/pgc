@@ -1354,3 +1354,122 @@ async fn guard_is_withdrawn_from_an_empty_migration_inside_a_transaction_too() {
 
     assert_eq!(guarded.get_script(), plain.get_script());
 }
+
+// ── drops of FROM-only objects follow the dump ──────────────────────────
+// `compare_event_triggers`, `compare_foreign_tables` and `compare_collations`
+// walked a `HashMap` of the FROM objects to find the ones TO lacks, so their
+// drops came out in a different order on every run of the same compare.
+// They now follow the FROM dump, which its queries sort by name. Eight
+// objects make a chance match of the dump order 1 in 40320.
+
+const ORDER_NAMES: [&str; 8] = ["a1", "b2", "c3", "d4", "e5", "f6", "g7", "h8"];
+
+/// The byte offset of each name in `script`, which must be increasing.
+fn assert_in_dump_order(script: &str, needle: impl Fn(&str) -> String) {
+    let positions: Vec<usize> = ORDER_NAMES
+        .iter()
+        .map(|n| {
+            script
+                .find(&needle(n))
+                .unwrap_or_else(|| panic!("no drop of {n}:\n{script}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "drops out of dump order:\n{script}"
+    );
+}
+
+#[tokio::test]
+async fn event_trigger_drops_follow_the_dump_order() {
+    use crate::dump::event_trigger::EventTrigger;
+    let mut from_dump = Dump::new(DumpConfig::default());
+    for name in ORDER_NAMES {
+        from_dump.event_triggers.push(EventTrigger::new(
+            name.to_string(),
+            "ddl_command_start".to_string(),
+            "public.f".to_string(),
+            vec![],
+            "O".to_string(),
+            "postgres".to_string(),
+            None,
+        ));
+    }
+    let mut comparer = Comparer::new(
+        from_dump,
+        Dump::new(DumpConfig::default()),
+        true,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_event_triggers().await.unwrap();
+    let script = comparer.get_script();
+    assert_in_dump_order(&script, |n| {
+        format!("drop event trigger if exists \"{n}\";")
+    });
+}
+
+#[tokio::test]
+async fn foreign_table_drops_follow_the_dump_order() {
+    use crate::dump::foreign_table::ForeignTable;
+    let mut from_dump = Dump::new(DumpConfig::default());
+    for name in ORDER_NAMES {
+        from_dump.foreign_tables.push(ForeignTable::new(
+            "public".to_string(),
+            name.to_string(),
+            "srv".to_string(),
+            "postgres".to_string(),
+            vec![],
+            vec![],
+        ));
+    }
+    let mut comparer = Comparer::new(
+        from_dump,
+        Dump::new(DumpConfig::default()),
+        true,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_foreign_tables().await.unwrap();
+    let script = comparer.get_script();
+    assert_in_dump_order(&script, |n| {
+        format!("drop foreign table if exists public.{n};")
+    });
+}
+
+#[tokio::test]
+async fn collation_drops_follow_the_dump_order() {
+    use crate::dump::collation::Collation;
+    let mut from_dump = Dump::new(DumpConfig::default());
+    for name in ORDER_NAMES {
+        let mut collation = Collation {
+            schema: "public".to_string(),
+            name: name.to_string(),
+            owner: "postgres".to_string(),
+            provider: "i".to_string(),
+            locale: None,
+            lc_collate: None,
+            lc_ctype: None,
+            icu_locale: Some("und".to_string()),
+            icu_rules: None,
+            deterministic: true,
+            comment: None,
+            hash: None,
+        };
+        collation.hash();
+        from_dump.collations.push(collation);
+    }
+    let mut comparer = Comparer::new(
+        from_dump,
+        Dump::new(DumpConfig::default()),
+        true,
+        false,
+        false,
+        GrantsMode::Ignore,
+    );
+    comparer.compare_collations().await.unwrap();
+    let script = comparer.get_script();
+    assert_in_dump_order(&script, |n| format!("DROP COLLATION IF EXISTS public.{n} "));
+}

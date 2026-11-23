@@ -565,7 +565,9 @@ impl Dump {
         // the availability and session-default queries are a few
         // milliseconds each and need no extra connection of their own.
         let extensions_fut = async {
-            let extensions = Self::fetch_extensions_standalone(pool, &schema_filter).await?;
+            let mut extensions = Self::fetch_extensions_standalone(pool, &schema_filter).await?;
+            Self::fetch_extension_update_targets_standalone(pool, &schema_filter, &mut extensions)
+                .await;
             let available = Self::fetch_available_extensions_standalone(pool).await;
             let scs_off = Self::fetch_standard_conforming_strings_off_standalone(pool).await;
             Ok::<_, Error>((extensions, available, scs_off))
@@ -807,6 +809,7 @@ impl Dump {
                     version: row.get("extversion"),
                     schema: row.get("nspname"),
                     owner: row.get::<Option<String>, _>("extowner").unwrap_or_default(),
+                    update_targets: None,
                 };
                 println!(
                     " - {} (version: {}, namespace: {})",
@@ -816,6 +819,70 @@ impl Dump {
             }
         }
         Ok(extensions)
+    }
+
+    /// For every installed extension the dump reads (the same schema filter
+    /// as [`fetch_extensions_standalone`](Self::fetch_extensions_standalone))
+    /// whose control file the server still has, the versions `ALTER
+    /// EXTENSION ... UPDATE TO` reaches from the installed one — an empty
+    /// array when none. `pg_extension_update_paths` reads the same update
+    /// scripts `ALTER EXTENSION` does, and exists on every supported server.
+    /// It lists every ordered pair of versions, so only the pairs starting at
+    /// the installed version are kept.
+    fn build_extension_update_targets_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(e.extname) as extname,
+                coalesce(
+                    array_agg(p.target order by p.target) filter (where p.target is not null),
+                    '{{}}'::text[]
+                ) as targets
+             from pg_extension e
+             join pg_namespace n on n.oid = e.extnamespace
+             join pg_available_extensions a on a.name = e.extname
+             left join lateral (
+                 select u.target
+                 from pg_extension_update_paths(e.extname) u
+                 where u.source = e.extversion and u.path is not null
+             ) p on true
+             where (n.nspname in {schema_filter} or n.nspname = 'public')
+             group by e.extname"
+        )
+    }
+
+    /// Fill [`Extension::update_targets`] of `extensions`. Never fails the
+    /// dump: like the installable versions, the query reads every extension
+    /// control file, and one broken third-party control file makes it error.
+    /// The targets then stay unknown, with a warning, and the comparer emits
+    /// extension updates as it did before it knew them.
+    async fn fetch_extension_update_targets_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+        extensions: &mut [Extension],
+    ) {
+        if extensions.is_empty() {
+            return;
+        }
+        let rows = match sqlx::query(&Self::build_extension_update_targets_query(schema_filter))
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not list extension update paths ({e}); \
+                     extension updates will be emitted without checking them."
+                );
+                return;
+            }
+        };
+        let targets: HashMap<String, Vec<String>> = rows
+            .iter()
+            .map(|row| (row.get("extname"), row.get("targets")))
+            .collect();
+        for ext in extensions.iter_mut() {
+            ext.update_targets = targets.get(&ext.name).cloned();
+        }
     }
 
     /// Every extension the server can install, with its default version and
@@ -3080,7 +3147,7 @@ impl Dump {
                         .try_get::<Option<i32>, _>("stat_target")
                         .ok()
                         .flatten()
-                        .and_then(|v| if v < 0 { None } else { Some(v) }),
+                        .filter(|&v| v >= 0),
                     hash: None,
                 };
                 stat.hash();

@@ -494,6 +494,51 @@ async fn dump_without_available_extensions_still_loads() {
         .expect("legacy dump loads");
     assert_eq!(dump.extensions.len(), 1);
     assert!(dump.available_extensions.is_empty());
+    // Nor do its extensions record their update paths: unknown, not "none".
+    assert_eq!(dump.extensions[0].update_targets, None);
+}
+
+/// `update_targets` is written only when it was read, and a recorded empty
+/// list (no version reachable) survives the file as `Some([])`, apart from
+/// an unknown one, which the comparer must treat differently.
+#[tokio::test]
+async fn extension_update_targets_round_trip_and_are_omitted_when_unknown() {
+    let dir = ScratchDir::new("ext-targets");
+    let path = dir.path_str("targets.dump");
+    let mut dump = empty_dump("shop");
+    let mut unknown = common::extension("hstore", "1.8", "public");
+    unknown.update_targets = None;
+    let mut top = common::extension("postgres_fdw", "1.3", "public");
+    top.update_targets = Some(Vec::new());
+    let mut old = common::extension("cube", "1.4", "public");
+    old.update_targets = Some(vec!["1.5".to_string()]);
+    dump.extensions = vec![unknown, top, old];
+    dump.write_to_file(&path).expect("write dump");
+
+    let json = dump_json(&path);
+    assert!(
+        json["extensions"][0].get("update_targets").is_none(),
+        "{json}"
+    );
+    assert_eq!(
+        json["extensions"][1]["update_targets"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        json["extensions"][2]["update_targets"],
+        serde_json::json!(["1.5"])
+    );
+
+    let reloaded = Dump::read_from_file(&path).await.expect("read dump");
+    let targets: Vec<Option<Vec<String>>> = reloaded
+        .extensions
+        .iter()
+        .map(|e| e.update_targets.clone())
+        .collect();
+    assert_eq!(
+        targets,
+        vec![None, Some(Vec::new()), Some(vec!["1.5".to_string()])]
+    );
 }
 
 #[tokio::test]

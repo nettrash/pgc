@@ -6856,20 +6856,51 @@ impl Comparer {
         for ext in &self.to.extensions {
             if let Some(&idx) = from_ext_map.get(ext.name.as_str()) {
                 let from_ext = &self.from.extensions[idx];
-                let alter = match available.get(ext.name.as_str()) {
-                    Some(avail) if avail.cannot_update(&from_ext.version, &ext.version) => {
-                        let mut alter = format!(
-                            "-- Extension {} version '{}' is not available on the migrated server \
-                             (installed: '{}'; installable: {}); version left unchanged.\n",
-                            line_comment_safe(&ext.name),
-                            line_comment_safe(&ext.version),
-                            line_comment_safe(&from_ext.version),
-                            line_comment_safe(&avail.versions_list())
+                // An update the FROM server cannot run is left out with a
+                // note: first a target version it cannot install at all
+                // (PostgreSQL 19's btree_gist 1.9), then one the installed
+                // version has no update path to, which is what a downgrade
+                // between two installable versions is (FROM on 19 at
+                // postgres_fdw 1.3, TO on 18 at 1.2). Contrib ships no
+                // downgrade scripts, and `alter extension ... update to`
+                // fails with "no update path".
+                let skipped_update = if from_ext.version == ext.version {
+                    None
+                } else if let Some(avail) = available
+                    .get(ext.name.as_str())
+                    .filter(|avail| avail.cannot_update(&from_ext.version, &ext.version))
+                {
+                    Some(format!(
+                        "-- Extension {} version '{}' is not available on the migrated server \
+                         (installed: '{}'; installable: {}); version left unchanged.\n",
+                        line_comment_safe(&ext.name),
+                        line_comment_safe(&ext.version),
+                        line_comment_safe(&from_ext.version),
+                        line_comment_safe(&avail.versions_list())
+                    ))
+                } else if from_ext.cannot_update_to(&ext.version) {
+                    Some(format!(
+                        "-- Extension {} has no update path from version '{}' to '{}' on the \
+                         migrated server (reachable: {}); version left unchanged.\n",
+                        line_comment_safe(&ext.name),
+                        line_comment_safe(&from_ext.version),
+                        line_comment_safe(&ext.version),
+                        line_comment_safe(&from_ext.update_targets_list())
+                    ))
+                } else {
+                    None
+                };
+                let alter = match skipped_update {
+                    Some(mut alter) => {
+                        eprintln!(
+                            "Warning: extension {} stays at version {}: the migrated server \
+                             cannot update it to the target's {} (manual intervention needed).",
+                            ext.name, from_ext.version, ext.version
                         );
                         alter.push_str(&from_ext.get_set_schema_script(ext));
                         alter
                     }
-                    _ => from_ext.get_alter_script(ext),
+                    None => from_ext.get_alter_script(ext),
                 };
                 if !alter.is_empty() {
                     self.script.push_str(
@@ -10884,9 +10915,10 @@ impl Comparer {
             .map(|ft| ((ft.schema.as_str(), ft.name.as_str()), ft))
             .collect();
 
-        // Drop foreign tables that exist only in FROM
-        for (key, ft) in &from_map {
-            if !to_map.contains_key(key) {
+        // Drop foreign tables that exist only in FROM, in dump order: walking
+        // `from_map` instead gave a different order on every run.
+        for ft in &self.from.foreign_tables {
+            if !to_map.contains_key(&(ft.schema.as_str(), ft.name.as_str())) {
                 if self.use_drop {
                     self.script.push_str(&ft.get_drop_script());
                 } else {
@@ -11457,9 +11489,10 @@ impl Comparer {
             .map(|e| (e.name.as_str(), e))
             .collect();
 
-        // Drop event triggers that only exist in FROM
-        for (name, et) in &from_map {
-            if !to_map.contains_key(name) {
+        // Drop event triggers that only exist in FROM, in dump order: walking
+        // `from_map` instead gave a different order on every run.
+        for et in &self.from.event_triggers {
+            if !to_map.contains_key(et.name.as_str()) {
                 if self.use_drop {
                     self.script.push_str(&et.get_drop_script());
                 } else {
@@ -11504,8 +11537,10 @@ impl Comparer {
             .map(|c| (format!("{}.{}", c.schema, c.name), c))
             .collect();
 
-        for (key, coll) in &from_map {
-            if !to_map.contains_key(key) {
+        // In dump order: walking `from_map` instead gave a different order
+        // on every run.
+        for coll in &self.from.collations {
+            if !to_map.contains_key(&format!("{}.{}", coll.schema, coll.name)) {
                 Self::emit_drop(&mut self.script, self.use_drop, &coll.get_drop_script());
             }
         }

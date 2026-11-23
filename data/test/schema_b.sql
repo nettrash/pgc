@@ -39,6 +39,10 @@ CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA public;  -- NEW EXTENSION
 -- Issue #241: same extension as FROM, different schema (shared_schema ->
 -- public). Expect one `alter extension fuzzystrmatch set schema public;`.
 CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch" WITH SCHEMA public;
+-- Extension versions: seg 1.4 -> 1.3 has no update path and stays at 1.4
+-- with a note; cube 1.4 -> 1.5 is updated (see schema_a.sql).
+CREATE EXTENSION IF NOT EXISTS seg WITH SCHEMA public VERSION '1.3';
+CREATE EXTENSION IF NOT EXISTS cube WITH SCHEMA public VERSION '1.5';
 
 -- Custom types (some modified, some removed, some added)
 CREATE TYPE test_schema.status_type AS ENUM ('active', 'inactive', 'pending', 'suspended');  -- MODIFIED: added 'suspended'

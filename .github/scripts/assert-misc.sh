@@ -54,9 +54,30 @@ if [ "$stale" != 0 ]; then
 else
   echo "OK: misc_pg19_ts_notes generated tsvector values are current"
 fi
+# seg is left out: TO asks for a downgrade no update script reaches, so a
+# keeps its version on purpose (checked below).
 same "extensions (name, version, schema)" \
   "select e.extname, e.extversion, n.nspname from pg_extension e
-     join pg_namespace n on n.oid = e.extnamespace order by 1"
+     join pg_namespace n on n.oid = e.extnamespace where e.extname <> 'seg' order by 1"
+# An update with no path (seg 1.4 -> 1.3) is left out instead of failing, and
+# one with a path (cube 1.4 -> 1.5) is still made. The note explaining the
+# skip is a comment, which USE_COMMENTS=false strips.
+out="${OUTPUT_SQL:-/tmp/output.sql}"
+seg_a=$(q a "select extversion from pg_extension where extname = 'seg'")
+seg_b=$(q b "select extversion from pg_extension where extname = 'seg'")
+if [ "$seg_a" != "1.4" ] || [ "$seg_b" != "1.3" ]; then
+  echo "ERROR: seg is '${seg_a}' in a and '${seg_b}' in b, expected 1.4 (left alone) and 1.3"
+  fail=1
+elif grep -qi "alter extension seg" "$out"; then
+  echo "ERROR: the migration still updates seg, which has no update path from 1.4 to 1.3:"
+  grep -i "alter extension seg" "$out"
+  fail=1
+elif ! grep -qx "alter extension cube update to '1.5';" "$out"; then
+  echo "ERROR: the migration does not update cube from 1.4 to 1.5"
+  fail=1
+else
+  echo "OK: seg left at 1.4 without a failing downgrade, cube updated to 1.5"
+fi
 same "misc_pg19 column types and defaults (oid8 and friends)" \
   "select c.relname, a.attname, format_type(a.atttypid, a.atttypmod), coalesce(pg_get_expr(ad.adbin, ad.adrelid), '')
      from pg_class c join pg_namespace n on n.oid = c.relnamespace

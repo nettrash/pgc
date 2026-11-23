@@ -1001,3 +1001,68 @@ async fn an_empty_dump_reads_the_database_wide_objects_its_database_holds() {
         "{clear_script}"
     );
 }
+
+/// A dump records, per installed extension, the versions `ALTER EXTENSION
+/// ... UPDATE TO` reaches from it, and a compare from it leaves out an update
+/// with no path (seg 1.4 to 1.3: contrib ships no downgrades) while still
+/// making one with a path (cube 1.4 to 1.5). Before, the downgrade was
+/// emitted and failed with "no update path" on every run.
+///
+/// Needs a database-creating connection and the `seg` and `cube` contrib
+/// modules (1.1-1.4 and 1.2-1.5 on every supported major).
+#[tokio::test]
+#[ignore = "needs a reachable PostgreSQL server; run with --ignored"]
+async fn a_dump_records_extension_update_paths_and_skips_a_downgrade() {
+    const DB: &str = "pgc_live_ext_update_paths";
+    let (admin_pool, pool, config) = clear_scratch_database(
+        DB,
+        "create extension seg with schema public version '1.4';
+         create extension cube with schema public version '1.4';",
+    )
+    .await;
+
+    let dir = ScratchDir::new("live-ext-paths");
+    let mut config = config.clone();
+    config.scheme = "public".to_string();
+    config.file = dir.path_str("from.dump");
+    let mut from = Dump::new(config);
+    let result = from.process(4).await;
+    drop_clear_scratch_database(admin_pool, pool, DB).await;
+    result.expect("dump the scratch database");
+
+    let targets = |name: &str| {
+        from.extensions
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} not dumped: {:?}", from.extensions))
+            .update_targets
+            .clone()
+    };
+    assert_eq!(targets("seg"), Some(Vec::new()));
+    assert_eq!(targets("cube"), Some(vec!["1.5".to_string()]));
+
+    // TO asks for seg 1.3 and cube 1.5.
+    let mut to = from.clone();
+    for ext in &mut to.extensions {
+        match ext.name.as_str() {
+            "seg" => ext.version = "1.3".to_string(),
+            "cube" => ext.version = "1.5".to_string(),
+            _ => {}
+        }
+    }
+    let out = dir.path_str("out.sql");
+    let mut comparer = Comparer::new(from, to, true, false, true, GrantsMode::Ignore);
+    comparer.compare().await.expect("compare");
+    comparer.save_script(&out).await.expect("save script");
+    let script = std::fs::read_to_string(&out).expect("read script");
+    let statements = common::strip_sql_comments(&script).to_lowercase();
+    assert!(!statements.contains("alter extension seg"), "{script}");
+    assert!(
+        statements.contains("alter extension cube update to '1.5';"),
+        "{script}"
+    );
+    assert!(
+        script.contains("-- Extension seg has no update path from version '1.4' to '1.3'"),
+        "{script}"
+    );
+}
