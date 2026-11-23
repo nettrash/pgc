@@ -130,7 +130,8 @@ committed stays in the history and in every clone, permanently.
 - **`app/Cargo.lock` is tracked.** It changes only for a dependency the issue agreed on. No blanket
   `cargo update` in a feature pull request.
 - **The toolchain is fixed:** edition 2024, and the code builds on **Rust 1.88.0** (the oldest
-  supported version) as well as on 1.95.0. Don't use language or library features newer than 1.88.
+  supported version) as well as on 1.95.0 and 1.100.0. Don't use language or library features
+  newer than 1.88.
 - **The `Dockerfile`'s Rust version matches the top of the CI matrix.** Changing either is a CI
   change (section 10).
 
@@ -158,8 +159,8 @@ committed stays in the history and in every clone, permanently.
 ## 12. Quality bar
 
 - **Zero warnings**, test targets included.
-- `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features` are clean on both
-  1.88.0 and 1.95.0, and `cargo doc` builds as in section 7.
+- `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features` are clean on
+  1.88.0, 1.95.0 and 1.100.0, and `cargo doc` builds as in section 7.
 - **Every existing test still passes.** A new test that is skipped or ignored by default is called out
   in the pull request.
 - **Commits reference the issue** (`#244 passwords with reserved characters`) and contain no build

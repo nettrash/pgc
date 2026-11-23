@@ -14,12 +14,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # Matrix validates the MSRV-ish floor (1.88.0) AND the toolchain used by
-    # the Dockerfile (1.95). Keep the upper bound in sync with `Dockerfile`.
+    # Matrix validates the MSRV-ish floor (1.88.0), the previous pinned
+    # toolchain (1.95.0) AND the toolchain used by the Dockerfile, the
+    # integration job and release.yml (1.100.0). Keep the upper bound in sync
+    # with `Dockerfile`. A newer clippy or Cargo brings new default lints
+    # (1.100's unused_dependencies and manual_filter), which only the newest
+    # leg reports.
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.88.0", "1.95.0"]
+        rust: ["1.88.0", "1.95.0", "1.100.0"]
 
     steps:
     - uses: actions/checkout@v4
@@ -94,7 +98,7 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: "1.95.0"
+        toolchain: "1.100.0"
 
     - name: Install PostgreSQL client
       run: |
