@@ -144,8 +144,7 @@ async fn issue180_set_unlogged_orders_dependents_before_referenced() {
 
     assert!(
         pos_child < pos_parent && pos_parent < pos_grand,
-        "SET UNLOGGED must be ordered child -> parent -> grandparent (FK leaves first); got\n{}",
-        script
+        "SET UNLOGGED must be ordered child -> parent -> grandparent (FK leaves first); got\n{script}"
     );
 }
 
@@ -210,8 +209,7 @@ async fn issue180_set_logged_orders_referenced_before_dependents() {
 
     assert!(
         pos_grand < pos_parent && pos_parent < pos_child,
-        "SET LOGGED must be ordered grandparent -> parent -> child (FK roots first); got\n{}",
-        script
+        "SET LOGGED must be ordered grandparent -> parent -> child (FK roots first); got\n{script}"
     );
 }
 
@@ -275,14 +273,12 @@ async fn issue180_persistence_change_does_not_emit_inline_inside_alter_table() {
         .expect("set unlogged must be emitted by the dedicated phase");
     assert!(
         add_pos < set_pos,
-        "SET UNLOGGED must come from the dedicated phase, after the per-table ALTER: {}",
-        script
+        "SET UNLOGGED must come from the dedicated phase, after the per-table ALTER: {script}"
     );
     assert_eq!(
         script.matches("set unlogged").count(),
         1,
-        "SET UNLOGGED must be emitted exactly once (no inline + dedicated double-up): {}",
-        script
+        "SET UNLOGGED must be emitted exactly once (no inline + dedicated double-up): {script}"
     );
 }
 
@@ -351,8 +347,7 @@ async fn issue180_owned_sequence_persistence_only_diff_is_skipped() {
 
     assert!(
         !script.contains("alter sequence test_order.items_id_seq"),
-        "owned-sequence persistence-only flip must be suppressed (table cascade handles it); got:\n{}",
-        script
+        "owned-sequence persistence-only flip must be suppressed (table cascade handles it); got:\n{script}"
     );
 }
 
@@ -418,18 +413,15 @@ async fn issue180_owned_sequence_other_diff_skips_only_persistence_line() {
 
     assert!(
         script.contains("alter sequence test_order.items_id_seq"),
-        "ALTER SEQUENCE must be emitted when non-persistence params changed: {}",
-        script
+        "ALTER SEQUENCE must be emitted when non-persistence params changed: {script}"
     );
     assert!(
         script.contains("cache 5"),
-        "the changed cache value must be in the script: {}",
-        script
+        "the changed cache value must be in the script: {script}"
     );
     assert!(
         !script.contains("alter sequence test_order.items_id_seq set unlogged"),
-        "SET UNLOGGED on owned sequence is redundant when the owning table is flipping persistence: {}",
-        script
+        "SET UNLOGGED on owned sequence is redundant when the owning table is flipping persistence: {script}"
     );
 }
 
@@ -473,8 +465,7 @@ async fn issue180_standalone_sequence_persistence_change_still_emits_set() {
 
     assert!(
         script.contains("alter sequence test_order.global_seq set unlogged"),
-        "standalone sequence must still emit SET UNLOGGED: {}",
-        script
+        "standalone sequence must still emit SET UNLOGGED: {script}"
     );
 }
 
@@ -935,12 +926,9 @@ async fn issue190_set_unlogged_orders_unqualified_public_fk_chain() {
     assert!(
         child_pos < parent_pos,
         "child (referrer) must SET UNLOGGED BEFORE parent (referenced); \
-         got child@{} parent@{} — alphabetical order would put `child` \
+         got child@{child_pos} parent@{parent_pos} — alphabetical order would put `child` \
          after `parent` and PostgreSQL would reject the SET on `parent` \
-         while `child` is still LOGGED:\n{}",
-        child_pos,
-        parent_pos,
-        script
+         while `child` is still LOGGED:\n{script}"
     );
 }
 
@@ -1144,8 +1132,7 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
     // Cycle-break banner must appear so the choice is loud.
     assert!(
         script.contains("Persistence-flip FK cycle (issue #191)"),
-        "cycle banner must mark the drop+SET+add block: {}",
-        script
+        "cycle banner must mark the drop+SET+add block: {script}"
     );
 
     // Both cycle FKs must be dropped BEFORE either SET UNLOGGED.
@@ -1160,13 +1147,11 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
         .expect("FK b_a_id_fkey must be dropped before SET (live, not commented)");
     assert!(
         !script.contains("-- alter table test_cycle.a drop constraint a_b_id_fkey;"),
-        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
-        script
+        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {script}"
     );
     assert!(
         !script.contains("-- alter table test_cycle.b drop constraint b_a_id_fkey;"),
-        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
-        script
+        "DROP CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {script}"
     );
     let set_a_pos = script
         .find("\nalter table test_cycle.a set unlogged;")
@@ -1176,19 +1161,11 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
         .expect("b SET UNLOGGED must be emitted");
     assert!(
         drop_a_pos < set_a_pos && drop_a_pos < set_b_pos,
-        "FK a_b_id_fkey drop must precede every SET: drop@{} a@{} b@{}\n{}",
-        drop_a_pos,
-        set_a_pos,
-        set_b_pos,
-        script
+        "FK a_b_id_fkey drop must precede every SET: drop@{drop_a_pos} a@{set_a_pos} b@{set_b_pos}\n{script}"
     );
     assert!(
         drop_b_pos < set_a_pos && drop_b_pos < set_b_pos,
-        "FK b_a_id_fkey drop must precede every SET: drop@{} a@{} b@{}\n{}",
-        drop_b_pos,
-        set_a_pos,
-        set_b_pos,
-        script
+        "FK b_a_id_fkey drop must precede every SET: drop@{drop_b_pos} a@{set_a_pos} b@{set_b_pos}\n{script}"
     );
 
     // Both cycle FKs must be re-added AFTER every SET so the post-
@@ -1205,29 +1182,19 @@ async fn issue191_persistence_flip_breaks_mutual_fk_cycle() {
         .expect("FK b_a_id_fkey must be re-added after SET (live, not commented)");
     assert!(
         !script.contains("-- alter table test_cycle.a add constraint a_b_id_fkey"),
-        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
-        script
+        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {script}"
     );
     assert!(
         !script.contains("-- alter table test_cycle.b add constraint b_a_id_fkey"),
-        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {}",
-        script
+        "ADD CONSTRAINT must be emitted LIVE under use_drop=true, not commented: {script}"
     );
     assert!(
         add_a_pos > set_a_pos && add_a_pos > set_b_pos,
-        "FK a_b_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
-        add_a_pos,
-        set_a_pos,
-        set_b_pos,
-        script
+        "FK a_b_id_fkey re-add must follow every SET: add@{add_a_pos} a@{set_a_pos} b@{set_b_pos}\n{script}"
     );
     assert!(
         add_b_pos > set_a_pos && add_b_pos > set_b_pos,
-        "FK b_a_id_fkey re-add must follow every SET: add@{} a@{} b@{}\n{}",
-        add_b_pos,
-        set_a_pos,
-        set_b_pos,
-        script
+        "FK b_a_id_fkey re-add must follow every SET: add@{add_b_pos} a@{set_a_pos} b@{set_b_pos}\n{script}"
     );
 }
 
@@ -1264,13 +1231,11 @@ async fn issue191_persistence_flip_acyclic_chain_does_not_drop_fks() {
 
     assert!(
         !script.contains("Persistence-flip FK cycle"),
-        "acyclic chain must not trip the cycle-break path: {}",
-        script
+        "acyclic chain must not trip the cycle-break path: {script}"
     );
     assert!(
         !script.contains("drop constraint child_parent_id_fkey"),
-        "live FK on an acyclic chain must not be dropped: {}",
-        script
+        "live FK on an acyclic chain must not be dropped: {script}"
     );
 }
 
@@ -1425,27 +1390,23 @@ async fn issue191_pr198_cycle_detection_excludes_blocked_non_cycle_nodes() {
     // Cycle banner must appear (a↔b cycle is present).
     assert!(
         script.contains("Persistence-flip FK cycle (issue #191)"),
-        "cycle banner must appear for the a↔b cycle: {}",
-        script
+        "cycle banner must appear for the a↔b cycle: {script}"
     );
     // True cycle FKs must be dropped.
     assert!(
         script.contains("alter table test_cycle.a drop constraint a_b_id_fkey;"),
-        "true cycle FK a_b_id_fkey must be dropped: {}",
-        script
+        "true cycle FK a_b_id_fkey must be dropped: {script}"
     );
     assert!(
         script.contains("alter table test_cycle.b drop constraint b_a_id_fkey;"),
-        "true cycle FK b_a_id_fkey must be dropped: {}",
-        script
+        "true cycle FK b_a_id_fkey must be dropped: {script}"
     );
     // The non-cycle FK (a → c) is merely *blocked by* the cycle in
     // Kahn's remainder but is not part of any directed cycle. With
     // SCC-based detection it must NOT be dropped.
     assert!(
         !script.contains("drop constraint a_c_id_fkey"),
-        "non-cycle FK a_c_id_fkey (a → c) must NOT be dropped: {}",
-        script
+        "non-cycle FK a_c_id_fkey (a → c) must NOT be dropped: {script}"
     );
 }
 
@@ -1540,40 +1501,34 @@ async fn issue191_pr198_use_drop_false_comments_out_cycle_break() {
     // Loud banner specifically calls out use_drop=false semantics.
     assert!(
         script.contains("use_drop=false"),
-        "banner must mention use_drop=false: {}",
-        script
+        "banner must mention use_drop=false: {script}"
     );
     // DROP CONSTRAINT lines must be commented out (i.e. they appear
     // only as `-- alter table ... drop constraint ...;`).
     assert!(
         !script.contains("\nalter table test_cycle.a drop constraint a_b_id_fkey;"),
-        "live DROP CONSTRAINT must NOT be emitted under use_drop=false: {}",
-        script
+        "live DROP CONSTRAINT must NOT be emitted under use_drop=false: {script}"
     );
     assert!(
         script.contains("-- alter table test_cycle.a drop constraint a_b_id_fkey;"),
-        "commented DROP CONSTRAINT must be emitted under use_drop=false: {}",
-        script
+        "commented DROP CONSTRAINT must be emitted under use_drop=false: {script}"
     );
     // ADD CONSTRAINT lines must also be commented out so re-running
     // with use_drop=true after manual review produces a clean diff.
     assert!(
         !script.contains("\nalter table test_cycle.a add constraint a_b_id_fkey foreign key"),
-        "live ADD CONSTRAINT must NOT be emitted under use_drop=false: {}",
-        script
+        "live ADD CONSTRAINT must NOT be emitted under use_drop=false: {script}"
     );
     assert!(
         script.contains("-- alter table test_cycle.a add constraint a_b_id_fkey foreign key"),
-        "commented ADD CONSTRAINT must be emitted under use_drop=false: {}",
-        script
+        "commented ADD CONSTRAINT must be emitted under use_drop=false: {script}"
     );
     // SET statements are NOT destructive and stay live, matching how
     // SETs are handled elsewhere when use_drop=false (the cycle case
     // is highlighted by the banner above).
     assert!(
         script.contains("alter table test_cycle.a set unlogged;"),
-        "SET UNLOGGED must remain live under use_drop=false: {}",
-        script
+        "SET UNLOGGED must remain live under use_drop=false: {script}"
     );
 }
 
@@ -1678,14 +1633,12 @@ async fn issue191_pr198_cycle_fk_comment_survives_round_trip() {
         script.contains(
             "comment on constraint a_b_id_fkey on test_cycle.a is 'FK a → b (cycle annotated)';"
         ),
-        "FK comment on a_b_id_fkey must be re-emitted after the SET: {}",
-        script
+        "FK comment on a_b_id_fkey must be re-emitted after the SET: {script}"
     );
     assert!(
         script.contains(
             "comment on constraint b_a_id_fkey on test_cycle.b is 'FK b → a (cycle annotated)';"
         ),
-        "FK comment on b_a_id_fkey must be re-emitted after the SET: {}",
-        script
+        "FK comment on b_a_id_fkey must be re-emitted after the SET: {script}"
     );
 }

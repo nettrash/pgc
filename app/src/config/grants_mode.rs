@@ -63,8 +63,7 @@ impl FromStr for GrantsMode {
             "addonly" | "add_only" | "add-only" => Ok(Self::AddOnly),
             "full" => Ok(Self::Full),
             _ => Err(format!(
-                "invalid grants mode '{}'; valid values: ignore, addonly, add_only, add-only, full",
-                s
+                "invalid grants mode '{s}'; valid values: ignore, addonly, add_only, add-only, full"
             )),
         }
     }

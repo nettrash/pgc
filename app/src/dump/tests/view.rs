@@ -241,14 +241,13 @@ fn test_get_alter_script_materialized_use_drop_false() {
     // Should contain a warning about manual intervention
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should contain a warning comment, script:\n{}",
-        script
+        "should contain a warning comment, script:\n{script}"
     );
 
     // Both drop and create should be commented out
     for line in script.lines() {
         if line.contains("drop materialized view") || line.contains("create materialized view") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }
@@ -263,7 +262,7 @@ fn test_get_alter_script_materialized_use_drop_true_contains_active_drop() {
     // The drop line should NOT be commented
     for line in script.lines() {
         if line.contains("drop materialized view") {
-            assert!(!line.starts_with("--"), "drop should be active: {}", line);
+            assert!(!line.starts_with("--"), "drop should be active: {line}");
         }
     }
 }
@@ -291,8 +290,7 @@ fn test_get_alter_script_regular_to_materialized_drops_view() {
     // DROP must target the current kind (regular view), not the target kind
     assert!(
         script.contains("drop view if exists"),
-        "should drop the regular view, script:\n{}",
-        script
+        "should drop the regular view, script:\n{script}"
     );
     assert!(
         !script.contains("drop materialized view"),
@@ -312,8 +310,7 @@ fn test_get_alter_script_materialized_to_regular_drops_materialized() {
     // DROP must target the current kind (materialized view)
     assert!(
         script.contains("drop materialized view if exists"),
-        "should drop the materialized view, script:\n{}",
-        script
+        "should drop the materialized view, script:\n{script}"
     );
     // Then create the regular view
     assert!(script.contains("create view"));
@@ -328,14 +325,13 @@ fn test_get_alter_script_regular_to_materialized_use_drop_false() {
 
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should warn about manual intervention, script:\n{}",
-        script
+        "should warn about manual intervention, script:\n{script}"
     );
 
     // Both drop and create should be commented out
     for line in script.lines() {
         if line.contains("drop view") || line.contains("create materialized view") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }
@@ -349,13 +345,12 @@ fn test_get_alter_script_materialized_to_regular_use_drop_false() {
 
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should warn about manual intervention, script:\n{}",
-        script
+        "should warn about manual intervention, script:\n{script}"
     );
 
     for line in script.lines() {
         if line.contains("drop materialized view") || line.contains("create view") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }
@@ -682,4 +677,63 @@ fn matview_index_alter_plan_ignores_an_unchanged_index() {
     assert!(plan.drop.is_empty());
     assert!(plan.create.is_empty());
     assert!(plan.comment_changes.is_empty());
+}
+
+#[test]
+fn pre_cascade_routine_dependencies_do_not_affect_the_hash_or_the_script() {
+    // They only decide what a routine's DROP ... CASCADE takes: hashing them
+    // would make every view look changed against a dump that predates them.
+    let legacy = create_view("select public.f(id) from public.users");
+    let mut current = legacy.clone();
+    current.routine_dependencies = Some(vec!["public.f(x integer)".to_string()]);
+    current.hash();
+    assert_eq!(legacy.hash, current.hash);
+    assert_eq!(legacy.get_script(), current.get_script());
+}
+
+#[test]
+fn pre_cascade_routine_dependencies_serde() {
+    // Absent in a pgc 1.0.x dump: unknown, not "calls nothing".
+    let json = r#"{
+        "schema": "analytics",
+        "name": "active_users",
+        "definition": "select id from public.users",
+        "table_relation": []
+    }"#;
+    let view: View = serde_json::from_str(json).expect("older dumps must stay readable");
+    assert_eq!(view.routine_dependencies, None);
+
+    // Written only when known; an empty list is kept apart from unknown.
+    let mut view = create_view("select 1");
+    let written = serde_json::to_value(&view).unwrap();
+    assert!(written.get("routine_dependencies").is_none(), "{written}");
+    view.routine_dependencies = Some(Vec::new());
+    let written = serde_json::to_value(&view).unwrap();
+    assert_eq!(written["routine_dependencies"], serde_json::json!([]));
+    let reread: View = serde_json::from_value(written).unwrap();
+    assert_eq!(reread.routine_dependencies, Some(Vec::new()));
+}
+
+// ==== r3-ddl: materialized view tablespace ====
+
+/// The dump stores `pg_tablespace.spcname` raw; it goes into `SET TABLESPACE`
+/// spelled as `quote_ident` would, so `pg_default` and any other plain name
+/// are unchanged and one that needs quoting cannot break the statement.
+#[test]
+fn a_materialized_view_tablespace_is_quoted_only_when_it_needs_it() {
+    for (space, spelled) in [
+        ("fast_ssd", "fast_ssd"),
+        ("Fast SSD", "\"Fast SSD\""),
+        ("ts\"; drop table t; --", "\"ts\"\"; drop table t; --\""),
+    ] {
+        let mut view = create_materialized_view("select 1");
+        view.tablespace = Some(space.to_string());
+        assert!(
+            view.get_script().contains(&format!(
+                "alter materialized view analytics.active_users set tablespace {spelled};"
+            )),
+            "{}",
+            view.get_script()
+        );
+    }
 }

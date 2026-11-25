@@ -13,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   # Keep in sync with the toolchain used by the integration job in rust.yml
   # and the version pinned in Dockerfile.
-  RUST_TOOLCHAIN: "1.95.0"
+  RUST_TOOLCHAIN: "1.100.0"
   # nfpm produces .deb/.rpm/.apk/.pkg.tar.zst from a single config.
   NFPM_VERSION: "2.40.0"
 
@@ -80,7 +80,7 @@ jobs:
             pkg_formats: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -250,7 +250,7 @@ jobs:
         run: ls -la dist
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pgc-${{ matrix.target }}
           path: dist/*
@@ -273,7 +273,7 @@ jobs:
           fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -282,7 +282,7 @@ jobs:
         run: ls -la dist
 
       - name: Upload assets to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           files: dist/*

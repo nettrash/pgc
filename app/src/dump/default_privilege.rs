@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::dump::acl::{AclEntry, quote_acl_role};
 use crate::utils::string_extensions::StringExt;
 
 /// A PostgreSQL default ACL entry (pg_default_acl).
@@ -123,21 +124,17 @@ struct GrantInfo {
 }
 
 /// Parse a PostgreSQL ACL string like "alice=rw/bob" into a GrantInfo.
+///
+/// The item is split the way [`AclEntry::parse`] splits it, so a quoted role
+/// name holding `=` or `/` stays whole, and the grantee is spelled as SQL
+/// needs it: aclitem text leaves `Reader` or `user` unquoted, and written
+/// as-is they would name `reader` or fail to parse.
 fn parse_acl_to_grant(acl: &str, object_type: &str) -> Option<GrantInfo> {
     // Format: grantee=privileges/grantor
-    let slash_pos = acl.rfind('/')?;
-    let grantee_priv = &acl[..slash_pos];
-    let eq_pos = grantee_priv.find('=')?;
-    let grantee_raw = &grantee_priv[..eq_pos];
-    let priv_chars = &grantee_priv[eq_pos + 1..];
+    let entry = AclEntry::parse(acl)?;
+    let grantee = quote_acl_role(&entry.grantee);
 
-    let grantee = if grantee_raw.is_empty() {
-        "PUBLIC".to_string()
-    } else {
-        grantee_raw.to_string()
-    };
-
-    let privs = expand_privilege_chars(priv_chars, object_type);
+    let privs = expand_privilege_chars(&entry.privileges, object_type);
     if privs.is_empty() {
         return None;
     }

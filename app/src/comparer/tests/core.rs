@@ -14,16 +14,28 @@ mod buffer_ordering;
 mod cascade_dependents;
 #[path = "core/column_dependents.rs"]
 mod column_dependents;
+#[path = "core/fix_comments.rs"]
+mod fix_comments;
+#[path = "core/fix_rules.rs"]
+mod fix_rules;
+#[path = "core/fix_sqlbody.rs"]
+mod fix_sqlbody;
 #[path = "core/grants.rs"]
 mod grants;
 #[path = "core/helpers.rs"]
 mod helpers;
 #[path = "core/matview_indexes.rs"]
 mod matview_indexes;
+#[path = "core/mixed_versions.rs"]
+mod mixed_versions;
 #[path = "core/persistence.rs"]
 mod persistence;
 #[path = "core/production.rs"]
 mod production;
+#[path = "core/publications.rs"]
+mod publications;
+#[path = "core/recreate.rs"]
+mod recreate;
 #[path = "core/routines.rs"]
 mod routines;
 #[path = "core/schemas_extensions.rs"]
@@ -32,8 +44,14 @@ mod schemas_extensions;
 mod script_output;
 #[path = "core/sequences.rs"]
 mod sequences;
+#[path = "core/statistics.rs"]
+mod statistics;
+#[path = "core/subscriptions_fdw.rs"]
+mod subscriptions_fdw;
 #[path = "core/tables.rs"]
 mod tables;
+#[path = "core/text_search.rs"]
+mod text_search;
 #[path = "core/types.rs"]
 mod types;
 #[path = "core/view_column_dependencies.rs"]

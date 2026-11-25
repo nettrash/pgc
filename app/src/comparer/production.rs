@@ -21,10 +21,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::comparer::scanner::{copy_quoted_literal, dollar_tag_at};
+use crate::comparer::scanner::{copy_quoted_literal, dollar_tag_at, is_line_end};
 use crate::dump::table_constraint::TableConstraint;
 use crate::dump::table_index::TableIndex;
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, block_comment_safe};
 
 /// A pair of script fragments produced by a production rewrite: statements that
 /// stay inside the migration transaction, and statements that must run after it
@@ -224,7 +224,8 @@ pub fn index_create_split(
         };
         split.in_txn.push_str(&format!(
             "/* partitioned index {}.{}: {reason} — created non-concurrently */\n",
-            index.schema, index.name
+            block_comment_safe(&index.schema),
+            block_comment_safe(&index.name)
         ));
         split.in_txn.push_str(&index.indexdef);
         split.in_txn.append_block(";");
@@ -285,6 +286,12 @@ pub fn index_drop_statement(index: &TableIndex, ctx: &PartitionContext) -> (Stri
         )
     }
 }
+
+/// The first `server_version_num` that adds a foreign key `NOT VALID` to a
+/// partitioned table (PostgreSQL 18). An older server refuses it ("cannot add
+/// NOT VALID foreign key on partitioned table"), so the comparer adds such a
+/// foreign key in one statement instead of through [`foreign_key_split`].
+pub(crate) const NOT_VALID_PARTITIONED_FK_MIN_VERSION: i32 = 180_000;
 
 /// Production rewrite of a foreign-key constraint creation: add it `NOT VALID`
 /// inside the transaction, then `VALIDATE CONSTRAINT` afterwards. Only enforced
@@ -392,10 +399,11 @@ const CREATE_GUARDS: &[CreateGuard] = &[
     },
 ];
 
-/// `alter table … <op>` forms whose object reference gains an idempotency
-/// guard. `op` is the operation keyword as generated (lowercase, no leading
-/// space); `guard` is inserted directly after it. `add constraint` is
-/// intentionally absent: PostgreSQL has no `IF NOT EXISTS` for it.
+/// `alter table … <op>` (and `alter domain … <op>`) forms whose object
+/// reference gains an idempotency guard. `op` is the operation keyword as
+/// generated (lowercase, no leading space); `guard` is inserted directly
+/// after it. `add constraint` is intentionally absent: PostgreSQL has no
+/// `IF NOT EXISTS` for it.
 struct AlterGuard {
     op: &'static [u8],
     guard: &'static [u8],
@@ -436,9 +444,10 @@ const ALTER_GUARDS: &[AlterGuard] = &[
 ///   * `alter table … add column`             → `… add column if not exists`
 ///   * `alter table … drop column`            → `… drop column if exists`
 ///   * `alter table … drop constraint`        → `… drop constraint if exists`
+///   * `alter domain … drop constraint`       → `… drop constraint if exists`
 ///
-/// `create type` and `alter table … add constraint` are deliberately left
-/// unguarded: PostgreSQL has no `IF NOT EXISTS` for them, and a
+/// `create type` and `alter table|domain … add constraint` are deliberately
+/// left unguarded: PostgreSQL has no `IF NOT EXISTS` for them, and a
 /// drop-then-create rewrite would risk cascading dependent objects.
 pub fn make_idempotent(script: &str) -> String {
     let src = script.as_bytes();
@@ -531,9 +540,11 @@ pub fn make_idempotent(script: &str) -> String {
             }
             continue;
         }
-        // Line comment -- … — copy verbatim. Trivia (see block comment).
+        // Line comment -- … — copy verbatim. Trivia (see block comment). A
+        // bare carriage return ends it as a line feed does, as in PostgreSQL's
+        // lexer, so the statement after one is rewritten like any other.
         if i + 1 < len && b == b'-' && src[i + 1] == b'-' {
-            while i < len && src[i] != b'\n' {
+            while i < len && !is_line_end(src[i]) {
                 out.push(src[i]);
                 i += 1;
             }
@@ -580,6 +591,14 @@ pub fn make_idempotent(script: &str) -> String {
             if matches_ci(src, i, b"alter table ") {
                 out.extend_from_slice(&src[i..i + b"alter table ".len()]);
                 i += b"alter table ".len();
+                pending_alter = true;
+                continue;
+            }
+            // `alter domain … drop constraint` takes `if exists` the same way;
+            // the domain's other operations match no `ALTER_GUARDS` entry.
+            if matches_ci(src, i, b"alter domain ") {
+                out.extend_from_slice(&src[i..i + b"alter domain ".len()]);
+                i += b"alter domain ".len();
                 pending_alter = true;
                 continue;
             }

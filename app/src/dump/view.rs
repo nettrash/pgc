@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::dump::table::IndexAlterPlan;
 use crate::dump::table_index::TableIndex;
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{
+    StringExt, comment_out, line_comment_safe, quote_identifier,
+};
 
 /// One output column of a regular view, as PostgreSQL records it in
 /// `pg_attribute`. Captured at dump time solely to decide whether a changed view
@@ -83,6 +85,23 @@ pub struct View {
     /// the view itself changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_relation: Option<Vec<String>>,
+    /// The routines this view's `_RETURN` rule depends on, as PostgreSQL
+    /// records them in `pg_depend`: the functions and aggregates it calls,
+    /// including the function behind a cast it applies, as
+    /// `schema.name(identity arguments)` — the form
+    /// [`Routine::dependency_key`](super::routine::Routine::dependency_key)
+    /// builds. `pg_catalog` and `information_schema` routines are left out:
+    /// pgc never drops them. `None` in dumps written before this field
+    /// existed; `Some([])` for a view that calls no other routine.
+    ///
+    /// It tells exactly which views a routine's `DROP … CASCADE` takes, where
+    /// the definition text can only be searched for the routine's name — which
+    /// an unchanged overload, or a built-in of the same name printed
+    /// unqualified, matches too. Excluded from `View::hash` for the reasons
+    /// [`View::column_relation`] is: it only decides what else a detected
+    /// routine change drags with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routine_dependencies: Option<Vec<String>>,
     /// Owner of the view
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner: String,
@@ -153,6 +172,7 @@ impl View {
             definition,
             table_relation,
             column_relation: None,
+            routine_dependencies: None,
             owner: String::new(),
             comment: None,
             is_materialized: false,
@@ -311,10 +331,13 @@ impl View {
                     params.join(", ")
                 ));
             }
+            // The dump stores `pg_tablespace.spcname` raw.
             if let Some(ref space) = self.tablespace {
                 script.append_block(&format!(
                     "alter materialized view {}.{} set tablespace {};",
-                    self.schema, self.name, space
+                    self.schema,
+                    self.name,
+                    quote_identifier(space)
                 ));
             }
         }
@@ -411,7 +434,10 @@ impl View {
         if self.schema != target.schema || self.name != target.name {
             return format!(
                 "-- Cannot alter view {}.{} because target is {}.{}\n",
-                self.schema, self.name, target.schema, target.name
+                line_comment_safe(&self.schema),
+                line_comment_safe(&self.name),
+                line_comment_safe(&target.schema),
+                line_comment_safe(&target.name)
             );
         }
 
@@ -440,7 +466,8 @@ impl View {
         {
             return format!(
                 "-- View {}.{} requires no changes.\n",
-                self.schema, self.name
+                line_comment_safe(&self.schema),
+                line_comment_safe(&self.name)
             );
         }
 
@@ -461,18 +488,14 @@ impl View {
             if use_drop {
                 return format!("{}{}", drop_script, target.get_script());
             } else {
-                let commented_drop = drop_script
-                    .lines()
-                    .map(|l| format!("-- {}\n", l))
-                    .collect::<String>();
-                let commented_create = target
-                    .get_script()
-                    .lines()
-                    .map(|l| format!("-- {}\n", l))
-                    .collect::<String>();
+                let commented_drop = comment_out(&drop_script);
+                let commented_create = comment_out(&target.get_script());
                 return format!(
                     "-- use_drop=false: view {}.{} requires drop+recreate; statements commented out (manual intervention needed)\n{}{}",
-                    target.schema, target.name, commented_drop, commented_create
+                    line_comment_safe(&target.schema),
+                    line_comment_safe(&target.name),
+                    commented_drop,
+                    commented_create
                 );
             }
         }

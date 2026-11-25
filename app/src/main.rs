@@ -67,7 +67,10 @@ struct Args {
     #[arg(long)]
     use_ssl: bool,
 
-    /// Use DROP statements in the output
+    /// Execute the DROP statements of the migration. Without it every DROP is
+    /// written commented out, including the drops a change to an object that
+    /// exists on both sides needs; the statements depending on them still run
+    /// and fail, so the script applies only partly (see the README).
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     use_drop: bool,
 
@@ -108,14 +111,31 @@ struct Args {
     /// instead of failing on a callee that does not exist yet. The cost is
     /// that a genuine mistake in a routine body is no longer caught while the
     /// migration runs. Session-scoped, so it also covers any post-commit
-    /// section. Default: false (output unchanged).
+    /// section. It does not cover a SQL-standard body (BEGIN ATOMIC ... END or
+    /// RETURN expr): PostgreSQL resolves that at CREATE time whatever this
+    /// says, so for those routines pgc's ordering, taken from the dependencies
+    /// PostgreSQL records for them, is the only safeguard. Default: false
+    /// (output unchanged).
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     guard_sql_routine_bodies: bool,
 
+    /// Write the migration for SQL clients that split a script at every `;`
+    /// outside quotes and comments (the VS Code PostgreSQL extension, among
+    /// others) instead of where psql ends a statement. Every statement such a
+    /// client would cut, a routine with a BEGIN ATOMIC body or a rule with
+    /// several actions, or would ask a bind parameter for ($1), is run through
+    /// a DO block that EXECUTEs it unchanged. So is a statement with a
+    /// carriage return, written as chr(13) there, because an editor such as
+    /// VS Code gives a file one kind of line ending when it opens it. Default:
+    /// false (output unchanged).
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
+    output_for_splitting_clients: bool,
+
     /// Use CASCADE in DROP statements for the clear command. WARNING: CASCADE can drop
     /// dependent objects outside the selected schema(s) (e.g., foreign keys or views in
-    /// other schemas that reference the dropped objects). Without this flag, drops rely
-    /// on explicit ordering only and will fail if unresolved cross-schema dependencies exist.
+    /// other schemas that reference the dropped objects). Without this flag, the drops
+    /// follow the dependencies PostgreSQL records (pg_depend) and fail cleanly where an
+    /// object outside the selected schema(s) depends on one of them.
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     use_cascade: bool,
 }
@@ -175,6 +195,7 @@ async fn run_main() -> Result<(), Error> {
                     args.grants_mode,
                     args.output_for_production,
                     args.guard_sql_routine_bodies,
+                    args.output_for_splitting_clients,
                 )
                 .await;
             }
@@ -283,6 +304,7 @@ async fn run_by_config(config: String) -> Result<(), Error> {
             cfg.grants_mode,
             cfg.output_for_production,
             cfg.guard_sql_routine_bodies,
+            cfg.output_for_splitting_clients,
         )
         .await;
 
@@ -342,10 +364,17 @@ async fn compare_dumps(
     grants_mode: GrantsMode,
     output_for_production: bool,
     guard_sql_routine_bodies: bool,
+    output_for_splitting_clients: bool,
 ) -> Result<(), Error> {
     println!("Reading dumps...");
     let from = Dump::read_from_file(&from).await?;
     let to = Dump::read_from_file(&to).await?;
+    // A pgc 1.0.x TO dump against a pgc 1.1+ FROM dump would turn everything
+    // pgc 1.0.x could not read into drops; refuse before writing any output.
+    if let Err(e) = Comparer::check_dump_versions(&from, &to) {
+        eprintln!("Error: {e}");
+        return Err(e);
+    }
     println!("--> Dump from:\n{}\n", from.get_info());
     println!("--> Dump to:\n{}\n", to.get_info());
     println!("Comparing dumps...");
@@ -359,6 +388,7 @@ async fn compare_dumps(
     );
     comparer.set_output_for_production(output_for_production);
     comparer.set_guard_sql_routine_bodies(guard_sql_routine_bodies);
+    comparer.set_output_for_splitting_clients(output_for_splitting_clients);
     comparer.compare().await?;
     comparer.save_script(&output).await?;
     println!("Dump compared successfully. Result script: {output}");

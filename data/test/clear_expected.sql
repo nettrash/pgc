@@ -3,26 +3,51 @@
  This is the expected output structure for the clear command test.
  The actual script header will differ (it includes runtime dump info).
 
- Objects are dropped in dependency-safe order:
-   1. Views (topologically sorted by table_relation; tie-break: materialized first, then alphabetical)
-   2. Foreign key constraints
-   3. Tables
-   4. Routines (functions, procedures)
-   5. Sequences
-   6. Types (enums, composites, domains)
-   7. Extensions
-   8. Schemas
+ Objects are dropped in these groups:
+   1. Event triggers (only those that depend on something dropped here), ahead of every
+      drop that would fire them
+   2. Views (topologically sorted by table_relation; tie-break: materialized first, then alphabetical),
+      together with the routines whose SQL-standard body (BEGIN ATOMIC / RETURN) reads a relation
+      and their SQL-standard callers: before the relations they read, callers before callees
+   3. Foreign key constraints, then tables
+   4. Foreign tables
+   5. Subscriptions, user mappings, foreign servers, foreign-data wrappers (only those that
+      depend on something dropped inside the selected schemas, and nothing outside them
+      depends on)
+   6. Extended statistics
+   7. Casts, operators
+   8. Routines (functions, procedures, aggregates)
+   9. Sequences
+  10. Types (enums, composites, domains)
+  11. Text search configurations and dictionaries, collations
+  12. Extensions
+  13. Schemas
+ and then reordered only where pg_depend says one object has to go before another. No
+ dependency in this schema crosses the groups, so they come out in the order above; within
+ a group the order follows the catalog, so the drops below (what PostgreSQL 19 produces) can
+ come in another order within a group on another server (PostgreSQL 14 lists the routines
+ differently).
 */
 
 begin;
 
-/* ---> Drop Views --------------- */
+
+/* ---> Drop Views and routines reading relations --------------- */
+
+/* Drop materialized view: clear_app.mv_daily_orders */
+drop materialized view if exists clear_app.mv_daily_orders;
 
 /* Drop materialized view: clear_shared.mv_audit_stats */
 drop materialized view if exists clear_shared.mv_audit_stats;
 
-/* Drop materialized view: clear_app.mv_daily_orders */
-drop materialized view if exists clear_app.mv_daily_orders;
+/* Drop function: clear_app.order_total_doubled */
+drop function if exists clear_app.order_total_doubled (p_customer_id integer);
+
+/* Drop function: clear_app.order_total_atomic */
+drop function if exists clear_app.order_total_atomic (p_customer_id integer);
+
+/* Drop function: clear_app.top_customer_count */
+drop function if exists clear_app.top_customer_count ();
 
 /* Drop view: clear_app.v_top_customers */
 drop view if exists clear_app.v_top_customers;
@@ -30,54 +55,57 @@ drop view if exists clear_app.v_top_customers;
 /* Drop view: clear_app.v_customer_summary */
 drop view if exists clear_app.v_customer_summary;
 
+
 /* ---> Drop Tables --------------- */
-
-/* Drop foreign key: clear_app.orders.orders_customer_id_fkey */
-alter table clear_app.orders drop constraint if exists orders_customer_id_fkey;
-
-/* Drop foreign key: clear_app.orders.orders_category_id_fkey */
-alter table clear_app.orders drop constraint if exists orders_category_id_fkey;
-
-/* Drop foreign key: clear_app.order_items.order_items_order_id_fkey */
-alter table clear_app.order_items drop constraint if exists order_items_order_id_fkey;
 
 /* Drop foreign key: clear_app.employees.employees_manager_id_fkey */
 alter table clear_app.employees drop constraint if exists employees_manager_id_fkey;
 
-/* Drop table: clear_app.customers */
-drop table if exists clear_app.customers;
+/* Drop foreign key: clear_app.order_items.order_items_order_id_fkey */
+alter table clear_app.order_items drop constraint if exists order_items_order_id_fkey;
+
+/* Drop foreign key: clear_app.orders.orders_category_id_fkey */
+alter table clear_app.orders drop constraint if exists orders_category_id_fkey;
+
+/* Drop foreign key: clear_app.orders.orders_customer_id_fkey */
+alter table clear_app.orders drop constraint if exists orders_customer_id_fkey;
 
 /* Drop table: clear_app.categories */
 drop table if exists clear_app.categories;
 
-/* Drop table: clear_app.orders */
-drop table if exists clear_app.orders;
-
-/* Drop table: clear_app.order_items */
-drop table if exists clear_app.order_items;
-
-/* Drop table: clear_shared.audit_log */
-drop table if exists clear_shared.audit_log;
+/* Drop table: clear_app.customers */
+drop table if exists clear_app.customers;
 
 /* Drop table: clear_app.employees */
 drop table if exists clear_app.employees;
 
-/* ---> Drop Routines --------------- */
+/* Drop table: clear_app.order_items */
+drop table if exists clear_app.order_items;
 
-/* Drop function: clear_app.update_timestamp */
-drop function if exists clear_app.update_timestamp ();
+/* Drop table: clear_app.orders */
+drop table if exists clear_app.orders;
+
+/* Drop table: clear_shared.audit_log */
+drop table if exists clear_shared.audit_log;
+
+
+/* ---> Drop Routines --------------- */
 
 /* Drop function: clear_app.get_customer_order_total */
 drop function if exists clear_app.get_customer_order_total (p_customer_id integer);
 
-/* Drop function: clear_shared.format_audit_entry */
-drop function if exists clear_shared.format_audit_entry (p_id integer);
+/* Drop function: clear_app.update_timestamp */
+drop function if exists clear_app.update_timestamp ();
 
 /* Drop function: clear_app.active_customer_count */
 drop function if exists clear_app.active_customer_count ();
 
+/* Drop function: clear_shared.format_audit_entry */
+drop function if exists clear_shared.format_audit_entry (p_id integer);
+
 /* Drop procedure: clear_app.cleanup_old_orders */
-drop procedure if exists clear_app.cleanup_old_orders (p_days integer);
+drop procedure if exists clear_app.cleanup_old_orders (IN p_days integer);
+
 
 /* ---> Drop Sequences --------------- */
 
@@ -86,6 +114,16 @@ drop sequence if exists clear_app.customer_id_seq;
 
 /* Drop sequence: clear_shared.audit_id_seq */
 drop sequence if exists clear_shared.audit_id_seq;
+
+/* Drop sequence: clear_app.categories_id_seq */
+drop sequence if exists clear_app.categories_id_seq;
+
+/* Drop sequence: clear_app.order_items_id_seq */
+drop sequence if exists clear_app.order_items_id_seq;
+
+/* Drop sequence: clear_app.employees_id_seq */
+drop sequence if exists clear_app.employees_id_seq;
+
 
 /* ---> Drop Types --------------- */
 
@@ -98,13 +136,15 @@ drop type if exists clear_app.full_name;
 /* Drop type: clear_app.positive_int */
 drop type if exists clear_app.positive_int;
 
-/* ---> Drop Extensions --------------- */
 
-/* Drop extension: uuid-ossp */
-drop extension if exists "uuid-ossp";
+/* ---> Drop Extensions --------------- */
 
 /* Drop extension: pg_trgm */
 drop extension if exists pg_trgm;
+
+/* Drop extension: "uuid-ossp" */
+drop extension if exists "uuid-ossp";
+
 
 /* ---> Drop Schemas --------------- */
 
@@ -114,4 +154,6 @@ drop schema if exists clear_app;
 /* Drop schema: clear_shared */
 drop schema if exists clear_shared;
 
+
 commit;
+

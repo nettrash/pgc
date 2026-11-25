@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::utils::string_extensions::StringExt;
+use crate::utils::string_extensions::{StringExt, comment_out};
 
 /// A PostgreSQL cast (pg_cast).
 /// Casts are global (not schema-scoped).
@@ -53,7 +53,7 @@ impl Cast {
         let func_clause = match self.cast_method.as_str() {
             "f" => {
                 if let Some(f) = &self.function_name {
-                    format!("WITH FUNCTION {}", f)
+                    format!("WITH FUNCTION {f}")
                 } else {
                     "WITHOUT FUNCTION".to_string()
                 }
@@ -103,12 +103,7 @@ impl Cast {
                 script.append_block(&self.get_drop_script());
             } else {
                 let drop = self.get_drop_script();
-                script.push_str(
-                    &drop
-                        .lines()
-                        .map(|l| format!("-- {}\n", l))
-                        .collect::<String>(),
-                );
+                script.push_str(&comment_out(&drop));
             }
             script.push_str(&target.get_script());
             return script;

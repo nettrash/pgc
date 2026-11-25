@@ -371,3 +371,164 @@ fn test_extension_hash_case_sensitivity() {
 
     assert_ne!(lower_schema.hash(), upper_schema.hash());
 }
+
+// ---- PG19: extension versions the migrated server cannot install ----
+
+#[test]
+fn get_script_default_version_omits_version() {
+    let extension = Extension::new(
+        "btree_gist".to_string(),
+        "1.8".to_string(),
+        "public".to_string(),
+    );
+    assert_eq!(
+        extension.get_script_default_version(),
+        "create extension if not exists btree_gist with schema public;\n\n"
+    );
+}
+
+#[test]
+fn get_alter_script_is_update_then_set_schema() {
+    let from = Extension::new("hstore".to_string(), "1.4".to_string(), "a".to_string());
+    let to = Extension::new("hstore".to_string(), "1.8".to_string(), "b".to_string());
+
+    assert_eq!(
+        from.get_update_script(&to),
+        "alter extension hstore update to '1.8';\n\n"
+    );
+    assert_eq!(
+        from.get_set_schema_script(&to),
+        "alter extension hstore set schema b;\n\n"
+    );
+    // Byte-identical to the pre-split output.
+    assert_eq!(
+        from.get_alter_script(&to),
+        "alter extension hstore update to '1.8';\n\nalter extension hstore set schema b;\n\n"
+    );
+    assert_eq!(from.get_update_script(&from), "");
+    assert_eq!(from.get_set_schema_script(&from), "");
+    assert_eq!(from.get_alter_script(&from), "");
+}
+
+fn btree_gist_on_19() -> AvailableExtension {
+    AvailableExtension {
+        name: "btree_gist".to_string(),
+        default_version: "1.9".to_string(),
+        versions: vec!["1.9".to_string()],
+    }
+}
+
+#[test]
+fn available_extension_can_install_matches_listed_versions_only() {
+    let a = btree_gist_on_19();
+    assert!(a.can_install("1.9"));
+    assert!(!a.can_install("1.8"));
+    assert!(!a.can_install(""));
+}
+
+#[test]
+fn available_extension_cannot_update_only_from_an_installable_version() {
+    let a = btree_gist_on_19();
+    // 1.9 -> 1.8: 1.9 is installable, 1.8 is not, so no path exists.
+    assert!(a.cannot_update("1.9", "1.8"));
+    // 1.8 -> 1.9 (pg_upgrade'd cluster): target installable.
+    assert!(!a.cannot_update("1.8", "1.9"));
+    // 1.7 -> 1.8: installed version not installable here, so an update
+    // script from it may still exist.
+    assert!(!a.cannot_update("1.7", "1.8"));
+}
+
+#[test]
+fn available_extension_versions_list() {
+    assert_eq!(btree_gist_on_19().versions_list(), "1.9");
+    let mut a = btree_gist_on_19();
+    a.versions = vec!["1.0".into(), "1.1".into()];
+    assert_eq!(a.versions_list(), "1.0, 1.1");
+    a.versions.clear();
+    assert_eq!(a.versions_list(), "none");
+}
+
+#[test]
+fn available_extension_serde_skips_empty_fields() {
+    let a = AvailableExtension {
+        name: "custom".to_string(),
+        default_version: String::new(),
+        versions: Vec::new(),
+    };
+    let json = serde_json::to_string(&a).unwrap();
+    assert_eq!(json, r#"{"name":"custom"}"#);
+    let back: AvailableExtension = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, a);
+
+    let full: AvailableExtension =
+        serde_json::from_str(r#"{"name":"btree_gist","default_version":"1.9","versions":["1.9"]}"#)
+            .unwrap();
+    assert_eq!(full, btree_gist_on_19());
+}
+
+fn postgres_fdw_at(version: &str, targets: Option<&[&str]>) -> Extension {
+    let mut ext = Extension::new(
+        "postgres_fdw".to_string(),
+        version.to_string(),
+        "public".to_string(),
+    );
+    ext.update_targets = targets.map(|t| t.iter().map(|v| v.to_string()).collect());
+    ext
+}
+
+#[test]
+fn cannot_update_to_is_false_when_the_targets_are_unknown() {
+    let ext = postgres_fdw_at("1.3", None);
+    assert!(!ext.cannot_update_to("1.2"));
+    assert!(!ext.cannot_update_to("1.4"));
+}
+
+#[test]
+fn cannot_update_to_follows_the_recorded_targets() {
+    // PostgreSQL 19 at postgres_fdw 1.3: no script leads anywhere.
+    let top = postgres_fdw_at("1.3", Some(&[]));
+    assert!(top.cannot_update_to("1.2"));
+    assert!(top.cannot_update_to("1.0"));
+
+    // PostgreSQL 19 at 1.1: the 1.1--1.2 and 1.2--1.3 scripts lead up only.
+    let old = postgres_fdw_at("1.1", Some(&["1.2", "1.3"]));
+    assert!(!old.cannot_update_to("1.2"));
+    assert!(!old.cannot_update_to("1.3"));
+    assert!(old.cannot_update_to("1.0"));
+}
+
+#[test]
+fn update_targets_list_names_the_reachable_versions() {
+    assert_eq!(
+        postgres_fdw_at("1.1", Some(&["1.2", "1.3"])).update_targets_list(),
+        "1.2, 1.3"
+    );
+    assert_eq!(
+        postgres_fdw_at("1.3", Some(&[])).update_targets_list(),
+        "none"
+    );
+    assert_eq!(postgres_fdw_at("1.3", None).update_targets_list(), "none");
+}
+
+#[test]
+fn update_targets_are_not_part_of_the_hash() {
+    // Recording them must not make every 1.0.x dump's extension look changed.
+    let unknown = postgres_fdw_at("1.3", None);
+    let known = postgres_fdw_at("1.3", Some(&["1.4"]));
+    assert_eq!(unknown.hash(), known.hash());
+}
+
+#[test]
+fn extension_serde_keeps_known_empty_targets_apart_from_unknown_ones() {
+    let unknown = postgres_fdw_at("1.3", None);
+    let json = serde_json::to_string(&unknown).unwrap();
+    assert!(!json.contains("update_targets"), "{json}");
+    let back: Extension = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.update_targets, None);
+
+    let none_reachable = postgres_fdw_at("1.3", Some(&[]));
+    let json = serde_json::to_string(&none_reachable).unwrap();
+    assert!(json.contains(r#""update_targets":[]"#), "{json}");
+    let back: Extension = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.update_targets, Some(Vec::new()));
+}

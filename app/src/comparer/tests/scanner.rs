@@ -20,8 +20,7 @@ fn preserves_triple_newlines_inside_dollar_quotes() {
     let out = strip_comments_and_collapse(input);
     assert!(
         out.contains("'block 1';\n\n\n\n  RAISE NOTICE 'block 2'"),
-        "blank lines inside $$ body must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ body must be preserved, got:\n{out}"
     );
 }
 
@@ -38,8 +37,7 @@ fn preserves_newlines_inside_tagged_dollar_quotes() {
     let out = strip_comments_and_collapse(input);
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $body$ must be preserved, got:\n{}",
-        out
+        "blank lines inside $body$ must be preserved, got:\n{out}"
     );
 }
 
@@ -73,8 +71,7 @@ fn mixed_dollar_quote_and_outside_newlines() {
     );
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $$ must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ must be preserved, got:\n{out}"
     );
 }
 
@@ -133,8 +130,7 @@ fn preserves_newlines_inside_single_quoted_string() {
     let out = strip_comments_and_collapse("COMMENT ON TABLE t IS 'line1\n\n\n\nline5';\n");
     assert!(
         out.contains("'line1\n\n\n\nline5'"),
-        "newlines inside single-quoted string must be preserved, got:\n{}",
-        out
+        "newlines inside single-quoted string must be preserved, got:\n{out}"
     );
 }
 
@@ -143,8 +139,7 @@ fn preserves_newlines_inside_e_string() {
     let out = strip_comments_and_collapse("SELECT E'first\n\n\n\nlast';\n");
     assert!(
         out.contains("E'first\n\n\n\nlast'"),
-        "newlines inside E-string must be preserved, got:\n{}",
-        out
+        "newlines inside E-string must be preserved, got:\n{out}"
     );
 }
 
@@ -153,8 +148,7 @@ fn preserves_newlines_inside_double_quoted_identifier() {
     let out = strip_comments_and_collapse("SELECT \"col\n\n\n\nname\";\n");
     assert!(
         out.contains("\"col\n\n\n\nname\""),
-        "newlines inside double-quoted identifier must be preserved, got:\n{}",
-        out
+        "newlines inside double-quoted identifier must be preserved, got:\n{out}"
     );
 }
 
@@ -169,21 +163,20 @@ fn e_string_with_escaped_quote_and_newlines() {
     let out = strip_comments_and_collapse("SELECT E'it\\'s\n\n\n\nfine';\n");
     assert!(
         out.contains("E'it\\'s\n\n\n\nfine'"),
-        "E-string with escaped quote and newlines must be preserved, got:\n{}",
-        out
+        "E-string with escaped quote and newlines must be preserved, got:\n{out}"
     );
 }
 
 #[test]
 fn single_quoted_doubled_quote_and_newlines() {
     let out = strip_comments_and_collapse("SELECT 'it''s\n\n\n\nfine';\n");
-    assert!(out.contains("'it''s\n\n\n\nfine'"), "got:\n{}", out);
+    assert!(out.contains("'it''s\n\n\n\nfine'"), "got:\n{out}");
 }
 
 #[test]
 fn lowercase_e_string_preserves_newlines() {
     let out = strip_comments_and_collapse("SELECT e'first\n\n\n\nlast';\n");
-    assert!(out.contains("e'first\n\n\n\nlast'"), "got:\n{}", out);
+    assert!(out.contains("e'first\n\n\n\nlast'"), "got:\n{out}");
 }
 
 #[test]
@@ -432,4 +425,44 @@ fn preserves_byte_length_and_line_structure_through_multibyte_text() {
 fn leaves_a_body_with_nothing_to_blank_untouched() {
     let src = "\n\tselect regexp_replace(s.util_a(v), 1, 2);\n";
     assert_eq!(blank_comments_and_literals(src), src);
+}
+
+// ---- A bare carriage return ends a line comment ---------------------------
+//
+// PostgreSQL's lexer defines a line comment as `--` followed by `[^\n\r]*`,
+// and psql splits statements the same way, so whatever follows a bare `\r`
+// runs as SQL. Stripping it along with the comment would drop a statement
+// PostgreSQL executes; leaving it in a routine body unscanned would hide a
+// real reference.
+
+#[test]
+fn line_comment_ends_at_a_bare_carriage_return() {
+    assert_eq!(
+        strip_comments_and_collapse("-- hidden\rselect 42;\n"),
+        "\rselect 42;\n"
+    );
+    assert_eq!(
+        strip_comments_and_collapse("select 1; -- a\r\nselect 2;\n"),
+        "select 1; \r\nselect 2;\n"
+    );
+    // Nothing after the comment on that line: unchanged behaviour.
+    assert_eq!(strip_comments_and_collapse("-- only\n"), "\n");
+}
+
+#[test]
+fn is_line_end_matches_the_postgresql_lexer() {
+    assert!(is_line_end(b'\n'));
+    assert!(is_line_end(b'\r'));
+    assert!(!is_line_end(b' '));
+    assert!(!is_line_end(b'\t'));
+    assert!(!is_line_end(0x0b)); // vertical tab
+    assert!(!is_line_end(0x0c)); // form feed
+}
+
+#[test]
+fn blanking_ends_a_line_comment_at_a_bare_carriage_return() {
+    let sql = "-- note\rperform public.audit();";
+    let blanked = blank_comments_and_literals(sql);
+    assert_eq!(blanked.len(), sql.len());
+    assert_eq!(blanked, "       \rperform public.audit();");
 }

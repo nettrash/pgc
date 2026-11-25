@@ -36,6 +36,13 @@ pub struct Config {
     /// migration's first statement — a safety net for routine ordering
     /// (issue #240). Default false; when false the output is unchanged.
     pub guard_sql_routine_bodies: bool,
+    /// Whether to wrap every statement that a SQL client splitting the script
+    /// at each `;` would cut (a `BEGIN ATOMIC` routine body, a rule with
+    /// several actions) or ask a bind parameter for (`$1`), or that holds a
+    /// carriage return an editor would turn into a line feed, in a `DO` block
+    /// that runs it unchanged. Default false; when false the output is
+    /// unchanged.
+    pub output_for_splitting_clients: bool,
 }
 
 impl Config {
@@ -110,6 +117,7 @@ impl Config {
         let mut max_connections: u32 = 16;
         let mut output_for_production = false;
         let mut guard_sql_routine_bodies = false;
+        let mut output_for_splitting_clients = false;
 
         for line in &config_data {
             if line.trim().is_empty() || line.starts_with('#') {
@@ -146,6 +154,7 @@ impl Config {
                 && key != "MAX_CONNECTIONS"
                 && key != "OUTPUT_FOR_PRODUCTION"
                 && key != "GUARD_SQL_ROUTINE_BODIES"
+                && key != "OUTPUT_FOR_SPLITTING_CLIENTS"
             {
                 return Err(format!("Unknown configuration key: {}", parts[0]));
             }
@@ -186,6 +195,17 @@ impl Config {
                             ));
                         }
                     }
+                }
+                "OUTPUT_FOR_SPLITTING_CLIENTS" => {
+                    output_for_splitting_clients = match value.as_str() {
+                        "TRUE" => true,
+                        "FALSE" => false,
+                        _ => {
+                            return Err(format!(
+                                "Invalid value for OUTPUT_FOR_SPLITTING_CLIENTS: {raw_value}"
+                            ));
+                        }
+                    };
                 }
                 "OUTPUT_FOR_PRODUCTION" => {
                     output_for_production = match value.as_str() {
@@ -289,6 +309,7 @@ impl Config {
             max_connections,
             output_for_production,
             guard_sql_routine_bodies,
+            output_for_splitting_clients,
         })
     }
 

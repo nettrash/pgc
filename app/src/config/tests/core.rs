@@ -491,3 +491,37 @@ fn test_invalid_guard_sql_routine_bodies_value_panics() {
     let _ = Config::new(file.clone());
     let _ = std::fs::remove_file(file);
 }
+
+// ── OUTPUT_FOR_SPLITTING_CLIENTS ───────────────────────────────────────
+
+#[test]
+fn test_output_for_splitting_clients_parses_true() {
+    let config_content =
+        "FROM_HOST=localhost\nTO_HOST=remotehost\nOUTPUT_FOR_SPLITTING_CLIENTS=true";
+    let file = write_temp_config(config_content, "test_output_for_splitting_clients_true.cfg");
+    let config = Config::new(file.clone());
+    assert!(config.output_for_splitting_clients);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn test_output_for_splitting_clients_defaults_false() {
+    // Opt-in: a config that does not name it keeps the output psql users get.
+    let config_content = "FROM_HOST=localhost\nTO_HOST=remotehost";
+    let file = write_temp_config(
+        config_content,
+        "test_output_for_splitting_clients_default.cfg",
+    );
+    let config = Config::new(file.clone());
+    assert!(!config.output_for_splitting_clients);
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+#[should_panic(expected = "Invalid value for OUTPUT_FOR_SPLITTING_CLIENTS")]
+fn test_invalid_output_for_splitting_clients_value_panics() {
+    let config_content = "FROM_HOST=localhost\nOUTPUT_FOR_SPLITTING_CLIENTS=yes";
+    let file = write_temp_config(config_content, "test_invalid_splitting_clients_value.cfg");
+    let _ = Config::new(file.clone());
+    let _ = std::fs::remove_file(file);
+}
