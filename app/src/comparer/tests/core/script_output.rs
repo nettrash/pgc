@@ -1473,3 +1473,85 @@ async fn collation_drops_follow_the_dump_order() {
     let script = comparer.get_script();
     assert_in_dump_order(&script, |n| format!("DROP COLLATION IF EXISTS public.{n} "));
 }
+
+// ── --output-for-splitting-clients ─────────────────────────────────────
+
+/// `s.next_id(p integer)`, a SQL-standard function only TO has.
+fn begin_atomic_function() -> crate::dump::routine::Routine {
+    let mut routine = crate::dump::routine::Routine::new(
+        "s".to_string(),
+        sqlx::postgres::types::Oid(810),
+        "next_id".to_string(),
+        "sql".to_string(),
+        "function".to_string(),
+        "integer".to_string(),
+        "p integer".to_string(),
+        None,
+        None,
+        String::new(),
+    );
+    routine.owner = "postgres".to_string();
+    routine.source_code = "BEGIN ATOMIC\n SELECT (p + 1);\nEND".to_string();
+    routine.is_sql_body = true;
+    routine.hash();
+    routine
+}
+
+/// The migration to a TO that adds `public.plain` (and `s.next_id` when
+/// `with_routine`), in a single transaction, with the option on or off.
+async fn splitting_clients_script(with_routine: bool, on: bool) -> String {
+    let from_dump = Dump::new(DumpConfig::default());
+    let mut to_dump = Dump::new(DumpConfig::default());
+    let mut table = Table::new(
+        "public".to_string(),
+        "plain".to_string(),
+        "public".to_string(),
+        "plain".to_string(),
+        "postgres".to_string(),
+        None,
+        vec![int_column("public", "plain", "id", 1)],
+        vec![],
+        vec![],
+        vec![],
+        None,
+    );
+    table.hash();
+    to_dump.tables.push(table);
+    if with_routine {
+        to_dump.routines.push(begin_atomic_function());
+    }
+    let mut comparer = Comparer::new(from_dump, to_dump, true, true, false, GrantsMode::Ignore);
+    comparer.set_output_for_splitting_clients(on);
+    comparer.compare().await.unwrap();
+    comparer.get_script()
+}
+
+#[tokio::test]
+async fn output_for_splitting_clients_wraps_a_begin_atomic_routine_and_nothing_else() {
+    let off = splitting_clients_script(true, false).await;
+    let on = splitting_clients_script(true, true).await;
+    let statement = "create or replace function s.next_id(p integer) returns integer language sql VOLATILE \
+                     PARALLEL UNSAFE BEGIN ATOMIC\n SELECT (p + 1);\nEND";
+    let plain = format!("{statement};");
+    let wrapped = format!(
+        "DO $pgc_client$\nBEGIN\n    EXECUTE $pgc_sql$\n{statement}\n$pgc_sql$;\nEND\n$pgc_client$;"
+    );
+    assert!(off.contains(&plain), "expected {plain:?} in:\n{off}");
+    assert!(on.contains(&wrapped), "expected {wrapped:?} in:\n{on}");
+    // The wrapper is the only difference, inside the begin/commit framing.
+    assert_eq!(on.replace(&wrapped, &plain), off);
+    assert!(
+        on.starts_with("begin;\n\n") && on.ends_with("commit;\n"),
+        "{on}"
+    );
+    assert!(on.find("begin;").unwrap() < on.find("DO $pgc_client$").unwrap());
+    assert!(on.find("DO $pgc_client$").unwrap() < on.rfind("commit;").unwrap());
+}
+
+#[tokio::test]
+async fn output_for_splitting_clients_leaves_a_migration_without_such_statements_unchanged() {
+    assert_eq!(
+        splitting_clients_script(false, true).await,
+        splitting_clients_script(false, false).await
+    );
+}

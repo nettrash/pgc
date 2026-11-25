@@ -5,9 +5,12 @@
 //!   kind in dependency order and accumulates the ordered script buffers.
 //! - [`production`] — rewrites a finished script so it can be applied to a live
 //!   database with minimal locking (`--output-for-production`).
-//! - `scanner` (private) — the shared SQL-aware scanner both use to skip string literals,
-//!   quoted identifiers, comments and dollar-quoted bodies.
+//! - [`splitting_clients`] — wraps the statements of a finished script that a
+//!   SQL client splitting at every `;` would cut (`--output-for-splitting-clients`).
+//! - `scanner` (private) — the shared SQL-aware scanner `core` and `production` use to
+//!   skip string literals, quoted identifiers, comments and dollar-quoted bodies.
 
 pub mod core;
 pub mod production;
 mod scanner;
+pub mod splitting_clients;

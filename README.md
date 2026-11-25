@@ -90,6 +90,8 @@ pgc 1.1 reads dumps written by any earlier version, but re-dump both sides after
 
 `--guard-sql-routine-bodies {true|false}` - set to `true` to emit `set check_function_bodies = false;` as the migration's first statement, so PostgreSQL does not resolve the names inside a routine body when the routine is created (default `false` — output is unchanged). See [Routine ordering](#routine-ordering).
 
+`--output-for-splitting-clients {true|false}` - set to `true` when the migration will be applied with a SQL client that splits a script at every `;`, such as the VS Code PostgreSQL extension, rather than with psql (default `false` — output is unchanged). See [Output for clients that split at every semicolon](#output-for-clients-that-split-at-every-semicolon).
+
 `--max-connections {number}` - maximum number of connections in the PostgreSQL connection pool. Default: `16`. Used by all concurrent introspection queries; table metadata is pulled schema-wide in one query per resource kind (columns, indexes, constraints, triggers, policies, partition info, definitions) so connection count mostly matters for the sibling queries (extensions, sequences, routines, views, etc.) running in parallel.
 
 `--use-cascade` - add `CASCADE` to every `DROP` statement in the clear script. **Warning:** `CASCADE` can silently drop dependent objects that live outside the selected schema(s) (e.g., foreign keys or views in other schemas referencing the dropped objects). Use only when you are certain no cross-schema dependencies should survive. Without this flag the drops follow the dependencies PostgreSQL records between the objects being dropped (see [Generate a clear (drop-all) script](#generate-a-clear-drop-all-script-for-a-database)), and the script fails cleanly where an object outside the selected schema(s) depends on one of them.
@@ -131,6 +133,50 @@ By default the delta script favours brevity and is meant to be applied to an idl
 Because `CREATE/DROP INDEX CONCURRENTLY`, `VALIDATE CONSTRAINT` and `ALTER INDEX ... ATTACH PARTITION` **cannot run inside a transaction block**, every such statement is moved to a clearly marked `Production post-commit` section emitted **after** the `commit;`. The rest of the migration still runs inside the single transaction when `--use-single-transaction` is set. Each post-commit statement runs in its own implicit transaction; most are safe to re-run thanks to idempotency guards, but `ALTER INDEX ... ATTACH PARTITION` has no built-in guard, so already-successful ATTACH steps may need to be skipped when replaying the section.
 
 `--output-for-production` defaults to `false`; when off the output is byte-for-byte identical to previous behaviour.
+
+### Output for clients that split at every semicolon
+
+```bash
+pgc --command compare --from {from_dump} --to {to_dump} --output {file} --output-for-splitting-clients
+```
+
+psql sends a migration to the server one statement at a time, and it knows where each statement ends. Many other SQL clients, the VS Code PostgreSQL extension among them, split the script at every `;` outside quotes, comments and dollar quotes instead. Two kinds of statement pgc writes have a `;` of their own: a routine with a SQL-standard body (`BEGIN ATOMIC ... END`, written the way `pg_dump` writes it) and a rule with several actions (`DO ALSO (...; ...)`). Such a client sends them in pieces, and the server rejects the first piece with `syntax error at end of input`. The same clients read a positional parameter (`$1`) outside quotes as a bind parameter and stop to ask for a value, and PostgreSQL writes a SQL-standard body over unnamed arguments with exactly those.
+
+With `--output-for-splitting-clients true` (config key `OUTPUT_FOR_SPLITTING_CLIENTS=true`) each such statement is run through a `DO` block, which the client sends whole:
+
+```sql
+DO $pgc_client$
+BEGIN
+    EXECUTE $pgc_sql$
+create or replace function app.next_id(p integer) returns integer language sql IMMUTABLE PARALLEL UNSAFE BEGIN ATOMIC
+ SELECT (p + 1);
+END
+$pgc_sql$;
+END
+$pgc_client$;
+```
+
+- The statement inside is byte for byte the one psql would have sent, and PostgreSQL takes a dollar-quoted string literally, so it runs exactly that statement, in the same session and transaction. A tag the statement contains gets a number (`$pgc_sql1$`).
+- A carriage return is the one byte not written as it is. Such clients run the script from an editor, and an editor that gives a file one kind of line ending, as VS Code does when it opens one, turns a CR inside a literal or a routine body (a body written on Windows ends its lines with CR LF) into a line feed: the object is created a little different and the next compare shows it again. So the migration holds no CR. A statement with one is run through the same `DO` block, written as the pieces between its CRs, which `EXECUTE` joins with `chr(13)` to give back the statement byte for byte:
+
+  ```sql
+  DO $pgc_client$
+  BEGIN
+      EXECUTE pg_catalog.array_to_string(ARRAY[$pgc_sql$
+  create or replace function app.greeting() returns text language sql IMMUTABLE PARALLEL UNSAFE BEGIN ATOMIC
+   SELECT 'line1$pgc_sql$, $pgc_sql$
+  line2'::text;
+  END
+  $pgc_sql$], pg_catalog.chr(13));
+  END
+  $pgc_client$;
+  ```
+- Statements are delimited where psql delimits them, so each one is wrapped whole. Every other statement is written as without the option: the output differs only by these blocks, and a migration that has no such statement is byte-for-byte the same.
+- The wrapping is the last step, after `--output-for-production`, and covers the post-commit sections as well.
+- `DO` runs PL/pgSQL, which every database has unless its extension was dropped. An error in a wrapped statement is reported with a `CONTEXT` line naming the `DO` block.
+- Other text some clients take for a parameter, such as `:name` or `?`, is not looked for.
+
+psql needs none of this. `--output-for-splitting-clients` defaults to `false`; when off the output is byte-for-byte identical to previous behaviour.
 
 ### Routine ordering
 
@@ -228,11 +274,14 @@ GRANTS_MODE=ignore
 MAX_CONNECTIONS=16
 OUTPUT_FOR_PRODUCTION=false
 GUARD_SQL_ROUTINE_BODIES=false
+OUTPUT_FOR_SPLITTING_CLIENTS=false
 ```
 
 `OUTPUT_FOR_PRODUCTION` (default `false`) is the configuration-file equivalent of the `--output-for-production` flag described in [Production-friendly output](#production-friendly-output).
 
 `GUARD_SQL_ROUTINE_BODIES` (default `false`) is the configuration-file equivalent of the `--guard-sql-routine-bodies` flag described in [Routine ordering](#routine-ordering).
+
+`OUTPUT_FOR_SPLITTING_CLIENTS` (default `false`) is the configuration-file equivalent of the `--output-for-splitting-clients` flag described in [Output for clients that split at every semicolon](#output-for-clients-that-split-at-every-semicolon).
 
 ## Choosing `MAX_CONNECTIONS`
 

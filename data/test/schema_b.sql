@@ -1,6 +1,17 @@
 -- Schema B: Modified PostgreSQL schema for testing database comparison
 -- This schema represents the "TO" database in comparisons
 -- Contains differences to test all comparison scenarios
+--
+-- Applies with no errors on PostgreSQL 18 and 19. A statement PostgreSQL 18
+-- cannot run sits in a DO $pg19$ block that EXECUTEs it only on PG19+, so
+-- older servers skip it instead of failing on it. A statement with a ';' of
+-- its own (a BEGIN ATOMIC body, a rule with several actions) sits in a
+-- DO $stmt$ block, so a client that splits the file at every ';' still sends
+-- it whole. PG14-17 still reject some
+-- PG15-18 syntax, so CI applies this file with psql -v ON_ERROR_STOP=0; such
+-- a statement has to fail on both sides alike. Keep positional parameters
+-- (a dollar sign and a digit) inside dollar-quoted bodies: SQL clients read
+-- them anywhere else as bind parameters and stop to ask for values.
 
 -- Create schemas (one removed, one added)
 CREATE SCHEMA IF NOT EXISTS test_schema;
@@ -2235,8 +2246,8 @@ CREATE TABLE test_schema.i243_identity_drop (
 
 -- ═════════════════════════════════════════════════════════════════════
 -- PostgreSQL 19 feature tests (pgc v1.1.0), TO side.
--- PG19-only statements fail harmlessly on PG14-18: CI applies this file
--- with ON_ERROR_STOP=0 and the round trip must still close there.
+-- PG19-only statements run in DO $pg19$ blocks (see the top of this
+-- file), so PG14-18 skip them, and the round trip must still close there.
 -- Keep every statement parenthesis-balanced — psql does not end a
 -- statement at ';' inside an open parenthesis, so one broken statement
 -- would swallow everything after it.
@@ -2246,10 +2257,11 @@ CREATE TABLE test_schema.i243_identity_drop (
 -- =============================================================================
 -- PG19 feature test: publication membership and options (TO side)
 -- =============================================================================
--- Requires wal_level = logical. Statements a server cannot parse fail
--- harmlessly under ON_ERROR_STOP=0 (column lists, row filters and TABLES IN
--- SCHEMA need PG15+, publish_generated_columns PG18+, FOR ALL SEQUENCES and
--- EXCEPT PG19+). See the FROM side for what each case exercises.
+-- Requires wal_level = logical. A publication a server cannot create is
+-- left out (column lists, row filters and TABLES IN SCHEMA need PG15+ and
+-- publish_generated_columns PG18+, which fail before; FOR ALL SEQUENCES and
+-- EXCEPT PG19+, skipped before). See the FROM side for what each case
+-- exercises.
 CREATE TABLE test_schema.tbl_pg19_pub_items (id integer PRIMARY KEY, qty integer, note text);
 CREATE TABLE test_schema.tbl_pg19_pub_orders (id integer PRIMARY KEY, amount numeric);
 CREATE TABLE test_schema."tbl_pg19_pub_Mixed" (id integer PRIMARY KEY);
@@ -2280,21 +2292,55 @@ CREATE PUBLICATION pg19_pub_parent_filter_to_only FOR TABLE test_schema.tbl_pg19
 CREATE PUBLICATION pg19_pub_gencols_on FOR TABLE test_schema.tbl_pg19_pub_items WITH (publish_generated_columns = stored);
 CREATE PUBLICATION pg19_pub_gencols_off FOR TABLE test_schema.tbl_pg19_pub_items;
 
-CREATE PUBLICATION pg19_pub_seq_unchanged FOR ALL SEQUENCES;
-CREATE PUBLICATION pg19_pub_seq_add FOR ALL TABLES, ALL SEQUENCES;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_seq_unchanged FOR ALL SEQUENCES
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_seq_add FOR ALL TABLES, ALL SEQUENCES
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE PUBLICATION pg19_pub_seq_remove FOR ALL TABLES;
 CREATE PUBLICATION pg19_pub_seq_to_tables FOR ALL TABLES WITH (publish = 'insert, update');
 COMMENT ON PUBLICATION pg19_pub_seq_to_tables IS 'switched from FOR ALL SEQUENCES in place';
 CREATE PUBLICATION pg19_pub_seq_to_list FOR TABLE test_schema.tbl_pg19_pub_items;
-CREATE PUBLICATION pg19_pub_list_to_seq FOR ALL SEQUENCES;
-CREATE PUBLICATION pg19_pub_seq_to_only FOR ALL SEQUENCES WITH (publish = 'insert, update');
-CREATE PUBLICATION pg19_pub_except_unchanged FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_items);
-CREATE PUBLICATION pg19_pub_except_change FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_orders, TABLE test_schema."tbl_pg19_pub_Mixed");
-CREATE PUBLICATION pg19_pub_except_clear FOR ALL TABLES, ALL SEQUENCES;
-CREATE PUBLICATION pg19_pub_except_add FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_items);
-CREATE PUBLICATION pg19_pub_except_rebuilt FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_rebuilt);
-CREATE PUBLICATION pg19_pub_except_to_only FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_events), ALL SEQUENCES;
-CREATE PUBLICATION pg19_pub_mixed_to_except FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_orders), ALL SEQUENCES;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_list_to_seq FOR ALL SEQUENCES
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_seq_to_only FOR ALL SEQUENCES WITH (publish = 'insert, update')
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_except_unchanged FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_items)
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_except_change FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_orders, TABLE test_schema."tbl_pg19_pub_Mixed")
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_except_clear FOR ALL TABLES, ALL SEQUENCES
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_except_add FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_items)
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_except_rebuilt FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_rebuilt)
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_except_to_only FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_events), ALL SEQUENCES
+        $sql$;
+        EXECUTE $sql$
+            CREATE PUBLICATION pg19_pub_mixed_to_except FOR ALL TABLES EXCEPT (TABLE test_schema.tbl_pg19_pub_orders), ALL SEQUENCES
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- reg-misc: see schema_a.sql. The parent's v is bigint here.
 CREATE TABLE test_schema.rv_regmisc_pubtbl_pt (id integer NOT NULL, v bigint) PARTITION BY RANGE (id);
@@ -2302,7 +2348,15 @@ CREATE TABLE test_schema.rv_regmisc_pubtbl_pt1 PARTITION OF test_schema.rv_regmi
 CREATE TABLE test_schema.rv_regmisc_pubtbl_other (id integer PRIMARY KEY);
 CREATE PUBLICATION rv_regmisc_pub_list_to_empty;
 CREATE PUBLICATION rv_regmisc_pub_list_to_all FOR ALL TABLES;
-CREATE PUBLICATION rv_regmisc_pub_list_to_except FOR ALL TABLES EXCEPT (TABLE test_schema.rv_regmisc_pubtbl_other);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE PUBLICATION rv_regmisc_pub_list_to_except FOR ALL TABLES EXCEPT (TABLE test_schema.rv_regmisc_pubtbl_other)
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE PUBLICATION rv_regmisc_pub_unchanged FOR TABLE test_schema.rv_regmisc_pubtbl_pt1, test_schema.rv_regmisc_pubtbl_other;
 
 -- pre-grants (rv_pgrants_*): see schema_a.sql.
@@ -2339,7 +2393,7 @@ CREATE SUBSCRIPTION rv_pgrants_sub_quoted
 -- (TO side)
 -- =============================================================================
 -- Note: Requires PostgreSQL 19+. See schema_a.sql for the case list; the
--- PG19-only statements fail harmlessly on PG14-18 on both sides alike.
+-- PG19-only statements are skipped on PG14-18 on both sides alike.
 -- Expected diff on PG19 (in this order):
 --   DROP SUBSCRIPTION pg19_subfdw_sub_from_only (before every other section)
 --   ALTER FOREIGN DATA WRAPPER pg19_subfdw_fdw_added CONNECTION ...
@@ -2352,20 +2406,44 @@ CREATE SUBSCRIPTION rv_pgrants_sub_quoted
 --   DROP FOREIGN DATA WRAPPER pg19_subfdw_fdw_from_only
 CREATE FOREIGN DATA WRAPPER pg19_subfdw_fdw_same
     HANDLER public.postgres_fdw_handler VALIDATOR public.postgres_fdw_validator;
-ALTER FOREIGN DATA WRAPPER pg19_subfdw_fdw_same CONNECTION public.postgres_fdw_connection;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER FOREIGN DATA WRAPPER pg19_subfdw_fdw_same CONNECTION public.postgres_fdw_connection
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- MODIFIED: gains a connection function
 CREATE FOREIGN DATA WRAPPER pg19_subfdw_fdw_added
     HANDLER public.postgres_fdw_handler VALIDATOR public.postgres_fdw_validator;
-ALTER FOREIGN DATA WRAPPER pg19_subfdw_fdw_added CONNECTION public.postgres_fdw_connection;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER FOREIGN DATA WRAPPER pg19_subfdw_fdw_added CONNECTION public.postgres_fdw_connection
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- MODIFIED: loses its connection function
 CREATE FOREIGN DATA WRAPPER pg19_subfdw_fdw_removed
     HANDLER public.postgres_fdw_handler VALIDATOR public.postgres_fdw_validator;
 
 -- ADDED: connection function only (NO HANDLER NO VALIDATOR CONNECTION ...)
-CREATE FOREIGN DATA WRAPPER pg19_subfdw_fdw_to_only
-    CONNECTION public.postgres_fdw_connection;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE FOREIGN DATA WRAPPER pg19_subfdw_fdw_to_only
+                CONNECTION public.postgres_fdw_connection
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 CREATE SERVER pg19_subfdw_srv_a
     FOREIGN DATA WRAPPER postgres_fdw
@@ -2379,16 +2457,26 @@ CREATE SERVER pg19_subfdw_srv_b
 CREATE USER MAPPING FOR PUBLIC SERVER pg19_subfdw_srv_b OPTIONS (user 'pgc_repl');
 
 -- MODIFIED: CONNECTION -> SERVER pg19_subfdw_srv_a
-CREATE SUBSCRIPTION pg19_subfdw_sub_to_server
-    SERVER pg19_subfdw_srv_a
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_sub_to_server
+                SERVER pg19_subfdw_srv_a
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE)
+        $sql$;
 
--- MODIFIED: SERVER pg19_subfdw_srv_from_only -> SERVER pg19_subfdw_srv_b
-CREATE SUBSCRIPTION pg19_subfdw_sub_switch
-    SERVER pg19_subfdw_srv_b
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE);
+        -- MODIFIED: SERVER pg19_subfdw_srv_from_only -> SERVER pg19_subfdw_srv_b
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_sub_switch
+                SERVER pg19_subfdw_srv_b
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE)
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- MODIFIED: SERVER pg19_subfdw_srv_a -> CONNECTION
 CREATE SUBSCRIPTION pg19_subfdw_sub_to_conn
@@ -2398,38 +2486,57 @@ CREATE SUBSCRIPTION pg19_subfdw_sub_to_conn
 
 -- MODIFIED: retain_dead_tuples off, max_retention_duration 5000, unreachable host
 --   (expect SET (retain_dead_tuples = false, ...) BEFORE the CONNECTION change)
-CREATE SUBSCRIPTION pg19_subfdw_rdt_off
-    CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE, max_retention_duration = 5000);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_rdt_off
+                CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE, max_retention_duration = 5000)
+        $sql$;
 
--- MODIFIED: retain_dead_tuples on, conninfo pointing at this server
---   (expect the CONNECTION change BEFORE SET (retain_dead_tuples = true))
-CREATE SUBSCRIPTION pg19_subfdw_rdt_on
-    CONNECTION 'host=127.0.0.1 port=5432 dbname=postgres user=postgres'
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE, retain_dead_tuples = true);
+        -- MODIFIED: retain_dead_tuples on, conninfo pointing at this server's Unix
+        --   socket (see schema_a.sql for why not 127.0.0.1)
+        --   (expect the CONNECTION change BEFORE SET (retain_dead_tuples = true))
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_rdt_on
+                CONNECTION 'host=/var/run/postgresql port=5432 dbname=postgres user=postgres'
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE, retain_dead_tuples = true)
+        $sql$;
 
--- MODIFIED: '30s' -> '10s'
-CREATE SUBSCRIPTION pg19_subfdw_wrt_changed
-    CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '10s');
--- MODIFIED: '45s' -> default. The explicit '-1' keeps this side PG19-only too.
-CREATE SUBSCRIPTION pg19_subfdw_wrt_reset
-    CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '-1');
--- MODIFIED: default -> '2min', max_retention_duration 0 -> 10000
-CREATE SUBSCRIPTION pg19_subfdw_wrt_set
-    CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '2min', max_retention_duration = 10000);
--- UNCHANGED
-CREATE SUBSCRIPTION pg19_subfdw_wrt_same
-    CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
-    PUBLICATION pgc_pg19_remote_pub
-    WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '1min');
+        -- MODIFIED: '30s' -> '10s'
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_wrt_changed
+                CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '10s')
+        $sql$;
+        -- MODIFIED: '45s' -> default. The explicit '-1' keeps this side PG19-only too.
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_wrt_reset
+                CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '-1')
+        $sql$;
+        -- MODIFIED: default -> '2min', max_retention_duration 0 -> 10000
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_wrt_set
+                CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '2min', max_retention_duration = 10000)
+        $sql$;
+        -- UNCHANGED
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION pg19_subfdw_wrt_same
+                CONNECTION 'host=127.0.0.1 port=1 dbname=pgc_nowhere'
+                PUBLICATION pgc_pg19_remote_pub
+                WITH (connect = false, slot_name = NONE, wal_receiver_timeout = '1min')
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- MODIFIED: owner postgres -> pgc_pg19_subfdw_owner and SERVER
 --   pg19_subfdw_srv_a -> pg19_subfdw_srv_owner, which maps only the new owner
@@ -2452,7 +2559,15 @@ CREATE SUBSCRIPTION pg19_subfdw_sub_owner_switch
     PUBLICATION pgc_pg19_remote_pub
     WITH (connect = false, slot_name = NONE);
 ALTER SUBSCRIPTION pg19_subfdw_sub_owner_switch OWNER TO pgc_pg19_subfdw_owner;
-ALTER SUBSCRIPTION pg19_subfdw_sub_owner_switch SERVER pg19_subfdw_srv_owner;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER SUBSCRIPTION pg19_subfdw_sub_owner_switch SERVER pg19_subfdw_srv_owner
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- r3-constraints (rv_r3c_*): a foreign server that changes its wrapper (every
 -- version). ALTER SERVER cannot change it, so it is dropped and created again
@@ -2528,14 +2643,22 @@ CREATE SUBSCRIPTION rv_r4s_sub_to_only_named
     PUBLICATION rv_r4s_remote_pub
     WITH (connect = false, slot_name = 'rv_r4s_other_slot');
 COMMENT ON SUBSCRIPTION rv_r4s_sub_to_only_named IS 'rv_r4s TO-only subscription';
--- ADDED (PG19+; a syntax error on PG14-18): a SERVER subscription with the
+-- ADDED (PG19+; skipped on PG14-18): a SERVER subscription with the
 --   PG19 options. retain_dead_tuples = true does not contact the publisher
 --   either under connect = false.
-CREATE SUBSCRIPTION rv_r4s_sub_to_only_server
-    SERVER pg19_subfdw_srv_a
-    PUBLICATION rv_r4s_remote_pub
-    WITH (connect = false, slot_name = NONE, retain_dead_tuples = true,
-          max_retention_duration = 1000, wal_receiver_timeout = '30s');
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE SUBSCRIPTION rv_r4s_sub_to_only_server
+                SERVER pg19_subfdw_srv_a
+                PUBLICATION rv_r4s_remote_pub
+                WITH (connect = false, slot_name = NONE, retain_dead_tuples = true,
+                      max_retention_duration = 1000, wal_receiver_timeout = '30s')
+        $sql$;
+    END IF;
+END
+$pg19$;
 -- r4-sub review: TO slots PostgreSQL refuses as a slot_name (see
 -- schema_a.sql). Expected diff: nothing for the two MODIFIED ones, whose
 -- slots the migration leaves out (a note under USE_COMMENTS=true, a warning
@@ -2683,12 +2806,21 @@ LANGUAGE sql
 SET output_plugin_libraries = pgoutput, test_decoding
 AS $$ SELECT 1 $$;
 
--- PG19: Requires PostgreSQL 19+ (TO NULL is a syntax error on PG14-18).
-CREATE FUNCTION test_schema.pg19_routines_guc_to_null()
-RETURNS integer
-LANGUAGE sql
-SET search_path TO NULL
-AS $$ SELECT 1 $$;
+-- PG19: Requires PostgreSQL 19+ (TO NULL is a syntax error on PG14-18, which
+-- skip it).
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE FUNCTION test_schema.pg19_routines_guc_to_null()
+            RETURNS integer
+            LANGUAGE sql
+            SET search_path TO NULL
+            AS $$ SELECT 1 $$
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 CREATE FUNCTION test_schema.pg19_routines_guc_from_null()
 RETURNS integer
@@ -2697,10 +2829,18 @@ SET search_path = public
 AS $$ SELECT 1 $$;
 
 -- PG19: TO-only procedure with an empty temp_tablespaces list (create path).
-CREATE PROCEDURE test_schema.pg19_routines_guc_null_proc()
-LANGUAGE sql
-SET temp_tablespaces TO NULL
-AS $$ SELECT 1 $$;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE PROCEDURE test_schema.pg19_routines_guc_null_proc()
+            LANGUAGE sql
+            SET temp_tablespaces TO NULL
+            AS $$ SELECT 1 $$
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- -----------------------------------------------------------------------------
 -- Aggregate SORTOP (all versions). See schema_a.sql.
@@ -2775,8 +2915,8 @@ REVOKE EXECUTE ON FUNCTION test_schema.pg19_routines_grant_revoked(bigint) FROM 
 --   alter table test_schema.wp19_tables_ck_parent alter constraint wp19_tables_ck_amount not enforced;
 --   alter table test_schema.wp19_tables_ck_child alter constraint wp19_tables_ck_amount not enforced;
 --   alter table test_schema.wp19_tables_ck_part alter constraint wp19_tables_ck_part_amount enforced;
--- On PG14-18 the ALTER CONSTRAINT statements below fail (ON_ERROR_STOP=0),
--- leaving TO identical to FROM for this part.
+-- On PG14-18 the ALTER CONSTRAINT statements below are skipped, leaving TO
+-- identical to FROM for this part.
 CREATE TABLE test_schema.wp19_tables_ck (
     id    integer PRIMARY KEY,
     qty   integer,
@@ -2784,14 +2924,30 @@ CREATE TABLE test_schema.wp19_tables_ck (
 );
 ALTER TABLE test_schema.wp19_tables_ck
     ADD CONSTRAINT wp19_tables_ck_relax CHECK (qty >= 0);
-ALTER TABLE test_schema.wp19_tables_ck
-    ALTER CONSTRAINT wp19_tables_ck_relax NOT ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.wp19_tables_ck
+                ALTER CONSTRAINT wp19_tables_ck_relax NOT ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 ALTER TABLE test_schema.wp19_tables_ck
     ADD CONSTRAINT wp19_tables_ck_tighten CHECK (price > 0);
 ALTER TABLE test_schema.wp19_tables_ck
     ADD CONSTRAINT wp19_tables_ck_notvalid CHECK (qty < 1000000) NOT VALID;
-ALTER TABLE test_schema.wp19_tables_ck
-    ALTER CONSTRAINT wp19_tables_ck_notvalid NOT ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.wp19_tables_ck
+                ALTER CONSTRAINT wp19_tables_ck_notvalid NOT ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 CREATE TABLE test_schema.wp19_tables_ck_parent (
     id     integer,
@@ -2801,8 +2957,16 @@ CREATE TABLE test_schema.wp19_tables_ck_parent (
 CREATE TABLE test_schema.wp19_tables_ck_child (
     CONSTRAINT wp19_tables_ck_amount CHECK (amount > 0)
 ) INHERITS (test_schema.wp19_tables_ck_parent);
-ALTER TABLE test_schema.wp19_tables_ck_parent
-    ALTER CONSTRAINT wp19_tables_ck_amount NOT ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.wp19_tables_ck_parent
+                ALTER CONSTRAINT wp19_tables_ck_amount NOT ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 CREATE TABLE test_schema.wp19_tables_ck_part (
     id     integer NOT NULL,
@@ -2873,8 +3037,16 @@ CREATE TABLE test_schema.wp19_tables_rc (
     g  integer GENERATED ALWAYS AS (id * 2) STORED,
     CONSTRAINT wp19_tables_rc_g_check CHECK (g > 0)
 );
-ALTER TABLE test_schema.wp19_tables_rc
-    ALTER CONSTRAINT wp19_tables_rc_g_check NOT ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.wp19_tables_rc
+                ALTER CONSTRAINT wp19_tables_rc_g_check NOT ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 CREATE TABLE test_schema.wp19_tables_gen_retype (
     id    integer PRIMARY KEY,
@@ -2914,10 +3086,20 @@ CREATE TABLE test_schema.wp19_tables_keep_parent (
 CREATE TABLE test_schema.wp19_tables_keep_child (
     CONSTRAINT wp19_tables_keep_amount CHECK (amount > 0)
 ) INHERITS (test_schema.wp19_tables_keep_parent);
-ALTER TABLE test_schema.wp19_tables_keep_parent
-    ALTER CONSTRAINT wp19_tables_keep_amount NOT ENFORCED;
-ALTER TABLE test_schema.wp19_tables_keep_child
-    ALTER CONSTRAINT wp19_tables_keep_amount ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.wp19_tables_keep_parent
+                ALTER CONSTRAINT wp19_tables_keep_amount NOT ENFORCED
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.wp19_tables_keep_child
+                ALTER CONSTRAINT wp19_tables_keep_amount ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 CREATE TABLE test_schema.wp19_tables_gen_vpart (
     id integer NOT NULL,
@@ -3410,8 +3592,14 @@ CREATE TRIGGER rv_r3g_items_upd AFTER UPDATE OF g ON test_schema.rv_r3g_items
 CREATE TRIGGER rv_r3g_items_when AFTER UPDATE ON test_schema.rv_r3g_items
     FOR EACH ROW WHEN (old.g IS DISTINCT FROM new.g)
     EXECUTE FUNCTION test_schema.rv_r3g_trg();
-CREATE FUNCTION test_schema.rv_r3g_items_sum() RETURNS numeric
-    LANGUAGE sql BEGIN ATOMIC SELECT sum(g) FROM test_schema.rv_r3g_items; END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_r3g_items_sum() RETURNS numeric
+            LANGUAGE sql BEGIN ATOMIC SELECT sum(g) FROM test_schema.rv_r3g_items; END
+    $sql$;
+END
+$stmt$;
 CREATE PUBLICATION rv_r3g_pub_filter FOR TABLE test_schema.rv_r3g_items WHERE (g > 0);
 CREATE PUBLICATION rv_r3g_pub_cols FOR TABLE test_schema.rv_r3g_items (id, g)
     WITH (publish_generated_columns = stored);
@@ -3445,9 +3633,15 @@ CREATE TRIGGER rv_r3g_ren_upd AFTER UPDATE OF h ON test_schema.rv_r3g_ren
 -- The same through a SQL-standard routine drop_views drops ahead of the
 -- tables (it reads a column TO retypes).
 CREATE TABLE test_schema.rv_r3g_cfg (id integer PRIMARY KEY, n bigint);
-CREATE FUNCTION test_schema.rv_r3g_k(x integer) RETURNS integer
-    LANGUAGE sql IMMUTABLE
-    BEGIN ATOMIC SELECT x + coalesce((SELECT max(n) FROM test_schema.rv_r3g_cfg), 0)::integer; END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_r3g_k(x integer) RETURNS integer
+            LANGUAGE sql IMMUTABLE
+            BEGIN ATOMIC SELECT x + coalesce((SELECT max(n) FROM test_schema.rv_r3g_cfg), 0)::integer; END
+    $sql$;
+END
+$stmt$;
 CREATE TABLE test_schema.rv_r3g_kt (
     id integer PRIMARY KEY,
     a  integer,
@@ -3568,9 +3762,15 @@ CREATE TRIGGER rv_r3g_rt_part_1_upd AFTER UPDATE OF tenant_id ON test_schema.rv_
 -- only once that routine is back; so does a CHECK calling a string-body
 -- reader whose return type changes, which is dropped with CASCADE only after
 -- the re-add.
-CREATE FUNCTION test_schema.rv_r3g_items_max() RETURNS integer
-    LANGUAGE sql STABLE
-    BEGIN ATOMIC SELECT coalesce(max(g), 0)::integer FROM test_schema.rv_r3g_items; END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_r3g_items_max() RETURNS integer
+            LANGUAGE sql STABLE
+            BEGIN ATOMIC SELECT coalesce(max(g), 0)::integer FROM test_schema.rv_r3g_items; END
+    $sql$;
+END
+$stmt$;
 CREATE TABLE test_schema.rv_r3g_use (
     id integer PRIMARY KEY,
     v  integer DEFAULT test_schema.rv_r3g_items_max(),
@@ -3600,9 +3800,15 @@ CREATE FUNCTION test_schema.rv_r3g_plus3(a integer, b integer) RETURNS integer
     LANGUAGE sql IMMUTABLE AS $$ SELECT a + b + 3 $$;
 CREATE OPERATOR test_schema.#@@# (LEFTARG = integer, RIGHTARG = integer,
     FUNCTION = test_schema.rv_r3g_plus3);
-CREATE FUNCTION test_schema.rv_r3g_uses_op() RETURNS integer
-    LANGUAGE sql IMMUTABLE
-    BEGIN ATOMIC SELECT (1 OPERATOR(test_schema.#@@#) 2); END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_r3g_uses_op() RETURNS integer
+            LANGUAGE sql IMMUTABLE
+            BEGIN ATOMIC SELECT (1 OPERATOR(test_schema.#@@#) 2); END
+    $sql$;
+END
+$stmt$;
 -- What only TO has on a generated column rv_r3g_fn's CASCADE takes: the
 -- table phase creates it first, the CASCADE takes it again, and it comes back
 -- with the re-add.
@@ -3669,14 +3875,38 @@ CREATE INDEX rv_r3g_plainp_1_g ON test_schema.rv_r3g_plainp_1 (g);
 CREATE TABLE test_schema.rv_r3c_ie_p (id integer, a integer);
 ALTER TABLE test_schema.rv_r3c_ie_p ADD CONSTRAINT rv_r3c_ie_p_ck CHECK (a > 0) NOT ENFORCED;
 CREATE TABLE test_schema.rv_r3c_ie_c () INHERITS (test_schema.rv_r3c_ie_p);
-ALTER TABLE ONLY test_schema.rv_r3c_ie_c ALTER CONSTRAINT rv_r3c_ie_p_ck ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE ONLY test_schema.rv_r3c_ie_c ALTER CONSTRAINT rv_r3c_ie_p_ck ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE TABLE test_schema.rv_r3c_ie_pt (id integer, a integer) PARTITION BY RANGE (id);
 ALTER TABLE test_schema.rv_r3c_ie_pt ADD CONSTRAINT rv_r3c_ie_pt_ck CHECK (a > 0) NOT ENFORCED;
 CREATE TABLE test_schema.rv_r3c_ie_pt_1 PARTITION OF test_schema.rv_r3c_ie_pt FOR VALUES FROM (0) TO (10);
-ALTER TABLE ONLY test_schema.rv_r3c_ie_pt_1 ALTER CONSTRAINT rv_r3c_ie_pt_ck ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE ONLY test_schema.rv_r3c_ie_pt_1 ALTER CONSTRAINT rv_r3c_ie_pt_ck ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE TABLE test_schema.rv_r3c_ie_pt_2 PARTITION OF test_schema.rv_r3c_ie_pt FOR VALUES FROM (10) TO (20);
 CREATE TABLE test_schema.rv_r3c_ie_pt_3 PARTITION OF test_schema.rv_r3c_ie_pt FOR VALUES FROM (20) TO (30);
-ALTER TABLE ONLY test_schema.rv_r3c_ie_pt_3 ALTER CONSTRAINT rv_r3c_ie_pt_ck ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE ONLY test_schema.rv_r3c_ie_pt_3 ALTER CONSTRAINT rv_r3c_ie_pt_ck ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 -- (2) Every table is a partition of its parent here.
 CREATE TABLE test_schema.rv_r3c_at (id integer NOT NULL, a integer, CONSTRAINT rv_r3c_at_ck CHECK (a > 0))
     PARTITION BY RANGE (id);
@@ -3919,25 +4149,47 @@ CREATE TABLE test_schema.t_pg19_stat_vcol (
     readded bigint GENERATED ALWAYS AS (qty + 2) VIRTUAL
 );
 
-CREATE STATISTICS test_schema.pg19_stat_vcol_rewrite (ndistinct)
-    ON qty, doubled FROM test_schema.t_pg19_stat_vcol;
-ALTER STATISTICS test_schema.pg19_stat_vcol_rewrite SET STATISTICS 500;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE STATISTICS test_schema.pg19_stat_vcol_rewrite (ndistinct)
+                ON qty, doubled FROM test_schema.t_pg19_stat_vcol
+        $sql$;
+        EXECUTE $sql$
+            ALTER STATISTICS test_schema.pg19_stat_vcol_rewrite SET STATISTICS 500
+        $sql$;
 
-CREATE STATISTICS test_schema.pg19_stat_vcol_expr
-    ON (doubled + 1) FROM test_schema.t_pg19_stat_vcol;
+        EXECUTE $sql$
+            CREATE STATISTICS test_schema.pg19_stat_vcol_expr
+                ON (doubled + 1) FROM test_schema.t_pg19_stat_vcol
+        $sql$;
 
-CREATE STATISTICS test_schema.pg19_stat_vcol_readd (ndistinct)
-    ON qty, readded FROM test_schema.t_pg19_stat_vcol;
-ALTER STATISTICS test_schema.pg19_stat_vcol_readd SET STATISTICS 550;
+        EXECUTE $sql$
+            CREATE STATISTICS test_schema.pg19_stat_vcol_readd (ndistinct)
+                ON qty, readded FROM test_schema.t_pg19_stat_vcol
+        $sql$;
+        EXECUTE $sql$
+            ALTER STATISTICS test_schema.pg19_stat_vcol_readd SET STATISTICS 550
+        $sql$;
 
-CREATE STATISTICS public.pg19_stat_vcol_xschema (mcv)
-    ON price, readded FROM test_schema.t_pg19_stat_vcol;
+        EXECUTE $sql$
+            CREATE STATISTICS public.pg19_stat_vcol_xschema (mcv)
+                ON price, readded FROM test_schema.t_pg19_stat_vcol
+        $sql$;
 
-CREATE STATISTICS test_schema.pg19_stat_vcol_kinds
-    ON qty, total FROM test_schema.t_pg19_stat_vcol;
+        EXECUTE $sql$
+            CREATE STATISTICS test_schema.pg19_stat_vcol_kinds
+                ON qty, total FROM test_schema.t_pg19_stat_vcol
+        $sql$;
 
-CREATE STATISTICS test_schema.pg19_stat_vcol_to_only
-    ON total FROM test_schema.t_pg19_stat_vcol;
+        EXECUTE $sql$
+            CREATE STATISTICS test_schema.pg19_stat_vcol_to_only
+                ON total FROM test_schema.t_pg19_stat_vcol
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- ==== END pg19:statistics ====
 
@@ -3994,14 +4246,24 @@ CREATE TABLE test_schema.misc_pg19_ts_notes (
 );
 -- ADDED (PG19+): the new Polish stemmer and a copy of the new built-in
 -- Esperanto configuration. No polish.stop / esperanto.stop ships, so no
--- STOPWORDS. Both fail harmlessly on PG14-18.
-CREATE TEXT SEARCH DICTIONARY test_schema.pg19_misc_dict_pl (
-    TEMPLATE = pg_catalog.snowball,
-    language = 'polish'
-);
-CREATE TEXT SEARCH CONFIGURATION test_schema.pg19_misc_tsconfig_eo (
-    COPY = pg_catalog.esperanto
-);
+-- STOPWORDS. Both are skipped on PG14-18.
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE TEXT SEARCH DICTIONARY test_schema.pg19_misc_dict_pl (
+                TEMPLATE = pg_catalog.snowball,
+                language = 'polish'
+            )
+        $sql$;
+        EXECUTE $sql$
+            CREATE TEXT SEARCH CONFIGURATION test_schema.pg19_misc_tsconfig_eo (
+                COPY = pg_catalog.esperanto
+            )
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- -----------------------------------------------------------------------------
 -- PG19 misc 2/5: oid8 data type (PG19+)
@@ -4010,63 +4272,115 @@ CREATE TEXT SEARCH CONFIGURATION test_schema.pg19_misc_tsconfig_eo (
 --     oid8 -> bigint (binary-coercible assignment cast), new oid8 / oid8[]
 --     columns with defaults, a CHECK, a hash index, a domain, a range type,
 --     a function and a view using the oid8 min/max aggregates.
--- Every oid8 statement fails on PG14-18 (type "oid8" does not exist), which
--- leaves the base table identical to the FROM side there.
+-- Every oid8 statement is skipped on PG14-18 (no oid8 type), which leaves
+-- the base table identical to the FROM side there.
 CREATE TABLE test_schema.misc_pg19_oid8_refs (
     id          bigint PRIMARY KEY,
     legacy_ref  oid,
     big_ref     bigint,
     back_ref    bigint
 );
-ALTER TABLE test_schema.misc_pg19_oid8_refs ALTER COLUMN id TYPE oid8;
-ALTER TABLE test_schema.misc_pg19_oid8_refs ALTER COLUMN legacy_ref TYPE oid8;
-ALTER TABLE test_schema.misc_pg19_oid8_refs ALTER COLUMN big_ref TYPE oid8;
-ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN ref_list oid8[] DEFAULT '{1,2}';
-ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN max_ref oid8 DEFAULT '18446744073709551615'::oid8;
-ALTER TABLE test_schema.misc_pg19_oid8_refs ADD CONSTRAINT chk_misc_pg19_oid8_refs_id CHECK (id > '0'::oid8);
-CREATE INDEX idx_misc_pg19_oid8_refs_max_ref ON test_schema.misc_pg19_oid8_refs USING hash (max_ref);
-CREATE DOMAIN test_schema.pg19_misc_oid8_nonzero AS oid8 CHECK (VALUE <> '0'::oid8);
-CREATE TYPE test_schema.pg19_misc_oid8_span AS RANGE (subtype = oid8);
-ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN nonzero_ref test_schema.pg19_misc_oid8_nonzero;
-ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN ref_span test_schema.pg19_misc_oid8_span;
-CREATE FUNCTION test_schema.pg19_misc_oid8_or_default(x oid8 DEFAULT '7'::oid8)
-RETURNS oid8 LANGUAGE sql IMMUTABLE AS 'SELECT x';
-CREATE VIEW test_schema.pg19_misc_oid8_refs_summary AS
-SELECT max(id) AS max_id, min(max_ref) AS min_ref FROM test_schema.misc_pg19_oid8_refs;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ALTER COLUMN id TYPE oid8
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ALTER COLUMN legacy_ref TYPE oid8
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ALTER COLUMN big_ref TYPE oid8
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN ref_list oid8[] DEFAULT '{1,2}'
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN max_ref oid8 DEFAULT '18446744073709551615'::oid8
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ADD CONSTRAINT chk_misc_pg19_oid8_refs_id CHECK (id > '0'::oid8)
+        $sql$;
+        EXECUTE $sql$
+            CREATE INDEX idx_misc_pg19_oid8_refs_max_ref ON test_schema.misc_pg19_oid8_refs USING hash (max_ref)
+        $sql$;
+        EXECUTE $sql$
+            CREATE DOMAIN test_schema.pg19_misc_oid8_nonzero AS oid8 CHECK (VALUE <> '0'::oid8)
+        $sql$;
+        EXECUTE $sql$
+            CREATE TYPE test_schema.pg19_misc_oid8_span AS RANGE (subtype = oid8)
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN nonzero_ref test_schema.pg19_misc_oid8_nonzero
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_oid8_refs ADD COLUMN ref_span test_schema.pg19_misc_oid8_span
+        $sql$;
+        EXECUTE $sql$
+            CREATE FUNCTION test_schema.pg19_misc_oid8_or_default(x oid8 DEFAULT '7'::oid8)
+            RETURNS oid8 LANGUAGE sql IMMUTABLE AS 'SELECT x'
+        $sql$;
+        EXECUTE $sql$
+            CREATE VIEW test_schema.pg19_misc_oid8_refs_summary AS
+            SELECT max(id) AS max_id, min(max_ref) AS min_ref FROM test_schema.misc_pg19_oid8_refs
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- -----------------------------------------------------------------------------
 -- PG19 misc 3/5: window-function null treatment IGNORE NULLS / RESPECT NULLS
 -- -----------------------------------------------------------------------------
 -- See schema_a.sql for the case matrix. On PG14-18 the IGNORE/RESPECT NULLS
--- statements fail to parse and the view is simply absent from this side.
+-- statements are skipped and the view is simply absent from this side.
 CREATE TABLE test_schema.misc_pg19_readings (
     id      integer PRIMARY KEY,
     sensor  integer NOT NULL,
     reading numeric
 );
-CREATE VIEW test_schema.pg19_misc_v_null_treatment AS
-SELECT id, sensor,
-       lag(reading) IGNORE NULLS OVER (PARTITION BY sensor ORDER BY id) AS prev_reading
-FROM test_schema.misc_pg19_readings;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE VIEW test_schema.pg19_misc_v_null_treatment AS
+            SELECT id, sensor,
+                   lag(reading) IGNORE NULLS OVER (PARTITION BY sensor ORDER BY id) AS prev_reading
+            FROM test_schema.misc_pg19_readings
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE VIEW test_schema.pg19_misc_v_null_treatment_off AS
 SELECT id,
        last_value(reading) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS last_known
 FROM test_schema.misc_pg19_readings;
 -- RESPECT NULLS is the default and is not deparsed: no diff against FROM on PG19.
-CREATE VIEW test_schema.pg19_misc_v_respect_nulls AS
-SELECT id,
-       first_value(reading) RESPECT NULLS OVER (ORDER BY id) AS first_reading
-FROM test_schema.misc_pg19_readings;
-CREATE MATERIALIZED VIEW test_schema.pg19_misc_mv_null_treatment AS
-SELECT sensor, id,
-       lead(reading, 1, 0) IGNORE NULLS OVER (PARTITION BY sensor ORDER BY id) AS next_reading
-FROM test_schema.misc_pg19_readings;
--- TO-only view mixing a named window with IGNORE NULLS.
-CREATE VIEW test_schema.pg19_misc_v_ignore_nulls_new AS
-SELECT id,
-       nth_value(reading, 2) IGNORE NULLS OVER w AS second_reading
-FROM test_schema.misc_pg19_readings
-WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE VIEW test_schema.pg19_misc_v_respect_nulls AS
+            SELECT id,
+                   first_value(reading) RESPECT NULLS OVER (ORDER BY id) AS first_reading
+            FROM test_schema.misc_pg19_readings
+        $sql$;
+        EXECUTE $sql$
+            CREATE MATERIALIZED VIEW test_schema.pg19_misc_mv_null_treatment AS
+            SELECT sensor, id,
+                   lead(reading, 1, 0) IGNORE NULLS OVER (PARTITION BY sensor ORDER BY id) AS next_reading
+            FROM test_schema.misc_pg19_readings
+        $sql$;
+        -- TO-only view mixing a named window with IGNORE NULLS.
+        EXECUTE $sql$
+            CREATE VIEW test_schema.pg19_misc_v_ignore_nulls_new AS
+            SELECT id,
+                   nth_value(reading, 2) IGNORE NULLS OVER w AS second_reading
+            FROM test_schema.misc_pg19_readings
+            WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- -----------------------------------------------------------------------------
 -- PG19 misc 4/5: JSON_ARRAY(query) deparse and empty-result semantics
@@ -4089,34 +4403,66 @@ SELECT JSON_ARRAY(SELECT id FROM test_schema.misc_pg19_ja_items ORDER BY id) AS 
 -- PG19 misc 5/5: heap reloptions autovacuum_parallel_workers and
 -- log_autoanalyze_min_duration (PG19+)
 -- -----------------------------------------------------------------------------
--- On PG14-18 every ALTER ... SET below fails with "unrecognized parameter";
+-- On PG14-18 every ALTER ... SET below is skipped ("unrecognized parameter");
 -- the objects are then identical to FROM (the new table is created without
 -- options) and the round trip stays idempotent.
 CREATE TABLE test_schema.misc_pg19_reloptions_test (
     id    serial PRIMARY KEY,
     value text
 ) WITH (fillfactor = 80);
-ALTER TABLE test_schema.misc_pg19_reloptions_test SET (
-    autovacuum_parallel_workers = 4,
-    log_autoanalyze_min_duration = 1000
-);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_reloptions_test SET (
+                autovacuum_parallel_workers = 4,
+                log_autoanalyze_min_duration = 1000
+            )
+        $sql$;
+    END IF;
+END
+$pg19$;
 -- TO only: new table, created with the PG19 options in its WITH (...) clause.
 CREATE TABLE test_schema.misc_pg19_reloptions_new (
     id integer PRIMARY KEY
 );
-ALTER TABLE test_schema.misc_pg19_reloptions_new SET (
-    autovacuum_parallel_workers = 0,
-    log_autoanalyze_min_duration = 250
-);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_reloptions_new SET (
+                autovacuum_parallel_workers = 0,
+                log_autoanalyze_min_duration = 250
+            )
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE TABLE test_schema.misc_pg19_reloptions_part (
     id    integer,
     value text
 ) PARTITION BY RANGE (id);
 CREATE TABLE test_schema.misc_pg19_reloptions_part_1
     PARTITION OF test_schema.misc_pg19_reloptions_part FOR VALUES FROM (0) TO (100);
-ALTER TABLE test_schema.misc_pg19_reloptions_part_1 SET (autovacuum_parallel_workers = 1);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.misc_pg19_reloptions_part_1 SET (autovacuum_parallel_workers = 1)
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE MATERIALIZED VIEW test_schema.pg19_misc_reloptions_mv AS SELECT 1 AS x;
-ALTER MATERIALIZED VIEW test_schema.pg19_misc_reloptions_mv SET (log_autoanalyze_min_duration = 10);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER MATERIALIZED VIEW test_schema.pg19_misc_reloptions_mv SET (log_autoanalyze_min_duration = 10)
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- -----------------------------------------------------------------------------
 -- PG19 misc: new contrib extension pg_stash_advice (PG19+)
@@ -4125,8 +4471,16 @@ ALTER MATERIALIZED VIEW test_schema.pg19_misc_reloptions_mv SET (log_autoanalyze
 -- extension-owned and never dumped. Expected on PG19:
 --   create extension if not exists pg_stash_advice with schema public version '1.0';
 -- (the version is installable on the migrated server, so it stays pinned).
--- Fails harmlessly on PG14-18 ("is not available"), absent on both sides.
-CREATE EXTENSION IF NOT EXISTS pg_stash_advice WITH SCHEMA public;
+-- Skipped on PG14-18 ("is not available"), absent on both sides.
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE EXTENSION IF NOT EXISTS pg_stash_advice WITH SCHEMA public
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- A table whose name starts with `pg` plus a non-underscore character must be
 -- dumped. The tables query filtered `tablename not like 'pg_%'`, where `_` is a
@@ -4521,7 +4875,7 @@ CREATE PUBLICATION rv_r4t_xpub FOR TABLE test_schema.rv_r4t_xtt (id, amount) WHE
 -- SQL-standard routine bodies (BEGIN ATOMIC ... END / RETURN expr, PG14+).
 -- TO: see schema_a.sql for the FROM side. pg19_sqlbody_upsert uses PG19's
 -- INSERT ... ON CONFLICT DO SELECT, a syntax error before 19: on PG14-18 it
--- fails under ON_ERROR_STOP=0, is absent from TO, and the diff drops it.
+-- is skipped, is absent from TO, and the diff drops it.
 CREATE TABLE test_schema.pg19_sqlbody_target (
     id  integer PRIMARY KEY,
     val text
@@ -4530,39 +4884,65 @@ CREATE TABLE public.pg19_sqlbody_public_target (
     id integer PRIMARY KEY
 );
 
-CREATE FUNCTION test_schema.pg19_sqlbody_unchanged(p integer) RETURNS integer
-LANGUAGE sql IMMUTABLE
-BEGIN ATOMIC
-    SELECT p + 1;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.pg19_sqlbody_unchanged(p integer) RETURNS integer
+        LANGUAGE sql IMMUTABLE
+        BEGIN ATOMIC
+            SELECT p + 1;
+        END
+    $sql$;
+END
+$stmt$;
 
 CREATE FUNCTION test_schema.pg19_sqlbody_return(p integer) RETURNS integer
 LANGUAGE sql IMMUTABLE
 RETURN p + 2;
 
 -- PG19+: ON CONFLICT DO SELECT with a lock strength and a WHERE filter.
-CREATE FUNCTION test_schema.pg19_sqlbody_upsert(p integer)
-RETURNS SETOF test_schema.pg19_sqlbody_target
-LANGUAGE sql
-BEGIN ATOMIC
-    INSERT INTO test_schema.pg19_sqlbody_target VALUES (p, 'x')
-    ON CONFLICT (id) DO SELECT FOR UPDATE WHERE pg19_sqlbody_target.val IS NOT NULL
-    RETURNING *;
-END;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE FUNCTION test_schema.pg19_sqlbody_upsert(p integer)
+            RETURNS SETOF test_schema.pg19_sqlbody_target
+            LANGUAGE sql
+            BEGIN ATOMIC
+                INSERT INTO test_schema.pg19_sqlbody_target VALUES (p, 'x')
+                ON CONFLICT (id) DO SELECT FOR UPDATE WHERE pg19_sqlbody_target.val IS NOT NULL
+                RETURNING *;
+            END
+        $sql$;
+    END IF;
+END
+$pg19$;
 
-CREATE PROCEDURE test_schema.pg19_sqlbody_proc_changed(p integer)
-LANGUAGE sql
-BEGIN ATOMIC
-    INSERT INTO test_schema.pg19_sqlbody_target VALUES (p, 'b')
-    ON CONFLICT (id) DO UPDATE SET val = excluded.val;
-    DELETE FROM test_schema.pg19_sqlbody_target WHERE val IS NULL;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE PROCEDURE test_schema.pg19_sqlbody_proc_changed(p integer)
+        LANGUAGE sql
+        BEGIN ATOMIC
+            INSERT INTO test_schema.pg19_sqlbody_target VALUES (p, 'b')
+            ON CONFLICT (id) DO UPDATE SET val = excluded.val;
+            DELETE FROM test_schema.pg19_sqlbody_target WHERE val IS NULL;
+        END
+    $sql$;
+END
+$stmt$;
 
-CREATE FUNCTION test_schema.pg19_sqlbody_to_atomic(p integer) RETURNS integer
-LANGUAGE sql IMMUTABLE
-BEGIN ATOMIC
-    SELECT p * 2;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.pg19_sqlbody_to_atomic(p integer) RETURNS integer
+        LANGUAGE sql IMMUTABLE
+        BEGIN ATOMIC
+            SELECT p * 2;
+        END
+    $sql$;
+END
+$stmt$;
 
 CREATE FUNCTION test_schema.pg19_sqlbody_to_string(p integer) RETURNS integer
 LANGUAGE sql IMMUTABLE
@@ -4575,12 +4955,18 @@ SET search_path = pg_catalog
 RETURN p * 4;
 
 -- TO-only procedure with SECURITY DEFINER and a comment.
-CREATE PROCEDURE test_schema.pg19_sqlbody_proc_to_only(p integer)
-LANGUAGE sql SECURITY DEFINER
-BEGIN ATOMIC
-    INSERT INTO test_schema.pg19_sqlbody_target VALUES (p, 'c')
-    ON CONFLICT (id) DO NOTHING;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE PROCEDURE test_schema.pg19_sqlbody_proc_to_only(p integer)
+        LANGUAGE sql SECURITY DEFINER
+        BEGIN ATOMIC
+            INSERT INTO test_schema.pg19_sqlbody_target VALUES (p, 'c')
+            ON CONFLICT (id) DO NOTHING;
+        END
+    $sql$;
+END
+$stmt$;
 COMMENT ON PROCEDURE test_schema.pg19_sqlbody_proc_to_only(integer) IS 'SQL-standard body procedure';
 
 -- TO-only pair: a SQL-standard body is parsed at CREATE time even with
@@ -4595,11 +4981,17 @@ RETURN test_schema.pg19_sqlbody_z_callee(p) * 10;
 
 -- TO-only: literals that must survive byte for byte, a CR LF (the deparsed
 -- body carries it raw) and a "$$" that is no dollar quote.
-CREATE FUNCTION test_schema.pg19_sqlbody_literals() RETURNS text
-LANGUAGE sql IMMUTABLE
-BEGIN ATOMIC
-    SELECT E'line1\r\nline2' || '$$ not a delimiter $$';
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.pg19_sqlbody_literals() RETURNS text
+        LANGUAGE sql IMMUTABLE
+        BEGIN ATOMIC
+            SELECT E'line1\r\nline2' || '$$ not a delimiter $$';
+        END
+    $sql$;
+END
+$stmt$;
 
 -- TO-only in public: the body is deparsed with an empty search_path, so the
 -- public table stays qualified (under the default search_path it printed
@@ -4655,12 +5047,12 @@ CREATE FUNCTION test_schema.pg19_sqlbody_parted_count() RETURNS bigint
 LANGUAGE sql STABLE
 RETURN (SELECT count(*) FROM test_schema.pg19_sqlbody_parted);
 
-CREATE FUNCTION test_schema.pg19_sqlbody_eq(integer, integer) RETURNS boolean
+CREATE FUNCTION test_schema.pg19_sqlbody_eq(l integer, r integer) RETURNS boolean
 LANGUAGE sql IMMUTABLE
-RETURN $1 = $2;
-CREATE FUNCTION test_schema.pg19_sqlbody_eq_or_null(integer, integer) RETURNS boolean
+RETURN l = r;
+CREATE FUNCTION test_schema.pg19_sqlbody_eq_or_null(l integer, r integer) RETURNS boolean
 LANGUAGE sql IMMUTABLE
-RETURN $1 = $2 OR $1 IS NULL;
+RETURN l = r OR l IS NULL;
 CREATE OPERATOR test_schema.=== (
     LEFTARG = integer, RIGHTARG = integer, FUNCTION = test_schema.pg19_sqlbody_eq_or_null
 );
@@ -4676,9 +5068,9 @@ CREATE TABLE test_schema.pg19_sqlbody_op_default (
 -- operator and cast phases (which follow the routine phase) have run. A
 -- SQL-standard body is resolved at CREATE time, so they, and the view calling
 -- one, are created after those phases.
-CREATE FUNCTION test_schema.pg19_sqlbody_ne(integer, integer) RETURNS boolean
+CREATE FUNCTION test_schema.pg19_sqlbody_ne(l integer, r integer) RETURNS boolean
 LANGUAGE sql IMMUTABLE
-RETURN $1 <> $2;
+RETURN l <> r;
 CREATE OPERATOR test_schema.<=> (
     LEFTARG = integer, RIGHTARG = integer, FUNCTION = test_schema.pg19_sqlbody_ne
 );
@@ -4704,11 +5096,17 @@ RETURN p::test_schema.pg19_sqlbody_pair;
 CREATE FUNCTION public.pg19_sqlbody_z_pub_callee(p integer) RETURNS integer
 LANGUAGE sql IMMUTABLE
 RETURN p * 2;
-CREATE FUNCTION public.pg19_sqlbody_a_pub_caller(p integer) RETURNS integer
-LANGUAGE sql IMMUTABLE
-BEGIN ATOMIC
-    SELECT public.pg19_sqlbody_z_pub_callee(p) + 1;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION public.pg19_sqlbody_a_pub_caller(p integer) RETURNS integer
+        LANGUAGE sql IMMUTABLE
+        BEGIN ATOMIC
+            SELECT public.pg19_sqlbody_z_pub_callee(p) + 1;
+        END
+    $sql$;
+END
+$stmt$;
 CREATE VIEW public.pg19_sqlbody_pub_view AS
 SELECT id FROM public.pg19_sqlbody_public_target;
 CREATE FUNCTION public.pg19_sqlbody_pub_view_count() RETURNS bigint
@@ -4729,21 +5127,39 @@ RETURN (SELECT count(*) FROM public.pg19_sqlbody_pub_view);
 -- every column of that type, with its data.
 CREATE TABLE test_schema.rv_cascade_codes (code varchar(10) PRIMARY KEY);
 INSERT INTO test_schema.rv_cascade_codes VALUES ('ok');
-CREATE FUNCTION test_schema.rv_cascade_is_valid(x text) RETURNS boolean
-LANGUAGE sql STABLE
-BEGIN ATOMIC
-    SELECT EXISTS (SELECT 1 FROM test_schema.rv_cascade_codes WHERE code = x);
-END;
-CREATE FUNCTION test_schema.rv_cascade_norm(x text) RETURNS text
-LANGUAGE sql IMMUTABLE
-BEGIN ATOMIC
-    SELECT lower(x) || coalesce((SELECT min(code) FROM test_schema.rv_cascade_codes WHERE false), '');
-END;
-CREATE FUNCTION test_schema.rv_cascade_first_code() RETURNS text
-LANGUAGE sql STABLE
-BEGIN ATOMIC
-    SELECT min(code) FROM test_schema.rv_cascade_codes;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_cascade_is_valid(x text) RETURNS boolean
+        LANGUAGE sql STABLE
+        BEGIN ATOMIC
+            SELECT EXISTS (SELECT 1 FROM test_schema.rv_cascade_codes WHERE code = x);
+        END
+    $sql$;
+END
+$stmt$;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_cascade_norm(x text) RETURNS text
+        LANGUAGE sql IMMUTABLE
+        BEGIN ATOMIC
+            SELECT lower(x) || coalesce((SELECT min(code) FROM test_schema.rv_cascade_codes WHERE false), '');
+        END
+    $sql$;
+END
+$stmt$;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_cascade_first_code() RETURNS text
+        LANGUAGE sql STABLE
+        BEGIN ATOMIC
+            SELECT min(code) FROM test_schema.rv_cascade_codes;
+        END
+    $sql$;
+END
+$stmt$;
 CREATE DOMAIN test_schema.rv_cascade_code_d AS text
     CONSTRAINT rv_cascade_code_d_check CHECK (test_schema.rv_cascade_is_valid(VALUE));
 -- The domain depends on its default: DROP ... CASCADE of rv_cascade_first_code
@@ -4930,11 +5346,17 @@ GRANT SELECT ON test_schema.rv_pcascade_items_mv TO pgc_pg19_pcascade_reader;
 COMMENT ON MATERIALIZED VIEW test_schema.rv_pcascade_items_mv IS 'rv_pcascade: over the view';
 -- A SQL-standard body reading the second view: PUBLIC and the function
 -- default's grantee are revoked, the reader granted.
-CREATE FUNCTION data.rv_pcascade_count() RETURNS bigint
-LANGUAGE sql STABLE
-BEGIN ATOMIC
-    SELECT count(*) FROM test_schema.rv_pcascade_items_v2;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION data.rv_pcascade_count() RETURNS bigint
+        LANGUAGE sql STABLE
+        BEGIN ATOMIC
+            SELECT count(*) FROM test_schema.rv_pcascade_items_v2;
+        END
+    $sql$;
+END
+$stmt$;
 REVOKE EXECUTE ON FUNCTION data.rv_pcascade_count() FROM PUBLIC, pgc_pg19_pcascade_exec;
 GRANT EXECUTE ON FUNCTION data.rv_pcascade_count() TO pgc_pg19_pcascade_reader;
 -- A rule on the second view reading the first; its actions run as the
@@ -4996,11 +5418,17 @@ GRANT SELECT ON public.rv_pcascade_int_v TO pgc_pg19_pcascade_owner WITH GRANT O
 --     the event trigger is dropped before any table (it would fail the drop
 --     of its own log table)
 CREATE TABLE test_schema.rv_preclear_cycle (x integer);
-CREATE FUNCTION test_schema.rv_preclear_cycle_max() RETURNS integer
-LANGUAGE sql STABLE
-BEGIN ATOMIC
-    SELECT max(x) FROM test_schema.rv_preclear_cycle;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_preclear_cycle_max() RETURNS integer
+        LANGUAGE sql STABLE
+        BEGIN ATOMIC
+            SELECT max(x) FROM test_schema.rv_preclear_cycle;
+        END
+    $sql$;
+END
+$stmt$;
 ALTER TABLE test_schema.rv_preclear_cycle
     ADD CONSTRAINT rv_preclear_cycle_chk
     CHECK (x IS NULL OR x > -1000000 OR test_schema.rv_preclear_cycle_max() IS NULL);
@@ -5011,11 +5439,17 @@ CREATE VIEW test_schema.rv_preclear_rule_count AS
 CREATE RULE rv_preclear_rule_log_count AS ON INSERT TO test_schema.rv_preclear_rule_src
     DO ALSO INSERT INTO test_schema.rv_preclear_rule_log
         SELECT n FROM test_schema.rv_preclear_rule_count;
-CREATE FUNCTION test_schema.rv_preclear_schema_count() RETURNS bigint
-LANGUAGE sql STABLE
-BEGIN ATOMIC
-    SELECT count(*) FROM information_schema.schemata;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_preclear_schema_count() RETURNS bigint
+        LANGUAGE sql STABLE
+        BEGIN ATOMIC
+            SELECT count(*) FROM information_schema.schemata;
+        END
+    $sql$;
+END
+$stmt$;
 CREATE TABLE test_schema.rv_preclear_snap (
     n bigint DEFAULT test_schema.rv_preclear_schema_count()
 );
@@ -5027,20 +5461,32 @@ CREATE AGGREGATE test_schema.rv_preclear_agg(integer) (
     INITCOND = '0'
 );
 CREATE TABLE test_schema.rv_preclear_gen (a integer);
-CREATE FUNCTION test_schema.rv_preclear_gen_bump(x integer) RETURNS integer
-LANGUAGE sql IMMUTABLE
-BEGIN ATOMIC
-    SELECT x + (SELECT count(*) FROM test_schema.rv_preclear_gen)::integer;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_preclear_gen_bump(x integer) RETURNS integer
+        LANGUAGE sql IMMUTABLE
+        BEGIN ATOMIC
+            SELECT x + (SELECT count(*) FROM test_schema.rv_preclear_gen)::integer;
+        END
+    $sql$;
+END
+$stmt$;
 ALTER TABLE test_schema.rv_preclear_gen
     ADD COLUMN g integer GENERATED ALWAYS AS (test_schema.rv_preclear_gen_bump(a)) STORED;
 CREATE VIEW test_schema.rv_preclear_gen_view AS
     SELECT a, g FROM test_schema.rv_preclear_gen;
-CREATE FUNCTION test_schema.rv_preclear_gen_view_count() RETURNS bigint
-LANGUAGE sql STABLE
-BEGIN ATOMIC
-    SELECT count(*) FROM test_schema.rv_preclear_gen_view;
-END;
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE FUNCTION test_schema.rv_preclear_gen_view_count() RETURNS bigint
+        LANGUAGE sql STABLE
+        BEGIN ATOMIC
+            SELECT count(*) FROM test_schema.rv_preclear_gen_view;
+        END
+    $sql$;
+END
+$stmt$;
 CREATE TABLE test_schema.rv_preclear_ddl_log (id bigserial PRIMARY KEY, tag text);
 CREATE FUNCTION test_schema.rv_preclear_log_ddl() RETURNS event_trigger
 LANGUAGE plpgsql AS $$
@@ -5089,8 +5535,16 @@ INSERT INTO test_schema.pg19_domains_usage VALUES (1, 10, 'ok', 'short', 'high',
 -- PG19: the IS JSON CHECK changes ARRAY -> OBJECT (drop + re-add).
 CREATE DOMAIN test_schema.pg19_domains_jsonb AS jsonb;
 CREATE DOMAIN test_schema.pg19_domains_json_doc AS test_schema.pg19_domains_jsonb;
-ALTER DOMAIN test_schema.pg19_domains_json_doc
-    ADD CONSTRAINT pg19_domains_json_doc_shape CHECK (VALUE IS JSON OBJECT);
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER DOMAIN test_schema.pg19_domains_json_doc
+                ADD CONSTRAINT pg19_domains_json_doc_shape CHECK (VALUE IS JSON OBJECT)
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- ==== END fix:domains ====
 
@@ -5323,11 +5777,17 @@ CREATE TABLE test_schema.pg19_rules_log (
     op text
 );
 
-CREATE RULE pg19_rules_chg AS ON INSERT TO test_schema.pg19_rules_src
-    DO INSTEAD (
-        INSERT INTO test_schema.pg19_rules_log (id, op) VALUES (NEW.id, 'v2');
-        INSERT INTO test_schema.pg19_rules_log (id, op) VALUES (NEW.id, 'v2-second');
-    );
+DO $stmt$
+BEGIN
+    EXECUTE $sql$
+        CREATE RULE pg19_rules_chg AS ON INSERT TO test_schema.pg19_rules_src
+            DO INSTEAD (
+                INSERT INTO test_schema.pg19_rules_log (id, op) VALUES (NEW.id, 'v2');
+                INSERT INTO test_schema.pg19_rules_log (id, op) VALUES (NEW.id, 'v2-second');
+            )
+    $sql$;
+END
+$stmt$;
 
 CREATE TABLE test_schema."Pg19 Rules Mixed" (
     id   integer,
@@ -5421,11 +5881,19 @@ CREATE TABLE test_schema.pg19_rules_upsert_front (
     val text
 );
 -- PG19+: ON CONFLICT DO SELECT with a lock strength in a rule action. A
--- syntax error before PostgreSQL 19 (fails harmlessly under ON_ERROR_STOP=0).
-CREATE RULE pg19_rules_upsert AS ON INSERT TO test_schema.pg19_rules_upsert_front
-    DO INSTEAD INSERT INTO test_schema.pg19_rules_upsert_target (id, val)
-    VALUES (NEW.id, NEW.val) ON CONFLICT (id) DO SELECT FOR UPDATE
-    RETURNING pg19_rules_upsert_target.id, pg19_rules_upsert_target.val;
+-- syntax error before PostgreSQL 19, which skips it.
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            CREATE RULE pg19_rules_upsert AS ON INSERT TO test_schema.pg19_rules_upsert_front
+                DO INSTEAD INSERT INTO test_schema.pg19_rules_upsert_target (id, val)
+                VALUES (NEW.id, NEW.val) ON CONFLICT (id) DO SELECT FOR UPDATE
+                RETURNING pg19_rules_upsert_target.id, pg19_rules_upsert_target.val
+        $sql$;
+    END IF;
+END
+$pg19$;
 
 -- ==== END fix:rules ====
 
@@ -5433,7 +5901,7 @@ CREATE RULE pg19_rules_upsert AS ON INSERT TO test_schema.pg19_rules_upsert_fron
 -- TO side. pgc writes a new table's column as serial / bigserial / smallserial
 -- only when that pseudo-type recreates the owned sequence exactly; every other
 -- owned sequence is created before the tables and gets OWNED BY after them.
--- Only the ALTER ... TYPE oid8 needs PG19; on PG14-18 it fails, the column
+-- Only the ALTER ... TYPE oid8 needs PG19; on PG14-18 it is skipped, the column
 -- stays bigint, and that table is an ordinary bigserial.
 
 -- numeric column, owned sequence with the serial-looking name
@@ -5459,7 +5927,15 @@ CREATE TABLE test_schema.pg19_serial_oid8 (
     id    bigint NOT NULL DEFAULT nextval('test_schema.pg19_serial_oid8_id_seq'),
     label text
 );
-ALTER TABLE test_schema.pg19_serial_oid8 ALTER COLUMN id TYPE oid8;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.pg19_serial_oid8 ALTER COLUMN id TYPE oid8
+        $sql$;
+    END IF;
+END
+$pg19$;
 ALTER SEQUENCE test_schema.pg19_serial_oid8_id_seq OWNED BY test_schema.pg19_serial_oid8.id;
 
 -- integer column, bigint owned sequence
@@ -5758,7 +6234,7 @@ $inhck$;
 
 -- A copy kept ENFORCED under a NOT ENFORCED parent, which a recursing
 -- rebuild of the CHECK resets (every version; the enforceability needs
--- PG19, and its ALTER CONSTRAINT fails harmlessly before). TO retypes the
+-- PG19, and its ALTER CONSTRAINT is skipped before). TO retypes the
 -- column the CHECK reads: integer -> bigint, a new collation, and on a
 -- partitioned parent a column that is not its key.
 CREATE TABLE test_schema.inhck_en (
@@ -5766,15 +6242,35 @@ CREATE TABLE test_schema.inhck_en (
     CONSTRAINT inhck_en_a CHECK (a > -1000)
 );
 CREATE TABLE test_schema.inhck_en_child () INHERITS (test_schema.inhck_en);
-ALTER TABLE test_schema.inhck_en ALTER CONSTRAINT inhck_en_a NOT ENFORCED;
-ALTER TABLE test_schema.inhck_en_child ALTER CONSTRAINT inhck_en_a ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.inhck_en ALTER CONSTRAINT inhck_en_a NOT ENFORCED
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.inhck_en_child ALTER CONSTRAINT inhck_en_a ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE TABLE test_schema.inhck_enc (
     t text COLLATE "C",
     CONSTRAINT inhck_enc_t CHECK (t <> 'x')
 );
 CREATE TABLE test_schema.inhck_enc_child () INHERITS (test_schema.inhck_enc);
-ALTER TABLE test_schema.inhck_enc ALTER CONSTRAINT inhck_enc_t NOT ENFORCED;
-ALTER TABLE test_schema.inhck_enc_child ALTER CONSTRAINT inhck_enc_t ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.inhck_enc ALTER CONSTRAINT inhck_enc_t NOT ENFORCED
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.inhck_enc_child ALTER CONSTRAINT inhck_enc_t ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 CREATE TABLE test_schema.inhck_enp (
     k integer NOT NULL,
     a bigint,
@@ -5782,8 +6278,33 @@ CREATE TABLE test_schema.inhck_enp (
 ) PARTITION BY RANGE (k);
 CREATE TABLE test_schema.inhck_enp_1
     PARTITION OF test_schema.inhck_enp FOR VALUES FROM (0) TO (100);
-ALTER TABLE test_schema.inhck_enp ALTER CONSTRAINT inhck_enp_a NOT ENFORCED;
-ALTER TABLE test_schema.inhck_enp_1 ALTER CONSTRAINT inhck_enp_a ENFORCED;
+DO $pg19$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 190000 THEN
+        EXECUTE $sql$
+            ALTER TABLE test_schema.inhck_enp ALTER CONSTRAINT inhck_enp_a NOT ENFORCED
+        $sql$;
+        EXECUTE $sql$
+            ALTER TABLE test_schema.inhck_enp_1 ALTER CONSTRAINT inhck_enp_a ENFORCED
+        $sql$;
+    END IF;
+END
+$pg19$;
 INSERT INTO test_schema.inhck_enp (k, a) VALUES (1, 1);
 
 -- ==== END fix:inhcheck ====
+
+-- ==== BEGIN fix:schemadefacl — a schema the migration creates under the default privileges for schemas ====
+-- Issue #251, for schemas (README section 81): the same database-wide row as
+-- FROM, last again. new_reporting_schema, created at the top of this file,
+-- predates it and keeps a NULL ACL.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgc_fix251_schema_reader') THEN
+        CREATE ROLE pgc_fix251_schema_reader;
+    END IF;
+END;
+$$;
+ALTER DEFAULT PRIVILEGES GRANT USAGE ON SCHEMAS TO pgc_fix251_schema_reader;
+
+-- ==== END fix:schemadefacl ====

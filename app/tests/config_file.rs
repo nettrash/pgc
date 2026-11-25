@@ -29,6 +29,7 @@ fn shipped_sample_config_parses() {
     assert_eq!(config.output, "delta.sql");
     assert!(!config.use_drop);
     assert!(!config.output_for_production);
+    assert!(!config.output_for_splitting_clients);
     // Not set in the sample — must fall back to the documented defaults.
     assert_eq!(config.grants_mode, GrantsMode::Ignore);
     assert_eq!(config.max_connections, 16);
@@ -87,6 +88,7 @@ USE_COMMENTS=false
 GRANTS_MODE=addonly
 MAX_CONNECTIONS=4
 OUTPUT_FOR_PRODUCTION=true
+OUTPUT_FOR_SPLITTING_CLIENTS=true
 ",
     );
 
@@ -115,6 +117,7 @@ OUTPUT_FOR_PRODUCTION=true
     assert_eq!(config.grants_mode, GrantsMode::AddOnly);
     assert_eq!(config.max_connections, 4);
     assert!(config.output_for_production);
+    assert!(config.output_for_splitting_clients);
 }
 
 #[test]
@@ -135,6 +138,7 @@ fn omitted_keys_fall_back_to_defaults() {
     assert_eq!(config.grants_mode, GrantsMode::Ignore);
     assert_eq!(config.max_connections, 16);
     assert!(!config.output_for_production);
+    assert!(!config.output_for_splitting_clients);
 }
 
 #[test]

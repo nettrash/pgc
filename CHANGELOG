@@ -41,6 +41,23 @@
                 such change is listed below.
 
                 Features:
+                    - New --output-for-splitting-clients flag (config
+                      key OUTPUT_FOR_SPLITTING_CLIENTS), default false,
+                      for SQL clients that split a script at every ;
+                      rather than where psql ends a statement, such as
+                      the VS Code PostgreSQL extension. Such a client
+                      sent a routine with a BEGIN ATOMIC body, or a rule
+                      with several actions, in pieces, so the first
+                      piece failed with a syntax error, and it stopped
+                      to ask a value for a $1 outside quotes. With the
+                      flag each such statement is run through a DO block
+                      that EXECUTEs it byte for byte. So is a statement
+                      with a carriage return, which the block writes as
+                      chr(13): VS Code gives a file one kind of line
+                      ending when it opens it, so a CR in a literal or a
+                      body reached the server as a line feed and the
+                      next compare showed the object again. The rest of
+                      the migration is written as before.
                     - PostgreSQL 19 publications. FOR ALL SEQUENCES and
                       FOR ALL TABLES EXCEPT (TABLE ...) are dumped,
                       compared and created, the excluded tables written as
@@ -159,7 +176,21 @@
                       standard_conforming_strings_off, which older
                       dumps may omit.
 
-                Bug fixes: - A publication that switched from FOR ALL
+                Bug fixes: - Resolved issue #251 (a schema the migration
+                creates ignored the default privileges for schemas,
+                ALTER DEFAULT PRIVILEGES ... ON SCHEMAS). In full grants
+                mode a new schema was planned from an empty ACL, so a
+                role the FROM defaults let in kept its USAGE or CREATE
+                on it although TO did not grant them, until the next
+                compare revoked them. A new schema is now planned from
+                the default privileges for schemas of every role that
+                may create it, like the other objects a migration
+                creates. The issue was reported for new functions and
+                procedures under ALTER DEFAULT PRIVILEGES ... ON
+                FUNCTIONS, which this release already plans from those
+                defaults (see the routine fixes below); schemas were the
+                one kind left.
+                - A publication that switched from FOR ALL
                 TABLES to a table list got ALTER PUBLICATION ... SET
                 TABLE, which PostgreSQL rejects on every version ("is
                 defined as FOR ALL TABLES"), so the migration failed and

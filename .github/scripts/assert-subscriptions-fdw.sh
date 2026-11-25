@@ -45,7 +45,7 @@ fi
 if [ "$ver" -ge 190000 ]; then
   # The fixture's PG19 cases must actually exist, or the check above is vacuous.
   for want in "sub|pg19_subfdw_sub_switch | postgres | f | <null> | {pgc_pg19_remote_pub} | pg19_subfdw_srv_b | f | 0 | -1" \
-              "sub|pg19_subfdw_rdt_on | postgres | f | host=127.0.0.1 port=5432 dbname=postgres user=postgres | {pgc_pg19_remote_pub} | - | t | 0 | -1" \
+              "sub|pg19_subfdw_rdt_on | postgres | f | host=/var/run/postgresql port=5432 dbname=postgres user=postgres | {pgc_pg19_remote_pub} | - | t | 0 | -1" \
               "sub|pg19_subfdw_wrt_set | postgres | f | host=127.0.0.1 port=1 dbname=pgc_nowhere | {pgc_pg19_remote_pub} | - | f | 10000 | 2min" \
               "sub|pg19_subfdw_sub_owner_switch | pgc_pg19_subfdw_owner | f | <null> | {pgc_pg19_remote_pub} | pg19_subfdw_srv_owner | f | 0 | -1" \
               "fdw|pg19_subfdw_fdw_added | postgres | postgres_fdw_handler() | postgres_fdw_validator(text[],oid) | {} | postgres_fdw_connection(oid,oid,internal)"; do
