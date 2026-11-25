@@ -20,8 +20,7 @@ fn preserves_triple_newlines_inside_dollar_quotes() {
     let out = strip_comments_and_collapse(input);
     assert!(
         out.contains("'block 1';\n\n\n\n  RAISE NOTICE 'block 2'"),
-        "blank lines inside $$ body must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ body must be preserved, got:\n{out}"
     );
 }
 
@@ -38,8 +37,7 @@ fn preserves_newlines_inside_tagged_dollar_quotes() {
     let out = strip_comments_and_collapse(input);
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $body$ must be preserved, got:\n{}",
-        out
+        "blank lines inside $body$ must be preserved, got:\n{out}"
     );
 }
 
@@ -73,8 +71,7 @@ fn mixed_dollar_quote_and_outside_newlines() {
     );
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $$ must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ must be preserved, got:\n{out}"
     );
 }
 
@@ -133,8 +130,7 @@ fn preserves_newlines_inside_single_quoted_string() {
     let out = strip_comments_and_collapse("COMMENT ON TABLE t IS 'line1\n\n\n\nline5';\n");
     assert!(
         out.contains("'line1\n\n\n\nline5'"),
-        "newlines inside single-quoted string must be preserved, got:\n{}",
-        out
+        "newlines inside single-quoted string must be preserved, got:\n{out}"
     );
 }
 
@@ -143,8 +139,7 @@ fn preserves_newlines_inside_e_string() {
     let out = strip_comments_and_collapse("SELECT E'first\n\n\n\nlast';\n");
     assert!(
         out.contains("E'first\n\n\n\nlast'"),
-        "newlines inside E-string must be preserved, got:\n{}",
-        out
+        "newlines inside E-string must be preserved, got:\n{out}"
     );
 }
 
@@ -153,8 +148,7 @@ fn preserves_newlines_inside_double_quoted_identifier() {
     let out = strip_comments_and_collapse("SELECT \"col\n\n\n\nname\";\n");
     assert!(
         out.contains("\"col\n\n\n\nname\""),
-        "newlines inside double-quoted identifier must be preserved, got:\n{}",
-        out
+        "newlines inside double-quoted identifier must be preserved, got:\n{out}"
     );
 }
 
@@ -169,21 +163,20 @@ fn e_string_with_escaped_quote_and_newlines() {
     let out = strip_comments_and_collapse("SELECT E'it\\'s\n\n\n\nfine';\n");
     assert!(
         out.contains("E'it\\'s\n\n\n\nfine'"),
-        "E-string with escaped quote and newlines must be preserved, got:\n{}",
-        out
+        "E-string with escaped quote and newlines must be preserved, got:\n{out}"
     );
 }
 
 #[test]
 fn single_quoted_doubled_quote_and_newlines() {
     let out = strip_comments_and_collapse("SELECT 'it''s\n\n\n\nfine';\n");
-    assert!(out.contains("'it''s\n\n\n\nfine'"), "got:\n{}", out);
+    assert!(out.contains("'it''s\n\n\n\nfine'"), "got:\n{out}");
 }
 
 #[test]
 fn lowercase_e_string_preserves_newlines() {
     let out = strip_comments_and_collapse("SELECT e'first\n\n\n\nlast';\n");
-    assert!(out.contains("e'first\n\n\n\nlast'"), "got:\n{}", out);
+    assert!(out.contains("e'first\n\n\n\nlast'"), "got:\n{out}");
 }
 
 #[test]

@@ -586,13 +586,13 @@ impl PgType {
                 let mut clauses = Vec::new();
 
                 if let Some(collation) = &self.domain_collation_name {
-                    clauses.push(format!("collate {}", collation));
+                    clauses.push(format!("collate {collation}"));
                 }
 
                 if let Some(default) = &self.typdefault
                     && !default.trim().is_empty()
                 {
-                    clauses.push(format!("default {}", default));
+                    clauses.push(format!("default {default}"));
                 }
 
                 if self.typnotnull {
@@ -682,16 +682,16 @@ impl PgType {
                     self.range_subtype.as_deref().unwrap_or("unknown")
                 );
                 if let Some(collation) = &self.range_collation {
-                    script.push_str(&format!(",\n    collation = {}", collation));
+                    script.push_str(&format!(",\n    collation = {collation}"));
                 }
                 if let Some(opclass) = &self.range_opclass {
-                    script.push_str(&format!(",\n    subtype_opclass = {}", opclass));
+                    script.push_str(&format!(",\n    subtype_opclass = {opclass}"));
                 }
                 if let Some(canonical) = &self.range_canonical {
-                    script.push_str(&format!(",\n    canonical = {}", canonical));
+                    script.push_str(&format!(",\n    canonical = {canonical}"));
                 }
                 if let Some(subdiff) = &self.range_subdiff {
-                    script.push_str(&format!(",\n    subtype_diff = {}", subdiff));
+                    script.push_str(&format!(",\n    subtype_diff = {subdiff}"));
                 }
                 if let Some(multirange) = &self.multirange_name {
                     // Qualified: PostgreSQL creates an unqualified
@@ -1331,7 +1331,7 @@ impl PgType {
                 let drop_script = self.get_drop_script();
                 let create_script = target.get_script();
                 if use_drop {
-                    format!("{}{}", drop_script, create_script)
+                    format!("{drop_script}{create_script}")
                 } else {
                     let commented = format!(
                         "-- use_drop=false: range type {}.{} requires drop+recreate; statements commented out\n{}{}",

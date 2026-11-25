@@ -311,6 +311,16 @@ struct MoveChecks {
     readds: Vec<TableConstraint>,
 }
 
+/// What `Comparer::inherited_adds` plans for one table (see
+/// [`InheritedRecreates`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct InheritedAdds {
+    /// [`InheritedRecreates::added_by_ancestor`].
+    pub(crate) added: HashMap<String, TableColumn>,
+    /// [`InheritedRecreates::dropped_after_leaving`].
+    pub(crate) dropped: Vec<String>,
+}
+
 /// The per-table answer of `Comparer::table_alter_caps`, keyed by FROM table
 /// `(schema, name)`.
 type TableAlterCapsMap = HashMap<(String, String), TableAlterCaps>;
@@ -2127,7 +2137,7 @@ impl Comparer {
             Some(a) => a,
             None => return false,
         };
-        let qualified = format!("{}.{}", schema, name);
+        let qualified = format!("{schema}.{name}");
         let refs: Vec<&str> = [
             Some(agg.sfunc.as_str()),
             agg.finalfunc.as_deref(),
@@ -2398,7 +2408,7 @@ impl Comparer {
 
     /// Returns the fully-quoted key used to match a table's `partition_of` reference.
     fn table_key(schema: &str, name: &str) -> String {
-        format!("\"{}\".\"{}\"", schema, name)
+        format!("\"{schema}\".\"{name}\"")
     }
 
     /// Normalise a `partition_of` reference so it can be compared against `table_key`.
@@ -2407,7 +2417,7 @@ impl Comparer {
         s.split('.')
             .map(|part| {
                 let trimmed = part.trim().trim_matches('"');
-                format!("\"{}\"", trimmed)
+                format!("\"{trimmed}\"")
             })
             .collect::<Vec<_>>()
             .join(".")
@@ -4027,6 +4037,213 @@ impl Comparer {
             }
         }
         plans
+    }
+
+    /// [`InheritedRecreates::retype_sources`] for FROM table `key`, whose
+    /// `columns` an ancestor retypes: for each, the TO column of the first
+    /// FROM parent, in the table's list order, that has it. That parent's
+    /// statements on the column reach the table last, as the comparer
+    /// alters parents first.
+    fn retype_sources(
+        &self,
+        key: &(String, String),
+        columns: &HashSet<String>,
+    ) -> HashMap<String, TableColumn> {
+        let mut sources = HashMap::new();
+        let from = &self.from.tables;
+        let Some(table) = from.iter().find(|t| t.schema == key.0 && t.name == key.1) else {
+            return sources;
+        };
+        let index = Self::relation_index(from.iter());
+        for reference in &table.inherits_from {
+            let Some(parent) = Self::lookup_relation(&index, reference).map(|p| &from[p]) else {
+                continue;
+            };
+            let Some(to_parent) = self
+                .to
+                .tables
+                .iter()
+                .find(|t| t.schema == parent.schema && t.name == parent.name)
+            else {
+                continue;
+            };
+            for column in columns {
+                if sources.contains_key(column) || !parent.columns.iter().any(|c| &c.name == column)
+                {
+                    continue;
+                }
+                if let Some(to_col) = to_parent.columns.iter().find(|c| &c.name == column) {
+                    sources.insert(column.clone(), to_col.clone());
+                }
+            }
+        }
+        sources
+    }
+
+    /// The columns, keyed by FROM table `(schema, name)`, that an
+    /// `INHERITS` parent's alter creates on a table before the table's own
+    /// alter runs (see [`InheritedRecreates::added_by_ancestor`] and
+    /// [`InheritedRecreates::dropped_after_leaving`]).
+    ///
+    /// A parent gains a column when it is altered in place (not a
+    /// partition, no `DROP TABLE`), FROM lacks the column and TO has it,
+    /// and it is not an identity column, which PostgreSQL refuses to add to
+    /// a table with children. Whether through its own `ADD COLUMN` or
+    /// through one of its parents', the column is there once its alter has
+    /// run. Its `ADD COLUMN` reaches every table that still inherits from
+    /// it, so a FROM child that lacks the column gets it too:
+    ///
+    /// * from a parent the child keeps, whatever the order of the two
+    ///   alters, as the link holds throughout. The comparer alters parents
+    ///   first, a table that joins new parents after every other and its TO
+    ///   descendants after it;
+    /// * from a parent the child leaves (`NO INHERIT`, in its own alter),
+    ///   only when the parent's alter runs first. It does unless the parent
+    ///   itself, or an ancestor it keeps, joins new parents: those are
+    ///   altered after every other table, which leaves the child to add the
+    ///   column itself, as before.
+    ///
+    /// A child that keeps the column in TO has the copy diffed against what
+    /// the parent's statements leave there, which is the parent's TO
+    /// column: each of them recurses. A child that leaves the parent and
+    /// does not have the column in TO drops it after its `NO INHERIT`. A
+    /// child that already has a column of that name has the parent's add
+    /// merged into it, and needs nothing.
+    pub(crate) fn inherited_adds(&self) -> HashMap<(String, String), InheritedAdds> {
+        let mut plans: HashMap<(String, String), InheritedAdds> = HashMap::new();
+        let from = &self.from.tables;
+        if from.iter().all(|t| t.inherits_from.is_empty()) {
+            return plans;
+        }
+        let to_by_key: HashMap<(&str, &str), &Table> = self
+            .to
+            .tables
+            .iter()
+            .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+            .collect();
+        let index = Self::relation_index(from.iter());
+        let n = from.len();
+        // The TO table of each FROM table altered in place.
+        let to_of: Vec<Option<&Table>> = from
+            .iter()
+            .map(|table| {
+                let &to_table = to_by_key.get(&(table.schema.as_str(), table.name.as_str()))?;
+                (table.partition_of.is_none() && !table.will_be_dropped_and_recreated(to_table))
+                    .then_some(to_table)
+            })
+            .collect();
+        // Each table's FROM parents, in its list's order, with whether TO
+        // keeps the link (see `Table::inheritance_moves`).
+        let parents: Vec<Vec<(usize, bool)>> = from
+            .iter()
+            .enumerate()
+            .map(|(i, table)| {
+                let kept = match to_of[i] {
+                    Some(to_table) => {
+                        table.inherits_from.len() - table.inheritance_moves(to_table).0.len()
+                    }
+                    None => table.inherits_from.len(),
+                };
+                table
+                    .inherits_from
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, reference)| {
+                        Self::lookup_relation(&index, reference)
+                            .filter(|&j| j != i)
+                            .map(|j| (j, position < kept))
+                    })
+                    .collect()
+            })
+            .collect();
+        // The tables altered after every other: those that join new
+        // parents, and the ones under them through a link they keep.
+        let mut late: Vec<bool> = (0..n)
+            .map(|i| to_of[i].is_some_and(|to| !from[i].inheritance_moves(to).1.is_empty()))
+            .collect();
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                if !late[i] && parents[i].iter().any(|&(p, kept)| kept && late[p]) {
+                    late[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let gained = |i: usize| -> Vec<&TableColumn> {
+            let Some(to_table) = to_of[i] else {
+                return Vec::new();
+            };
+            to_table
+                .columns
+                .iter()
+                .filter(|to_col| {
+                    !to_col.is_identity && !from[i].columns.iter().any(|c| c.name == to_col.name)
+                })
+                .collect()
+        };
+
+        for (c, child) in from.iter().enumerate() {
+            let Some(to_child) = to_of[c] else {
+                continue;
+            };
+            let mut plan = InheritedAdds::default();
+            for &(p, kept) in &parents[c] {
+                if !kept && late[p] {
+                    continue;
+                }
+                for parent_col in gained(p) {
+                    let name = &parent_col.name;
+                    if child.columns.iter().any(|col| &col.name == name)
+                        || plan.added.contains_key(name)
+                        || plan.dropped.contains(name)
+                    {
+                        continue;
+                    }
+                    match to_child.columns.iter().find(|col| &col.name == name) {
+                        Some(child_col) => {
+                            plan.added
+                                .insert(name.clone(), Self::inherited_copy(parent_col, child_col));
+                        }
+                        None if !kept => plan.dropped.push(name.clone()),
+                        // TO has no table without the columns of a parent.
+                        None => {}
+                    }
+                }
+            }
+            if plan != InheritedAdds::default() {
+                plans.insert((child.schema.clone(), child.name.clone()), plan);
+            }
+        }
+        plans
+    }
+
+    /// The copy of `parent_col` that a parent's `ADD COLUMN` and the
+    /// statements after it leave on the child whose TO column is
+    /// `child_col` (see [`Self::inherited_adds`]): the parent's definition,
+    /// its storage, compression and statistics target included, as each
+    /// of those statements recurses. A default statistics target is taken
+    /// as the child's own form of it, as -1 and none are the same; the
+    /// comment is the child's, which the alter writes either way.
+    fn inherited_copy(parent_col: &TableColumn, child_col: &TableColumn) -> TableColumn {
+        TableColumn {
+            schema: child_col.schema.clone(),
+            table: child_col.table.clone(),
+            ordinal_position: child_col.ordinal_position,
+            storage: parent_col
+                .storage
+                .clone()
+                .or_else(|| child_col.type_storage.clone()),
+            statistics_target: parent_col
+                .statistics_target
+                .filter(|target| *target >= 0)
+                .or_else(|| child_col.statistics_target.filter(|target| *target < 0)),
+            comment: child_col.comment.clone(),
+            ..parent_col.clone()
+        }
     }
 
     /// The FROM objects that block a column drop the table phase runs to
@@ -8181,8 +8398,8 @@ impl Comparer {
     /// [`InheritedRecreates`]): the generated-column drop + adds the family
     /// shares, the members whose rows an ancestor's alter rewrites first,
     /// the CHECK constraints the family drops and re-adds together, the
-    /// columns an ancestor's alter retypes, and what attaching or detaching
-    /// a partition moves. `compare_tables` adds the foreign keys dropped
+    /// columns an ancestor's alter retypes or adds, and what attaching or
+    /// detaching a partition moves. `compare_tables` adds the foreign keys dropped
     /// ahead; `Comparer::typed_retype_pre_section` reads the same plan
     /// before the composite section.
     fn plan_inherited_recreates(
@@ -8222,10 +8439,15 @@ impl Comparer {
             }
         }
         for (key, columns) in self.inherited_retypes(alter_caps) {
-            inherited_recreates
-                .entry(key)
-                .or_default()
-                .retyped_by_ancestor = columns;
+            let sources = self.retype_sources(&key, &columns);
+            let plan = inherited_recreates.entry(key).or_default();
+            plan.retype_sources = sources;
+            plan.retyped_by_ancestor = columns;
+        }
+        for (key, adds) in self.inherited_adds() {
+            let plan = inherited_recreates.entry(key).or_default();
+            plan.added_by_ancestor = adds.added;
+            plan.dropped_after_leaving = adds.dropped;
         }
         for (key, names) in self.triggers_dropped_before_attach() {
             inherited_recreates
@@ -17415,10 +17637,10 @@ fn column_recreate_block(column: &TableColumn) -> String {
 /// returned unchanged rather than corrupted.
 fn inject_if_not_exists_into_create_index(script: &str) -> String {
     if let Some(rest) = script.strip_prefix("CREATE UNIQUE INDEX ") {
-        return format!("CREATE UNIQUE INDEX IF NOT EXISTS {}", rest);
+        return format!("CREATE UNIQUE INDEX IF NOT EXISTS {rest}");
     }
     if let Some(rest) = script.strip_prefix("CREATE INDEX ") {
-        return format!("CREATE INDEX IF NOT EXISTS {}", rest);
+        return format!("CREATE INDEX IF NOT EXISTS {rest}");
     }
     script.to_string()
 }
@@ -17469,7 +17691,7 @@ fn view_recreate_block(view: &View) -> String {
 /// it is returned unchanged.
 fn rewrite_create_view_to_create_or_replace(script: &str) -> String {
     if let Some(rest) = script.strip_prefix("create view ") {
-        return format!("CREATE OR REPLACE VIEW {}", rest);
+        return format!("CREATE OR REPLACE VIEW {rest}");
     }
     script.to_string()
 }

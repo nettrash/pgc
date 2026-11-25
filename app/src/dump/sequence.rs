@@ -192,7 +192,7 @@ impl Sequence {
             self.owned_by_column.as_deref(),
         ) {
             (Some(schema), Some(table), Some(column)) => {
-                Some(format!("owned by {}.{}.{}", schema, table, column))
+                Some(format!("owned by {schema}.{table}.{column}"))
             }
             _ => None,
         }

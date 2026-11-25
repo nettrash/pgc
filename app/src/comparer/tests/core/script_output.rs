@@ -559,8 +559,7 @@ fn get_script_preserves_triple_newlines_inside_dollar_quotes() {
     // The three consecutive newlines inside $$ must survive
     assert!(
         out.contains("'block 1';\n\n\n\n  RAISE NOTICE 'block 2'"),
-        "blank lines inside $$ body must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ body must be preserved, got:\n{out}"
     );
 }
 
@@ -580,8 +579,7 @@ fn get_script_preserves_newlines_inside_tagged_dollar_quotes() {
     let out = c.get_script();
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $body$ must be preserved, got:\n{}",
-        out
+        "blank lines inside $body$ must be preserved, got:\n{out}"
     );
 }
 
@@ -622,8 +620,7 @@ fn get_script_mixed_dollar_quote_and_outside_newlines() {
     // Inside: preserved
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $$ must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ must be preserved, got:\n{out}"
     );
 }
 
@@ -660,8 +657,7 @@ fn get_script_strips_comments_but_preserves_dollar_body_newlines() {
     // Dollar body preserved
     assert!(
         out.contains("BEGIN\n\n\n\n  NULL;"),
-        "blank lines inside $$ body must be preserved, got:\n{}",
-        out
+        "blank lines inside $$ body must be preserved, got:\n{out}"
     );
 }
 
@@ -682,8 +678,7 @@ fn get_script_unterminated_dollar_quote_copies_to_end() {
     let out = c.get_script();
     assert!(
         out.contains("\n\n\n\n"),
-        "unterminated $$ body newlines must be preserved, got:\n{}",
-        out
+        "unterminated $$ body newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -695,8 +690,7 @@ fn get_script_preserves_newlines_inside_single_quoted_string() {
     let out = c.get_script();
     assert!(
         out.contains("'line1\n\n\n\nline5'"),
-        "newlines inside single-quoted string must be preserved, got:\n{}",
-        out
+        "newlines inside single-quoted string must be preserved, got:\n{out}"
     );
 }
 
@@ -708,8 +702,7 @@ fn get_script_preserves_newlines_inside_e_string() {
     let out = c.get_script();
     assert!(
         out.contains("E'first\n\n\n\nlast'"),
-        "newlines inside E-string must be preserved, got:\n{}",
-        out
+        "newlines inside E-string must be preserved, got:\n{out}"
     );
 }
 
@@ -721,8 +714,7 @@ fn get_script_preserves_newlines_inside_double_quoted_identifier() {
     let out = c.get_script();
     assert!(
         out.contains("\"col\n\n\n\nname\""),
-        "newlines inside double-quoted identifier must be preserved, got:\n{}",
-        out
+        "newlines inside double-quoted identifier must be preserved, got:\n{out}"
     );
 }
 
@@ -743,8 +735,7 @@ fn get_script_e_string_with_escaped_quote_and_newlines() {
     let out = c.get_script();
     assert!(
         out.contains("E'it\\'s\n\n\n\nfine'"),
-        "E-string with escaped quote and newlines must be preserved, got:\n{}",
-        out
+        "E-string with escaped quote and newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -756,8 +747,7 @@ fn get_script_single_quoted_doubled_quote_and_newlines() {
     let out = c.get_script();
     assert!(
         out.contains("'it''s\n\n\n\nfine'"),
-        "single-quoted string with doubled quote and newlines must be preserved, got:\n{}",
-        out
+        "single-quoted string with doubled quote and newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -769,8 +759,7 @@ fn get_script_lowercase_e_string_preserves_newlines() {
     let out = c.get_script();
     assert!(
         out.contains("e'first\n\n\n\nlast'"),
-        "newlines inside lowercase e-string must be preserved, got:\n{}",
-        out
+        "newlines inside lowercase e-string must be preserved, got:\n{out}"
     );
 }
 
@@ -781,8 +770,7 @@ fn get_script_unterminated_single_quoted_string_copies_to_end() {
     let out = c.get_script();
     assert!(
         out.contains("\n\n\n\n"),
-        "unterminated single-quoted string newlines must be preserved, got:\n{}",
-        out
+        "unterminated single-quoted string newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -793,8 +781,7 @@ fn get_script_unterminated_e_string_copies_to_end() {
     let out = c.get_script();
     assert!(
         out.contains("\n\n\n\n"),
-        "unterminated E-string newlines must be preserved, got:\n{}",
-        out
+        "unterminated E-string newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -805,8 +792,7 @@ fn get_script_unterminated_double_quoted_identifier_copies_to_end() {
     let out = c.get_script();
     assert!(
         out.contains("\n\n\n\n"),
-        "unterminated double-quoted identifier newlines must be preserved, got:\n{}",
-        out
+        "unterminated double-quoted identifier newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -828,19 +814,16 @@ fn get_script_newline_count_resets_after_single_quoted_literal() {
     let out = c.get_script();
     assert!(
         out.contains("'inside\n\n\n\ntext'"),
-        "newlines inside literal must be preserved, got:\n{}",
-        out
+        "newlines inside literal must be preserved, got:\n{out}"
     );
     // The two newlines before and after the literal should survive.
     assert!(
         out.contains("A;\n\n'inside"),
-        "two newlines before literal should survive, got:\n{}",
-        out
+        "two newlines before literal should survive, got:\n{out}"
     );
     assert!(
         out.contains("';\n\nB;"),
-        "two newlines after literal should survive, got:\n{}",
-        out
+        "two newlines after literal should survive, got:\n{out}"
     );
 }
 
@@ -896,8 +879,7 @@ fn get_script_mixed_literal_types_with_newlines() {
         .unwrap();
     assert!(
         !between_stmts.contains("\n\n\n"),
-        "newlines between statements should be collapsed, got segment: {:?}",
-        between_stmts
+        "newlines between statements should be collapsed, got segment: {between_stmts:?}"
     );
 }
 
@@ -919,8 +901,7 @@ fn get_script_double_quoted_doubled_escape_and_newlines() {
     let out = c.get_script();
     assert!(
         out.contains("\"col\"\"\n\n\n\nname\""),
-        "double-quoted identifier with escaped quote and newlines must be preserved, got:\n{}",
-        out
+        "double-quoted identifier with escaped quote and newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -937,8 +918,7 @@ fn get_script_comment_stripped_but_single_quoted_newlines_preserved() {
     assert!(!out.contains("-- strip this"), "comment should be removed");
     assert!(
         out.contains("'multi\n\n\n\nline'"),
-        "single-quoted newlines must survive comment stripping + collapsing, got:\n{}",
-        out
+        "single-quoted newlines must survive comment stripping + collapsing, got:\n{out}"
     );
 }
 
@@ -953,8 +933,7 @@ fn get_script_block_comment_stripped_but_e_string_newlines_preserved() {
     );
     assert!(
         out.contains("E'keep\n\n\n\nme'"),
-        "E-string newlines must survive after block comment stripping, got:\n{}",
-        out
+        "E-string newlines must survive after block comment stripping, got:\n{out}"
     );
 }
 
@@ -966,13 +945,11 @@ fn get_script_adjacent_single_quoted_strings_both_preserved() {
     let out = c.get_script();
     assert!(
         out.contains("'a\n\n\n\nb'"),
-        "first literal newlines must be preserved, got:\n{}",
-        out
+        "first literal newlines must be preserved, got:\n{out}"
     );
     assert!(
         out.contains("'c\n\n\n\nd'"),
-        "second literal newlines must be preserved, got:\n{}",
-        out
+        "second literal newlines must be preserved, got:\n{out}"
     );
 }
 
@@ -992,8 +969,7 @@ fn get_script_dollar_body_containing_single_quoted_newlines() {
     let out = c.get_script();
     assert!(
         out.contains("'msg\n\n\n\nend'"),
-        "single-quoted literal inside dollar body must be preserved, got:\n{}",
-        out
+        "single-quoted literal inside dollar body must be preserved, got:\n{out}"
     );
 }
 
@@ -1024,13 +1000,11 @@ fn get_script_multiple_e_strings_on_same_line() {
     let out = c.get_script();
     assert!(
         out.contains("E'x\n\n\n\ny'"),
-        "first E-string newlines must be preserved, got:\n{}",
-        out
+        "first E-string newlines must be preserved, got:\n{out}"
     );
     assert!(
         out.contains("E'a\n\n\n\nb'"),
-        "second E-string newlines must be preserved, got:\n{}",
-        out
+        "second E-string newlines must be preserved, got:\n{out}"
     );
 }
 

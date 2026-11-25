@@ -76,9 +76,9 @@ impl Operator {
 
     fn operand_signature(&self) -> String {
         match (&self.left_type, &self.right_type) {
-            (Some(l), Some(r)) => format!("{}, {}", l, r),
-            (Some(l), None) => format!("{}, NONE", l),
-            (None, Some(r)) => format!("NONE, {}", r),
+            (Some(l), Some(r)) => format!("{l}, {r}"),
+            (Some(l), None) => format!("{l}, NONE"),
+            (None, Some(r)) => format!("NONE, {r}"),
             (None, None) => "NONE, NONE".to_string(),
         }
     }
@@ -93,16 +93,16 @@ impl Operator {
             ),
         ];
         if let Some(c) = &self.commutator {
-            opts.push(format!("COMMUTATOR = {}", c));
+            opts.push(format!("COMMUTATOR = {c}"));
         }
         if let Some(n) = &self.negator {
-            opts.push(format!("NEGATOR = {}", n));
+            opts.push(format!("NEGATOR = {n}"));
         }
         if let Some(r) = &self.restrict {
-            opts.push(format!("RESTRICT = {}", r));
+            opts.push(format!("RESTRICT = {r}"));
         }
         if let Some(j) = &self.join {
-            opts.push(format!("JOIN = {}", j));
+            opts.push(format!("JOIN = {j}"));
         }
         if self.is_hashes {
             opts.push("HASHES".to_string());

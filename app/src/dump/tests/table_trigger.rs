@@ -428,7 +428,7 @@ fn test_trigger_with_very_long_definition() {
     assert_eq!(trigger.definition, long_definition);
 
     let script = trigger.get_script("public", "t");
-    assert_eq!(script, format!("{};\n\n", long_definition));
+    assert_eq!(script, format!("{long_definition};\n\n"));
 
     // Hash should work with very long definitions
     let mut hasher = Sha256::new();

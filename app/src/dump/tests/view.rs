@@ -241,14 +241,13 @@ fn test_get_alter_script_materialized_use_drop_false() {
     // Should contain a warning about manual intervention
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should contain a warning comment, script:\n{}",
-        script
+        "should contain a warning comment, script:\n{script}"
     );
 
     // Both drop and create should be commented out
     for line in script.lines() {
         if line.contains("drop materialized view") || line.contains("create materialized view") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }
@@ -263,7 +262,7 @@ fn test_get_alter_script_materialized_use_drop_true_contains_active_drop() {
     // The drop line should NOT be commented
     for line in script.lines() {
         if line.contains("drop materialized view") {
-            assert!(!line.starts_with("--"), "drop should be active: {}", line);
+            assert!(!line.starts_with("--"), "drop should be active: {line}");
         }
     }
 }
@@ -291,8 +290,7 @@ fn test_get_alter_script_regular_to_materialized_drops_view() {
     // DROP must target the current kind (regular view), not the target kind
     assert!(
         script.contains("drop view if exists"),
-        "should drop the regular view, script:\n{}",
-        script
+        "should drop the regular view, script:\n{script}"
     );
     assert!(
         !script.contains("drop materialized view"),
@@ -312,8 +310,7 @@ fn test_get_alter_script_materialized_to_regular_drops_materialized() {
     // DROP must target the current kind (materialized view)
     assert!(
         script.contains("drop materialized view if exists"),
-        "should drop the materialized view, script:\n{}",
-        script
+        "should drop the materialized view, script:\n{script}"
     );
     // Then create the regular view
     assert!(script.contains("create view"));
@@ -328,14 +325,13 @@ fn test_get_alter_script_regular_to_materialized_use_drop_false() {
 
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should warn about manual intervention, script:\n{}",
-        script
+        "should warn about manual intervention, script:\n{script}"
     );
 
     // Both drop and create should be commented out
     for line in script.lines() {
         if line.contains("drop view") || line.contains("create materialized view") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }
@@ -349,13 +345,12 @@ fn test_get_alter_script_materialized_to_regular_use_drop_false() {
 
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should warn about manual intervention, script:\n{}",
-        script
+        "should warn about manual intervention, script:\n{script}"
     );
 
     for line in script.lines() {
         if line.contains("drop materialized view") || line.contains("create view") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }

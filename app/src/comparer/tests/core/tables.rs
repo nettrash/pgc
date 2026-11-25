@@ -650,7 +650,7 @@ async fn partition_child_non_pk_col_type_change_no_recreate() {
         vec![],
         None,
     );
-    from_child.partition_of = Some(format!("{}.{}", schema, tbl));
+    from_child.partition_of = Some(format!("{schema}.{tbl}"));
     from_child.partition_bound =
         Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
     from_child.hash();
@@ -693,7 +693,7 @@ async fn partition_child_non_pk_col_type_change_no_recreate() {
         vec![],
         None,
     );
-    to_child.partition_of = Some(format!("{}.{}", schema, tbl));
+    to_child.partition_of = Some(format!("{schema}.{tbl}"));
     to_child.partition_bound = Some("FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')".to_string());
     to_child.hash();
 
@@ -721,10 +721,9 @@ async fn partition_child_non_pk_col_type_change_no_recreate() {
     );
     // Child should NOT be recreated
     assert!(
-        !script.to_lowercase().contains(&format!(
-            "create table {}.{} partition of",
-            schema, child_tbl
-        )),
+        !script
+            .to_lowercase()
+            .contains(&format!("create table {schema}.{child_tbl} partition of")),
         "Partition child must not be recreated, got: {script}"
     );
     assert!(
@@ -943,8 +942,7 @@ async fn fk_pre_drop_commented_when_use_drop_false() {
     });
     assert!(
         has_commented_fk_drop,
-        "FK pre-drop should be commented out when use_drop=false, script:\n{}",
-        script
+        "FK pre-drop should be commented out when use_drop=false, script:\n{script}"
     );
 
     // Should NOT have an active (uncommented) drop constraint for the FK
@@ -1022,8 +1020,7 @@ async fn fk_pre_drop_active_when_use_drop_true() {
     });
     assert!(
         has_active_fk_drop,
-        "FK pre-drop should be active when use_drop=true, script:\n{}",
-        script
+        "FK pre-drop should be active when use_drop=true, script:\n{script}"
     );
 }
 
@@ -1066,8 +1063,7 @@ async fn trigger_pre_drop_commented_when_use_drop_false() {
     });
     assert!(
         has_commented_trigger_drop,
-        "Trigger pre-drop should be commented when use_drop=false, script:\n{}",
-        script
+        "Trigger pre-drop should be commented when use_drop=false, script:\n{script}"
     );
 
     let has_active_trigger_drop = script.lines().any(|l| {
@@ -1116,8 +1112,7 @@ async fn trigger_pre_drop_active_when_use_drop_true() {
     });
     assert!(
         has_active_trigger_drop,
-        "Trigger pre-drop should be active when use_drop=true, script:\n{}",
-        script
+        "Trigger pre-drop should be active when use_drop=true, script:\n{script}"
     );
 }
 
@@ -4793,4 +4788,346 @@ async fn inhcheck_retype_of_a_column_the_check_does_not_read_restores_nothing() 
         "{script}"
     );
     assert!(!script.contains("alter constraint"), "{script}");
+}
+
+// ---- An INHERITS parent's new column: its ADD COLUMN recurses ----
+
+fn text_col(table: &str, name: &str, ordinal: i32) -> TableColumn {
+    TableColumn {
+        data_type: "text".to_string(),
+        numeric_precision: None,
+        numeric_precision_radix: None,
+        numeric_scale: None,
+        storage: Some("EXTENDED".to_string()),
+        type_storage: Some("EXTENDED".to_string()),
+        ..int_column("public", table, name, ordinal)
+    }
+}
+
+fn add_family(dump: &mut Dump, with_n: bool) {
+    let n = |table: &str, ordinal: i32| with_n.then(|| text_col(table, "n", ordinal));
+    dump.tables.push(plain_table(
+        "z_par",
+        [Some(int_column("public", "z_par", "id", 1)), n("z_par", 2)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        &[],
+    ));
+    // Sorted before its parent on purpose: the order must not matter.
+    dump.tables.push(plain_table(
+        "a_chi",
+        [
+            Some(int_column("public", "a_chi", "id", 1)),
+            n("a_chi", 2),
+            Some(int_column("public", "a_chi", "x", 3)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        &["public.z_par"],
+    ));
+    dump.tables.push(plain_table(
+        "b_grand",
+        [
+            Some(int_column("public", "b_grand", "id", 1)),
+            n("b_grand", 2),
+            Some(int_column("public", "b_grand", "x", 3)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        &["public.a_chi"],
+    ));
+}
+
+#[tokio::test]
+async fn an_inheritance_parents_new_column_is_added_on_the_parent_only() {
+    // The parent's ADD COLUMN recurses to every table that inherits from
+    // it, so the children's own ADD COLUMN failed ("column ... already
+    // exists"). pgc 1.0.x got away with it only when a child sorted first.
+    let mut from = Dump::new(DumpConfig::default());
+    let mut to = Dump::new(DumpConfig::default());
+    add_family(&mut from, false);
+    add_family(&mut to, true);
+    let mut comparer = Comparer::new(from, to, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+    assert!(
+        script.contains("alter table public.z_par add column n text;"),
+        "{script}"
+    );
+    for child in ["a_chi", "b_grand"] {
+        assert!(
+            !script.contains(&format!("alter table public.{child} add column")),
+            "{script}"
+        );
+        assert!(
+            !script.contains(&format!("alter table public.{child} alter column n")),
+            "{script}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_childs_own_settings_on_an_inherited_new_column_are_set_on_its_copy() {
+    // What the child has on top of the parent's definition is set after
+    // the parent's add: its own default, NOT NULL, statistics target and
+    // comment. The parent's storage reaches it with the parent's SET
+    // STORAGE, which recurses, so the child does not set it again.
+    let mut from = Dump::new(DumpConfig::default());
+    let mut to = Dump::new(DumpConfig::default());
+    add_family(&mut from, false);
+    add_family(&mut to, true);
+    for table in to.tables.iter_mut() {
+        let n = table.columns.iter_mut().find(|c| c.name == "n").unwrap();
+        n.storage = Some("MAIN".to_string());
+        if table.name == "z_par" {
+            n.column_default = Some("'p'::text".to_string());
+        }
+        if table.name != "z_par" {
+            // The grandchild has what the child's statements give it.
+            n.column_default = Some("'c'::text".to_string());
+            n.is_nullable = false;
+            n.statistics_target = Some(222);
+        }
+        if table.name == "a_chi" {
+            n.comment = Some("child copy".to_string());
+        }
+        table.hash();
+    }
+    let mut comparer = Comparer::new(from, to, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+    let parent_add = script
+        .find("alter table public.z_par add column n text default 'p'::text;")
+        .expect(&script);
+    let parent_storage = script
+        .find("alter table public.z_par alter column n set storage MAIN;")
+        .expect(&script);
+    let child = [
+        "alter table public.a_chi alter column n set default 'c'::text;",
+        "alter table public.a_chi alter column n set not null;",
+        "alter table public.a_chi alter column n set statistics 222;",
+        "comment on column public.a_chi.n is 'child copy';",
+    ]
+    .map(|statement| script.find(statement).expect(&script));
+    assert!(
+        parent_add < parent_storage && parent_storage < child[0],
+        "{script}"
+    );
+    assert!(
+        !script.contains("alter table public.a_chi add column"),
+        "{script}"
+    );
+    // Written once: the copy carries the child's comment, so the diff
+    // against it does not write it a second time.
+    assert_eq!(
+        script.matches("comment on column public.a_chi.n").count(),
+        1,
+        "{script}"
+    );
+    assert!(
+        !script.contains("alter table public.a_chi alter column n set storage"),
+        "{script}"
+    );
+    // The grandchild inherits the child's copy, the child's own default
+    // and NOT NULL included: those recurse to it as well.
+    assert!(!script.contains("alter table public.b_grand"), "{script}");
+}
+
+#[tokio::test]
+async fn a_child_leaving_its_parent_drops_the_copy_the_parents_add_gave_it() {
+    // TO takes the child out of the family, and does not give it the
+    // column. The parent's ADD COLUMN runs first and still reaches the
+    // child; NO INHERIT then keeps the copy as a local column, which
+    // stayed behind until the next run.
+    let mut from = Dump::new(DumpConfig::default());
+    let mut to = Dump::new(DumpConfig::default());
+    add_family(&mut from, false);
+    add_family(&mut to, true);
+    let child = to.tables.iter_mut().find(|t| t.name == "a_chi").unwrap();
+    child.inherits_from.clear();
+    child.columns.retain(|c| c.name != "n");
+    child.hash();
+    let grand = to.tables.iter_mut().find(|t| t.name == "b_grand").unwrap();
+    grand.columns.retain(|c| c.name != "n");
+    grand.hash();
+    let script = |use_drop: bool| {
+        let (from, to) = (from.clone(), to.clone());
+        async move {
+            let mut comparer = Comparer::new(from, to, use_drop, false, true, GrantsMode::Ignore);
+            comparer.compare_tables().await.unwrap();
+            comparer.get_script()
+        }
+    };
+    let with_drop = script(true).await;
+    let add = with_drop
+        .find("alter table public.z_par add column n text;")
+        .expect(&with_drop);
+    let leave = with_drop
+        .find("alter table public.a_chi no inherit public.z_par;")
+        .expect(&with_drop);
+    let drop = with_drop
+        .find("alter table public.a_chi drop column n;")
+        .expect(&with_drop);
+    assert!(add < leave && leave < drop, "{with_drop}");
+    // The child's drop recurses to the grandchild's inherited copy.
+    assert!(
+        !with_drop.contains("alter table public.b_grand drop column n"),
+        "{with_drop}"
+    );
+
+    // Without use_drop the NO INHERIT is only a comment, the copy stays
+    // inherited, and no drop may touch it.
+    let without_drop = script(false).await;
+    assert!(
+        !without_drop.contains("alter table public.a_chi drop column n;"),
+        "{without_drop}"
+    );
+}
+
+#[test]
+fn inherited_adds_cover_only_the_links_the_parents_add_runs_through() {
+    let key = |name: &str| ("public".to_string(), name.to_string());
+    let plan = |from: Dump, to: Dump| {
+        Comparer::new(from, to, true, false, true, GrantsMode::Ignore).inherited_adds()
+    };
+    let family = || {
+        let mut from = Dump::new(DumpConfig::default());
+        let mut to = Dump::new(DumpConfig::default());
+        add_family(&mut from, false);
+        add_family(&mut to, true);
+        (from, to)
+    };
+
+    // Kept links, through every level.
+    let (from, to) = family();
+    let plans = plan(from, to);
+    assert_eq!(
+        plans[&key("a_chi")].added["n"],
+        TableColumn {
+            schema: "public".to_string(),
+            table: "a_chi".to_string(),
+            ordinal_position: 2,
+            ..text_col("z_par", "n", 2)
+        }
+    );
+    assert!(plans[&key("b_grand")].added.contains_key("n"));
+    assert!(!plans.contains_key(&key("z_par")));
+
+    // A child that already has the column: the parent's add merges into it.
+    let (mut from, to) = family();
+    for table in from.tables.iter_mut().filter(|t| t.name != "z_par") {
+        let name = table.name.clone();
+        table.columns.push(text_col(&name, "n", 4));
+        table.hash();
+    }
+    assert!(plan(from, to).is_empty());
+
+    // A child that joins the parent: it is altered after the parent, which
+    // reaches it no more, so it adds the column itself before INHERIT.
+    let (mut from, to) = family();
+    let child = from.tables.iter_mut().find(|t| t.name == "a_chi").unwrap();
+    child.inherits_from.clear();
+    child.hash();
+    let plans = plan(from, to);
+    assert!(!plans.contains_key(&key("a_chi")), "{plans:?}");
+    assert!(plans[&key("b_grand")].added.contains_key("n"));
+
+    // A child that leaves a parent which itself joins a new parent: that
+    // parent is altered after every other table, so it adds nothing to the
+    // child first.
+    let (mut from, mut to) = family();
+    for dump in [&mut from, &mut to] {
+        dump.tables.push(plain_table(
+            "y_top",
+            vec![int_column("public", "y_top", "id", 1)],
+            &[],
+        ));
+    }
+    let parent = to.tables.iter_mut().find(|t| t.name == "z_par").unwrap();
+    parent.inherits_from = vec!["public.y_top".to_string()];
+    parent.hash();
+    let child = to.tables.iter_mut().find(|t| t.name == "a_chi").unwrap();
+    child.inherits_from.clear();
+    child.hash();
+    let plans = plan(from, to);
+    assert!(!plans.contains_key(&key("a_chi")), "{plans:?}");
+
+    // An identity column cannot be added to a table with children.
+    let (from, mut to) = family();
+    for table in to.tables.iter_mut() {
+        let n = table.columns.iter_mut().find(|c| c.name == "n").unwrap();
+        *n = TableColumn {
+            is_identity: true,
+            identity_generation: Some("BY DEFAULT".to_string()),
+            ..int_column("public", &n.table, "n", 2)
+        };
+        table.hash();
+    }
+    assert!(plan(from, to).is_empty());
+
+    // A parent the migration does not alter in place adds nothing.
+    let (from, mut to) = family();
+    let parent = to.tables.iter_mut().find(|t| t.name == "z_par").unwrap();
+    parent.partition_key = Some("RANGE (id)".to_string());
+    parent.hash();
+    let plans = plan(from, to);
+    assert!(!plans.contains_key(&key("a_chi")), "{plans:?}");
+}
+
+#[tokio::test]
+async fn an_inheritance_childs_column_retyped_by_its_parent_keeps_its_storage() {
+    // The parent's ALTER COLUMN ... TYPE recurses and resets every copy's
+    // storage; its SET STORAGE MAIN, diffed from that reset, recurses too.
+    // So the child that shares MAIN needs nothing, and the one with its
+    // own EXTERNAL sets it after the parent.
+    let varchar = |table: &str| TableColumn {
+        data_type: "character varying".to_string(),
+        character_maximum_length: Some(10),
+        ..text_col(table, "v", 2)
+    };
+    let with_storage = |column: TableColumn, storage: &str| TableColumn {
+        storage: Some(storage.to_string()),
+        ..column
+    };
+    let dump = |column: &dyn Fn(&str) -> TableColumn| {
+        let mut dump = Dump::new(DumpConfig::default());
+        let table = |name: &str, storage: &str, inherits: &[&str]| {
+            plain_table(
+                name,
+                vec![
+                    int_column("public", name, "id", 1),
+                    with_storage(column(name), storage),
+                ],
+                inherits,
+            )
+        };
+        dump.tables.push(table("z_rp", "MAIN", &[]));
+        dump.tables.push(table("a_same", "MAIN", &["public.z_rp"]));
+        dump.tables
+            .push(table("b_own", "EXTERNAL", &["public.z_rp"]));
+        dump
+    };
+    let from = dump(&varchar);
+    let to = dump(&|table: &str| text_col(table, "v", 2));
+    let mut comparer = Comparer::new(from, to, true, false, true, GrantsMode::Ignore);
+    comparer.compare_tables().await.unwrap();
+    let script = comparer.get_script();
+    let retype = script
+        .find("alter table public.z_rp alter column v type text;")
+        .expect(&script);
+    let parent = script
+        .find("alter table public.z_rp alter column v set storage MAIN;")
+        .expect(&script);
+    let own = script
+        .find("alter table public.b_own alter column v set storage EXTERNAL;")
+        .expect(&script);
+    assert!(retype < parent && parent < own, "{script}");
+    assert!(!script.contains("alter table public.a_same"), "{script}");
+    assert!(
+        !script.contains("alter table public.b_own alter column v type"),
+        "{script}"
+    );
 }

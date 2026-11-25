@@ -372,6 +372,13 @@ pub(crate) struct InheritedRecreates {
     /// [`Table::ancestor_retype_pre_script`]); a re-created one is added
     /// back in this table's alter.
     pub(crate) retyped_by_ancestor: HashSet<String>,
+    /// For each column of [`InheritedRecreates::retyped_by_ancestor`], the
+    /// TO column of the parent it inherits it from. The retype resets the
+    /// column's storage and compression, and that parent's own `SET
+    /// STORAGE` and `SET COMPRESSION`, diffed from the reset, recurse to
+    /// this table, so its copy ends up with the parent's: the alter diffs
+    /// its own from those.
+    pub(crate) retype_sources: HashMap<String, TableColumn>,
     /// Foreign keys of this table, by name, that the comparer drops ahead
     /// of the table alters because they reference a column another table's
     /// alter drops and re-adds (see `Comparer::column_drop_blockers`).
@@ -420,6 +427,22 @@ pub(crate) struct InheritedRecreates {
     /// has it. Planned only with `use_drop`; without it such a CHECK is one
     /// of [`InheritedRecreates::attach_checks`].
     pub(crate) inherit_readds: Vec<TableConstraint>,
+    /// Columns this table gains, by name, that an `INHERITS` parent's alter
+    /// creates for it, mapped to the copy that leaves here. A parent's `ADD
+    /// COLUMN` recurses to every table that inherits from it when it runs,
+    /// and the comparer alters parents first, so the table already has the
+    /// column by its own turn. Its own `ADD COLUMN` failed ("column ...
+    /// already exists"). The alter sets only what differs from the copy:
+    /// the parent's statements on the column recurse too (`SET DEFAULT`,
+    /// `SET NOT NULL`, storage, compression, statistics target), so the copy
+    /// is the parent's TO column; the comment is never inherited (see
+    /// `Comparer::inherited_adds`).
+    pub(crate) added_by_ancestor: HashMap<String, TableColumn>,
+    /// Columns, by name, that a parent's recursing `ADD COLUMN` creates on
+    /// this table although TO does not have them here, as the table leaves
+    /// that parent (`NO INHERIT`) after it. `NO INHERIT` keeps the copy as
+    /// a local column, so the alter drops it after the `NO INHERIT`.
+    pub(crate) dropped_after_leaving: Vec<String>,
 }
 
 /// A NOT NULL constraint a table's alter renames (see
@@ -1650,7 +1673,7 @@ impl Table {
                 && let Some(parent_schema) = row.get::<Option<String>, _>("parent_schema")
             {
                 (
-                    Some(format!("{}.{}", parent_schema, parent_table)),
+                    Some(format!("{parent_schema}.{parent_table}")),
                     row.get("partition_bound"),
                 )
             } else {
@@ -1935,12 +1958,12 @@ impl Table {
                 unlogged_prefix, self.schema, self.name, parent
             ));
             if let Some(bound) = &self.partition_bound {
-                script.push_str(&format!("\n    {}", bound));
+                script.push_str(&format!("\n    {bound}"));
             }
 
             // A sub-partition is itself partitioned — emit PARTITION BY before tablespace/semicolon
             if let Some(partition_key) = &self.partition_key {
-                script.push_str(&format!("\npartition by {}", partition_key));
+                script.push_str(&format!("\npartition by {partition_key}"));
             }
 
             // Storage parameters. CREATE TABLE ... PARTITION OF takes WITH (...) just
@@ -1988,7 +2011,7 @@ impl Table {
             }
 
             if let Some(partition_key) = &self.partition_key {
-                script.push_str(&format!("\npartition by {}", partition_key));
+                script.push_str(&format!("\npartition by {partition_key}"));
             }
 
             if let Some(am) = &self.access_method {
@@ -3064,12 +3087,36 @@ impl Table {
                 // An ancestor's `ALTER COLUMN ... TYPE` retypes this column.
                 // So does a typed table's type (see `typed_by_type`).
                 let retyped_elsewhere;
-                let new_col =
+                let reset_by_retype;
+                let (new_col, old_col) =
                     if typed_by_type || inherited.retyped_by_ancestor.contains(&new_col.name) {
                         retyped_elsewhere = new_col.with_type_of(old_col);
-                        &retyped_elsewhere
+                        // That `ALTER ... TYPE` resets the column's storage
+                        // and compression, as this table's own would (see
+                        // `TableColumn::alter_parts_recreating`): to the new
+                        // type's defaults, or to what an ancestor's own
+                        // statements leave on it, as they recurse too (see
+                        // `InheritedRecreates::retype_sources`).
+                        let old_col = if new_col.type_clause_differs(old_col) {
+                            let (storage, compression) =
+                                match inherited.retype_sources.get(&new_col.name) {
+                                    Some(parent) => {
+                                        (parent.storage.clone(), parent.compression.clone())
+                                    }
+                                    None => (new_col.type_storage.clone(), None),
+                                };
+                            reset_by_retype = TableColumn {
+                                storage,
+                                compression,
+                                ..old_col.clone()
+                            };
+                            &reset_by_retype
+                        } else {
+                            old_col
+                        };
+                        (&retyped_elsewhere, old_col)
                     } else {
-                        new_col
+                        (new_col, old_col)
                     };
                 let ahead_of_retype = in_the_way.contains(old_col.name.as_str());
                 let retype_pre_script = if ahead_of_retype && before_ancestor_retype(old_col) {
@@ -3243,6 +3290,24 @@ impl Table {
                 if let Some(comment_script) = new_col.get_comment_script() {
                     column_alter_script.push_str(&comment_script);
                 }
+            } else if let Some(copy) = inherited.added_by_ancestor.get(&new_col.name) {
+                // A parent's recursing `ADD COLUMN` has created it (see
+                // `InheritedRecreates::added_by_ancestor`): only what this
+                // table has on top of that copy is set, and the comment.
+                column_alter_script.push_str(
+                    &new_col
+                        .alter_parts_recreating(
+                            copy,
+                            use_drop,
+                            caps.generated,
+                            set_expression_only,
+                            false,
+                        )
+                        .inline,
+                );
+                if let Some(comment_script) = new_col.get_comment_script() {
+                    column_alter_script.push_str(&comment_script);
+                }
             } else if !is_target_partition {
                 column_alter_script.push_str(&new_col.get_add_script());
             }
@@ -3281,6 +3346,21 @@ impl Table {
                 } else {
                     column_drop_script.push_str(&drop_cmd);
                 }
+            }
+        }
+        // The copies a left parent's `ADD COLUMN` gave this table (see
+        // `InheritedRecreates::dropped_after_leaving`): local once the
+        // `NO INHERIT` above has run. Without `use_drop` that is commented
+        // out and the copy stays inherited, which no drop may touch.
+        if use_drop {
+            for name in &inherited.dropped_after_leaving {
+                column_drop_script.push_str(
+                    &format!(
+                        "alter table {}.{} drop column {name};",
+                        self.schema, self.name
+                    )
+                    .with_empty_lines(),
+                );
             }
         }
 
@@ -4536,7 +4616,7 @@ impl Table {
     pub fn get_trigger_alter_script(&self, to_table: &Table, use_drop: bool) -> String {
         let (drop_part, create_part) =
             self.get_trigger_alter_parts(to_table, use_drop, &HashSet::new());
-        format!("{}{}", drop_part, create_part)
+        format!("{drop_part}{create_part}")
     }
 
     /// The comparer's form of [`Table::get_trigger_alter_script`]: without

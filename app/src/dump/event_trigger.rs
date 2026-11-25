@@ -100,7 +100,7 @@ impl EventTrigger {
                 .map(|t| format!("'{}'", escape_single_quotes(t)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            script.push_str(&format!("\n    when tag in ({})", tags_str));
+            script.push_str(&format!("\n    when tag in ({tags_str})"));
         }
 
         script.push_str(&format!("\n    execute function {}();", self.function_name));

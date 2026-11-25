@@ -53,7 +53,7 @@ impl Cast {
         let func_clause = match self.cast_method.as_str() {
             "f" => {
                 if let Some(f) = &self.function_name {
-                    format!("WITH FUNCTION {}", f)
+                    format!("WITH FUNCTION {f}")
                 } else {
                     "WITHOUT FUNCTION".to_string()
                 }

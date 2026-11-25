@@ -6913,3 +6913,187 @@ fn storage_name_spells_every_storage_code() {
     }
     assert_eq!(storage_name(""), None);
 }
+
+// ---- ALTER COLUMN ... TYPE resets storage and compression ----
+
+fn varchar_column_with(
+    name: &str,
+    ordinal_position: i32,
+    storage: &str,
+    compression: Option<&str>,
+    statistics_target: Option<i32>,
+) -> TableColumn {
+    TableColumn {
+        data_type: "character varying".to_string(),
+        character_maximum_length: Some(10),
+        ..text_column_with(
+            name,
+            ordinal_position,
+            storage,
+            compression,
+            statistics_target,
+        )
+    }
+}
+
+fn users_with(columns: Vec<TableColumn>) -> Table {
+    let mut table = table_of("users", columns, vec![]);
+    table.hash();
+    table
+}
+
+#[test]
+fn a_retyped_column_gets_back_the_storage_and_compression_both_sides_share() {
+    // ALTER COLUMN ... TYPE gives the column its new type's storage and the
+    // default compression; the statistics target stays. A MAIN, pglz
+    // column that kept both through a type change lost them, and only the
+    // next compare set them again.
+    let from = users_with(vec![
+        int_col("users", "id", 1),
+        varchar_column_with("note", 2, "MAIN", Some("pglz"), Some(77)),
+    ]);
+    let to = users_with(vec![
+        int_col("users", "id", 1),
+        text_column_with("note", 2, "MAIN", Some("pglz"), Some(77)),
+    ]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter table public.users alter column note type text;\n\n\
+         alter table public.users alter column note set storage MAIN;\n\n\
+         alter table public.users alter column note set compression pglz;\n\n"
+    );
+}
+
+#[test]
+fn a_column_retyped_to_its_new_types_defaults_needs_nothing_more() {
+    // The retype itself sets EXTENDED and the default compression, which
+    // is what TO has: a SET of the old values would be wrong, and none of
+    // the new ones is needed.
+    let from = users_with(vec![
+        int_col("users", "id", 1),
+        varchar_column_with("note", 2, "MAIN", Some("pglz"), None),
+    ]);
+    let to = users_with(vec![
+        int_col("users", "id", 1),
+        text_column_with("note", 2, "EXTENDED", None, None),
+    ]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter table public.users alter column note type text;\n\n"
+    );
+}
+
+#[test]
+fn a_retype_states_the_storage_when_the_dump_does_not_say_the_types() {
+    // A dump written before pgc read `typstorage` does not say what the
+    // retype resets the storage to, so it is stated.
+    let from = users_with(vec![varchar_column_with("note", 1, "EXTENDED", None, None)]);
+    let mut to_col = text_column_with("note", 1, "EXTENDED", None, None);
+    to_col.type_storage = None;
+    let to = users_with(vec![to_col]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter table public.users alter column note type text;\n\n\
+         alter table public.users alter column note set storage EXTENDED;\n\n"
+    );
+}
+
+#[test]
+fn a_type_change_left_as_a_comment_keeps_the_old_storage() {
+    // use_drop=false: a stored generated column's retype is only written as
+    // a comment, so nothing resets the storage, and MAIN on both sides
+    // needs no statement.
+    let generated = |column: TableColumn| TableColumn {
+        is_generated: "ALWAYS".to_string(),
+        generation_expression: Some("(name || 'x')".to_string()),
+        ..column
+    };
+    let from = users_with(vec![
+        base_column("name", 1),
+        generated(varchar_column_with("tag", 2, "MAIN", None, None)),
+    ]);
+    let to = users_with(vec![
+        base_column("name", 1),
+        TableColumn {
+            generation_expression: Some("(name || 'y')".to_string()),
+            ..generated(text_column_with("tag", 2, "MAIN", None, None))
+        },
+    ]);
+    let script = from.get_alter_script(&to, false);
+    assert!(
+        !script
+            .lines()
+            .any(|line| line.starts_with("alter table") && line.contains("set storage")),
+        "{script}"
+    );
+    assert!(
+        script.contains("-- alter table public.users drop column tag;"),
+        "{script}"
+    );
+}
+
+#[test]
+fn a_typed_tables_column_retyped_by_its_type_gets_back_its_storage_and_compression() {
+    // The type's ALTER ATTRIBUTE ... TYPE CASCADE resets them on the table.
+    let from = typed_users_with(
+        vec![varchar_column_with(
+            "note",
+            1,
+            "MAIN",
+            Some("pglz"),
+            Some(30),
+        )],
+        vec![],
+    );
+    let to = typed_users_with(
+        vec![text_column_with("note", 1, "MAIN", Some("pglz"), Some(30))],
+        vec![],
+    );
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter table public.users alter column note set storage MAIN;\n\n\
+         alter table public.users alter column note set compression pglz;\n\n"
+    );
+}
+
+#[test]
+fn a_column_an_ancestor_retypes_is_diffed_from_what_the_parents_statements_leave() {
+    // The parent's retype recurses to the child and resets it, and the
+    // parent's own SET STORAGE MAIN, diffed from that reset, recurses too.
+    let caps = TableAlterCaps::default();
+    let from = users_with(vec![varchar_column_with("note", 1, "EXTERNAL", None, None)]);
+    let to = users_with(vec![text_column_with("note", 1, "EXTERNAL", None, None)]);
+    let mut inherited = InheritedRecreates::default();
+    inherited.retyped_by_ancestor.insert("note".to_string());
+    inherited.retype_sources.insert(
+        "note".to_string(),
+        text_column_with("note", 1, "MAIN", Some("pglz"), None),
+    );
+    assert_eq!(
+        from.get_alter_script_in_family(&to, true, false, caps, &inherited)
+            .0,
+        "alter table public.users alter column note set storage EXTERNAL;\n\n\
+         alter table public.users alter column note set compression default;\n\n"
+    );
+    // The child shares the parent's settings: they reach it, nothing to do.
+    let to = users_with(vec![text_column_with(
+        "note",
+        1,
+        "MAIN",
+        Some("pglz"),
+        None,
+    )]);
+    assert_eq!(
+        from.get_alter_script_in_family(&to, true, false, caps, &inherited)
+            .0,
+        ""
+    );
+    // No parent known: the reset leaves the new type's defaults.
+    inherited.retype_sources.clear();
+    assert_eq!(
+        from.get_alter_script_in_family(&to, true, false, caps, &inherited)
+            .0,
+        "alter table public.users alter column note set storage MAIN;\n\n\
+         alter table public.users alter column note set compression pglz;\n\n"
+    );
+}

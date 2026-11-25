@@ -71,8 +71,7 @@ async fn issue188_phase7_restores_plain_index_on_generated_column() {
 
     assert!(
         script.contains("CREATE INDEX IF NOT EXISTS idx_gen_col ON test_deps.items"),
-        "plain index on generated column must be re-emitted from pg_depend graph: {}",
-        script
+        "plain index on generated column must be re-emitted from pg_depend graph: {script}"
     );
 }
 
@@ -135,13 +134,11 @@ async fn issue188_phase7_restores_check_constraint_on_generated_column() {
 
     assert!(
         script.contains("alter table test_deps.items add constraint chk_gen_positive"),
-        "CHECK constraint anchored on generated column must be re-emitted: {}",
-        script
+        "CHECK constraint anchored on generated column must be re-emitted: {script}"
     );
     assert!(
         script.contains("alter table test_deps.items drop constraint if exists chk_gen_positive;"),
-        "drop-if-exists guard for column-anchored CHECK constraint missing: {}",
-        script
+        "drop-if-exists guard for column-anchored CHECK constraint missing: {script}"
     );
 }
 
@@ -200,8 +197,7 @@ async fn issue188_phase7_skips_dependent_absent_from_to() {
 
     assert!(
         !script.contains("idx_gen_col"),
-        "index absent from TO must not be resurrected from pg_depend: {}",
-        script
+        "index absent from TO must not be resurrected from pg_depend: {script}"
     );
 }
 
@@ -289,15 +285,13 @@ async fn issue188_phase7_skips_index_backing_constraint() {
     // The constraint emission must fire …
     assert!(
         script.contains("alter table test_deps.items add constraint items_gen_col_key"),
-        "UNIQUE constraint must be re-emitted: {}",
-        script
+        "UNIQUE constraint must be re-emitted: {script}"
     );
     // … and the backing-index CREATE must NOT also be emitted (the
     // constraint creates the index implicitly).
     assert!(
         !script.contains("CREATE UNIQUE INDEX IF NOT EXISTS items_gen_col_key"),
-        "backing index must be skipped when a same-named constraint emission already recreates it: {}",
-        script
+        "backing index must be skipped when a same-named constraint emission already recreates it: {script}"
     );
 }
 
@@ -385,19 +379,16 @@ async fn issue188_path_b_virtual_flip_restores_dependent_index() {
     // The drop+add for the column must fire (Path B trigger).
     assert!(
         script.contains("drop column"),
-        "STORED→VIRTUAL flip should DROP COLUMN: {}",
-        script
+        "STORED→VIRTUAL flip should DROP COLUMN: {script}"
     );
     // The recreate block must include the dependent index.
     assert!(
         script.contains("Recreate dependents dropped by virtual-column rewrite"),
-        "labeled recreate block must wrap Path B dependents: {}",
-        script
+        "labeled recreate block must wrap Path B dependents: {script}"
     );
     assert!(
         script.contains("CREATE INDEX IF NOT EXISTS idx_gen_col ON test_deps.items"),
-        "plain index on virtually-recreated column must be re-emitted: {}",
-        script
+        "plain index on virtually-recreated column must be re-emitted: {script}"
     );
 }
 
@@ -502,15 +493,13 @@ async fn issue188_phase7_restores_fk_on_different_table() {
 
     assert!(
         script.contains("alter table test_deps.items_child add constraint fk_items_child_ref_gen"),
-        "FK on a different table must be re-emitted via pg_depend graph: {}",
-        script
+        "FK on a different table must be re-emitted via pg_depend graph: {script}"
     );
     assert!(
         script.contains(
             "alter table test_deps.items_child drop constraint if exists fk_items_child_ref_gen;"
         ),
-        "drop-if-exists guard for cross-table FK missing: {}",
-        script
+        "drop-if-exists guard for cross-table FK missing: {script}"
     );
 }
 
@@ -635,10 +624,7 @@ async fn issue188_phase7_emits_fk_after_unique_target() {
         .expect("FK constraint must be re-emitted");
     assert!(
         uniq_pos < fk_pos,
-        "FK must be emitted AFTER its UNIQUE target; got uniq@{} fk@{}: {}",
-        uniq_pos,
-        fk_pos,
-        script
+        "FK must be emitted AFTER its UNIQUE target; got uniq@{uniq_pos} fk@{fk_pos}: {script}"
     );
 }
 

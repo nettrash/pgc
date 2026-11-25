@@ -190,7 +190,7 @@ impl TableConstraint {
             parts.join(" ")
         };
 
-        script.push_str(&format!("{} ", clause));
+        script.push_str(&format!("{clause} "));
         if !self.is_enforced {
             // Issue #182: PG18+ `pg_get_constraintdef()` already emits
             // `NOT ENFORCED` for non-enforced constraints, so the
@@ -733,7 +733,7 @@ impl TableConstraint {
         let definition = self.definition.as_deref()?;
         let col = Self::parse_pg_identifier(Self::strip_not_null_prefix(definition)?)?;
         let table = Self::normalize_identifier_for_name(table_raw);
-        let base = format!("{}_{}_not_null", table, col);
+        let base = format!("{table}_{col}_not_null");
         let cname = Self::normalize_identifier_for_name(&self.name);
 
         // Split cname into (head, trailing_digits). PG appends a numeric

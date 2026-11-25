@@ -26,7 +26,7 @@ jobs:
         rust: ["1.88.0", "1.95.0", "1.100.0"]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
         pg_version: ["14", "15", "16", "17", "18", "19"]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -386,7 +386,7 @@ jobs:
     if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Read crate version
       id: crate
@@ -395,11 +395,11 @@ jobs:
         echo "version=${version}" >> "$GITHUB_OUTPUT"
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
     
     - name: Log in to Docker Hub
       if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
@@ -407,7 +407,7 @@ jobs:
     
     - name: Extract metadata
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@v6
       with:
         images: nettrash/pgc
         tags: |
@@ -417,7 +417,7 @@ jobs:
           type=raw,value=latest,enable={{is_default_branch}}
     
     - name: Build Docker image for testing (single platform)
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
       with:
         context: .
         platforms: linux/amd64
@@ -438,7 +438,7 @@ jobs:
     - name: Build and push Docker image (multi-platform)
       # Push to registry if: not a PR AND (on master branch OR manually triggered)
       if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
       with:
         context: .
         platforms: linux/amd64,linux/arm64

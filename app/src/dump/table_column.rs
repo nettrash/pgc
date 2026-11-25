@@ -428,7 +428,9 @@ impl TableColumn {
         }
     }
 
-    fn type_clause_differs(&self, other: &TableColumn) -> bool {
+    /// Whether the `type` clause an `ALTER COLUMN ... TYPE` writes differs,
+    /// the collation included: the change such a statement makes.
+    pub(crate) fn type_clause_differs(&self, other: &TableColumn) -> bool {
         self.render_type_clause() != other.render_type_clause()
     }
 
@@ -1330,6 +1332,8 @@ impl TableColumn {
         let type_statement = self
             .type_clause_differs(existing)
             .then_some(statements.len());
+        // Whether that `ALTER COLUMN ... TYPE` stays live (see `post` below).
+        let mut retyped = type_statement.is_some();
         if type_statement.is_some() {
             statements.push(
                 format!(
@@ -1473,6 +1477,7 @@ impl TableColumn {
                     // drop + add below when it does not.
                     if old_is_generated && let Some(index) = type_statement {
                         statements.remove(index);
+                        retyped = false;
                     }
                     let header = if self.plain_needs_rewrite(existing) {
                         "-- use_drop=false: PostgreSQL 14 keeps a generated column depending on the functions and operators its expression used after DROP EXPRESSION, so making it plain with a new type needs a rewrite that drops the column; statements commented out\n"
@@ -1517,8 +1522,19 @@ impl TableColumn {
             }
         }
 
+        // `ALTER COLUMN ... TYPE` gives the column its new type's storage
+        // and the default compression, whatever it had before; only the
+        // statistics target stays. So a retyped column's settings are
+        // diffed from those, or a non-default one both sides share was lost
+        // (a type that does not say its storage, `type_storage`, always
+        // gets it set).
+        let (existing_storage, existing_compression) = if retyped {
+            (self.type_storage.as_ref(), None)
+        } else {
+            (existing.storage.as_ref(), existing.compression.as_ref())
+        };
         let mut post = Vec::new();
-        if self.storage != existing.storage
+        if self.storage.as_ref() != existing_storage
             && let Some(storage) = &self.storage
         {
             post.push(
@@ -1530,7 +1546,7 @@ impl TableColumn {
             );
         }
 
-        if self.compression != existing.compression {
+        if self.compression.as_ref() != existing_compression {
             if let Some(compression) = &self.compression {
                 post.push(
                     format!(
@@ -1810,6 +1826,10 @@ impl PartialEq for TableColumn {
             && self.statistics_target == other.statistics_target
     }
 }
+
+/// Every field `eq` compares is compared for equality as a whole (the
+/// generation expression through an equivalence), so it is reflexive.
+impl Eq for TableColumn {}
 
 #[cfg(test)]
 #[path = "tests/table_column.rs"]

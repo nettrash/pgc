@@ -115,23 +115,23 @@ impl TablePolicy {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        script.push_str(&format!(" to {}", role_clause));
+        script.push_str(&format!(" to {role_clause}"));
 
         if let Some(using_clause) = &self.using_clause {
             let trimmed = using_clause.trim();
             if trimmed.starts_with('(') && trimmed.ends_with(')') {
-                script.push_str(&format!(" using {}", trimmed));
+                script.push_str(&format!(" using {trimmed}"));
             } else {
-                script.push_str(&format!(" using ({})", trimmed));
+                script.push_str(&format!(" using ({trimmed})"));
             }
         }
 
         if let Some(check_clause) = &self.check_clause {
             let trimmed = check_clause.trim();
             if trimmed.starts_with('(') && trimmed.ends_with(')') {
-                script.push_str(&format!(" with check {}", trimmed));
+                script.push_str(&format!(" with check {trimmed}"));
             } else {
-                script.push_str(&format!(" with check ({})", trimmed));
+                script.push_str(&format!(" with check ({trimmed})"));
             }
         }
 

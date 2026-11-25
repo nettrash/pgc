@@ -72,7 +72,7 @@ impl Collation {
             "d" => "default",
             _ => "libc",
         };
-        opts.push(format!("PROVIDER = {}", provider_name));
+        opts.push(format!("PROVIDER = {provider_name}"));
 
         if let Some(locale) = &self.locale {
             opts.push(format!("LOCALE = '{}'", locale.replace('\'', "''")));

@@ -108,12 +108,12 @@ impl ForeignDataWrapper {
     pub fn get_script(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(h) = &self.handler_func {
-            parts.push(format!("HANDLER {}", h));
+            parts.push(format!("HANDLER {h}"));
         } else {
             parts.push("NO HANDLER".to_string());
         }
         if let Some(v) = &self.validator_func {
-            parts.push(format!("VALIDATOR {}", v));
+            parts.push(format!("VALIDATOR {v}"));
         } else {
             parts.push("NO VALIDATOR".to_string());
         }
@@ -169,12 +169,12 @@ impl ForeignDataWrapper {
             let mut parts: Vec<String> = Vec::new();
             if definition_changed {
                 if let Some(h) = &target.handler_func {
-                    parts.push(format!("HANDLER {}", h));
+                    parts.push(format!("HANDLER {h}"));
                 } else if self.handler_func.is_some() {
                     parts.push("NO HANDLER".to_string());
                 }
                 if let Some(v) = &target.validator_func {
-                    parts.push(format!("VALIDATOR {}", v));
+                    parts.push(format!("VALIDATOR {v}"));
                 } else if self.validator_func.is_some() {
                     parts.push("NO VALIDATOR".to_string());
                 }

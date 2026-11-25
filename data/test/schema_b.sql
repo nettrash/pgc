@@ -6340,6 +6340,51 @@ ALTER TABLE test_schema.colset_part ALTER COLUMN doc SET STATISTICS 250;
 
 -- ==== END fix:colsettings ====
 
+-- ==== BEGIN fix:inhadd — an INHERITS parent's new column is added once, on the parent ====
+-- README section 83: the new columns, the child's own settings on its copy,
+-- and two tables that leave the family.
+CREATE TABLE test_schema.inhadd_par (id integer, note text DEFAULT 'p' NOT NULL, tag text);
+ALTER TABLE test_schema.inhadd_par ALTER COLUMN note SET STORAGE MAIN;
+CREATE TABLE test_schema.inhadd_chi (x integer) INHERITS (test_schema.inhadd_par);
+CREATE TABLE test_schema.inhadd_grand (y integer) INHERITS (test_schema.inhadd_chi);
+-- These recurse to inhadd_grand, which then sets its target back.
+ALTER TABLE test_schema.inhadd_chi ALTER COLUMN note SET DEFAULT 'c';
+ALTER TABLE test_schema.inhadd_chi ALTER COLUMN tag SET NOT NULL;
+ALTER TABLE test_schema.inhadd_chi ALTER COLUMN tag SET STATISTICS 120;
+ALTER TABLE test_schema.inhadd_grand ALTER COLUMN tag SET STATISTICS -1;
+COMMENT ON COLUMN test_schema.inhadd_chi.note IS 'inherited copy';
+CREATE TABLE test_schema.inhadd_left (id integer, z integer);
+CREATE TABLE test_schema.inhadd_own (id integer, z integer, tag text);
+-- ==== END fix:inhadd ====
+
+-- ==== BEGIN fix:retypesettings — a retyped column keeps its storage and compression ====
+-- README section 84: the same settings, on the new types.
+CREATE TABLE test_schema.rtset_own (
+    id integer,
+    v text,
+    w text,
+    s text,
+    c text COLLATE "POSIX"
+);
+ALTER TABLE test_schema.rtset_own ALTER COLUMN v SET STORAGE MAIN;
+ALTER TABLE test_schema.rtset_own ALTER COLUMN w SET COMPRESSION pglz;
+ALTER TABLE test_schema.rtset_own ALTER COLUMN s SET STATISTICS 77;
+ALTER TABLE test_schema.rtset_own ALTER COLUMN c SET STORAGE EXTERNAL;
+CREATE TABLE test_schema.rtset_par (id integer, v text);
+ALTER TABLE test_schema.rtset_par ALTER COLUMN v SET STORAGE MAIN;
+CREATE TABLE test_schema.rtset_chi (x integer) INHERITS (test_schema.rtset_par);
+CREATE TABLE test_schema.rtset_chi2 (x integer) INHERITS (test_schema.rtset_par);
+ALTER TABLE test_schema.rtset_chi2 ALTER COLUMN v SET STORAGE EXTERNAL;
+CREATE TABLE test_schema.rtset_part (id integer, v text) PARTITION BY RANGE (id);
+CREATE TABLE test_schema.rtset_part_1 PARTITION OF test_schema.rtset_part
+    FOR VALUES FROM (0) TO (100);
+ALTER TABLE test_schema.rtset_part ALTER COLUMN v SET STORAGE MAIN;
+CREATE TYPE test_schema.rtset_t AS (a integer, b text);
+CREATE TABLE test_schema.rtset_typed OF test_schema.rtset_t;
+ALTER TABLE test_schema.rtset_typed ALTER COLUMN b SET STORAGE MAIN;
+ALTER TABLE test_schema.rtset_typed ALTER COLUMN b SET COMPRESSION pglz;
+-- ==== END fix:retypesettings ====
+
 -- ==== BEGIN fix:schemadefacl — a schema the migration creates under the default privileges for schemas ====
 -- Issue #251, for schemas (README section 81): the same database-wide row as
 -- FROM, last again. new_reporting_schema, created at the top of this file,

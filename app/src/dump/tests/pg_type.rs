@@ -268,8 +268,7 @@ fn get_alter_script_domain_drop_default_use_drop_false() {
         if line.contains("drop default") {
             assert!(
                 line.starts_with("--"),
-                "drop default should be commented: {}",
-                line
+                "drop default should be commented: {line}"
             );
         }
     }
@@ -293,8 +292,7 @@ fn get_alter_script_domain_drop_default_use_drop_true() {
         if line.contains("drop default") {
             assert!(
                 !line.starts_with("--"),
-                "drop default should be active: {}",
-                line
+                "drop default should be active: {line}"
             );
         }
     }
@@ -317,8 +315,7 @@ fn get_alter_script_domain_drop_not_null_use_drop_false() {
         if line.contains("drop not null") {
             assert!(
                 line.starts_with("--"),
-                "drop not null should be commented: {}",
-                line
+                "drop not null should be commented: {line}"
             );
         }
     }
@@ -341,8 +338,7 @@ fn get_alter_script_domain_drop_not_null_use_drop_true() {
         if line.contains("drop not null") {
             assert!(
                 !line.starts_with("--"),
-                "drop not null should be active: {}",
-                line
+                "drop not null should be active: {line}"
             );
         }
     }
@@ -369,14 +365,13 @@ fn get_alter_script_domain_drop_constraint_use_drop_false() {
     // Should contain a warning about manual intervention
     assert!(
         script.contains("use_drop=false") && script.contains("manual intervention needed"),
-        "should contain a warning comment, script:\n{}",
-        script
+        "should contain a warning comment, script:\n{script}"
     );
 
     // Both drop and add constraint should be commented out
     for line in script.lines() {
         if line.contains("drop constraint") || line.contains("add constraint") {
-            assert!(line.starts_with("--"), "should be commented: {}", line);
+            assert!(line.starts_with("--"), "should be commented: {line}");
         }
     }
 }
@@ -401,8 +396,7 @@ fn get_alter_script_domain_remove_constraint_use_drop_false() {
         if line.contains("drop constraint") {
             assert!(
                 line.starts_with("--"),
-                "drop constraint should be commented: {}",
-                line
+                "drop constraint should be commented: {line}"
             );
         }
     }
@@ -443,8 +437,7 @@ fn get_alter_script_domain_all_drops_use_drop_false() {
         if line.contains("drop not null") {
             assert!(
                 line.starts_with("--"),
-                "drop not null should be commented: {}",
-                line
+                "drop not null should be commented: {line}"
             );
         }
     }
@@ -453,8 +446,7 @@ fn get_alter_script_domain_all_drops_use_drop_false() {
         if line.contains("drop constraint") {
             assert!(
                 line.starts_with("--"),
-                "drop constraint should be commented: {}",
-                line
+                "drop constraint should be commented: {line}"
             );
         }
     }
@@ -469,8 +461,7 @@ fn get_alter_script_domain_all_drops_use_drop_false() {
         if line.contains("add constraint") && line.contains("FreshConstraint") {
             assert!(
                 !line.starts_with("--"),
-                "new constraint add should be active: {}",
-                line
+                "new constraint add should be active: {line}"
             );
         }
     }

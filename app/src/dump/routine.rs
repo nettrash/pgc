@@ -355,10 +355,10 @@ impl AggregateInfo {
         if let Some(ref v) = self.sspace
             && *v != 0
         {
-            opts.push(format!("    SSPACE = {}", v));
+            opts.push(format!("    SSPACE = {v}"));
         }
         if let Some(ref v) = self.finalfunc {
-            opts.push(format!("    FINALFUNC = {}", v));
+            opts.push(format!("    FINALFUNC = {v}"));
         }
         if self.finalfunc_extra {
             opts.push("    FINALFUNC_EXTRA".to_string());
@@ -369,36 +369,36 @@ impl AggregateInfo {
                 "w" => "READ_WRITE",
                 _ => "READ_ONLY",
             };
-            opts.push(format!("    FINALFUNC_MODIFY = {}", label));
+            opts.push(format!("    FINALFUNC_MODIFY = {label}"));
         }
         if let Some(ref v) = self.combinefunc {
-            opts.push(format!("    COMBINEFUNC = {}", v));
+            opts.push(format!("    COMBINEFUNC = {v}"));
         }
         if let Some(ref v) = self.serialfunc {
-            opts.push(format!("    SERIALFUNC = {}", v));
+            opts.push(format!("    SERIALFUNC = {v}"));
         }
         if let Some(ref v) = self.deserialfunc {
-            opts.push(format!("    DESERIALFUNC = {}", v));
+            opts.push(format!("    DESERIALFUNC = {v}"));
         }
         if let Some(ref v) = self.initcond {
             opts.push(format!("    INITCOND = '{}'", v.replace('\'', "''")));
         }
         if let Some(ref v) = self.msfunc {
-            opts.push(format!("    MSFUNC = {}", v));
+            opts.push(format!("    MSFUNC = {v}"));
         }
         if let Some(ref v) = self.minvfunc {
-            opts.push(format!("    MINVFUNC = {}", v));
+            opts.push(format!("    MINVFUNC = {v}"));
         }
         if let Some(ref v) = self.mstype {
-            opts.push(format!("    MSTYPE = {}", v));
+            opts.push(format!("    MSTYPE = {v}"));
         }
         if let Some(ref v) = self.msspace
             && *v != 0
         {
-            opts.push(format!("    MSSPACE = {}", v));
+            opts.push(format!("    MSSPACE = {v}"));
         }
         if let Some(ref v) = self.mfinalfunc {
-            opts.push(format!("    MFINALFUNC = {}", v));
+            opts.push(format!("    MFINALFUNC = {v}"));
         }
         if self.mfinalfunc_extra {
             opts.push("    MFINALFUNC_EXTRA".to_string());
@@ -409,7 +409,7 @@ impl AggregateInfo {
                 "w" => "READ_WRITE",
                 _ => "READ_ONLY",
             };
-            opts.push(format!("    MFINALFUNC_MODIFY = {}", label));
+            opts.push(format!("    MFINALFUNC_MODIFY = {label}"));
         }
         if let Some(ref v) = self.minitcond {
             opts.push(format!("    MINITCOND = '{}'", v.replace('\'', "''")));
@@ -1294,7 +1294,7 @@ impl Routine {
         let base = if sanitized.is_empty() {
             "pgc_body".to_string()
         } else {
-            format!("pgc_{}_body", sanitized)
+            format!("pgc_{sanitized}_body")
         };
 
         let mut idx = 0;
@@ -1302,9 +1302,9 @@ impl Routine {
             let candidate = if idx == 0 {
                 base.clone()
             } else {
-                format!("{}_{}", base, idx)
+                format!("{base}_{idx}")
             };
-            let delimiter = format!("${}$", candidate);
+            let delimiter = format!("${candidate}$");
             if !self.source_code.contains(&delimiter) {
                 return delimiter;
             }

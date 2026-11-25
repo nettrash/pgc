@@ -392,11 +392,10 @@ impl Dump {
     pub async fn process(&mut self, max_connections: u32) -> Result<(), Error> {
         if max_connections < FILL_SIBLING_BRANCH_COUNT {
             eprintln!(
-                "Warning: max_connections ({}) is below the number of parallel \
-                 dump branches ({}). Branches will queue for connections and \
+                "Warning: max_connections ({max_connections}) is below the number of parallel \
+                 dump branches ({FILL_SIBLING_BRANCH_COUNT}). Branches will queue for connections and \
                  the dump may be significantly slower. Consider raising \
-                 MAX_CONNECTIONS to at least {}.",
-                max_connections, FILL_SIBLING_BRANCH_COUNT, FILL_SIBLING_BRANCH_COUNT
+                 MAX_CONNECTIONS to at least {FILL_SIBLING_BRANCH_COUNT}."
             );
         }
 
@@ -751,7 +750,7 @@ impl Dump {
                 let has_usage: bool = row.get("has_usage");
 
                 if !has_usage {
-                    println!(" - {} (skipped: no USAGE privilege)", schema_name);
+                    println!(" - {schema_name} (skipped: no USAGE privilege)");
                     continue;
                 }
 
@@ -789,8 +788,7 @@ impl Dump {
                 join pg_namespace n on e.extnamespace = n.oid
                 left join pg_roles r on r.oid = e.extowner
             where
-                (n.nspname in {} or n.nspname = 'public')",
-            schema_filter
+                (n.nspname in {schema_filter} or n.nspname = 'public')"
         );
 
         let rows = sqlx::query(query.as_str())
@@ -1006,7 +1004,7 @@ impl Dump {
              join pg_class c on c.oid = t.typrelid
              join pg_attribute a on a.attrelid = c.oid
              where
-                n.nspname in {}
+                n.nspname in {schema_filter}
                 and t.typtype = 'c'
                 and c.relkind = 'c'
                 and t.typisdefined = true
@@ -1019,8 +1017,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )
-             order by t.oid, a.attnum",
-            schema_filter
+             order by t.oid, a.attnum"
         )
     }
 
@@ -1051,7 +1048,7 @@ impl Dump {
                 join pg_namespace n on n.oid = t.typnamespace
                 join pg_class c on c.oid = t.typrelid
                 where
-                    n.nspname in {}
+                    n.nspname in {schema_filter}
                     and t.typtype = 'c'
                     and c.relkind = 'c'
                     and t.typisdefined = true
@@ -1112,8 +1109,7 @@ impl Dump {
                 select type_oid, array_agg(typed_table order by typed_table) as typed_tables
                 from typed
                 group by type_oid
-            ) tt on tt.type_oid = c.type_oid",
-            schema_filter
+            ) tt on tt.type_oid = c.type_oid"
         )
     }
 
@@ -1155,22 +1151,21 @@ impl Dump {
                 quote_ident(opc_ns.nspname) || '.' || quote_ident(opc.opcname) as range_opclass,
                 case when r.rngcanonical <> 0 then r.rngcanonical::regproc::text else null end as range_canonical,
                 case when r.rngsubdiff <> 0 then r.rngsubdiff::regproc::text else null end as range_subdiff,
-                {}
+                {multirange_col}
             from pg_range r
             join pg_type t on t.oid = r.rngtypid
             join pg_namespace n on n.oid = t.typnamespace
             join pg_opclass opc on opc.oid = r.rngsubopc
             join pg_namespace opc_ns on opc_ns.oid = opc.opcnamespace
-            {}
-            where n.nspname in {}
+            {multirange_join}
+            where n.nspname in {schema_filter}
               and not exists (
                   select 1 from pg_depend ext_dep
                   where ext_dep.classid = 'pg_type'::regclass
                   and ext_dep.objid = t.oid
                   and ext_dep.objsubid = 0
                   and ext_dep.deptype = 'e'
-              )",
-            multirange_col, multirange_join, schema_filter
+              )"
         )
     }
 
@@ -1231,7 +1226,7 @@ impl Dump {
                 and d.classoid = 'pg_type'::regclass
                 and d.objsubid = 0
         where
-            n.nspname in {}
+            n.nspname in {schema_filter}
             and (
                 t.typtype in ('d', 'e', 'r', 'm')
                 or (t.typtype = 'c' and c.relkind = 'c')
@@ -1243,8 +1238,7 @@ impl Dump {
                 and ext_dep.objid = t.oid
                 and ext_dep.objsubid = 0
                 and ext_dep.deptype = 'e'
-            )",
-            schema_filter
+            )"
         )
     }
 
@@ -1462,7 +1456,7 @@ impl Dump {
             join pg_namespace n on n.oid = t.typnamespace
             where c.contype = 'c'
               and c.contypid <> 0
-              and n.nspname in {}
+              and n.nspname in {schema_filter}
               and not exists (
                   select 1 from pg_depend ext_dep
                   where ext_dep.classid = 'pg_type'::regclass
@@ -1470,8 +1464,7 @@ impl Dump {
                   and ext_dep.objsubid = 0
                   and ext_dep.deptype = 'e'
               )
-            order by c.contypid, c.conname",
-            schema_filter
+            order by c.contypid, c.conname"
         )
     }
 
@@ -1684,15 +1677,14 @@ impl Dump {
                 left join pg_attribute owner_attr on owner_attr.attrelid = dep.refobjid
                     and owner_attr.attnum = dep.refobjsubid
             where
-                seq.schemaname in {}
+                seq.schemaname in {schema_filter}
                 and not exists (
                     select 1 from pg_depend ext_dep
                     where ext_dep.classid = 'pg_class'::regclass
                     and ext_dep.objid = seq_class.oid
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
-                )",
-            schema_filter
+                )"
         )
     }
 
@@ -1777,7 +1769,7 @@ impl Dump {
                 left join pg_description d on d.objoid = r.oid and d.classoid = 'pg_proc'::regclass and d.objsubid = 0
                 left join pg_aggregate agg on agg.aggfnoid = r.oid
             where
-                n.nspname in {}
+                n.nspname in {schema_filter}
                 and n.nspname not in ('pg_catalog', 'information_schema')
                 and (l.lanname not in ('c', 'internal') or r.prokind in ('a', 'w'))
                 and r.prokind in ('f', 'p', 'a', 'w')
@@ -1787,8 +1779,7 @@ impl Dump {
                     and ext_dep.objid = r.oid
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
-                );",
-            schema_filter
+                );"
         )
     }
 
@@ -2328,7 +2319,7 @@ impl Dump {
                     and d.objsubid = 0
                 where
                     t.schemaname not in ('pg_catalog', 'information_schema')
-                    and t.schemaname in {}
+                    and t.schemaname in {schema_filter}
                     and t.tablename not like 'pg\\_%'
                     and not exists (
                         select 1 from pg_depend ext_dep
@@ -2336,8 +2327,7 @@ impl Dump {
                         and ext_dep.objid = c.oid
                         and ext_dep.objsubid = 0
                         and ext_dep.deptype = 'e'
-                    );",
-            schema_filter
+                    );"
         )
     }
 
@@ -2824,9 +2814,8 @@ impl Dump {
                 and d.objsubid = a.attnum
             where c.relkind in ('v', 'm')
                 and n.nspname not in ('pg_catalog', 'information_schema')
-                and n.nspname in {}
-            order by n.nspname, c.relname, a.attnum;",
-            schema_filter
+                and n.nspname in {schema_filter}
+            order by n.nspname, c.relname, a.attnum;"
         )
     }
 
@@ -2854,7 +2843,7 @@ impl Dump {
             join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
             where c.relkind = 'v'
                 and n.nspname not in ('pg_catalog', 'information_schema')
-                and n.nspname in {}
+                and n.nspname in {schema_filter}
                 and not exists (
                     select 1 from pg_depend ext_dep
                     where ext_dep.classid = 'pg_class'::regclass
@@ -2862,8 +2851,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )
-            order by n.nspname, c.relname, a.attnum;",
-            schema_filter
+            order by n.nspname, c.relname, a.attnum;"
         )
     }
 
@@ -2902,7 +2890,7 @@ impl Dump {
                 and d.classoid = 'pg_class'::regclass
                 and d.objsubid = 0
             where
-                n.nspname in {}
+                n.nspname in {schema_filter}
                 and not exists (
                     select 1 from pg_depend ext_dep
                     where ext_dep.classid = 'pg_class'::regclass
@@ -2910,8 +2898,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )
-            order by n.nspname, c.relname",
-            schema_filter
+            order by n.nspname, c.relname"
         )
     }
 
@@ -2938,7 +2925,7 @@ impl Dump {
             join pg_foreign_table ft on ft.ftrelid = c.oid
             left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
             where
-                n.nspname in {}
+                n.nspname in {schema_filter}
                 and a.attnum > 0
                 and not a.attisdropped
                 and not exists (
@@ -2948,8 +2935,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )
-            order by n.nspname, c.relname, a.attnum",
-            schema_filter
+            order by n.nspname, c.relname, a.attnum"
         )
     }
 
@@ -3375,8 +3361,7 @@ impl Dump {
                   and ext.objid = tg.oid
                   and ext.objsubid = 0
                   and ext.deptype = 'e'
-              )",
-            schema_filter = schema_filter
+              )"
         )
     }
 
@@ -3479,7 +3464,7 @@ impl Dump {
                 and d.classoid = 'pg_rewrite'::regclass
                 and d.objsubid = 0
             where
-                n.nspname in {}
+                n.nspname in {schema_filter}
                 and r.rulename <> '_RETURN'
                 and not exists (
                     select 1 from pg_depend ext_dep
@@ -3488,8 +3473,7 @@ impl Dump {
                     and ext_dep.objsubid = 0
                     and ext_dep.deptype = 'e'
                 )
-            order by n.nspname, c.relname, r.rulename",
-            schema_filter
+            order by n.nspname, c.relname, r.rulename"
         )
     }
 
@@ -3601,11 +3585,11 @@ impl Dump {
                 quote_ident(c.collname) as coll_name,
                 COALESCE(quote_ident(r.rolname), '') as coll_owner,
                 c.collprovider::text as coll_provider,
-                {} as coll_locale,
+                {coll_locale_col} as coll_locale,
                 c.collcollate as coll_collate,
                 c.collctype as coll_ctype,
-                {} as coll_icu_locale,
-                {} as coll_icu_rules,
+                {icu_locale_col} as coll_icu_locale,
+                {icu_rules_col} as coll_icu_rules,
                 c.collisdeterministic as coll_deterministic,
                 d.description as coll_comment
              FROM pg_collation c
@@ -3613,7 +3597,7 @@ impl Dump {
              LEFT JOIN pg_roles r ON r.oid = c.collowner
              LEFT JOIN pg_description d ON d.objoid = c.oid
                  AND d.classoid = 'pg_collation'::regclass AND d.objsubid = 0
-             WHERE n.nspname IN {}
+             WHERE n.nspname IN {schema_filter}
                AND c.collencoding IN (-1, (SELECT encoding FROM pg_database WHERE datname = current_database()))
                AND NOT EXISTS
                (
@@ -3626,11 +3610,7 @@ impl Dump {
                         ext.objsubid = 0 AND
                         ext.deptype = 'e'
                     )
-             ORDER BY n.nspname, c.collname",
-            coll_locale_col,
-            icu_locale_col,
-            icu_rules_col,
-            schema_filter
+             ORDER BY n.nspname, c.collname"
         )
     }
 
@@ -3732,7 +3712,7 @@ impl Dump {
              JOIN pg_namespace pn ON pn.oid = p.prsnamespace
              LEFT JOIN pg_description d ON d.objoid = c.oid
                  AND d.classoid = 'pg_ts_config'::regclass AND d.objsubid = 0
-             WHERE n.nspname IN {}
+             WHERE n.nspname IN {schema_filter}
                AND NOT EXISTS
                (
                     SELECT 1
@@ -3744,8 +3724,7 @@ impl Dump {
                         ext.objsubid = 0 AND
                         ext.deptype = 'e'
                     )
-             ORDER BY n.nspname, c.cfgname",
-            schema_filter
+             ORDER BY n.nspname, c.cfgname"
         )
     }
 
@@ -3766,7 +3745,7 @@ impl Dump {
              JOIN pg_catalog.ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype
              JOIN pg_ts_dict d ON d.oid = m.mapdict
              JOIN pg_namespace dn ON dn.oid = d.dictnamespace
-             WHERE n.nspname IN {}
+             WHERE n.nspname IN {schema_filter}
                AND NOT EXISTS
                (
                     SELECT 1
@@ -3779,8 +3758,7 @@ impl Dump {
                         ext.deptype = 'e'
                 )
              GROUP BY c.cfgnamespace, c.oid, c.cfgname, t.alias
-             ORDER BY c.oid, t.alias",
-            schema_filter
+             ORDER BY c.oid, t.alias"
         )
     }
 
@@ -3792,7 +3770,7 @@ impl Dump {
                 quote_ident(c.cfgname) as cfg_name
              FROM pg_ts_config c
              JOIN pg_namespace n ON n.oid = c.cfgnamespace
-             WHERE n.nspname IN {}
+             WHERE n.nspname IN {schema_filter}
                AND NOT EXISTS
                (
                     SELECT 1
@@ -3804,8 +3782,7 @@ impl Dump {
                         ext.objsubid = 0 AND
                         ext.deptype = 'e'
                     )
-             ORDER BY n.nspname, c.cfgname",
-            schema_filter
+             ORDER BY n.nspname, c.cfgname"
         )
     }
 
@@ -3841,7 +3818,7 @@ impl Dump {
             mapping_map
                 .entry(cfg_oid)
                 .or_default()
-                .push(format!("{}:{}", token_type, dicts));
+                .push(format!("{token_type}:{dicts}"));
         }
 
         let mut ts_configs = Vec::new();
@@ -3912,7 +3889,7 @@ impl Dump {
              JOIN pg_namespace tn ON tn.oid = t.tmplnamespace
              LEFT JOIN pg_description desc2 ON desc2.objoid = d.oid
                  AND desc2.classoid = 'pg_ts_dict'::regclass AND desc2.objsubid = 0
-             WHERE n.nspname IN {}
+             WHERE n.nspname IN {schema_filter}
                AND NOT EXISTS
                (
                     SELECT 1
@@ -3924,8 +3901,7 @@ impl Dump {
                         ext.objsubid = 0 AND
                         ext.deptype = 'e'
                 )
-             ORDER BY n.nspname, d.dictname",
-            schema_filter
+             ORDER BY n.nspname, d.dictname"
         )
     }
 
@@ -3979,7 +3955,7 @@ impl Dump {
                 SELECT t.oid
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                WHERE n.nspname IN {}
+                WHERE n.nspname IN {schema_filter}
             )
             SELECT
                 pg_catalog.format_type(c.castsource, NULL) as source_type,
@@ -4009,8 +3985,7 @@ impl Dump {
             )
               AND (c.castsource IN (SELECT oid FROM user_types)
                    OR c.casttarget IN (SELECT oid FROM user_types))
-            ORDER BY source_type, target_type",
-            schema_filter
+            ORDER BY source_type, target_type"
         )
     }
 
@@ -4086,7 +4061,7 @@ impl Dump {
              LEFT JOIN pg_namespace jn ON jn.oid = jp.pronamespace
              LEFT JOIN pg_description d ON d.objoid = o.oid
                  AND d.classoid = 'pg_operator'::regclass AND d.objsubid = 0
-             WHERE n.nspname IN {}
+             WHERE n.nspname IN {schema_filter}
                AND NOT EXISTS
                (
                     SELECT 1
@@ -4098,8 +4073,7 @@ impl Dump {
                         ext.objsubid = 0 AND
                         ext.deptype = 'e'
                 )
-             ORDER BY n.nspname, o.oprname",
-            schema_filter
+             ORDER BY n.nspname, o.oprname"
         )
     }
 
@@ -4160,9 +4134,8 @@ impl Dump {
              FROM pg_default_acl da
              JOIN pg_roles r ON r.oid = da.defaclrole
              LEFT JOIN pg_namespace n ON n.oid = da.defaclnamespace
-             WHERE da.defaclnamespace = 0 OR n.nspname IN {}
-             ORDER BY r.rolname, COALESCE(n.nspname, ''), da.defaclobjtype",
-            schema_filter
+             WHERE da.defaclnamespace = 0 OR n.nspname IN {schema_filter}
+             ORDER BY r.rolname, COALESCE(n.nspname, ''), da.defaclobjtype"
         );
 
         let rows = sqlx::query(query.as_str())

@@ -6081,6 +6081,53 @@ CREATE TABLE test_schema.colset_part_1 PARTITION OF test_schema.colset_part
 
 -- ==== END fix:colsettings ====
 
+-- ==== BEGIN fix:inhadd — an INHERITS parent's new column is added once, on the parent ====
+-- README section 83. TO adds note and tag to inhadd_par. Its ADD COLUMN
+-- recurses to every table that inherits from it, so the children's own
+-- ADD COLUMN failed ("column ... already exists"). The children sort before
+-- their parent, the order pgc 1.0.x happened to get through with.
+CREATE TABLE test_schema.inhadd_par (id integer);
+CREATE TABLE test_schema.inhadd_chi (x integer) INHERITS (test_schema.inhadd_par);
+CREATE TABLE test_schema.inhadd_grand (y integer) INHERITS (test_schema.inhadd_chi);
+-- TO takes these two out of the family: inhadd_left without the new
+-- columns, inhadd_own with tag as a column of its own.
+CREATE TABLE test_schema.inhadd_left (z integer) INHERITS (test_schema.inhadd_par);
+CREATE TABLE test_schema.inhadd_own (z integer) INHERITS (test_schema.inhadd_par);
+-- ==== END fix:inhadd ====
+
+-- ==== BEGIN fix:retypesettings — a retyped column keeps its storage and compression ====
+-- README section 84. ALTER COLUMN ... TYPE gives a column its new type's
+-- storage and the default compression, so the settings both sides share
+-- were lost. The statistics target stays.
+CREATE TABLE test_schema.rtset_own (
+    id integer,
+    v varchar(10),
+    w varchar(10),
+    s varchar(10),
+    c text COLLATE "C"
+);
+ALTER TABLE test_schema.rtset_own ALTER COLUMN v SET STORAGE MAIN;
+ALTER TABLE test_schema.rtset_own ALTER COLUMN w SET COMPRESSION pglz;
+ALTER TABLE test_schema.rtset_own ALTER COLUMN s SET STATISTICS 77;
+ALTER TABLE test_schema.rtset_own ALTER COLUMN c SET STORAGE EXTERNAL;
+-- An INHERITS parent's retype recurses to its children.
+CREATE TABLE test_schema.rtset_par (id integer, v varchar(10));
+ALTER TABLE test_schema.rtset_par ALTER COLUMN v SET STORAGE MAIN;
+CREATE TABLE test_schema.rtset_chi (x integer) INHERITS (test_schema.rtset_par);
+CREATE TABLE test_schema.rtset_chi2 (x integer) INHERITS (test_schema.rtset_par);
+ALTER TABLE test_schema.rtset_chi2 ALTER COLUMN v SET STORAGE EXTERNAL;
+-- A partitioned table's retype recurses to its partitions.
+CREATE TABLE test_schema.rtset_part (id integer, v varchar(10)) PARTITION BY RANGE (id);
+CREATE TABLE test_schema.rtset_part_1 PARTITION OF test_schema.rtset_part
+    FOR VALUES FROM (0) TO (100);
+ALTER TABLE test_schema.rtset_part ALTER COLUMN v SET STORAGE MAIN;
+-- A typed table, retyped by its type's ALTER ATTRIBUTE ... TYPE CASCADE.
+CREATE TYPE test_schema.rtset_t AS (a integer, b varchar(10));
+CREATE TABLE test_schema.rtset_typed OF test_schema.rtset_t;
+ALTER TABLE test_schema.rtset_typed ALTER COLUMN b SET STORAGE MAIN;
+ALTER TABLE test_schema.rtset_typed ALTER COLUMN b SET COMPRESSION pglz;
+-- ==== END fix:retypesettings ====
+
 -- ==== BEGIN fix:schemadefacl — a schema the migration creates under the default privileges for schemas ====
 -- Issue #251, for schemas (README section 81). ALTER DEFAULT PRIVILEGES ...
 -- ON SCHEMAS has no IN SCHEMA form: the row is database-wide and applies to

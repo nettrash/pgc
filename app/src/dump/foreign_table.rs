@@ -125,7 +125,7 @@ impl ForeignTable {
                 script.push_str(" not null");
             }
             if let Some(def) = &col.column_default {
-                script.push_str(&format!(" default {}", def));
+                script.push_str(&format!(" default {def}"));
             }
             if !col.options.is_empty() {
                 script.push_str(&format!(" options ({})", col.options.join(", ")));
@@ -241,7 +241,7 @@ impl ForeignTable {
             let drop = self.get_drop_script();
             let create = target.get_script();
             if use_drop {
-                return format!("{}{}", drop, create);
+                return format!("{drop}{create}");
             } else {
                 let commented_drop = comment_out(&drop);
                 let commented_create = comment_out(&create);
@@ -316,7 +316,7 @@ impl ForeignTable {
                     col_def.push_str(" not null");
                 }
                 if let Some(def) = &col.column_default {
-                    col_def.push_str(&format!(" default {}", def));
+                    col_def.push_str(&format!(" default {def}"));
                 }
                 statements.push(
                     format!(

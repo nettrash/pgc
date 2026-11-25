@@ -77,8 +77,7 @@ async fn kind_transition_regular_to_materialized_use_drop_true() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
     assert!(
         has_active_drop,
-        "Regular→mat: DROP VIEW should be active when use_drop=true, script:\n{}",
-        script
+        "Regular→mat: DROP VIEW should be active when use_drop=true, script:\n{script}"
     );
     // CREATE MATERIALIZED VIEW should be active
     let has_active_create = script
@@ -86,8 +85,7 @@ async fn kind_transition_regular_to_materialized_use_drop_true() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create materialized view"));
     assert!(
         has_active_create,
-        "Regular→mat: CREATE MATERIALIZED VIEW should be active when use_drop=true, script:\n{}",
-        script
+        "Regular→mat: CREATE MATERIALIZED VIEW should be active when use_drop=true, script:\n{script}"
     );
 }
 
@@ -127,8 +125,7 @@ async fn kind_transition_regular_to_materialized_use_drop_false() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
     assert!(
         !has_active_drop,
-        "Regular→mat: DROP VIEW should be commented when use_drop=false, script:\n{}",
-        script
+        "Regular→mat: DROP VIEW should be commented when use_drop=false, script:\n{script}"
     );
     // CREATE should be commented (manual intervention needed)
     let has_active_create = script
@@ -136,13 +133,11 @@ async fn kind_transition_regular_to_materialized_use_drop_false() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create materialized view"));
     assert!(
         !has_active_create,
-        "Regular→mat: CREATE MATERIALIZED VIEW should be commented when use_drop=false, script:\n{}",
-        script
+        "Regular→mat: CREATE MATERIALIZED VIEW should be commented when use_drop=false, script:\n{script}"
     );
     assert!(
         script.contains("manual intervention needed"),
-        "Should contain manual intervention warning, script:\n{}",
-        script
+        "Should contain manual intervention warning, script:\n{script}"
     );
 }
 
@@ -182,8 +177,7 @@ async fn kind_transition_materialized_to_regular_use_drop_true() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop materialized view"));
     assert!(
         has_active_drop,
-        "Mat→regular: DROP MATERIALIZED VIEW should be active when use_drop=true, script:\n{}",
-        script
+        "Mat→regular: DROP MATERIALIZED VIEW should be active when use_drop=true, script:\n{script}"
     );
     // CREATE OR REPLACE VIEW should be active
     let has_active_create = script
@@ -191,8 +185,7 @@ async fn kind_transition_materialized_to_regular_use_drop_true() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create or replace view"));
     assert!(
         has_active_create,
-        "Mat→regular: CREATE OR REPLACE VIEW should be active when use_drop=true, script:\n{}",
-        script
+        "Mat→regular: CREATE OR REPLACE VIEW should be active when use_drop=true, script:\n{script}"
     );
 }
 
@@ -232,8 +225,7 @@ async fn kind_transition_materialized_to_regular_use_drop_false() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop materialized view"));
     assert!(
         !has_active_drop,
-        "Mat→regular: DROP MATERIALIZED VIEW should be commented when use_drop=false, script:\n{}",
-        script
+        "Mat→regular: DROP MATERIALIZED VIEW should be commented when use_drop=false, script:\n{script}"
     );
     // CREATE OR REPLACE VIEW should also be commented (kind transition)
     let has_active_create = script
@@ -241,13 +233,11 @@ async fn kind_transition_materialized_to_regular_use_drop_false() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("create or replace view"));
     assert!(
         !has_active_create,
-        "Mat→regular: CREATE OR REPLACE VIEW should be commented when use_drop=false, script:\n{}",
-        script
+        "Mat→regular: CREATE OR REPLACE VIEW should be commented when use_drop=false, script:\n{script}"
     );
     assert!(
         script.contains("manual intervention needed"),
-        "Should contain manual intervention warning, script:\n{}",
-        script
+        "Should contain manual intervention warning, script:\n{script}"
     );
 }
 
@@ -277,8 +267,7 @@ async fn from_only_view_commented_drop_when_use_drop_false() {
     // The DROP must appear in the output …
     assert!(
         script.to_lowercase().contains("drop view"),
-        "FROM-only view must produce a DROP statement even with use_drop=false, script:\n{}",
-        script
+        "FROM-only view must produce a DROP statement even with use_drop=false, script:\n{script}"
     );
     // … but it must be commented out, not active SQL.
     let has_active_drop = script
@@ -286,8 +275,7 @@ async fn from_only_view_commented_drop_when_use_drop_false() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
     assert!(
         !has_active_drop,
-        "FROM-only view DROP should be commented when use_drop=false, script:\n{}",
-        script
+        "FROM-only view DROP should be commented when use_drop=false, script:\n{script}"
     );
 }
 
@@ -316,8 +304,7 @@ async fn from_only_view_active_drop_when_use_drop_true() {
         .any(|l| !l.starts_with("--") && l.to_lowercase().contains("drop view"));
     assert!(
         has_active_drop,
-        "FROM-only view DROP should be active SQL when use_drop=true, script:\n{}",
-        script
+        "FROM-only view DROP should be active SQL when use_drop=true, script:\n{script}"
     );
 }
 
@@ -388,8 +375,7 @@ async fn issue189_signature_change_recreates_byte_identical_materialized_view() 
 
     assert!(
         script.contains("create materialized view if not exists test_deps.mv_things"),
-        "materialized view must be re-emitted with IF NOT EXISTS: {}",
-        script
+        "materialized view must be re-emitted with IF NOT EXISTS: {script}"
     );
 }
 
@@ -433,8 +419,7 @@ async fn issue189_view_not_referencing_routine_is_not_recreated() {
 
     assert!(
         !script.contains("v_other"),
-        "view that doesn't reference the cascaded routine must not be re-emitted: {}",
-        script
+        "view that doesn't reference the cascaded routine must not be re-emitted: {script}"
     );
 }
 
@@ -483,8 +468,7 @@ async fn issue189_view_recreate_skipped_when_to_definition_no_longer_references_
         let recreate_section = &script[start..recreate_end];
         assert!(
             !recreate_section.contains("v_things"),
-            "Phase 7 must not re-emit a view whose TO definition no longer references the routine: {}",
-            recreate_section
+            "Phase 7 must not re-emit a view whose TO definition no longer references the routine: {recreate_section}"
         );
     }
 }
@@ -503,8 +487,7 @@ fn issue189_rewrite_create_view_anchored_to_prefix() {
     assert!(
         rewritten.starts_with("CREATE OR REPLACE VIEW public.v_with_literal as\n"),
         "leading `create view` must be rewritten even when the body \
-         contains the same phrase as a string literal: {}",
-        rewritten
+         contains the same phrase as a string literal: {rewritten}"
     );
     // Already in the desired form — return unchanged (no double rewrite).
     let already = "CREATE OR REPLACE VIEW public.v as\nSELECT 1;\n";
@@ -555,15 +538,13 @@ async fn issue189_view_definition_with_create_or_replace_literal_is_recreated() 
     assert!(
         script.contains("CREATE OR REPLACE VIEW test_deps.v_things"),
         "view recreate must emit `CREATE OR REPLACE VIEW` at the leading \
-         statement even when the body contains the same phrase: {}",
-        script
+         statement even when the body contains the same phrase: {script}"
     );
     // The body's literal must survive unchanged — we do NOT want a
     // rewrite that mangles a non-prefix occurrence.
     assert!(
         script.contains("'CREATE OR REPLACE VIEW evil.v AS SELECT 1'"),
-        "literal inside the view body must be left intact: {}",
-        script
+        "literal inside the view body must be left intact: {script}"
     );
 }
 
@@ -587,13 +568,11 @@ async fn issue189_view_recreate_skipped_when_routine_unchanged() {
 
     assert!(
         !script.contains("Recreate dependents dropped by CASCADE"),
-        "no CASCADE drop happened — recreate phase must stay silent: {}",
-        script
+        "no CASCADE drop happened — recreate phase must stay silent: {script}"
     );
     assert!(
         !script.contains("CREATE OR REPLACE VIEW test_deps.v_things"),
-        "view must not be re-emitted when the function is unchanged: {}",
-        script
+        "view must not be re-emitted when the function is unchanged: {script}"
     );
 }
 

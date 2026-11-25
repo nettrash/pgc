@@ -84,8 +84,7 @@ async fn issue179_signature_change_recreates_all_cascade_dependents() {
     );
     assert!(
         script.contains("alter table test_deps.items drop constraint if exists chk_compute;"),
-        "drop-if-exists guard for CHECK constraint missing: {}",
-        script
+        "drop-if-exists guard for CHECK constraint missing: {script}"
     );
 
     let idx_pos = script
@@ -161,8 +160,7 @@ async fn issue179_recreate_skipped_when_routine_unchanged() {
 
     assert!(
         !script.contains("Recreate dependents dropped by CASCADE"),
-        "no CASCADE drop happened — recreate phase must stay silent: {}",
-        script
+        "no CASCADE drop happened — recreate phase must stay silent: {script}"
     );
     assert!(!script.contains("alter table test_deps.items add constraint chk_compute"));
     assert!(!script.contains("CREATE INDEX idx_compute"));
@@ -319,30 +317,25 @@ async fn issue179_unqualified_function_calls_are_detected() {
 
     assert!(
         script.contains("alter table test_deps.items add constraint chk_compute"),
-        "unqualified CHECK reference must trigger recreate: {}",
-        script
+        "unqualified CHECK reference must trigger recreate: {script}"
     );
     assert!(
         script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
-        "unqualified index reference must trigger recreate: {}",
-        script
+        "unqualified index reference must trigger recreate: {script}"
     );
     assert!(
         script.contains(
             "alter table test_deps.items add column if not exists gen_col bigint generated always as (compute(value)) stored;"
         ),
-        "unqualified generated-column reference must trigger recreate: {}",
-        script
+        "unqualified generated-column reference must trigger recreate: {script}"
     );
     assert!(
         script.contains("alter table test_deps.items alter column def_col set default compute(0);"),
-        "unqualified column DEFAULT reference must trigger recreate: {}",
-        script
+        "unqualified column DEFAULT reference must trigger recreate: {script}"
     );
     assert!(
         script.contains("create policy p_items on test_deps.items"),
-        "unqualified policy reference must trigger recreate: {}",
-        script
+        "unqualified policy reference must trigger recreate: {script}"
     );
 }
 
@@ -579,46 +572,39 @@ async fn issue179_to_side_gate_skips_dependents_no_longer_referencing_routine() 
     // requires DROP+CREATE).
     assert!(
         script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
-        "function drop must still be emitted: {}",
-        script
+        "function drop must still be emitted: {script}"
     );
 
     // CRITICAL: the destructive generated-column path must stay silent.
     assert!(
         !script.contains("alter table test_deps.items drop column if exists gen_col"),
-        "generated column must NOT be dropped+re-added when TO no longer references the routine — that would cascade-destroy attached indexes/FKs without restoring them: {}",
-        script
+        "generated column must NOT be dropped+re-added when TO no longer references the routine — that would cascade-destroy attached indexes/FKs without restoring them: {script}"
     );
     assert!(
         !script.contains("alter table test_deps.items add column gen_col"),
-        "generated column add must not be emitted when TO does not reference the routine: {}",
-        script
+        "generated column add must not be emitted when TO does not reference the routine: {script}"
     );
 
     // Constraint, index, and policy recreates must also be skipped to
     // avoid redundant work that would conflict with `compare_tables`.
     assert!(
         !script.contains("alter table test_deps.items add constraint chk_compute"),
-        "CHECK recreate must not fire when TO definition no longer references the routine: {}",
-        script
+        "CHECK recreate must not fire when TO definition no longer references the routine: {script}"
     );
     assert!(
         !script.contains("CREATE INDEX idx_compute ON test_deps.items"),
-        "index recreate must not fire when TO indexdef no longer references the routine: {}",
-        script
+        "index recreate must not fire when TO indexdef no longer references the routine: {script}"
     );
     assert!(
         !script.contains("create policy p_items"),
-        "policy recreate must not fire when TO clauses no longer reference the routine: {}",
-        script
+        "policy recreate must not fire when TO clauses no longer reference the routine: {script}"
     );
 
     // Column DEFAULT must also be skipped (TO default is `0`, no
     // function reference).
     assert!(
         !script.contains("alter table test_deps.items alter column def_col set default 0;"),
-        "column DEFAULT recreate must not fire when TO default no longer references the routine: {}",
-        script
+        "column DEFAULT recreate must not fire when TO default no longer references the routine: {script}"
     );
 }
 
@@ -657,30 +643,25 @@ async fn issue179_to_side_gate_still_recreates_when_to_keeps_reference() {
     // references the routine.
     assert!(
         script.contains("alter table test_deps.items add constraint chk_compute"),
-        "CHECK constraint recreate expected when TO still references the routine: {}",
-        script
+        "CHECK constraint recreate expected when TO still references the routine: {script}"
     );
     assert!(
         script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
-        "index recreate expected when TO still references the routine: {}",
-        script
+        "index recreate expected when TO still references the routine: {script}"
     );
     assert!(
         script.contains("alter table test_deps.items add column if not exists gen_col"),
-        "generated column recreate expected when TO still references the routine: {}",
-        script
+        "generated column recreate expected when TO still references the routine: {script}"
     );
     assert!(
         script.contains(
             "alter table test_deps.items alter column def_col set default test_deps.compute(0);"
         ),
-        "column DEFAULT recreate expected when TO still references the routine: {}",
-        script
+        "column DEFAULT recreate expected when TO still references the routine: {script}"
     );
     assert!(
         script.contains("create policy p_items on test_deps.items"),
-        "policy recreate expected when TO still references the routine: {}",
-        script
+        "policy recreate expected when TO still references the routine: {script}"
     );
 }
 
@@ -786,8 +767,7 @@ async fn issue179_overload_collision_does_not_destroy_unrelated_column() {
     // The integer overload is still cascaded.
     assert!(
         script.contains("drop function if exists test_deps.compute (x integer) cascade;"),
-        "integer overload must still be DROP+CREATEd: {}",
-        script
+        "integer overload must still be DROP+CREATEd: {script}"
     );
 
     // CRITICAL: Phase 7 must NOT emit a DROP COLUMN. The text matcher
@@ -796,8 +776,7 @@ async fn issue179_overload_collision_does_not_destroy_unrelated_column() {
     // destroy the unrelated column. Pinning this prevents regression.
     assert!(
         !script.contains("drop column if exists gen_col"),
-        "overload collision must not emit DROP COLUMN — would cascade-destroy attached indexes/FKs: {}",
-        script
+        "overload collision must not emit DROP COLUMN — would cascade-destroy attached indexes/FKs: {script}"
     );
     // The recreate that *is* emitted must use IF NOT EXISTS so the
     // surviving column is left intact when the script runs.
@@ -805,8 +784,7 @@ async fn issue179_overload_collision_does_not_destroy_unrelated_column() {
         let snippet = &script[add_idx..(add_idx + 80).min(script.len())];
         assert!(
             snippet.contains("if not exists"),
-            "ADD COLUMN must use IF NOT EXISTS to be non-destructive on overload false-positives: {}",
-            snippet
+            "ADD COLUMN must use IF NOT EXISTS to be non-destructive on overload false-positives: {snippet}"
         );
     }
 }
@@ -907,8 +885,7 @@ async fn issue179_quoted_routine_name_recreates_dependents() {
 
     assert!(
         script.contains("alter table public.items add constraint chk_my"),
-        "quoted-name function reference must trigger CHECK recreate: {}",
-        script
+        "quoted-name function reference must trigger CHECK recreate: {script}"
     );
 }
 
@@ -973,18 +950,15 @@ async fn issue179_defaults_only_change_uses_create_or_replace_no_cascade() {
 
     assert!(
         script.contains("create or replace function test_deps.compute(x integer DEFAULT 1)"),
-        "defaults-only change must be re-emitted via CREATE OR REPLACE: {}",
-        script
+        "defaults-only change must be re-emitted via CREATE OR REPLACE: {script}"
     );
     assert!(
         !script.contains("drop function if exists test_deps.compute"),
-        "defaults-only change must NOT emit DROP FUNCTION CASCADE: {}",
-        script
+        "defaults-only change must NOT emit DROP FUNCTION CASCADE: {script}"
     );
     assert!(
         !script.contains("alter table test_deps.items add constraint chk_compute"),
-        "dependents must NOT be recreated when the function was not actually dropped: {}",
-        script
+        "dependents must NOT be recreated when the function was not actually dropped: {script}"
     );
 }
 
@@ -1102,13 +1076,11 @@ async fn issue179_partition_child_skips_inherited_dependents() {
     // be recreated against the parent.
     assert!(
         script.contains("alter table test_deps.items add constraint chk_compute"),
-        "parent CHECK must be re-added: {}",
-        script
+        "parent CHECK must be re-added: {script}"
     );
     assert!(
         script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items "),
-        "parent index must be re-created: {}",
-        script
+        "parent index must be re-created: {script}"
     );
 
     // Inherited child constraint (coninhcount > 0) must NOT be re-added
@@ -1118,13 +1090,11 @@ async fn issue179_partition_child_skips_inherited_dependents() {
     // match `chk_compute_local` below.)
     assert!(
         !script.contains("alter table test_deps.items_2026 drop constraint if exists chk_compute;"),
-        "inherited child CHECK must not be re-emitted: {}",
-        script
+        "inherited child CHECK must not be re-emitted: {script}"
     );
     assert!(
         !script.contains("alter table test_deps.items_2026 add constraint chk_compute check"),
-        "inherited child CHECK must not be re-added: {}",
-        script
+        "inherited child CHECK must not be re-added: {script}"
     );
 
     // Truly-local child constraint (coninhcount == 0) IS re-emitted.
@@ -1132,13 +1102,11 @@ async fn issue179_partition_child_skips_inherited_dependents() {
         script.contains(
             "alter table test_deps.items_2026 drop constraint if exists chk_compute_local;"
         ),
-        "local child CHECK must be re-emitted: {}",
-        script
+        "local child CHECK must be re-emitted: {script}"
     );
     assert!(
         script.contains("alter table test_deps.items_2026 add constraint chk_compute_local"),
-        "local child CHECK must be re-added: {}",
-        script
+        "local child CHECK must be re-added: {script}"
     );
 
     // Partition-inherited index: must not be re-emitted on the child.
@@ -1146,8 +1114,7 @@ async fn issue179_partition_child_skips_inherited_dependents() {
     // the recreate uses `CREATE INDEX` or `CREATE INDEX IF NOT EXISTS`.
     assert!(
         !script.contains("idx_compute ON test_deps.items_2026"),
-        "partition-inherited index must not be re-emitted on child: {}",
-        script
+        "partition-inherited index must not be re-emitted on child: {script}"
     );
 
     // Partition child's generated column must NOT be added — PostgreSQL
@@ -1156,8 +1123,7 @@ async fn issue179_partition_child_skips_inherited_dependents() {
     // below is the load-bearing one for partition-child safety.)
     assert!(
         !script.contains("alter table test_deps.items_2026 add column if not exists gen_col"),
-        "partition child column must not be re-added: {}",
-        script
+        "partition child column must not be re-added: {script}"
     );
 }
 
@@ -1321,8 +1287,7 @@ async fn issue179_quoted_routine_names_match_unqualified_calls() {
 
     assert!(
         script.contains("alter table public.items add constraint chk_myfunc"),
-        "quoted routine name must still match its unqualified deparsed dependent: {}",
-        script
+        "quoted routine name must still match its unqualified deparsed dependent: {script}"
     );
 }
 
@@ -1368,23 +1333,19 @@ async fn issue179_defaults_only_change_emits_create_or_replace_no_cascade() {
 
     assert!(
         script.contains("create or replace function test_deps.compute(x integer DEFAULT 1)"),
-        "defaults-only change must use CREATE OR REPLACE FUNCTION: {}",
-        script
+        "defaults-only change must use CREATE OR REPLACE FUNCTION: {script}"
     );
     assert!(
         !script.contains("drop function if exists test_deps.compute"),
-        "defaults-only change must NOT emit DROP FUNCTION CASCADE: {}",
-        script
+        "defaults-only change must NOT emit DROP FUNCTION CASCADE: {script}"
     );
     assert!(
         !script.contains("alter table test_deps.items add constraint chk_compute"),
-        "Phase 7 must NOT fire on defaults-only change (no CASCADE happened): {}",
-        script
+        "Phase 7 must NOT fire on defaults-only change (no CASCADE happened): {script}"
     );
     assert!(
         !script.contains("CREATE INDEX IF NOT EXISTS idx_compute ON test_deps.items"),
-        "no index recreate on defaults-only change: {}",
-        script
+        "no index recreate on defaults-only change: {script}"
     );
 }
 

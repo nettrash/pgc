@@ -908,13 +908,11 @@ async fn compare_routines_procedure_with_config_params() {
 
     assert!(
         script.contains("SET search_path = public, pg_temp"),
-        "script must contain SET search_path, got:\n{}",
-        script
+        "script must contain SET search_path, got:\n{script}"
     );
     assert!(
         script.contains("SET lock_timeout = '5s'"),
-        "script must contain SET lock_timeout, got:\n{}",
-        script
+        "script must contain SET lock_timeout, got:\n{script}"
     );
 }
 
@@ -945,13 +943,11 @@ async fn compare_routines_function_with_config_params() {
 
     assert!(
         script.contains("SET work_mem = '256MB'"),
-        "script must contain SET work_mem, got:\n{}",
-        script
+        "script must contain SET work_mem, got:\n{script}"
     );
     assert!(
         script.contains("VOLATILE"),
-        "function flags must still be present, got:\n{}",
-        script
+        "function flags must still be present, got:\n{script}"
     );
 }
 
@@ -1007,18 +1003,15 @@ async fn compare_routines_config_change_triggers_update() {
 
     assert!(
         script.contains("create or replace function"),
-        "config change must trigger CREATE OR REPLACE, got:\n{}",
-        script
+        "config change must trigger CREATE OR REPLACE, got:\n{script}"
     );
     assert!(
         script.contains("SET search_path = public"),
-        "script must contain SET search_path, got:\n{}",
-        script
+        "script must contain SET search_path, got:\n{script}"
     );
     assert!(
         script.contains("SET lock_timeout = '5s'"),
-        "script must contain SET lock_timeout, got:\n{}",
-        script
+        "script must contain SET lock_timeout, got:\n{script}"
     );
 }
 
@@ -1069,13 +1062,11 @@ async fn compare_routines_config_removal_triggers_update() {
 
     assert!(
         script.contains("create or replace function"),
-        "config removal must trigger CREATE OR REPLACE, got:\n{}",
-        script
+        "config removal must trigger CREATE OR REPLACE, got:\n{script}"
     );
     assert!(
         !script.contains("SET search_path"),
-        "removed config must not appear in script, got:\n{}",
-        script
+        "removed config must not appear in script, got:\n{script}"
     );
 }
 

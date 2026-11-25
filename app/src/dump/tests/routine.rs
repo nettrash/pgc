@@ -655,8 +655,7 @@ fn get_aggregate_script_ordered_set() {
         script.contains(
             "create or replace aggregate public.my_percentile(double precision ORDER BY double precision)"
         ),
-        "Expected ordered-set syntax with ORDER BY, got: {}",
-        script
+        "Expected ordered-set syntax with ORDER BY, got: {script}"
     );
     assert!(script.contains("SFUNC = ordered_set_transition"));
     assert!(script.contains("FINALFUNC = percentile_disc_final"));
@@ -705,8 +704,7 @@ fn get_aggregate_script_hypothetical_set() {
     let script = routine.get_script();
     assert!(
         script.contains("create or replace aggregate public.my_rank(\"any\" ORDER BY \"any\")"),
-        "Expected hypothetical-set syntax with ORDER BY, got: {}",
-        script
+        "Expected hypothetical-set syntax with ORDER BY, got: {script}"
     );
     assert!(script.contains("HYPOTHETICAL"));
 }
@@ -753,8 +751,7 @@ fn get_aggregate_script_ordered_set_no_direct_args() {
     let script = routine.get_script();
     assert!(
         script.contains("create or replace aggregate public.my_mode(ORDER BY anyelement)"),
-        "Expected ordered-set syntax with no direct args, got: {}",
-        script
+        "Expected ordered-set syntax with no direct args, got: {script}"
     );
 }
 
@@ -1109,8 +1106,7 @@ fn get_script_function_with_config() {
     let script = routine.get_script();
     assert!(
         script.contains("PARALLEL UNSAFE SET work_mem = '256MB' as $$"),
-        "SET clause must appear between flags and AS, got:\n{}",
-        script
+        "SET clause must appear between flags and AS, got:\n{script}"
     );
 }
 
@@ -1126,8 +1122,7 @@ fn get_script_function_with_multiple_config() {
     let script = routine.get_script();
     assert!(
         script.contains("SET search_path = public, pg_temp SET statement_timeout = '30s'"),
-        "all SET clauses must appear in order, got:\n{}",
-        script
+        "all SET clauses must appear in order, got:\n{script}"
     );
 }
 
@@ -1146,8 +1141,7 @@ fn get_script_procedure_with_config() {
         script.contains(
             "SECURITY DEFINER SET search_path = public, pg_temp SET lock_timeout = '5s' as $$"
         ),
-        "procedure SET clauses must appear after SECURITY DEFINER and before AS, got:\n{}",
-        script
+        "procedure SET clauses must appear after SECURITY DEFINER and before AS, got:\n{script}"
     );
     // Must not contain function-only flags
     assert!(!script.contains("VOLATILE"));
@@ -1163,8 +1157,7 @@ fn get_script_procedure_config_only_no_security_definer() {
     let script = routine.get_script();
     assert!(
         script.contains("language sql SET search_path = public as $$"),
-        "config must appear even without SECURITY DEFINER, got:\n{}",
-        script
+        "config must appear even without SECURITY DEFINER, got:\n{script}"
     );
 }
 

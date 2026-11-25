@@ -2002,6 +2002,39 @@ The fixture is the fix:colsettings block near the end of both schema files. Comp
 
 Round 2 compares all of these, so it is the check: before the fix it held one `SET` per lost setting.
 
+### 83. An INHERITS Parent's New Column Is Added Once, on the Parent (all versions)
+
+The fixture is the fix:inhadd block near the end of both schema files, with `.github/scripts/assert-inhadd.sh`.
+
+**The problem.** A parent's `ADD COLUMN` recurses to every table that inherits from it, and the migration alters parents first. So each child already had the column when its own `ADD COLUMN` ran, and that failed with `column ... already exists`. pgc 1.0.x got through only when a child's name sorted before its parent's (the child's add came first and the parent's merged into it). Round 2 cannot see the failure: the parent's add has given every child the column, so both sides agree. A child that leaves the parent in the same migration (`NO INHERIT`) got the column too, and kept it as a column of its own that TO did not have.
+
+**What happens now.** A child leaves a column a parent adds to that parent's `ADD COLUMN`. It sets only what it has on top of the parent's definition, because the parent's own statements on the column recurse too: its default, `NOT NULL`, storage, compression, statistics target, and its comment, which is never inherited. A child that leaves the parent keeps the copy as a column of its own, or drops it after its `NO INHERIT` when TO does not have it. A child that joins the parent (`INHERIT`) still adds the column itself, before its `INHERIT`, as before.
+
+#### Tables (fix:inhadd block)
+- **Modified**: `test_schema.inhadd_par`. TO adds `note text DEFAULT 'p' NOT NULL` (`MAIN`) and `tag text`.
+- **Modified**: `test_schema.inhadd_chi`, a child that sorts before its parent. Its copy of `note` gets its own default `'c'` and a comment; its `tag` is `NOT NULL` with statistics 120.
+- **Modified**: `test_schema.inhadd_grand`, the child's child. It inherits the child's default, `NOT NULL` and statistics target, and sets its target back to the default.
+- **Modified**: `test_schema.inhadd_left` leaves the family and has neither new column, so it drops both after its `NO INHERIT`.
+- **Modified**: `test_schema.inhadd_own` leaves the family and keeps `tag` as a column of its own.
+
+The assert compares the columns (local or inherited, `NOT NULL`, default, storage, compression, statistics target, comment) and the inheritance links of `a` and `b`. It also requires that no child of `inhadd_par` adds a column in the migration.
+
+### 84. A Retyped Column Keeps Its Storage and Compression (all versions)
+
+The fixture is the fix:retypesettings block near the end of both schema files. The assert of section 83 compares its columns too.
+
+**The problem.** `ALTER COLUMN ... TYPE` gives a column its new type's storage and the default compression, whatever it had, and keeps the statistics target. The migration compared the two settings with the old column only, so a setting both sides shared was lost until the next compare set it again. The same happened to a typed table's column that its type retypes (`ALTER ATTRIBUTE ... TYPE CASCADE`), and to the copies an INHERITS or partitioned parent's retype reaches.
+
+**What happens now.** A retyped column is diffed from what the retype leaves: its new type's storage (`type_storage`) and the default compression, or, for a copy an INHERITS parent's retype reaches, the parent's TO settings, which the parent's own `SET STORAGE` and `SET COMPRESSION` pass down. A dump that does not say the type's storage always gets `SET STORAGE`.
+
+#### Tables (fix:retypesettings block)
+- **Modified**: `test_schema.rtset_own`. `varchar(10)` becomes `text` for `v` (`MAIN`), `w` (`pglz`) and `s` (statistics 77, which the retype keeps), and `c` changes collation from `"C"` to `"POSIX"` (`EXTERNAL`), which is an `ALTER COLUMN ... TYPE` too.
+- **Modified**: `test_schema.rtset_par` (`MAIN`) and its children `rtset_chi`, which shares `MAIN`, and `rtset_chi2`, which has `EXTERNAL` of its own.
+- **Modified**: `test_schema.rtset_part`, partitioned, with partition `rtset_part_1`, `MAIN` on the parent.
+- **Modified**: `test_schema.rtset_typed` (`OF test_schema.rtset_t`), whose type retypes `b`; the table has `MAIN` and `pglz`.
+
+Round 2 compares all of these: before the fix it held one `SET` per lost setting.
+
 ---
 
 ## Clear Command Test (`clear_test.sql`)

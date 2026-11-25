@@ -101,7 +101,7 @@ fn test_dependent_serialized_keys_match_struct_fields() {
         "\"dep_table\":",
         "\"dep_name\":",
     ] {
-        assert!(json.contains(key), "missing key {} in {}", key, json);
+        assert!(json.contains(key), "missing key {key} in {json}");
     }
 }
 

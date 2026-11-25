@@ -405,7 +405,7 @@ impl Statistic {
             let drop = self.get_drop_script();
             let create = target.get_script();
             if use_drop {
-                return format!("{}{}", drop, create);
+                return format!("{drop}{create}");
             } else {
                 let commented_drop = comment_out(&drop);
                 let commented_create = comment_out(&create);

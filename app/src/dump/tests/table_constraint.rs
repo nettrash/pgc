@@ -1717,7 +1717,7 @@ fn test_auto_not_null_column_truncated_to_63_bytes() {
     // constraint name is a truncated prefix.
     let table = "a".repeat(50);
     let column = "b".repeat(50);
-    let full_base = format!("{}_{}_not_null", table, column);
+    let full_base = format!("{table}_{column}_not_null");
     assert!(full_base.len() > 63);
 
     // PG truncates to 63 bytes — emulate that.
@@ -1744,7 +1744,7 @@ fn test_auto_not_null_column_truncated_with_collision_suffix_reclips_head() {
     // bytes, neither of which exercises the re-clipping arithmetic.
     let table = "x".repeat(28);
     let column = "y".repeat(27);
-    let full_base = format!("{}_{}_not_null", table, column);
+    let full_base = format!("{table}_{column}_not_null");
     assert_eq!(
         full_base.len(),
         65,
@@ -1797,7 +1797,7 @@ fn test_auto_not_null_column_reclips_when_base_fits_but_suffix_overflows() {
     // comparer emitted false-positive DROP/ADD diffs for it.
     let table = "a".repeat(27);
     let column = "b".repeat(26);
-    let full_base = format!("{}_{}_not_null", table, column);
+    let full_base = format!("{table}_{column}_not_null");
     assert_eq!(
         full_base.len(),
         63,
