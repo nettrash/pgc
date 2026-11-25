@@ -361,6 +361,7 @@ fn nextval_column(table: &str, name: &str, data_type: &str, sequence_name: &str)
         storage: None,
         compression: None,
         statistics_target: None,
+        type_storage: None,
         acl: vec![],
         serial_type: None,
         generation_blocks_retype: false,

@@ -1986,6 +1986,22 @@ The fixture is the fix:schemadefacl block at the end of both schema files: `ALTE
 - `new_reporting_schema`'s privileges in `a` match `b`;
 - `a` holds the row (so the fixture is not vacuous), and the round-1 SQL has the `REVOKE`.
 
+### 82. Columns the Migration Creates Keep Their Storage, Compression and Statistics Target (all versions; the re-added generated column PG14–16)
+
+The fixture is the fix:colsettings block near the end of both schema files. Compression is `pglz`, set explicitly (`attcompression = 'p'`, not the default `''`): every build has it, and not every build has `lz4`.
+
+**The problem (issue #252).** `ADD COLUMN` starts a column with its type's storage (`pg_type.typstorage`), the default compression method and the default statistics target. The migration's `ADD COLUMN` set none of the three, so a new column with any other value came out with the default, and only round 2 found it. The same went for a column that is dropped and added again from its TO definition (a generated column whose change has no in-place form): its settings were compared with the dropped column's, so the settings both sides share were lost. It also went for a typed table's column that its type's `ADD ATTRIBUTE` adds.
+
+**What happens now.** The dump records each column's type storage (`type_storage`). The `ADD COLUMN` is followed by `SET STORAGE` when the column's storage is not its type's own, and by `SET COMPRESSION` and `SET STATISTICS` when it has either. A dump written before `type_storage` existed cannot tell, so `SET STORAGE` is always written for it. A typed table's new column gets the same three, measured against what `ADD ATTRIBUTE` gives it.
+
+#### Tables (fix:colsettings block)
+- **Modified**: `test_schema.colset_add`. TO adds `compressed` (`pglz`), `main_note` (`MAIN`), `targeted` (statistics 400), `all_three` (`EXTERNAL`, `pglz`, 150) and `num_extended`. That one is `numeric`, whose own storage is `MAIN`, set to `EXTENDED`: the storage `text` starts with but `numeric` does not, so the check has to use the column's own type, not one fixed default. `plain_new` keeps every default and gets no extra statement. `kept` (`pglz` on both sides) is unchanged.
+- **Modified**: `test_schema.colset_gen`. The STORED expression of `g` changes, and its `MAIN`, `pglz` and statistics 300 are the same on both sides. PostgreSQL 14–16 drop and re-add it, and the re-added column gets all three. 17+ use `SET EXPRESSION`, which keeps them.
+- **Modified**: `test_schema.colset_typed` (`OF test_schema.colset_t`). The type gains `b text`, which TO's table gives `MAIN`, `pglz` and statistics 90.
+- **Modified**: `test_schema.colset_part`, partitioned, with partition `colset_part_1`. TO adds `doc` with `MAIN`, `pglz` and statistics 250, set on the parent and recursing to the partition, as the migration does.
+
+Round 2 compares all of these, so it is the check: before the fix it held one `SET` per lost setting.
+
 ---
 
 ## Clear Command Test (`clear_test.sql`)

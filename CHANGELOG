@@ -176,7 +176,23 @@
                       standard_conforming_strings_off, which older
                       dumps may omit.
 
-                Bug fixes: - Resolved issue #251 (a schema the migration
+                Bug fixes: - Resolved issue #252 (a column the
+                migration adds lost its storage, compression method and
+                statistics target). ADD COLUMN starts a column with its
+                type's storage and the default compression and target,
+                and the migration set none of them, so a new column with
+                any other value came out with the default until the next
+                compare set it. The same happened to a column dropped
+                and added again (a generated column whose change has no
+                in-place form), whose settings were compared with the
+                dropped column's, and to the column a typed table gets
+                from its type's ADD ATTRIBUTE. The ADD COLUMN is now
+                followed by SET STORAGE when the storage is not the
+                type's own (each dump now records that; with a dump
+                written before, it is always set), and by SET
+                COMPRESSION and SET STATISTICS when the column has
+                either.
+                - Resolved issue #251 (a schema the migration
                 creates ignored the default privileges for schemas,
                 ALTER DEFAULT PRIVILEGES ... ON SCHEMAS). In full grants
                 mode a new schema was planned from an empty ACL, so a

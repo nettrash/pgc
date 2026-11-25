@@ -53,6 +53,7 @@ fn base_column(name: &str, ordinal_position: i32) -> TableColumn {
         storage: None,
         compression: None,
         statistics_target: None,
+        type_storage: None,
         acl: vec![],
         serial_type: None,
         generation_blocks_retype: false,
@@ -941,6 +942,7 @@ fn create_dummy_column(name: &str, data_type: &str) -> TableColumn {
         storage: None,
         compression: None,
         statistics_target: None,
+        type_storage: None,
         acl: vec![],
         serial_type: None,
         generation_blocks_retype: false,
@@ -6814,4 +6816,100 @@ fn typed_table_recreated_by_its_alter_uses_the_typed_form() {
         "{script}"
     );
     assert!(!script.contains("id text"), "{script}");
+}
+
+/// A `text` column `name` with the storage, compression method and
+/// statistics target given, of a type whose own storage is EXTENDED.
+fn text_column_with(
+    name: &str,
+    ordinal_position: i32,
+    storage: &str,
+    compression: Option<&str>,
+    statistics_target: Option<i32>,
+) -> TableColumn {
+    let mut column = base_column(name, ordinal_position);
+    column.storage = Some(storage.to_string());
+    column.type_storage = Some("EXTENDED".to_string());
+    column.compression = compression.map(str::to_string);
+    column.statistics_target = statistics_target;
+    column
+}
+
+#[test]
+fn a_new_column_keeps_its_storage_compression_and_statistics_target() {
+    // Issue #252, as reported: the new column came without its compression
+    // method, storage or statistics target, and only a second compare found
+    // them missing.
+    let table = |columns: Vec<TableColumn>| {
+        let mut table = table_of("users", columns, vec![]);
+        table.hash();
+        table
+    };
+    let col_a = || text_column_with("col_a", 2, "EXTENDED", Some("lz4"), None);
+    let from = table(vec![int_col("users", "id", 1), col_a()]);
+    let to = table(vec![
+        int_col("users", "id", 1),
+        col_a(),
+        text_column_with("col_b", 3, "EXTENDED", Some("lz4"), None),
+        text_column_with("col_c", 4, "MAIN", None, Some(200)),
+        text_column_with("col_d", 5, "EXTENDED", None, None),
+    ]);
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter table public.users add column col_b text;\n\n\
+         alter table public.users alter column col_b set compression lz4;\n\n\
+         alter table public.users add column col_c text;\n\n\
+         alter table public.users alter column col_c set storage MAIN;\n\n\
+         alter table public.users alter column col_c set statistics 200;\n\n\
+         alter table public.users add column col_d text;\n\n"
+    );
+}
+
+#[test]
+fn a_typed_tables_new_attribute_gets_its_storage_compression_and_statistics_target() {
+    // The type's `ADD ATTRIBUTE ... CASCADE` adds the column with its type's
+    // storage and the default compression and target, so what TO gives it
+    // is set on the table (issue #252).
+    let from = typed_users_with(vec![base_column("id", 1)], vec![]);
+    let to = typed_users_with(
+        vec![
+            base_column("id", 1),
+            text_column_with("note", 2, "MAIN", Some("pglz"), Some(80)),
+            text_column_with("plain", 3, "EXTENDED", None, None),
+        ],
+        vec![],
+    );
+    assert_eq!(
+        from.get_alter_script(&to, true),
+        "alter table public.users alter column note set storage MAIN;\n\n\
+         alter table public.users alter column note set compression pglz;\n\n\
+         alter table public.users alter column note set statistics 80;\n\n"
+    );
+}
+
+#[test]
+fn fetch_columns_query_reads_the_storage_of_the_columns_type() {
+    // What `ADD COLUMN` starts a column of that type with (issue #252).
+    let query = Table::build_columns_query("", "", "('public')");
+    assert!(
+        query.contains("t.typstorage::text as col_type_storage"),
+        "{query}"
+    );
+    assert!(
+        query.contains("JOIN pg_type t ON t.oid = a.atttypid"),
+        "{query}"
+    );
+}
+
+#[test]
+fn storage_name_spells_every_storage_code() {
+    for (code, name) in [
+        ("p", "PLAIN"),
+        ("e", "EXTERNAL"),
+        ("m", "MAIN"),
+        ("x", "EXTENDED"),
+    ] {
+        assert_eq!(storage_name(code).as_deref(), Some(name));
+    }
+    assert_eq!(storage_name(""), None);
 }

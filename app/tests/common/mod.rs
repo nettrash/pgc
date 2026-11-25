@@ -208,6 +208,7 @@ pub fn int_column(schema: &str, table: &str, name: &str, ordinal: i32) -> TableC
         storage: None,
         compression: None,
         statistics_target: None,
+        type_storage: None,
         acl: vec![],
         serial_type: None,
         generation_blocks_retype: false,
