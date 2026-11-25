@@ -54,6 +54,7 @@ fn create_test_column() -> TableColumn {
         storage: None,
         compression: None,
         statistics_target: None,
+        type_storage: None,
         acl: vec![],
         serial_type: None,
         generation_blocks_retype: false,
@@ -2452,4 +2453,167 @@ fn only_collation_differs_tells_a_collation_change_from_a_type_change() {
     retyped.data_type = "text".to_string();
     retyped.character_maximum_length = None;
     assert!(!c.only_collation_differs(&retyped));
+}
+
+/// A `text` column with its type's own storage, as `ADD COLUMN` creates it.
+fn text_column() -> TableColumn {
+    let mut column = create_test_column();
+    column.data_type = "text".to_string();
+    column.character_maximum_length = None;
+    column.character_octet_length = None;
+    column.storage = Some("EXTENDED".to_string());
+    column.type_storage = Some("EXTENDED".to_string());
+    column
+}
+
+const ADD_TEXT_COLUMN: &str = "alter table public.test_table add column test_column text;\n\n";
+
+#[test]
+fn add_script_gives_a_new_column_its_storage_compression_and_statistics_target() {
+    // Issue #252: `ADD COLUMN` starts a column with its type's storage, the
+    // default compression and the default statistics target, and the
+    // migration left it at those.
+    let mut column = text_column();
+    column.storage = Some("MAIN".to_string());
+    column.compression = Some("lz4".to_string());
+    column.statistics_target = Some(500);
+    column.comment = Some("notes".to_string());
+    assert_eq!(
+        column.get_add_script(),
+        format!(
+            "{ADD_TEXT_COLUMN}\
+             alter table public.test_table alter column test_column set storage MAIN;\n\n\
+             alter table public.test_table alter column test_column set compression lz4;\n\n\
+             alter table public.test_table alter column test_column set statistics 500;\n\n\
+             comment on column public.test_table.test_column is 'notes';\n\n"
+        )
+    );
+    // Each on its own, NOT NULL too: the settings follow the whole ADD COLUMN.
+    let mut column = text_column();
+    column.is_nullable = false;
+    column.compression = Some("pglz".to_string());
+    assert_eq!(
+        column.get_add_script_with_not_null("constraint c_nn not null"),
+        "alter table public.test_table add column test_column text constraint c_nn not null;\n\n\
+         alter table public.test_table alter column test_column set compression pglz;\n\n"
+    );
+}
+
+#[test]
+fn add_script_leaves_out_what_a_new_column_starts_with() {
+    let column = text_column();
+    assert_eq!(column.get_add_script(), ADD_TEXT_COLUMN);
+    assert_eq!(column.get_new_column_settings_script(), "");
+    // A negative target is the default (the dump keeps none, but a fixture may).
+    let mut column = text_column();
+    column.statistics_target = Some(-1);
+    assert_eq!(column.get_add_script(), ADD_TEXT_COLUMN);
+    // A storage of its own on a type whose default is not EXTENDED.
+    let mut numeric = text_column();
+    numeric.data_type = "numeric".to_string();
+    numeric.type_storage = Some("MAIN".to_string());
+    assert_eq!(
+        numeric.get_new_column_settings_script(),
+        "alter table public.test_table alter column test_column set storage EXTENDED;\n\n"
+    );
+    numeric.storage = Some("MAIN".to_string());
+    assert_eq!(numeric.get_new_column_settings_script(), "");
+}
+
+#[test]
+fn add_script_states_the_storage_when_the_dump_does_not_say_the_types() {
+    // A dump written before pgc read `typstorage` cannot tell the type's own
+    // storage from one set on the column; setting it is right either way.
+    let mut column = text_column();
+    column.type_storage = None;
+    assert_eq!(
+        column.get_add_script(),
+        format!(
+            "{ADD_TEXT_COLUMN}\
+             alter table public.test_table alter column test_column set storage EXTENDED;\n\n"
+        )
+    );
+    // Without a storage at all (a hand-built dump) there is nothing to set.
+    column.storage = None;
+    assert_eq!(column.get_add_script(), ADD_TEXT_COLUMN);
+}
+
+#[test]
+fn type_storage_is_not_part_of_the_column() {
+    // A fact about the type: two dumps of the same column agree whatever
+    // they record of it.
+    let column = text_column();
+    let mut unknown = column.clone();
+    unknown.type_storage = None;
+    assert_eq!(column, unknown);
+    let hash = |c: &TableColumn| {
+        let mut hasher = Sha256::new();
+        c.add_to_hasher(&mut hasher);
+        hasher.finalize()
+    };
+    assert_eq!(hash(&column), hash(&unknown));
+}
+
+#[test]
+fn a_re_added_column_gets_the_settings_both_sides_share() {
+    // Issue #252: a generated column dropped and added again (here: a STORED
+    // expression change on a server without SET EXPRESSION) had its storage,
+    // compression and target measured against the dropped column, so the
+    // settings both sides share were lost with it.
+    let generated = |expr: &str| {
+        let mut column = text_column();
+        column.is_generated = "ALWAYS".to_string();
+        column.generation_expression = Some(expr.to_string());
+        column.generation_type = Some("s".to_string());
+        column.storage = Some("MAIN".to_string());
+        column.compression = Some("lz4".to_string());
+        column.statistics_target = Some(300);
+        column
+    };
+    let existing = generated("(x || 'a'::text)");
+    let mut updated = generated("(x || 'b'::text)");
+    let settings = "alter table public.test_table alter column test_column set storage MAIN;\n\n\
+                    alter table public.test_table alter column test_column set compression lz4;\n\n\
+                    alter table public.test_table alter column test_column set statistics 300;\n\n";
+    assert_eq!(
+        updated.get_alter_script(&existing, true).unwrap(),
+        format!(
+            "alter table public.test_table drop column test_column;\n\n\
+             alter table public.test_table add column test_column text generated always as (x || 'b'::text) stored;\n\n\
+             {settings}"
+        )
+    );
+    // A setting that changes too is set once, to its TO value; one TO leaves
+    // at the default needs nothing on the new column.
+    updated.compression = Some("pglz".to_string());
+    updated.statistics_target = None;
+    let parts = updated.alter_parts(&existing, true, GeneratedAlterCaps::default(), false);
+    assert_eq!(parts.post, "");
+    assert_eq!(
+        parts.deferred,
+        "alter table public.test_table add column test_column text generated always as (x || 'b'::text) stored;\n\n\
+         alter table public.test_table alter column test_column set storage MAIN;\n\n\
+         alter table public.test_table alter column test_column set compression pglz;\n\n"
+    );
+    // Without use_drop the column stays: only what changes is set, live,
+    // and the re-add is commented out with its settings.
+    let script = updated.get_alter_script(&existing, false).unwrap();
+    let live: Vec<&str> = script
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with("--"))
+        .collect();
+    assert_eq!(
+        live,
+        [
+            "alter table public.test_table alter column test_column set compression pglz;",
+            "alter table public.test_table alter column test_column set statistics -1;",
+        ],
+        "{script}"
+    );
+    assert!(
+        script.contains(
+            "-- alter table public.test_table alter column test_column set storage MAIN;"
+        ),
+        "{script}"
+    );
 }

@@ -72,6 +72,18 @@ fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// The `SET STORAGE` name of an `attstorage` / `typstorage` code, `None` for
+/// any other value.
+fn storage_name(code: &str) -> Option<String> {
+    match code {
+        "p" => Some("PLAIN".to_string()),
+        "e" => Some("EXTERNAL".to_string()),
+        "m" => Some("MAIN".to_string()),
+        "x" => Some("EXTENDED".to_string()),
+        _ => None,
+    }
+}
+
 /// The key column list of a `PRIMARY KEY (...)` constraint definition as
 /// `pg_get_constraintdef` renders it — the text between the first `(` and the
 /// `)` that closes it — and what follows that `)` (`INCLUDE (...)`,
@@ -973,6 +985,7 @@ impl Table {
                 CASE WHEN a.attgenerated <> '' THEN pg_get_expr(ad.adbin, ad.adrelid) ELSE NULL END as generation_expression,
                 a.attgenerated::text as attgenerated,
                 a.attstorage::text as col_storage,
+                t.typstorage::text as col_type_storage,
                 a.attstattarget::int4 as col_stattarget,
                 'YES' as is_updatable,
                 pd.description as column_comment{compression_col}{generation_col},
@@ -1105,16 +1118,7 @@ impl Table {
                         views
                     }),
                     comment: row.get("column_comment"),
-                    storage: {
-                        let s: String = row.get("col_storage");
-                        match s.as_str() {
-                            "p" => Some("PLAIN".to_string()),
-                            "e" => Some("EXTERNAL".to_string()),
-                            "m" => Some("MAIN".to_string()),
-                            "x" => Some("EXTENDED".to_string()),
-                            _ => None,
-                        }
-                    },
+                    storage: storage_name(row.get("col_storage")),
                     compression: if caps.has_attcompression {
                         let c: String = row.get("col_compression");
                         match c.as_str() {
@@ -1129,6 +1133,7 @@ impl Table {
                         let st: Option<i32> = row.get("col_stattarget");
                         st.filter(|&v| v >= 0)
                     },
+                    type_storage: storage_name(row.get("col_type_storage")),
                     acl: row.get::<Vec<String>, _>("col_acl"),
                     serial_type: None,
                     generation_blocks_retype: caps.generation_deps_on_column
@@ -3139,9 +3144,10 @@ impl Table {
                         // An ancestor's drop + add re-creates this column (see
                         // `InheritedRecreates`). What its `ADD COLUMN` does not
                         // carry over is still this table's to set: the
-                        // storage/compression/statistics changes, and the
+                        // storage, compression and statistics target a new
+                        // column does not start with (issue #252), and the
                         // comment, which a recursing `ADD COLUMN` never copies.
-                        generated_script.push_str(&parts.post);
+                        generated_script.push_str(&new_col.get_new_column_settings_script());
                         if let Some(comment_script) = new_col.get_comment_script() {
                             generated_script.push_str(&comment_script);
                         }
@@ -3187,11 +3193,15 @@ impl Table {
                 }
             } else if typed_by_type {
                 // The type's `ADD ATTRIBUTE … CASCADE` adds it as a bare
-                // column, NULL in every row; what TO gives it on top of that
-                // is set here.
+                // column, NULL in every row, with its type's storage and the
+                // default compression and statistics target; what TO gives
+                // it on top of that is set here (issue #252).
                 let added_by_type = TableColumn {
                     column_default: None,
                     is_nullable: true,
+                    storage: new_col.type_storage.clone(),
+                    compression: None,
+                    statistics_target: None,
                     ..new_col.clone()
                 };
                 let alter = |to: &TableColumn, from: &TableColumn| {

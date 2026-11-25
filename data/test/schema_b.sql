@@ -6294,6 +6294,52 @@ INSERT INTO test_schema.inhck_enp (k, a) VALUES (1, 1);
 
 -- ==== END fix:inhcheck ====
 
+-- ==== BEGIN fix:colsettings — columns the migration creates keep their storage, compression and statistics target ====
+-- Issue #252 (README section 82): the new columns, with what a new column
+-- does not start with. numeric's own storage is MAIN, text's EXTENDED.
+CREATE TABLE test_schema.colset_add (
+    id integer PRIMARY KEY,
+    kept text,
+    compressed text,
+    main_note text,
+    targeted integer,
+    all_three text,
+    num_extended numeric,
+    plain_new text
+);
+ALTER TABLE test_schema.colset_add ALTER COLUMN kept SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_add ALTER COLUMN compressed SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_add ALTER COLUMN main_note SET STORAGE MAIN;
+ALTER TABLE test_schema.colset_add ALTER COLUMN targeted SET STATISTICS 400;
+ALTER TABLE test_schema.colset_add ALTER COLUMN all_three SET STORAGE EXTERNAL;
+ALTER TABLE test_schema.colset_add ALTER COLUMN all_three SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_add ALTER COLUMN all_three SET STATISTICS 150;
+ALTER TABLE test_schema.colset_add ALTER COLUMN num_extended SET STORAGE EXTENDED;
+
+CREATE TABLE test_schema.colset_gen (
+    id integer PRIMARY KEY,
+    x text,
+    g text GENERATED ALWAYS AS (x || 'b') STORED
+);
+ALTER TABLE test_schema.colset_gen ALTER COLUMN g SET STORAGE MAIN;
+ALTER TABLE test_schema.colset_gen ALTER COLUMN g SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_gen ALTER COLUMN g SET STATISTICS 300;
+
+CREATE TYPE test_schema.colset_t AS (a integer, b text);
+CREATE TABLE test_schema.colset_typed OF test_schema.colset_t;
+ALTER TABLE test_schema.colset_typed ALTER COLUMN b SET STORAGE MAIN;
+ALTER TABLE test_schema.colset_typed ALTER COLUMN b SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_typed ALTER COLUMN b SET STATISTICS 90;
+
+CREATE TABLE test_schema.colset_part (id integer, k text, doc text) PARTITION BY RANGE (id);
+CREATE TABLE test_schema.colset_part_1 PARTITION OF test_schema.colset_part
+    FOR VALUES FROM (0) TO (100);
+ALTER TABLE test_schema.colset_part ALTER COLUMN doc SET STORAGE MAIN;
+ALTER TABLE test_schema.colset_part ALTER COLUMN doc SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_part ALTER COLUMN doc SET STATISTICS 250;
+
+-- ==== END fix:colsettings ====
+
 -- ==== BEGIN fix:schemadefacl — a schema the migration creates under the default privileges for schemas ====
 -- Issue #251, for schemas (README section 81): the same database-wide row as
 -- FROM, last again. new_reporting_schema, created at the top of this file,

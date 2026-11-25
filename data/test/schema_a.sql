@@ -6049,6 +6049,38 @@ INSERT INTO test_schema.inhck_enp (k, a) VALUES (1, 1);
 
 -- ==== END fix:inhcheck ====
 
+-- ==== BEGIN fix:colsettings — columns the migration creates keep their storage, compression and statistics target ====
+-- Issue #252 (README section 82). TO's new columns have a storage,
+-- compression method or statistics target a new column does not start with.
+-- Compression is pglz, set explicitly: every build has it, lz4 not.
+CREATE TABLE test_schema.colset_add (
+    id integer PRIMARY KEY,
+    kept text
+);
+ALTER TABLE test_schema.colset_add ALTER COLUMN kept SET COMPRESSION pglz;
+
+-- Dropped and added again on PostgreSQL 14-16, where a STORED expression
+-- change has no SET EXPRESSION; the settings are the same on both sides.
+CREATE TABLE test_schema.colset_gen (
+    id integer PRIMARY KEY,
+    x text,
+    g text GENERATED ALWAYS AS (x || 'a') STORED
+);
+ALTER TABLE test_schema.colset_gen ALTER COLUMN g SET STORAGE MAIN;
+ALTER TABLE test_schema.colset_gen ALTER COLUMN g SET COMPRESSION pglz;
+ALTER TABLE test_schema.colset_gen ALTER COLUMN g SET STATISTICS 300;
+
+-- A typed table, whose new column comes from its type's ADD ATTRIBUTE.
+CREATE TYPE test_schema.colset_t AS (a integer);
+CREATE TABLE test_schema.colset_typed OF test_schema.colset_t;
+
+-- A partitioned table, whose settings recurse to the partition.
+CREATE TABLE test_schema.colset_part (id integer, k text) PARTITION BY RANGE (id);
+CREATE TABLE test_schema.colset_part_1 PARTITION OF test_schema.colset_part
+    FOR VALUES FROM (0) TO (100);
+
+-- ==== END fix:colsettings ====
+
 -- ==== BEGIN fix:schemadefacl — a schema the migration creates under the default privileges for schemas ====
 -- Issue #251, for schemas (README section 81). ALTER DEFAULT PRIVILEGES ...
 -- ON SCHEMAS has no IN SCHEMA form: the row is database-wide and applies to

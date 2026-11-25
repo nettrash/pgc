@@ -318,6 +318,14 @@ pub struct TableColumn {
     /// Per-column statistics target (attstattarget; -1 = use default)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statistics_target: Option<i32>,
+    /// The storage strategy a new column of this type starts with: the
+    /// type's `pg_type.typstorage`, which `ADD COLUMN` gives the column
+    /// before any `SET STORAGE` (see
+    /// `TableColumn::get_new_column_settings_script`). A fact about the type,
+    /// not the column: left out of `PartialEq` and the hash. `None` in a dump
+    /// written before pgc read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_storage: Option<String>,
     /// Column-level ACL entries (attacl)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acl: Vec<String>,
@@ -1405,6 +1413,10 @@ impl TableColumn {
         // copy starts with no storage, compression, statistics target or
         // comment of its own.
         let mut rewrite = false;
+        // Whether the column is dropped and added again from its TO
+        // definition, whose `ADD COLUMN` sets its storage, compression and
+        // statistics target itself (issue #252).
+        let mut readded = false;
 
         // Issue #181: `generation_type` (`s`/`v`) flips count as a change
         // too; see `generated_changed`. So does a type change PostgreSQL 14
@@ -1450,6 +1462,7 @@ impl TableColumn {
                     } else {
                         parts.drop = self.get_drop_script();
                         parts.deferred = self.get_add_script();
+                        readded = true;
                     }
                 } else {
                     // The in-place statements stay live, all but a type change
@@ -1559,8 +1572,10 @@ impl TableColumn {
             }
         }
 
-        // The rewrite's own statements carry the rest.
-        if rewrite {
+        // The rewrite's own statements carry the rest, and so does the
+        // re-added column's `ADD COLUMN`: a change measured against the
+        // dropped column would miss a setting both sides share.
+        if rewrite || readded {
             post.clear();
         }
 
@@ -1601,8 +1616,46 @@ impl TableColumn {
         parts
     }
 
+    /// The `ADD COLUMN` that creates this column, followed by the statements
+    /// that give it the storage, compression and statistics target it has
+    /// here (see `TableColumn::get_new_column_settings_script`) and by its
+    /// comment.
     pub fn get_add_script(&self) -> String {
         self.get_add_script_with_not_null("not null")
+    }
+
+    /// The statements that give a column just created from this definition
+    /// the storage strategy, compression method and statistics target it
+    /// has here. `ADD COLUMN`, and the `ADD ATTRIBUTE` of a typed table's
+    /// type, start a column with its type's storage, the default compression
+    /// and the default statistics target, so the migration lost every other
+    /// value (issue #252). Storage is set when it is not the type's own, and
+    /// when the dump does not say what that is (`type_storage`): stating it
+    /// is right either way.
+    pub(crate) fn get_new_column_settings_script(&self) -> String {
+        let table = format!("{}.{}", self.schema, self.table);
+        let mut script = String::new();
+        if let Some(storage) = &self.storage
+            && self.type_storage.as_ref() != Some(storage)
+        {
+            script.append_block(&format!(
+                "alter table {table} alter column {} set storage {storage};",
+                self.name
+            ));
+        }
+        if let Some(compression) = &self.compression {
+            script.append_block(&format!(
+                "alter table {table} alter column {} set compression {compression};",
+                self.name
+            ));
+        }
+        if let Some(target) = self.statistics_target.filter(|target| *target >= 0) {
+            script.append_block(&format!(
+                "alter table {table} alter column {} set statistics {target};",
+                self.name
+            ));
+        }
+        script
     }
 
     /// [`TableColumn::get_add_script`] with `not_null` — such as
@@ -1676,6 +1729,7 @@ impl TableColumn {
         }
 
         statement.append_block(";");
+        statement.push_str(&self.get_new_column_settings_script());
 
         if let Some(comment) = &self.comment {
             statement.append_block(&format!(
