@@ -120,6 +120,11 @@ pub struct Comparer {
     /// statement (issue #240). Off by default; when off the output is
     /// byte-for-byte what it always was.
     guard_sql_routine_bodies: bool,
+    /// Wrap each statement a client splitting at every `;` would cut, or that
+    /// holds a carriage return, in a `DO` block
+    /// (`--output-for-splitting-clients`). Off by default; when off the output
+    /// is byte-for-byte what it always was.
+    output_for_splitting_clients: bool,
 
     // The script that will be generated
     script: String,
@@ -399,6 +404,7 @@ impl Comparer {
             grants_mode,
             output_for_production: false,
             guard_sql_routine_bodies: false,
+            output_for_splitting_clients: false,
             script: String::new(),
             production_post_script: String::new(),
             enum_pre_script: String::new(),
@@ -926,6 +932,52 @@ impl Comparer {
         self
     }
 
+    /// Write the migration for SQL clients that split a script at every `;`
+    /// outside quotes and comments, such as the VS Code PostgreSQL extension,
+    /// rather than where psql ends a statement.
+    ///
+    /// Such a client cuts a statement with a `;` of its own, the `BEGIN
+    /// ATOMIC … END` body of a SQL-standard routine or a rule with several
+    /// actions, and sends the pieces one by one, so the first piece fails. It
+    /// also reads a positional parameter (`$1`) outside quotes as a bind
+    /// parameter and stops to ask for a value, and it runs the script from an
+    /// editor that may give every line ending one kind, as VS Code does, so a
+    /// carriage return in a literal or a body would reach the server as a line
+    /// feed. With this set, every statement with any of these is run through a
+    /// `DO` block that `EXECUTE`s it unchanged
+    /// (see [`wrap_for_splitting_clients`](super::splitting_clients::wrap_for_splitting_clients)),
+    /// as the last step of [`compare`](Self::compare), after the
+    /// `--output-for-production` rewrite. Every other statement is written as
+    /// before.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pgc::comparer::core::Comparer;
+    /// # use pgc::config::dump_config::DumpConfig;
+    /// # use pgc::config::grants_mode::GrantsMode;
+    /// # use pgc::dump::core::Dump;
+    /// # let config = || DumpConfig {
+    /// #     host: "localhost".to_string(), port: "5432".to_string(),
+    /// #     user: "postgres".to_string(), password: String::new(),
+    /// #     database: "shop".to_string(), scheme: "public".to_string(),
+    /// #     ssl: false, file: String::new(),
+    /// # };
+    /// let mut comparer = Comparer::new(
+    ///     Dump::new(config()),
+    ///     Dump::new(config()),
+    ///     true,
+    ///     true,
+    ///     true,
+    ///     GrantsMode::Ignore,
+    /// );
+    /// comparer.set_output_for_splitting_clients(true);
+    /// ```
+    pub fn set_output_for_splitting_clients(&mut self, value: bool) -> &mut Self {
+        self.output_for_splitting_clients = value;
+        self
+    }
+
     /// Compare dumps and generate the script.
     ///
     /// A FROM dump written by pgc 1.0.x against a TO dump written by pgc 1.1+
@@ -1160,6 +1212,12 @@ impl Comparer {
                     self.script = self.script.replacen(&format!("{guard}\n\n"), "", 1);
                 }
             }
+        }
+
+        // Last, so it sees every statement in its final form, including the
+        // production rewrite's guards and the post-commit sections.
+        if self.output_for_splitting_clients {
+            self.script = super::splitting_clients::wrap_for_splitting_clients(&self.script);
         }
 
         Ok(())
@@ -1672,11 +1730,12 @@ impl Comparer {
     /// and one the migration drops and recreates — a routine whose return type
     /// or kind changes or that a pre-drop or another routine's `CASCADE`
     /// takes, a view a table change or a routine's `CASCADE` takes, a table
-    /// the alter path rebuilds, a range type. `default_type` is the kind's
-    /// `pg_default_acl.defaclobjtype` (`r` for tables, views and foreign
-    /// tables, `S`, `f`, `T`), `object_kind` its `GRANT` keyword and
-    /// `schema` / `owner` the TO object's. The FROM object's own ACL is no
-    /// use for a recreated one: the `DROP` removed it.
+    /// the alter path rebuilds, a range type, a new schema. `default_type` is
+    /// the kind's `pg_default_acl.defaclobjtype` (`r` for tables, views and
+    /// foreign tables, `S`, `f`, `T`, `n` for schemas), `object_kind` its
+    /// `GRANT` keyword and `schema` / `owner` the TO object's (for a schema,
+    /// its own name, which no `n` row can be scoped to). The FROM object's
+    /// own ACL is no use for a recreated one: the `DROP` removed it.
     ///
     /// PostgreSQL starts the object from `acldefault(kind, owner)` — the
     /// owner, and for routines and types PUBLIC's `EXECUTE` / `USAGE` — unless
@@ -16186,36 +16245,51 @@ impl Comparer {
 
         // --- Schemas ---
         for schema in &self.to.schemas {
-            let (from_acl, from_owner) = from_schema_map
-                .get(schema.name.as_str())
-                .copied()
-                .unwrap_or((&[], ""));
-            // Asymmetric owner filters: ALTER ... OWNER TO removes the FROM
-            // owner's implicit-owner ACL entry from the FROM relation and
-            // creates one for the TO owner. Pre-fix the comparer used a
-            // single symmetric filter and treated the FROM owner's
-            // implicit privileges as if they would persist post-migration,
-            // producing non-idempotent REVOKE/GRANT pairs whenever
-            // ownership changed.
-            let from_owners: Vec<&str> =
-                [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+            let target = acl::AclTarget::Object {
+                kind: "SCHEMA",
+                name: &schema.name,
+            };
             let to_owners: Vec<&str> = [schema.owner.as_str()]
                 .into_iter()
                 .filter(|o| !o.is_empty())
                 .collect();
-            let owners = [from_owner, schema.owner.as_str()];
-            let scripts = acl::generate_grants_scripts(
-                from_acl,
-                &schema.acl,
-                full,
-                acl::AclTarget::Object {
-                    kind: "SCHEMA",
-                    name: &schema.name,
-                },
-                &from_owners,
-                &to_owners,
-                Self::grantor_revokes(true, &owners, revoke_style, replay_guard),
-            );
+            let scripts = match from_schema_map.get(schema.name.as_str()).copied() {
+                Some((from_acl, from_owner)) => {
+                    // Asymmetric owner filters: ALTER ... OWNER TO removes the
+                    // FROM owner's implicit-owner ACL entry from the FROM
+                    // relation and creates one for the TO owner. Pre-fix the
+                    // comparer used a single symmetric filter and treated the
+                    // FROM owner's implicit privileges as if they would
+                    // persist post-migration, producing non-idempotent
+                    // REVOKE/GRANT pairs whenever ownership changed.
+                    let from_owners: Vec<&str> =
+                        [from_owner].into_iter().filter(|o| !o.is_empty()).collect();
+                    let owners = [from_owner, schema.owner.as_str()];
+                    acl::generate_grants_scripts(
+                        from_acl,
+                        &schema.acl,
+                        full,
+                        target,
+                        &from_owners,
+                        &to_owners,
+                        Self::grantor_revokes(true, &owners, revoke_style, replay_guard),
+                    )
+                }
+                // A new schema starts from what its creation gives it, like
+                // a new table: FROM's `ALTER DEFAULT PRIVILEGES ... ON
+                // SCHEMAS` rows (`defaclobjtype = 'n'`, always database-wide)
+                // apply to the `CREATE SCHEMA`, so in full mode what they
+                // grant and TO lacks is revoked in this run rather than on
+                // the next compare (issue #251). A schema is never dropped and
+                // recreated, so only a new one gets here.
+                None => acl::generate_created_object_grants(
+                    &self.created_object_acl("n", &schema.name, "SCHEMA", &schema.owner),
+                    &schema.acl,
+                    full,
+                    target,
+                    &to_owners,
+                ),
+            };
             Self::push_grants(
                 &mut self.script,
                 &mut schema_revokes,

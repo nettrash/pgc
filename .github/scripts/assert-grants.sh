@@ -106,6 +106,18 @@ fi
 has "GRANT SELECT (g) ON TABLE public.rv_regmisc_grants_readd TO pgc_pg19_grants_reader;"
 has "GRANT SELECT (g) ON TABLE public.rv_regmisc_grants_readd TO pgc_pg19_grants_delegate WITH GRANT OPTION;"
 has "GRANT SELECT (code) ON TABLE public.rv_regmisc_grants_rebuilt TO pgc_pg19_grants_reader;"
+# fix:schemadefacl (issue #251): new_reporting_schema, which the migration
+# creates, starts with the USAGE the default privileges for schemas give
+# pgc_fix251_schema_reader; round 1 revokes it, so a holds what b does.
+sq=$(acl_rows schema.new_reporting_schema "coalesce(n.nspacl, acldefault('n', n.nspowner))" "pg_namespace n" "n.nspname = 'new_reporting_schema'")
+sd_a=$($PSQL -d a -c "$sq"); sd_b=$($PSQL -d b -c "$sq")
+if [ "$sd_a" != "$sd_b" ]; then
+  echo "::error::grants: new_reporting_schema privileges in database a differ from b after applying the migration"
+  diff <(echo "$sd_a") <(echo "$sd_b") || true
+  fail=1
+fi
+expect "default privileges for schemas in a (the fixture applied)" "select count(*) from pg_default_acl d, aclexplode(d.defaclacl) x where d.defaclobjtype = 'n' and x.grantee = 'pgc_fix251_schema_reader'::regrole" "1"
+has "REVOKE USAGE ON SCHEMA new_reporting_schema FROM pgc_fix251_schema_reader;"
 sets=$(grep -c '^SET ROLE ' <<<"$stmts" || true); resets=$(grep -c '^RESET ROLE;$' <<<"$stmts" || true)
 [ "$sets" = "$resets" ] || { echo "::error::grants: $sets SET ROLE but $resets RESET ROLE"; fail=1; }
 exit $fail

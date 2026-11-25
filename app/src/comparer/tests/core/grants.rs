@@ -3833,6 +3833,75 @@ async fn new_types_under_from_default_privileges_of_an_unknown_creator() {
     );
 }
 
+fn schema_with(name: &str, owner: &str, acl: &[&str]) -> Schema {
+    let mut schema = Schema::new(name.to_string(), name.to_string(), None);
+    schema.owner = owner.to_string();
+    schema.acl = acl.iter().map(|a| a.to_string()).collect();
+    schema.hash();
+    schema
+}
+
+#[tokio::test]
+async fn new_schema_under_from_default_privileges_for_schemas() {
+    // Issue #251, for schemas: `ALTER DEFAULT PRIVILEGES GRANT USAGE ON
+    // SCHEMAS TO worker` in FROM gives the schema the migration creates
+    // worker's USAGE, which a TO schema with a NULL ACL lacks. It used to be
+    // planned from an empty ACL, so the REVOKE came only on the next compare.
+    // Another role's row (`FOR ROLE app`) may be the one that applies, as for
+    // routines; rows for other kinds do not apply to a schema.
+    let mut from = Dump::new(DumpConfig::default());
+    from.default_privileges = vec![
+        pregrants_default_row(
+            "postgres",
+            "",
+            "n",
+            &["postgres=UC/postgres", "worker=U/postgres"],
+        ),
+        pregrants_default_row("app", "", "n", &["app=UC/app", "service=UC/app"]),
+        pregrants_default_row(
+            "postgres",
+            "",
+            "f",
+            &["postgres=X/postgres", "other=X/postgres"],
+        ),
+        pregrants_default_row("postgres", "s2", "r", &["other=r/postgres"]),
+    ];
+    let mut to = Dump::new(DumpConfig::default());
+    to.schemas.push(schema_with("s2", "postgres", &[]));
+    assert_eq!(
+        pregrants_compare(from.clone(), to.clone(), GrantsMode::Full, false).await,
+        "REVOKE CREATE, USAGE ON SCHEMA s2 FROM service;\n\n\
+         REVOKE USAGE ON SCHEMA s2 FROM worker;\n"
+    );
+    // Add-only revokes nothing, and a NULL ACL has nothing to grant.
+    assert_eq!(
+        pregrants_compare(from.clone(), to, GrantsMode::AddOnly, false).await,
+        ""
+    );
+    // What TO grants is granted, held or not; what the defaults may give and
+    // TO lacks is revoked.
+    let mut to = Dump::new(DumpConfig::default());
+    to.schemas.push(schema_with(
+        "s2",
+        "postgres",
+        &["postgres=UC/postgres", "worker=U/postgres"],
+    ));
+    assert_eq!(
+        pregrants_compare(from.clone(), to, GrantsMode::Full, false).await,
+        "REVOKE CREATE, USAGE ON SCHEMA s2 FROM service;\n\n\
+         GRANT USAGE ON SCHEMA s2 TO worker;\n"
+    );
+    // A schema FROM already has keeps its own ACL: the defaults applied when
+    // it was created, and its ACL records what they gave it.
+    from.schemas.push(schema_with("s2", "postgres", &[]));
+    let mut to = Dump::new(DumpConfig::default());
+    to.schemas.push(schema_with("s2", "postgres", &[]));
+    assert_eq!(
+        pregrants_compare(from, to, GrantsMode::Full, false).await,
+        ""
+    );
+}
+
 /// `compare_types` drops and recreates a changed range type, which comes back
 /// with `acldefault()`: its TO ACL is re-applied from there, not from the ACL
 /// the `DROP` removed.

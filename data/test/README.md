@@ -9,6 +9,23 @@ This folder contains two comprehensive PostgreSQL schemas designed to test all p
 - `clear_test.sql` - Schema for testing the `clear` command (drop-all script generation)
 - `clear_expected.sql` - Expected structure of the `clear` command output
 
+## Applying the fixtures
+
+Both files apply with no errors on PostgreSQL 18 and 19, in psql or in a SQL client that stops at the first error. A statement that needs PostgreSQL 19 sits in a `DO $pg19$` block, which `EXECUTE`s it only when `server_version_num` is at least 190000. Older servers skip it, so the PG19-only objects are absent from both sides there. The wrapped statement keeps its text and its place in the file, so PG19 creates the same objects in the same order.
+
+PostgreSQL 14–17 still reject some PG15–18 syntax (row filters, `VIRTUAL` generated columns, `NOT ENFORCED`, and so on). On those majors, apply the files the way CI does:
+
+```bash
+psql -d a -v ON_ERROR_STOP=0 -f data/test/schema_a.sql
+psql -d b -v ON_ERROR_STOP=0 -f data/test/schema_b.sql
+```
+
+A statement with a `;` of its own, a `BEGIN ATOMIC` body or a rule with several actions, sits in a `DO $stmt$` block that `EXECUTE`s it unconditionally. psql keeps such a statement whole, but a client that splits the file at every `;` outside quotes would send only its first part.
+
+When adding a PG19-only statement, put it in a `DO $pg19$` block as `EXECUTE $sql$ ... $sql$;`, and do the same in a `DO $stmt$` block for a statement with a `;` of its own. Static SQL in a `DO` block is parsed when the block compiles, so PG18 would reject it even in a branch that never runs. Keep positional parameters (`$1`) inside dollar-quoted bodies: SQL clients read them anywhere else as bind parameters and stop to ask for values.
+
+The migration pgc writes from these fixtures has the same kinds of statement. To apply it with such a client, generate it with `--output-for-splitting-clients true` (`OUTPUT_FOR_SPLITTING_CLIENTS=true`), which puts each of them in a `DO $pgc_client$` block (see the main README). CI checks that on every major with `.github/scripts/assert-splitting-clients.sh`. The script builds `pgc_split_a` from `schema_a.sql` and generates the migration to `b` with and without the option. It checks that the two differ only by those blocks. It then applies the wrapped migration the way such a client does: every line ending made a line feed, as VS Code does when it opens the file (so the migration may hold no carriage return; `pg19_sqlbody_literals` has one, which pgc writes as `chr(13)`), then one piece per `;`. The next compare must be empty.
+
 ## Testing Coverage
 
 These schemas are designed to test comparison capabilities for the following PostgreSQL objects:
@@ -460,7 +477,7 @@ Two tables differ:
 - `tbl_pg19_pub_rebuilt` changes its partition key (RANGE → LIST), so the migration drops and recreates it.
 - `tbl_pg19_pub_dropped` exists only in FROM.
 
-A statement the server cannot parse fails harmlessly under `ON_ERROR_STOP=0` and leaves that publication out of one side.
+A publication the server cannot create is left out of one side. Before PG19 the `FOR ALL SEQUENCES` and `EXCEPT` statements are skipped (see "Applying the fixtures"), and before PG15 or PG18 the row-filter, column-list, `TABLES IN SCHEMA` and `publish_generated_columns` ones fail under `ON_ERROR_STOP=0`.
 
 All versions:
 - **Modified**: `pg19_pub_all_to_list` goes from `FOR ALL TABLES` to `FOR TABLE`, and `pg19_pub_all_to_empty` goes from `FOR ALL TABLES` to empty. No ALTER can leave FOR ALL TABLES, so both are dropped and recreated. Before this change the first emitted a failing `SET TABLE` on every run and the second emitted nothing.
@@ -526,7 +543,7 @@ Requires PostgreSQL 19+ (`postgres_fdw` 1.3 supplies `postgres_fdw_connection`).
   - On PG16–18 the diff is the `OWNER TO` alone. PG14/15 refuse a non-superuser subscription owner on both sides, so they show no diff
 - **Removed**: `pg19_subfdw_sub_from_only` — on the FROM-only server; dropped before every other section
 - **Modified**: `pg19_subfdw_rdt_off` — `retain_dead_tuples` true → false, `max_retention_duration` 60000 → 5000, and the conninfo moves from this server to an unreachable host. While `retain_dead_tuples` is on, a source change contacts the new publisher, so the `SET` must come first
-- **Modified**: `pg19_subfdw_rdt_on` — `retain_dead_tuples` false → true, and the conninfo moves from an unreachable host to this server (`host=127.0.0.1 port=5432 user=postgres`, trust-authenticated inside the official image). Turning it on always contacts the publisher, so the `SET` must follow the `CONNECTION` change
+- **Modified**: `pg19_subfdw_rdt_on` — `retain_dead_tuples` false → true, and the conninfo moves from an unreachable host to this server (`host=/var/run/postgresql port=5432 user=postgres`). Turning it on always contacts the publisher, so the `SET` must follow the `CONNECTION` change
 - **Modified**: `pg19_subfdw_wrt_changed` — `wal_receiver_timeout` `'30s'` → `'10s'`
 - **Modified**: `pg19_subfdw_wrt_reset` — `'45s'` → default (`SET (wal_receiver_timeout = '-1')`; there is no `RESET` form)
 - **Modified**: `pg19_subfdw_wrt_set` — default → `'2min'` together with `max_retention_duration` 0 → 10000, in one `SET (...)`
@@ -770,7 +787,7 @@ The options are set with separate `ALTER ... SET` statements. On PG14–18 only 
 - **Modified**: materialized view `pg19_misc_reloptions_mv` gains `log_autoanalyze_min_duration=10` (drop + create + `alter materialized view ... set`)
 
 ### 52. New Contrib Extension pg_stash_advice (PG19+)
-- **Added (PG19+)**: `pg_stash_advice` in `public`, TO only. Expected: `create extension if not exists pg_stash_advice with schema public version '1.0';`. The version is installable on the migrated server, so it stays pinned. The extension needs no `shared_preload_libraries`, and its member objects are extension-owned and never dumped. On PG14–18 it fails harmlessly (`is not available`).
+- **Added (PG19+)**: `pg_stash_advice` in `public`, TO only. Expected: `create extension if not exists pg_stash_advice with schema public version '1.0';`. The version is installable on the migrated server, so it stays pinned. The extension needs no `shared_preload_libraries`, and its member objects are extension-owned and never dumped. On PG14–18 it is skipped (`is not available` there).
 
 ### 53. Aggregate Changes In Place, PARALLEL, SORTOP and Unbounded State
 Applies on every version: PG14–18 accept and store negative state sizes too; PostgreSQL 19's planner reads a negative `SSPACE` as "unbounded".
@@ -914,7 +931,7 @@ Unlike a string body, such a body is a hard dependent (`pg_depend`) of every rel
 - **Added**:
   - `test_schema.pg19_sqlbody_options(integer)`: every option comes before the body.
   - `test_schema.pg19_sqlbody_proc_to_only(integer)`: `SECURITY DEFINER`, with a comment.
-  - `test_schema.pg19_sqlbody_literals()`: a CR LF and a `$$` inside literals, kept byte for byte.
+  - `test_schema.pg19_sqlbody_literals()`: a CR LF and a `$$` inside literals, kept byte for byte (with `--output-for-splitting-clients` the CR is written as `chr(13)`, and `assert-splitting-clients.sh` checks it survives an editor's line-ending normalization).
 - **Dependency order**: `test_schema.pg19_sqlbody_a_caller` calls `test_schema.pg19_sqlbody_z_callee`, and `public.pg19_sqlbody_a_pub_caller` calls `public.pg19_sqlbody_z_pub_callee`.
   - The callee sorts last by name but must be created first.
   - The public pair relies on the body being deparsed with an empty `search_path`. Under the default path the callee printed as a bare `pg19_sqlbody_z_pub_callee(p)`, which the dependency scan cannot see.
@@ -989,7 +1006,7 @@ All objects live in `test_schema` and are named `pg19_rules_*` (or the quoted `"
   The routine-dependents pass (issue #179/#189) recreates the view, and all three rules must come back.
 - **Comment removed on a rule the CASCADE did not take**: `pg19_rules_tag_txt_view` calls the unchanged `pg19_rules_tag(text)` overload. The routine-dependents pass matches it by name and re-creates it with `CREATE OR REPLACE VIEW`, so its rule `pg19_rules_tag_txt_del` is re-emitted with `CREATE OR REPLACE RULE`, although nothing dropped it. TO removes the rule's comment, so the recreate must also clear it with `comment on rule ... is null`.
 - **Added**: `pg19_rules_new_view_ins`, on the TO-only view `pg19_rules_new_view`, calls the TO-only function `pg19_rules_fn`. Rules are therefore created after Routines & Views, Operators and Casts, just before Event Triggers.
-- **PG19+ `ON CONFLICT DO SELECT`**: `pg19_rules_upsert` changes from `ON CONFLICT (id) DO NOTHING` to `ON CONFLICT (id) DO SELECT FOR UPDATE RETURNING ...` and is replaced in place. Before 19 the TO statement is a syntax error under `ON_ERROR_STOP=0`, so the rule is absent from TO and the diff drops it.
+- **PG19+ `ON CONFLICT DO SELECT`**: `pg19_rules_upsert` changes from `ON CONFLICT (id) DO NOTHING` to `ON CONFLICT (id) DO SELECT FOR UPDATE RETURNING ...` and is replaced in place. Before 19 the TO statement is a syntax error and is skipped, so the rule is absent from TO and the diff drops it.
 - **The round-2 diff does not catch all of this.** A rule lost the same way on both sides — say, by a table recreate that no later dump can see — converges. The guard is the `Assert rules match after round 1` CI step, which checks that:
   - `pg_get_ruledef` and the comment of every non-`_RETURN` rule are the same in `a` and `b`;
   - every fixture rule above is present, and the removed ones are gone;
@@ -1953,6 +1970,22 @@ The `DO`-gated cases need a drop and re-add of an inherited column on PostgreSQL
 - on PG17+ the CHECK is dropped before the family's first `SET EXPRESSION` and added after its last, `inhck_g_v` is added after the child's `SET EXPRESSION`, and `inhck_i_b` is never dropped;
 - on PG19 `ALTER CONSTRAINT ... ENFORCED` follows each parent's retype for `inhck_en_child`, `inhck_enc_child` and `inhck_enp_1`.
 
+### 81. A Schema the Migration Creates Under the Default Privileges for Schemas (all versions)
+
+The fixture is the fix:schemadefacl block at the end of both schema files: `ALTER DEFAULT PRIVILEGES GRANT USAGE ON SCHEMAS TO pgc_fix251_schema_reader`, the same on both sides, for `postgres`, the role that also runs the migration. The statement has no `IN SCHEMA` form, so the row is database-wide. Both files run it last, after every `CREATE SCHEMA` of their own.
+
+**The problem (issue #251).** A new object starts from its creator's default privileges. For tables, sequences, views, routines and types, the grants of an object the migration creates are planned from the FROM rows for its kind (`Comparer::created_object_acl`). A new schema was planned from an empty ACL instead. `new_reporting_schema`, TO only with a NULL ACL, was created under the row and kept the reader's `USAGE`. Round 2 revoked it, so the migration needed a second run. The routine half of the issue (`ON FUNCTIONS`) was fixed earlier and is covered by section 69's `data.rv_pcascade_plain_new`.
+
+**What happens now.** A new schema is planned from the FROM rows for schemas of every role that may create it (`defaclobjtype = 'n'`). Whatever they may grant that TO lacks is revoked in round 1, and every TO grant is issued. Add-only mode revokes nothing.
+
+#### Schemas (fix:schemadefacl block)
+- **Added**: `new_reporting_schema` (section 1): `REVOKE USAGE ON SCHEMA new_reporting_schema FROM pgc_fix251_schema_reader`.
+- **Unchanged**: the default privilege row itself.
+
+**CI assertion** (`.github/scripts/assert-grants.sh`), run after round 1:
+- `new_reporting_schema`'s privileges in `a` match `b`;
+- `a` holds the row (so the fixture is not vacuous), and the round-1 SQL has the `REVOKE`.
+
 ---
 
 ## Clear Command Test (`clear_test.sql`)
@@ -2220,6 +2253,7 @@ The comparison should detect and generate SQL for:
   - A view whose plain `DROP VIEW` would fail, and every view of a pgc 1.0.x FROM dump, is left to the CASCADE as before.
 - Re-applying, in the same migration, the privileges of a view re-created after a routine's `DROP ... CASCADE` took it, planned from the schema's default privileges. A view matched only by the routine's name, which the CASCADE does not take, keeps its privileges, grantor-named revokes included.
 - Planning the privileges of a routine the migration creates (new, or dropped and re-created) from the FROM default privileges for functions of every role that may create it: a database-wide entry replaces PUBLIC's `EXECUTE`, and a schema entry adds to it.
+- Planning the privileges of a schema the migration creates from the FROM default privileges for schemas of every role that may create it, so that in full mode what they grant and TO lacks is revoked in the same run (issue #251)
 - Comparing a NULL routine ACL in TO with an explicit one in FROM as the default it stands for (PUBLIC's `EXECUTE`). No `REVOKE ... FROM PUBLIC` is emitted for it, and PUBLIC's `EXECUTE` is granted back where FROM lacks it.
 - Spelling grantees whose names need quotes (mixed case, keywords, spaces) as quoted identifiers in object and column `GRANT` / `REVOKE` and in `ALTER DEFAULT PRIVILEGES`, the same way as the grantor-named revokes. The owner's own aclitem entry is recognised whatever its case.
 - Comparing a routine's or type's NULL ACL as the default privileges it stands for (PUBLIC `EXECUTE` / `USAGE`), so `REVOKE ... FROM PUBLIC` and its reverse are migrated in the first run. An ACL with everything revoked (`{}`) is kept distinct from NULL.
