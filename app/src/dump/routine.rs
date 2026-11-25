@@ -958,7 +958,7 @@ impl Routine {
     /// PostgreSQL stores defaults separately from the argument list in pg_proc.
     /// `pg_get_function_identity_arguments()` returns arguments without defaults,
     /// while `pg_get_expr(proargdefaults, 0)` returns a comma-separated list of
-    /// default expressions that apply to the **last N** arguments.
+    /// default expressions that apply to the **last N input** arguments.
     ///
     /// This method merges them back so `CREATE OR REPLACE` includes the defaults
     /// and doesn't fail with "cannot remove parameter defaults from existing function".
@@ -972,38 +972,37 @@ impl Routine {
             return self.arguments.clone();
         }
 
-        // Split arguments respecting parenthesized type expressions (e.g. "numeric(10,2)")
         let args = Self::split_arguments(&self.arguments);
-        // Split defaults — these are simple expressions, but may contain commas inside
-        // function calls; use the same splitter for safety.
-        let defaults = Self::split_arguments(defaults_str);
-
-        if defaults.is_empty() || defaults.len() > args.len() {
-            return self.arguments.clone();
-        }
-
-        // Defaults apply to the last N arguments
-        let first_default_idx = args.len() - defaults.len();
+        let mut defaults = Self::split_arguments(defaults_str).into_iter().rev();
         let mut result_parts: Vec<String> = Vec::with_capacity(args.len());
 
-        for (i, arg) in args.iter().enumerate() {
-            if i >= first_default_idx {
-                let default_val = defaults[i - first_default_idx].trim();
+        for arg in args.iter().rev() {
+            let arg = arg.trim();
+            // PostgreSQL prints modes as uppercase prefixes. INOUT is an input.
+            let mode = arg.split_ascii_whitespace().next();
+            if !matches!(mode, Some("OUT" | "TABLE"))
+                && let Some(default_val) = defaults.next()
+            {
+                let default_val = default_val.trim();
                 if default_val.to_uppercase().starts_with("DEFAULT ") {
-                    result_parts.push(format!("{} {}", arg.trim(), default_val));
+                    result_parts.push(format!("{arg} {default_val}"));
                 } else {
-                    result_parts.push(format!("{} DEFAULT {}", arg.trim(), default_val));
+                    result_parts.push(format!("{arg} DEFAULT {default_val}"));
                 }
             } else {
-                result_parts.push(arg.trim().to_string());
+                result_parts.push(arg.to_string());
             }
         }
 
+        if defaults.next().is_some() {
+            return self.arguments.clone();
+        }
+        result_parts.reverse();
         result_parts.join(", ")
     }
 
-    /// Splits a comma-separated string respecting parenthesized groups and
-    /// single-quoted string literals.
+    /// Splits a comma-separated string respecting parentheses, brackets,
+    /// string literals, and quoted identifiers.
     /// E.g. "a numeric(10,2), b text"    → ["a numeric(10,2)", " b text"]
     /// E.g. "','::character varying, 0"  → ["','::character varying", " 0"]
     ///
@@ -1014,59 +1013,42 @@ impl Routine {
     fn split_arguments(s: &str) -> Vec<String> {
         let mut parts = Vec::new();
         let mut depth = 0;
-        let mut in_quote = false;
+        let mut quote = None;
         let mut current = String::new();
         let mut iter = s.chars().peekable();
 
         while let Some(ch) = iter.next() {
-            if in_quote {
-                // Inside a single-quoted string literal.
-                // Two consecutive single quotes represent an escaped quote ('').
-                if ch == '\'' {
-                    if iter.peek() == Some(&'\'') {
-                        // Escaped quote: consume both characters and stay in-quote.
-                        current.push('\'');
-                        current.push(iter.next().unwrap()); // safe: peek() confirmed Some above
-                    } else {
-                        // Closing quote.
-                        in_quote = false;
+            if let Some(delimiter) = quote {
+                current.push(ch);
+                if ch == delimiter {
+                    if iter.next_if_eq(&delimiter).is_some() {
                         current.push(ch);
+                    } else {
+                        quote = None;
                     }
-                } else {
-                    current.push(ch);
                 }
                 continue;
             }
 
-            // Outside any string literal.
             match ch {
-                '\'' => {
-                    in_quote = true;
-                    current.push(ch);
-                }
-                '(' => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                ')' => {
-                    depth -= 1;
-                    current.push(ch);
-                }
+                '\'' | '"' => quote = Some(ch),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
                 ',' if depth == 0 => {
                     parts.push(std::mem::take(&mut current));
+                    continue;
                 }
-                _ => {
-                    current.push(ch);
-                }
+                _ => {}
             }
+            current.push(ch);
         }
 
         if !current.is_empty() {
             parts.push(current);
         }
         debug_assert!(
-            !in_quote,
-            "split_arguments: unclosed single-quote in input: {s:?}"
+            quote.is_none(),
+            "split_arguments: unclosed quote in input: {s:?}"
         );
         parts
     }

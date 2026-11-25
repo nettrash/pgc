@@ -413,6 +413,43 @@ fn get_script_for_function_includes_defaults() {
 }
 
 #[test]
+fn get_script_places_default_before_out_parameters() {
+    let mut routine = build_function_routine();
+    routine.arguments =
+        "paccount text, pprocessid uuid, OUT amount numeric, OUT is_local boolean".to_string();
+    routine.arguments_defaults = Some("NULL::uuid".to_string());
+    routine.return_type = "record".to_string();
+    routine.source_code = "BEGIN amount := 1; is_local := true; END".to_string();
+
+    assert_eq!(
+        routine.get_script(),
+        concat!(
+            "create or replace function public.add(paccount text, ",
+            "pprocessid uuid DEFAULT NULL::uuid, OUT amount numeric, OUT is_local boolean) ",
+            "returns record language plpgsql VOLATILE PARALLEL UNSAFE as ",
+            "$$BEGIN amount := 1; is_local := true; END$$;\n\n"
+        )
+    );
+}
+
+#[test]
+fn arguments_with_defaults_preserves_mixed_parameter_modes() {
+    let mut routine = build_function_routine();
+    routine.arguments =
+        r#"id integer, INOUT payload integer[], OUT "result,""count" integer, "OUT" text, OUT status boolean"#
+            .to_string();
+    routine.arguments_defaults = Some("ARRAY[1, 2], ','::text".to_string());
+
+    assert_eq!(
+        routine.arguments_with_defaults(),
+        concat!(
+            r#"id integer, INOUT payload integer[] DEFAULT ARRAY[1, 2], "#,
+            r#"OUT "result,""count" integer, "OUT" text DEFAULT ','::text, OUT status boolean"#
+        )
+    );
+}
+
+#[test]
 fn get_script_includes_owner_when_present() {
     let mut routine = build_function_routine();
     routine.owner = "pgc_owner".to_string();
